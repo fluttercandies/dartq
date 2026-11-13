@@ -1741,6 +1741,16 @@ impl Interp<'_> {
                 // formal takes its target's type instead, so it never claims
                 // the implicit-`dynamic` face.
                 let (ty, implicit_dynamic) = match self.pending_ty.take() {
+                    // A WRITTEN annotation this lattice cannot spell — a
+                    // record type (`end_record_type` records the opaque
+                    // `Unknown` face) — is a declared type, never the
+                    // implicit-`dynamic` face: the read row keeps the
+                    // suppress face and the type layer's own static face
+                    // (its record decode) decides every consult, the way
+                    // upstream's `ResolutionVisitor` only overwrites a
+                    // formal whose element type is still `InvalidTypeImpl`
+                    // (no annotation was written at all).
+                    Some(Ty::UNKNOWN) if self.pending_ty_written => (Ty::UNKNOWN, false),
                     // The context-inferred formal face (official
                     // `_inferFormalParameters`): an implicitly typed
                     // formal of an open function literal arrives with

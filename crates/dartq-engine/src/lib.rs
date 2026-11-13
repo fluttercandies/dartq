@@ -95,6 +95,10 @@ pub use query::{
 pub use reachability::Reachability;
 pub use scheduler::{DrainReport, Task, Tier};
 pub use state::persist::PersistedFacts;
+pub use state::persist::{
+    AnswerAim, AnswerFace, AnswerMiss, AnswerProbe, AnswerShape, AnswerStamp, AnswerSummary,
+    envelope_key,
+};
 pub use state::{DirectiveFacts, DirectiveKind, FeatureGrants, LibraryId, ScannedFace, UnitFacts};
 pub use warm::{WarmStats, WarmStep};
 
@@ -397,11 +401,9 @@ impl Engine {
         let build = state::persist::analyzer_build();
         let grants = self.state.feature_grants.fingerprint();
         let packages = state::persist::package_graph_fingerprint(&self.state.packages);
-        keyed
-            .iter()
+        keyed.iter()
             .map(|&(content, fingerprint)| {
-                let key =
-                    state::persist::lint_rows_key(build, grants, packages, content, fingerprint);
+                let key = state::persist::lint_rows_key(build, grants, packages, content, fingerprint);
                 store.read(&key).ok()
             })
             .collect()
@@ -433,6 +435,100 @@ impl Engine {
         }
         store.put_known_batch(&batch);
         store.flush();
+    }
+
+    /// Probes the answered-turn record for `shape` (#4243): derives the
+    /// envelope key ([`state::persist::envelope_key`], the single
+    /// derivation point — the daemon turn cache reads the same spelling),
+    /// reads the sidecar, compares the caller's read-time stamp set, and
+    /// serves the stored blob on equality. Any leg's failure is
+    /// [`AnswerProbe::Miss`] — the caller takes today's full path
+    /// unchanged (the pure-accelerator contract; nothing here can change
+    /// an answer, only skip re-deriving one already rendered under
+    /// pinned-equal inputs).
+    ///
+    /// The stamps arrive as a parameter, not a fresh walk, by design: the
+    /// record pins the tree as the *rendering run read it*, so the caller
+    /// captures once ([`Self::stat_workspace`]) before the run and hands
+    /// the same set to this probe and to [`Self::persist_answer`] — a
+    /// post-render capture could otherwise stamp an edit the bytes never
+    /// saw and serve stale rows forever.
+    pub fn probe_answer(
+        &mut self,
+        shape: &state::persist::AnswerShape,
+        stamps: &[(PathBuf, state::persist::AnswerStamp)],
+    ) -> state::persist::AnswerProbe {
+        let miss = |engine: &mut Self, reason: state::persist::AnswerMiss| {
+            if let Some(sink) = engine.state.trace.as_mut() {
+                sink.answer_miss(reason.key());
+            }
+            state::persist::AnswerProbe::Miss(reason)
+        };
+        let Some(store) = self.state.l3.as_ref() else {
+            return miss(self, state::persist::AnswerMiss::NoStore);
+        };
+        let key = state::persist::envelope_key(
+            &self.snapshot_header(),
+            self.state.feature_grants.fingerprint(),
+            shape,
+        );
+        match probe_answer_at(store.root(), &key, stamps) {
+            state::persist::AnswerProbe::Hit { bytes, summary } => {
+                if let Some(sink) = self.state.trace.as_mut() {
+                    sink.answer_hit(&key);
+                }
+                state::persist::AnswerProbe::Hit { bytes, summary }
+            }
+            state::persist::AnswerProbe::Miss(reason) => miss(self, reason),
+        }
+    }
+
+    /// Persists the answered-turn record (#4243): files the rendered
+    /// bytes into the content store (content-addressed — an unchanged
+    /// answer writes zero bytes) and rewrites the mutable sidecar beside
+    /// them under the envelope key. The stamps are the caller's read-time
+    /// capture (see [`Self::probe_answer`]); a disarmed store or a failed
+    /// write is a silent no-op — a future miss, never an error (the
+    /// accelerator posture).
+    pub fn persist_answer(
+        &mut self,
+        shape: &state::persist::AnswerShape,
+        stamps: Vec<(PathBuf, state::persist::AnswerStamp)>,
+        rendered: &[u8],
+        summary: state::persist::AnswerSummary,
+    ) {
+        let key = state::persist::envelope_key(
+            &self.snapshot_header(),
+            self.state.feature_grants.fingerprint(),
+            shape,
+        );
+        let Some(store) = self.state.l3.as_mut() else {
+            return;
+        };
+        let blob = store.put(rendered);
+        store.flush();
+        let Some(sidecar) =
+            state::persist::encode_answer(&state::persist::AnsweredRecord {
+                version: state::persist::ANSWER_RECORD_VERSION,
+                blob: blob.to_string(),
+                stamps,
+                summary,
+            })
+        else {
+            return;
+        };
+        let path = store::answer_record_path(store.root(), &key);
+        let _ = store::write_answer_record(&path, &sidecar);
+    }
+
+    /// Records a face the v1 gates refused before any probe ran: the
+    /// trace taxonomy's `gated-*` rows — the reason key is
+    /// the caller's own (`gated-plugins`, `gated-overlay`, …), spelled
+    /// whole at the call site.
+    pub fn answer_gated(&mut self, reason: &'static str) {
+        if let Some(sink) = self.state.trace.as_mut() {
+            sink.answer_miss(reason);
+        }
     }
 
     /// The reachability inputs' workspace epoch (#4205): an
@@ -602,9 +698,21 @@ impl Engine {
     /// canonically sorted (path bytes, offset, code name) — the superset the
     /// incremental-equals-full oracle contract needs (deviation note in
     /// engine-api-spec: the drafted per-`targets` return cannot satisfy the
-    /// byte-equality arm, so `targets` drives only the `AnalyzeFile`
-    /// amplification events). The owned twin of [`Self::analyze_shared`]:
+    /// byte-equality arm). The owned twin of [`Self::analyze_shared`]:
     /// the same pipeline, the rows cloned out of the standing buffer.
+    ///
+    /// # Targeted turns (#4234)
+    ///
+    /// A non-empty `targets` set is a *file-aim* turn: the cross-session
+    /// replay adopts only the libraries owning the target files (and the
+    /// pipeline recomputes only them), so the returned set covers the
+    /// targets' libraries — every other library defers to the next
+    /// untargeted call, where it recomputes/replays and the full set
+    /// returns. The rows are exactly the full turn's rows for those
+    /// files (a file's rows live in its owning library's run), which is
+    /// what a file-aim caller's `covered` filter would keep; the
+    /// workspace-level faces (analysis-options issues, pubspec rows) are
+    /// never sliced. An empty set keeps the full-turn contract above.
     ///
     /// # Errors
     ///
@@ -621,8 +729,9 @@ impl Engine {
         // its stored library runs before the pipeline head (the apply the
         // head would run anyway, then adoption into `results`), and every
         // completed run persists after — also on `Err(Cancelled)`, whose
-        // completed units are whole results worth keeping.
-        self.state.replay_library_runs(on_event);
+        // completed units are whole results worth keeping. A file-aim turn
+        // slices that replay to the target libraries (#4234).
+        let targeted = self.state.replay_library_runs(on_event, targets);
         let analyzed = pipeline::analyze(
             &mut self.state,
             &mut self.graph,
@@ -631,8 +740,16 @@ impl Engine {
             on_event,
             cancel,
         );
+        // A targeted turn's standing merge covers the aim alone: dropping
+        // it keeps a later untargeted turn on the full-merge path instead
+        // of splicing onto a partial buffer.
+        if targeted {
+            self.state.merged = None;
+        }
         self.state.persist_library_runs();
-        let mut diagnostics = analyzed?.as_ref().clone();
+        let mut diagnostics = analyzed?
+        .as_ref()
+        .clone();
         self.capture_nested_pubspecs();
         // The settle's arming point (#2739): a completed analyze arms the
         // `Tier::Background` warm lane — O(1), the plan's items
@@ -652,7 +769,8 @@ impl Engine {
     }
 
     /// The shared-output twin of [`Self::analyze`] (#1387): the identical
-    /// contract and faces, with the merged rows handed over as one
+    /// contract and faces — including the targeted-turn contract on
+    /// `targets` (#4234) — with the merged rows handed over as one
     /// refcounted `Arc<Vec<Diagnostic>>` instead of an owned clone. A cycle
     /// in which no contributor re-analyzed — the interactive keystroke's
     /// dominant shape — returns a bump on the standing buffer, so the
@@ -674,10 +792,11 @@ impl Engine {
         cancel: &CancellationToken,
     ) -> Result<Arc<Vec<Diagnostic>>, Cancelled> {
         self.capture_pubspecs();
-        // #4199, as in [`Self::analyze`]: replay the staged generation's
-        // stored runs ahead of the pipeline head, persist the completed
+        // #4199/#4234, as in [`Self::analyze`]: replay the staged
+        // generation's stored runs ahead of the pipeline head (sliced to
+        // the target libraries on a file-aim turn), persist the completed
         // ones behind it (cancelled runs keep their finished units too).
-        self.state.replay_library_runs(on_event);
+        let targeted = self.state.replay_library_runs(on_event, targets);
         let analyzed = pipeline::analyze(
             &mut self.state,
             &mut self.graph,
@@ -686,6 +805,9 @@ impl Engine {
             on_event,
             cancel,
         );
+        if targeted {
+            self.state.merged = None;
+        }
         self.state.persist_library_runs();
         let shared = analyzed?;
         self.capture_nested_pubspecs();
@@ -1512,6 +1634,209 @@ impl Engine {
         }
         Ok(stats)
     }
+
+    /// The workspace's freshness stamp set (#4243): the stat-only walk
+    /// over every input the rendered answer reads — every discovered
+    /// `.dart` file (the [`discover_root`] predicate, no bytes read),
+    /// every options entry's located file (the nested-options gap the
+    /// context salt leaves), every package-table pubspec, and the
+    /// consumed `package_config.json` — each stamped with the full
+    /// identity tuple ([`state::persist::AnswerStamp`]). Sorted by
+    /// normalized path, deduped; a file that cannot stat is omitted, so
+    /// its later appearance changes the set. The probe compares this set
+    /// against the record's read-time capture; set equality plus the
+    /// envelope key's dimensions is the warm-serve trust boundary.
+    ///
+    /// The caller runs this BEFORE the turn's reads (discovery, options
+    /// loads): an edit racing the run leaves the captured stamps older
+    /// than the tree, which over-invalidates on the next probe — the
+    /// safe direction by construction.
+    #[must_use]
+    pub fn stat_workspace(&self) -> Vec<(PathBuf, state::persist::AnswerStamp)> {
+        workspace_stamps(&self.state.packages, &self.state.options, &self.context_root)
+    }
+}
+
+/// The generation header over an analysis context's identity inputs —
+/// the one derivation [`Engine::snapshot_header`] and the pre-assembly
+/// probe ([`probe_answer_unassembled`]) share, so an engine-backed key
+/// and an unassembled key can never spell differently.
+fn generation_header(
+    sdk: &SdkSnapshot,
+    target: &str,
+    packages: &PackageTable,
+    context_root: &Path,
+    declared_variables: &rustc_hash::FxHashMap<String, String>,
+) -> GenerationHeader {
+    let mut roots: Vec<PathBuf> = packages.iter().map(|package| package.root.clone()).collect();
+    roots.sort();
+    roots.dedup();
+    GenerationHeader {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        semantic_version: state::FACTS_SEMANTIC_VERSION,
+        sdk_identity: state::persist::sdk_identity(sdk, target),
+        package_graph_fingerprint: state::persist::package_graph_fingerprint(packages),
+        context_salt: state::persist::context_salt(
+            state::persist::analyzer_build(),
+            context_root,
+            target,
+            declared_variables,
+            &roots,
+        ),
+    }
+}
+
+/// The workspace's freshness stamp set ([`Engine::stat_workspace`]'s
+/// derivation, shared with the pre-assembly probe): the stat-only walk
+/// over the context roots' discovered `.dart` universe, every options
+/// entry's located file, every package-table pubspec, and the consumed
+/// `package_config.json` — derived from the same context inputs
+/// [`state::EngineState::new`] assembles, never a second spelling.
+fn workspace_stamps(
+    packages: &PackageTable,
+    options: &rustc_hash::FxHashMap<PathBuf, std::sync::Arc<analysis_options::AnalysisOptions>>,
+    context_root: &Path,
+) -> Vec<(PathBuf, state::persist::AnswerStamp)> {
+    // The discovered `.dart` universe: exactly the walk discovery
+    // enqueues, stat-only.
+    let roots = state::context_roots(packages);
+    let all_roots: FxHashSet<PathBuf> = roots.iter().cloned().collect();
+    let mut paths: Vec<PathBuf> = roots
+        .par_iter()
+        .map(|root| discover_root(options, root, &all_roots))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect();
+    // Every options entry's located file — the root entries resolve
+    // through the ancestor walk, nested entries are their own files;
+    // the dedup below folds the shared ancestors.
+    let mut option_files: Vec<PathBuf> = options
+        .keys()
+        .filter_map(|dir| analysis_options::AnalysisOptions::find_for_dir(dir))
+        .collect();
+    option_files.sort();
+    option_files.dedup();
+    paths.extend(option_files);
+    // Every package-table pubspec (the raw-bytes face the pubspec
+    // lint reads; the package-graph fingerprint pins identity
+    // columns, never content) and the consumed package config.
+    paths.extend(packages.iter().map(|package| package.root.join("pubspec.yaml")));
+    paths.push(context_root.join("package_config.json"));
+    // One normalization pass (the discovery spelling — symlinked
+    // parents canonicalize so two processes derive one set), then the
+    // parallel stat fan-out.
+    let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    let normalized = dartq_source::normalize_paths(&refs);
+    let mut stamps: Vec<(PathBuf, state::persist::AnswerStamp)> = paths
+        .par_iter()
+        .zip(&normalized)
+        .filter_map(|(path, normalized)| {
+            state::persist::AnswerStamp::capture(path).map(|stamp| (normalized.clone(), stamp))
+        })
+        .collect();
+    stamps.sort_by(|a, b| {
+        a.0.as_os_str()
+            .as_encoded_bytes()
+            .cmp(b.0.as_os_str().as_encoded_bytes())
+    });
+    stamps.dedup_by(|a, b| a.0 == b.0);
+    stamps
+}
+
+/// The answered-turn record read at `root` under `key` — the probe core
+/// [`Engine::probe_answer`] and [`probe_answer_unassembled`] share: the
+/// sidecar read, the read-time stamp comparison, and the blob read, all
+/// straight from the store's on-disk layout (no books needed — the
+/// record's blob is content-addressed and eviction removes the file, so
+/// a present file is the whole truth). Any leg's failure is a miss.
+fn probe_answer_at(
+    root: &Path,
+    key: &[u8; 16],
+    stamps: &[(PathBuf, state::persist::AnswerStamp)],
+) -> state::persist::AnswerProbe {
+    let path = store::answer_record_path(root, key);
+    let Some(sidecar) = store::read_answer_record(&path).ok() else {
+        return state::persist::AnswerProbe::Miss(state::persist::AnswerMiss::NoRecord);
+    };
+    let Some(record) = state::persist::decode_answer(&sidecar) else {
+        return state::persist::AnswerProbe::Miss(state::persist::AnswerMiss::Decode);
+    };
+    if record.stamps.as_slice() != stamps {
+        return state::persist::AnswerProbe::Miss(state::persist::AnswerMiss::Stamps);
+    }
+    let Some(blob) = dartq_source::ContentId::parse_hex(&record.blob).ok() else {
+        return state::persist::AnswerProbe::Miss(state::persist::AnswerMiss::Decode);
+    };
+    let Some(bytes) = std::fs::read(store::answer_blob_path(root, &blob)).ok() else {
+        return state::persist::AnswerProbe::Miss(state::persist::AnswerMiss::Blob);
+    };
+    state::persist::AnswerProbe::Hit {
+        bytes,
+        summary: record.summary,
+    }
+}
+
+/// The one-shot face's pre-assembly answered-turn probe (#4260): derives
+/// the probe's every input — the generation header, the feature-grants
+/// fingerprint, and the workspace stamps — straight from an assembled
+/// [`EngineConfig`], through the same derivations the assembled engine
+/// folds ([`generation_header`], [`state::EngineState::new`]'s options
+/// and grants, [`workspace_stamps`]), and probes the record store under
+/// `cache_root` without opening any store (the sidecar and blob read by
+/// path) and without constructing an engine. A hit lets the caller serve
+/// the recorded stdout before `Engine::new` and the store arms ever run;
+/// a miss hands back the read-time stamps for the persist side, the same
+/// capture an assembled [`Engine::stat_workspace`] would produce.
+///
+/// `cache_root` is the content store's root ([`store::default_root`]'s
+/// spelling); the store need not exist — every read failure is a miss,
+/// never an error (the pure-accelerator contract).
+#[must_use]
+pub fn probe_answer_unassembled(
+    config: &EngineConfig,
+    cache_root: &Path,
+    shape: &state::persist::AnswerShape,
+) -> (
+    state::persist::AnswerProbe,
+    Vec<(PathBuf, state::persist::AnswerStamp)>,
+) {
+    // The header's one heavy input is the analyzer build (the current
+    // executable's content hash); the options, grants, and stamps legs
+    // are independent of it, so the header derives beside them — the
+    // two legs' costs overlap instead of adding.
+    let (header, grants, stamps) = std::thread::scope(|scope| {
+        let header = scope.spawn(|| {
+            generation_header(
+                &config.sdk,
+                &config.target,
+                &config.packages,
+                &config.config_dir,
+                &config.declared_variables,
+            )
+        });
+        let options = analysis_options::AnalysisOptions::for_roots(
+            &state::context_roots(&config.packages),
+            &config.pub_config,
+            &config.config_dir,
+        );
+        let grants = state::FeatureGrants::new(
+            &config.sdk,
+            &config.target,
+            &config.packages,
+            &options,
+            &config.experiments,
+        )
+        .fingerprint();
+        let stamps = workspace_stamps(&config.packages, &options, &config.config_dir);
+        (
+            header.join().expect("the header derivation cannot panic"),
+            grants,
+            stamps,
+        )
+    });
+    let key = state::persist::envelope_key(&header, grants, shape);
+    (probe_answer_at(cache_root, &key, &stamps), stamps)
 }
 
 /// One refresh pass's outcome (#2596): how many sources re-read from
@@ -2002,15 +2327,17 @@ impl Engine {
         // exact over owned columns.
         rows.push((
             "packages_rows",
-            (self.state.packages.len() * std::mem::size_of::<dartq_package::PackageIdentity>())
-                as u64,
+            (self.state.packages.len()
+                * std::mem::size_of::<dartq_package::PackageIdentity>()) as u64,
             "est",
         ));
         rows.push((
             "options_entries",
             (self.state.options.capacity()
-                * (std::mem::size_of::<(PathBuf, Arc<crate::analysis_options::AnalysisOptions>)>()
-                    + 1)) as u64,
+                * (std::mem::size_of::<(
+                    PathBuf,
+                    Arc<crate::analysis_options::AnalysisOptions>,
+                )>() + 1)) as u64,
             "exact",
         ));
         rows
@@ -2077,29 +2404,13 @@ impl Engine {
     /// `save` at flush; callers never derive it by hand.
     #[must_use]
     pub fn snapshot_header(&self) -> GenerationHeader {
-        let mut roots: Vec<PathBuf> = self
-            .state
-            .packages
-            .iter()
-            .map(|package| package.root.clone())
-            .collect();
-        roots.sort();
-        roots.dedup();
-        GenerationHeader {
-            format_version: SNAPSHOT_FORMAT_VERSION,
-            semantic_version: state::FACTS_SEMANTIC_VERSION,
-            sdk_identity: state::persist::sdk_identity(&self.state.sdk, &self.state.target),
-            package_graph_fingerprint: state::persist::package_graph_fingerprint(
-                &self.state.packages,
-            ),
-            context_salt: state::persist::context_salt(
-                state::persist::analyzer_build(),
-                &self.context_root,
-                &self.state.target,
-                &self.state.declared_variables,
-                &roots,
-            ),
-        }
+        generation_header(
+            &self.state.sdk,
+            &self.state.target,
+            &self.state.packages,
+            &self.context_root,
+            &self.state.declared_variables,
+        )
     }
 
     /// Writes the resident facts into `store` as one generation — the M3
@@ -2992,6 +3303,16 @@ mod tests {
         // Canonicalize before the pub faces resolve it (the #287 spelling
         // universe — macOS /var vs /private/var).
         let root = root.canonicalize().expect("fixture root resolves");
+        let engine = facade_engine_over(&root);
+        (root, engine)
+    }
+
+    /// Assembles a fresh [`Engine`] over an existing facade fixture root —
+    /// the same binding [`facade_engine`] lands on first assembly. The
+    /// envelope tests re-assemble between legs to mirror the one-shot CLI
+    /// flow (options location is assembly-time state; each run locates
+    /// the options files fresh off disk).
+    fn facade_engine_over(root: &Path) -> Engine {
         let config_dir = root.join(".dart_tool");
         let config = Arc::new(
             PackageConfig::parse(
@@ -3012,7 +3333,7 @@ mod tests {
             &config_dir,
         )
         .expect("graph");
-        let engine = Engine::new(EngineConfig {
+        Engine::new(EngineConfig {
             store: memory_store(),
             sdk: SdkSnapshot::load(&root.join("sdk"), None).expect("synthetic SDK loads"),
             packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
@@ -3024,8 +3345,201 @@ mod tests {
             declared_variables: FxHashMap::default(),
             experiments: Vec::new(),
         })
-        .expect("engine");
-        (root, engine)
+        .expect("engine")
+    }
+
+    /// The answered-turn envelope's invalidation matrix, engine leg: a
+    /// persisted record serves on an unchanged tree, and every
+    /// stamp-domain face — a source edit, an appearing
+    /// nested options file (appearance re-keys; a content edit moves only
+    /// the stamp — the context-salt gap the envelope closes), a pubspec
+    /// edit, a package-config edit — plus the header fork an options edit
+    /// causes and the blob-eviction posture each demote to the miss the
+    /// full path answers. The P0 stamp-domain-enumeration gate.
+    #[test]
+    fn answer_envelope_invalidates_on_every_stamp_domain_face() {
+        let (root, mut engine) = facade_engine();
+        std::fs::create_dir_all(root.join("lib")).expect("lib dir");
+        std::fs::write(root.join("lib/main.dart"), "int main() => 1;\n").expect("seed");
+        let cache = root.join("cache");
+        engine
+            .open_content_store(&store::StoreConfig {
+                root: cache.clone(),
+                size_limit: store::DEFAULT_SIZE_LIMIT,
+            })
+            .expect("store arms");
+        engine.discover_workspace().expect("discover");
+        let cancel = CancellationToken::default();
+        engine
+            .analyze(&[], &mut |_| {}, &cancel)
+            .expect("analyze");
+
+        // The serving shape: the full-workspace ask, one face.
+        let shape = AnswerShape::new(AnswerFace::AnalyzeLon, vec![]);
+        let summary = AnswerSummary {
+            files: 1,
+            loc: 1,
+            diagnostics: 0,
+            libraries_analyzed: 1,
+            libraries_from_cache: 0,
+            has_error: false,
+            has_warning: false,
+            has_info: false,
+        };
+
+        // Persist under the read-time stamps; an unchanged tree serves the
+        // exact bytes and summary back.
+        let stamps = engine.stat_workspace();
+        engine.persist_answer(&shape, stamps, b"rendered-v1", summary);
+        match engine.probe_answer(&shape, &engine.stat_workspace()) {
+            AnswerProbe::Hit { bytes, summary: hit } => {
+                assert_eq!(bytes, b"rendered-v1");
+                assert_eq!(hit, summary);
+            }
+            AnswerProbe::Miss(reason) => panic!("quiet tree must hit: {reason:?}"),
+        }
+
+        // A source edit moves the stamp set — the P0 stale-serve face.
+        std::fs::write(root.join("lib/main.dart"), "int main() => 2;\n").expect("edit");
+        assert_eq!(
+            engine.probe_answer(&shape, &engine.stat_workspace()),
+            AnswerProbe::Miss(AnswerMiss::Stamps),
+            "source edit re-renders"
+        );
+        // The re-rendered turn re-persists under the new stamps and hits
+        // again (the touch posture: the sidecar is mutable).
+        let stamps = engine.stat_workspace();
+        engine.persist_answer(&shape, stamps, b"rendered-v2", summary);
+        assert!(matches!(
+            engine.probe_answer(&shape, &engine.stat_workspace()),
+            AnswerProbe::Hit { .. }
+        ));
+
+        // An appearing nested options file re-keys the envelope (the
+        // grants fingerprint folds the per-directory options experiments,
+        // so the ask's inputs moved): options location is assembly-time,
+        // so the next run — a fresh engine over the same tree, exactly
+        // the one-shot CLI flow — locates it and probes under a key no
+        // record holds.
+        std::fs::write(root.join("lib/analysis_options.yaml"), "linter:\n  rules: []\n")
+            .expect("options");
+        let mut reassembled = facade_engine_over(&root);
+        reassembled
+            .open_content_store(&store::StoreConfig {
+                root: cache.clone(),
+                size_limit: store::DEFAULT_SIZE_LIMIT,
+            })
+            .expect("store arms");
+        reassembled.discover_workspace().expect("discover");
+        assert_eq!(
+            reassembled.probe_answer(&shape, &reassembled.stat_workspace()),
+            AnswerProbe::Miss(AnswerMiss::NoRecord),
+            "nested options appearance re-keys"
+        );
+        // The context-salt gap the design closes: a nested options
+        // CONTENT edit moves no key input — the grants fold only
+        // experiment flags, the salt only per-root files — so the
+        // options_entries stamp is the only guard.
+        let stamps = reassembled.stat_workspace();
+        reassembled.persist_answer(&shape, stamps, b"rendered-v2", summary);
+        assert!(matches!(
+            reassembled.probe_answer(&shape, &reassembled.stat_workspace()),
+            AnswerProbe::Hit { .. }
+        ));
+        std::fs::write(
+            root.join("lib/analysis_options.yaml"),
+            "linter:\n  rules:\n    - empty_statements\n",
+        )
+        .expect("options edit");
+        assert_eq!(
+            reassembled.probe_answer(&shape, &reassembled.stat_workspace()),
+            AnswerProbe::Miss(AnswerMiss::Stamps),
+            "nested options content edit invalidates"
+        );
+
+        // A root options edit forks the context salt — the header leg: the
+        // derived key moves, so the sidecar reads as absent (no record
+        // under the new key), never a stale serve.
+        std::fs::remove_file(root.join("lib/analysis_options.yaml")).expect("clean");
+        std::fs::write(root.join("analysis_options.yaml"), "linter:\n  rules: []\n").expect("root");
+        assert_eq!(
+            engine.probe_answer(&shape, &engine.stat_workspace()),
+            AnswerProbe::Miss(AnswerMiss::NoRecord),
+            "options edit forks the header"
+        );
+        std::fs::remove_file(root.join("analysis_options.yaml")).expect("clean");
+        let stamps = engine.stat_workspace();
+        engine.persist_answer(&shape, stamps, b"rendered-v2", summary);
+        assert!(matches!(
+            engine.probe_answer(&shape, &engine.stat_workspace()),
+            AnswerProbe::Hit { .. }
+        ));
+
+        // A pubspec content edit (identity columns stand, bytes move).
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: t\nversion: 0.2.0\nenvironment:\n  sdk: ^3.5.0\n",
+        )
+        .expect("pubspec");
+        assert_eq!(
+            engine.probe_answer(&shape, &engine.stat_workspace()),
+            AnswerProbe::Miss(AnswerMiss::Stamps),
+            "pubspec edit invalidates"
+        );
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        )
+        .expect("restore");
+        let stamps = engine.stat_workspace();
+        engine.persist_answer(&shape, stamps, b"rendered-v2", summary);
+
+        // A package_config edit.
+        std::fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "t", "rootUri": "../", "languageVersion": "3.5"}], "generator": "dartq"}"#,
+        )
+        .expect("config edit");
+        assert_eq!(
+            engine.probe_answer(&shape, &engine.stat_workspace()),
+            AnswerProbe::Miss(AnswerMiss::Stamps),
+            "package_config edit invalidates"
+        );
+
+        // A vanished source file is a set move, not a stamp move — same
+        // miss.
+        std::fs::write(
+            root.join("lib/extra.dart"),
+            "int extra() => 3;\nint more() => 4;\n",
+        )
+        .expect("extra");
+        let stamps = engine.stat_workspace();
+        engine.persist_answer(&shape, stamps, b"rendered-v3", summary);
+        assert!(matches!(
+            engine.probe_answer(&shape, &engine.stat_workspace()),
+            AnswerProbe::Hit { .. }
+        ));
+        std::fs::remove_file(root.join("lib/extra.dart")).expect("remove");
+        assert_eq!(
+            engine.probe_answer(&shape, &engine.stat_workspace()),
+            AnswerProbe::Miss(AnswerMiss::Stamps),
+            "file removal invalidates"
+        );
+
+        // Blob eviction: the sidecar stands, the store lost the bytes —
+        // read-through failure is the miss, never a partial serve.
+        std::fs::write(root.join("lib/extra.dart"), "int extra() => 3;\nint more() => 4;\n")
+            .expect("restore");
+        let stamps = engine.stat_workspace();
+        engine.persist_answer(&shape, stamps, b"rendered-v3", summary);
+        let hex = dartq_source::content_hash(b"rendered-v3").to_string();
+        let blob = cache.join("store").join(&hex[..2]).join(&hex);
+        std::fs::remove_file(&blob).expect("evict");
+        assert_eq!(
+            engine.probe_answer(&shape, &engine.stat_workspace()),
+            AnswerProbe::Miss(AnswerMiss::Blob),
+            "blob eviction misses"
+        );
     }
 
     /// #2596: the stat-guarded refresh picks up out-of-band disk deltas —

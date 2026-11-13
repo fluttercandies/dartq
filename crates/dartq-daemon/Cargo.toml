@@ -12,6 +12,10 @@ categories = ["development-tools"]
 
 [dependencies]
 crossbeam-channel = { workspace = true }
+# The turn-boundary `mi_collect` (#4220): the daemon process runs under
+# the CLI binary's mimalloc; the `extended` feature only un-gates the
+# raw bindings (no C build change).
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 dartq-commands = { workspace = true }
 # The `dartq/debug/*` faces ride dartq-debug's synchronous VM Service
 # client and session orchestration (launch/attach, breakpoints, steps,

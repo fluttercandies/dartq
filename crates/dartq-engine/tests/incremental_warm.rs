@@ -538,7 +538,10 @@ fn pure_replay_reinstalls_the_query_surfaces() {
     // A two-library workspace with a real cross-library reference:
     // `greet` is declared in greeter.dart and invoked in main.dart, so
     // the surface carries both a declaration target and a resolved use.
-    let initial = [("lib/main.dart", MAIN_0), ("lib/greeter.dart", GREETER_0)];
+    let initial = [
+        ("lib/main.dart", MAIN_0),
+        ("lib/greeter.dart", GREETER_0),
+    ];
     let fixture = Fixture::new(&initial);
     let state: BTreeMap<String, String> = initial
         .iter()

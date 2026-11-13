@@ -454,10 +454,7 @@ mod tests {
             live_min: 0,
         };
         enforce(root.path(), &[], None, limits);
-        assert!(
-            !oldest.exists() && !middle.exists(),
-            "the two LRU caches go"
-        );
+        assert!(!oldest.exists() && !middle.exists(), "the two LRU caches go");
         assert!(newest.exists(), "100 bytes fit the 150-byte cap");
 
         // Under the floor the idle caches go LRU first too, until the
@@ -472,10 +469,7 @@ mod tests {
         // 1000 − 950 = 50 short: the LRU cache (100 bytes) clears it.
         enforce(root.path(), &[], Some(950), limits);
         assert!(!a.exists(), "the LRU idle cache goes");
-        assert!(
-            b.exists() && newest.exists(),
-            "the floor is clear: the rest stay"
-        );
+        assert!(b.exists() && newest.exists(), "the floor is clear: the rest stay");
     }
 
     /// A live cache is never deleted whole, however short the volume: its
@@ -500,10 +494,7 @@ mod tests {
             live.join(STORE).join("aa").join("key").exists(),
             "1000 → 500 bytes reaches the 600-byte minimum: the fresh file stays"
         );
-        assert!(
-            live.join(ROOTS_FILE).exists(),
-            "the live cache is never deleted"
-        );
+        assert!(live.join(ROOTS_FILE).exists(), "the live cache is never deleted");
     }
 
     /// The live trim deletes the oldest files first, stops at the store
@@ -548,17 +539,9 @@ mod tests {
     /// (`0` is unset).
     #[test]
     fn the_floor_is_two_percent_within_four_and_sixteen_gib() {
-        assert_eq!(
-            floor_of(100 * GIB, None),
-            4 * GIB,
-            "2 GiB → the 4 GiB floor"
-        );
+        assert_eq!(floor_of(100 * GIB, None), 4 * GIB, "2 GiB → the 4 GiB floor");
         assert_eq!(floor_of(500 * GIB, None), 10 * GIB, "2% of 500 GiB");
-        assert_eq!(
-            floor_of(2048 * GIB, None),
-            16 * GIB,
-            "40 GiB → the 16 GiB cap"
-        );
+        assert_eq!(floor_of(2048 * GIB, None), 16 * GIB, "40 GiB → the 16 GiB cap");
         assert_eq!(floor_of(0, None), 4 * GIB, "an unread volume floors");
         assert_eq!(floor_of(500 * GIB, Some(12_345)), 12_345, "the override");
         assert_eq!(floor_of(500 * GIB, Some(0)), 10 * GIB, "0 is unset");
@@ -611,6 +594,8 @@ mod tests {
             max_concurrent: 0,
             pool: false,
             max_roots: 0,
+            warm: 0,
+            warm_ttl_secs: 0,
         };
         let files = Files::of(&daemon);
         fs::write(&files.spec, serde_json::to_vec(&spec).expect("spec")).expect("spec file");
@@ -619,14 +604,8 @@ mod tests {
         let idle = cache(&caches, "idle", 10, now, 100);
 
         budget(root.path(), &daemon, Pass::Start, starved);
-        assert!(
-            !idle.exists(),
-            "a start pass under the floor frees idle caches"
-        );
-        assert!(
-            live.join(ROOTS_FILE).exists(),
-            "the live daemon's cache stays"
-        );
+        assert!(!idle.exists(), "a start pass under the floor frees idle caches");
+        assert!(live.join(ROOTS_FILE).exists(), "the live daemon's cache stays");
 
         let next = cache(&caches, "next", 10, now, 100);
         budget(root.path(), &daemon, Pass::Routine, starved);
@@ -650,10 +629,7 @@ mod tests {
         let kept = cache(&caches, "kept", 10, now, 100);
         backdate(120);
         budget(root.path(), &daemon, Pass::Routine, roomy);
-        assert!(
-            kept.exists(),
-            "a routine pass with room keeps idle caches under the cap"
-        );
+        assert!(kept.exists(), "a routine pass with room keeps idle caches under the cap");
         assert!(live.join(ROOTS_FILE).exists());
     }
 

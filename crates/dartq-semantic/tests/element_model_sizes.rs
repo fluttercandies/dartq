@@ -17,14 +17,16 @@ fn element_model_row_structs_stay_at_their_pinned_sizes() {
     // has anything left to win.
     assert_eq!(size_of::<Ty>(), 12, "Ty must stay niche-packed at 12 bytes");
 
-    // `TopDecl`: payload = kind(1) + type_params u16(2) + two `Ty`(24) +
-    // `Option<Box<Formals>>`(8) = 35 bytes, rounded to the 8-byte alignment
-    // of the boxed formals — 40 is exact, no padding lever without boxing a
-    // `Ty`.
+    // `TopDecl`: kind(1) + type_params u16(2) + the alias/closure-solver
+    // columns `type_param_names`/`type_param_bounds` (two `Box`es, 32 —
+    // the 0.1.21 wave's generic top-level declarations) + two `Ty`(24) +
+    // `Option<Box<Formals>>`(8) + the metadata star `annotations`
+    // (`Box<[Annotation]>`, 16 — the wave's top-level dmu target face) =
+    // 88. Boxing a `Ty` is the only lever left.
     assert_eq!(
         size_of::<TopDecl>(),
-        40,
-        "TopDecl budget: 8 + 12 + 12 + 4+4"
+        88,
+        "TopDecl budget: 16 + 32 + 12 + 12 + 8 + 16"
     );
 
     // `MemberEntry`: payload = two boxed columns(32) + `Option<Box<Formals>>`
@@ -53,16 +55,18 @@ fn element_model_row_structs_stay_at_their_pinned_sizes() {
     // `Formals`: two boxed formal columns — exactly 32.
     assert_eq!(size_of::<Formals>(), 32, "Formals budget: 16 + 16");
 
-    // `Container`: ten boxed 16-byte columns (members, ctor formals,
-    // annotations, primary formals, constructors, and — since #2246 — the
-    // with/implements/on/residue/enum-constant clause columns, which were
-    // inline `Vec`s worth 224 bytes total) + superclass(8) + the scalar tail
-    // (kind, eight modifier flags, type_params u16 = 11 bytes) = 179, rounded
-    // to 184. A clause column reverting to an inline `Vec` re-adds 8 bytes
-    // per field and pushes this past the pin.
+    // `Container`: seventeen boxed 16-byte columns (members, ctor/factory
+    // formals, annotations, primary formals, constructors, the
+    // with/implements/on/residue/enum-constant clause columns, the
+    // type-parameter name/bound columns, and the 0.1.21 wave's variance
+    // and clause-argument columns `type_param_variances` /
+    // `with/implements/on_clause_args`) + superclass(8) +
+    // superclass_args u32(4) + the scalar tail (kind, eleven modifier
+    // flags, type_params u16). A clause column reverting to an inline
+    // `Vec` re-adds 8 bytes per field and pushes this past the pin.
     assert_eq!(
         size_of::<Container>(),
-        184,
-        "Container budget: 10*16 + 8 + 11 rounded to 8"
+        320,
+        "Container budget: 17*16 + 8 + 4 + 18 rounded to 8"
     );
 }

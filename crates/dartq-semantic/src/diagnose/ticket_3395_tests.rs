@@ -25,7 +25,7 @@
 //!
 //! [`extension_application`]: crate::diagnose::row_resolution
 
-use crate::diagnose::test_rig::{assert_silent, code_names, report_ops};
+use crate::diagnose::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// An `on Object?` extension defines the member: the nullable receiver
 /// resolves the access through the extension, so nothing reports.
@@ -113,7 +113,12 @@ fn t3395_extension_this_operator_silent() {
 
 /// The composite-receiver operator face: `(a ?? b)` re-derives `C?`, and
 /// the `on C?` extension declares `+` — the resolved application stands
-/// the dereference row down.
+/// the dereference row down (no `unchecked_use_of_nullable_value` on the
+/// receiver). The right operand's own formal ask still reports: `a: C?`
+/// against the operator formal `C` (oracle-verified — `dart analyze` on
+/// the fixture reports exactly this one row; re-pinned from the old
+/// silent expectation, which the pre-inference engine only met by
+/// under-reporting the argument face).
 #[test]
 fn t3395_composite_operator_on_nullable_extension_silent() {
     let report = report_ops(
@@ -121,5 +126,15 @@ fn t3395_composite_operator_on_nullable_extension_silent() {
          extension E on C? { C operator +(C o) => o; } \
          C? g(C? a, C? b) => (a ?? b) + a;",
     );
-    assert_silent(&report);
+    let codes = code_names(&report);
+    assert_eq!(
+        codes,
+        vec!["argument_type_not_assignable"],
+        "{:?}",
+        rows(&report)
+    );
+    assert!(
+        !codes.contains(&"unchecked_use_of_nullable_value"),
+        "the extension application resolves the receiver dereference"
+    );
 }

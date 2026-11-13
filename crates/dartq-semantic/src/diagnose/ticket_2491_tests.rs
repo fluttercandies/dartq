@@ -272,9 +272,19 @@ class Watcher<ValueT> extends Listener<ValueT> {{
         "{:?}",
         messages(&report)
     );
-    assert_eq!(
-        report.diagnostics[0].message,
-        "The method 'notifyValue' is declared with 0 type parameters, but 1 type arguments are given."
+    // The row is pinned by CODE, not by index: the shared RESULT preamble's
+    // getter (`ValueT get value => const ResultData()` at its line 7) carries
+    // its own oracle-true `return_of_invalid_type` row ("A value of type
+    // 'ResultData<dynamic>' can't be returned from the function 'value'
+    // because it has a return type of 'ValueT'." — RETURN_OF_INVALID_TYPE
+    // 7:23, dart analyze 3.13.7 probed on this exact fixture), and the
+    // source-ordered merge rightly stages that earlier-offset row first —
+    // diagnostics[0] is the preamble's return row, never the send's.
+    assert!(
+        report.diagnostics.iter().any(|d| d.message
+            == "The method 'notifyValue' is declared with 0 type parameters, but 1 type arguments are given."),
+        "{:?}",
+        messages(&report)
     );
 }
 

@@ -195,6 +195,49 @@ impl<'a> Engine<'a> {
         }
         let mut ghost_offset: Option<u32> = None;
         let mut ghost_rows: Vec<usize> = Vec::new();
+        // The literal-junk exception slot (`on E catch (5, s)`, probed
+        // 3.13.7): the official parser wants an identifier, splices the
+        // synthetic one (the ghost the ensure route planted at the junk's
+        // own offset), and the junk TOKEN still blocks the `,`/`)` slot
+        // it wants next — it reports the missing `)` and closes the group
+        // right there, so `catchParameters` never grows a second slot and
+        // the `, tail` names nothing (no `s` row at all, and the nameless
+        // exception is NOT auto-used — its trace sibling never existed;
+        // the oracle reports `unused_catch_clause` '<unnamed>' beside the
+        // parse rows alone). A literal can never begin a formal; the
+        // keyword junk shapes (`var e`) keep their own branches below.
+        let literal_junk_head = self.locals[mark..]
+            .iter()
+            .find(|decl| matches!(decl.kind, LocalKind::CatchException { .. }))
+            .filter(|decl| self.is_nameless(decl.name))
+            .map(|decl| decl.range.offset)
+            .is_some_and(|offset| {
+                // The consume-in-doubt ghost plants at the junk's END
+                // ([`Self::junk_ends_at`]'s geometry): the junk is the
+                // token that ends exactly at the ghost's offset.
+                let tokens = self.tokens.as_slice();
+                let at = tokens.partition_point(|token| token.utf16_offset < offset);
+                at.checked_sub(1)
+                    .and_then(|index| tokens.get(index))
+                    .is_some_and(|token| {
+                        self.utf16_of((token.byte_offset + token.byte_len) as usize) == offset
+                            && matches!(
+                                token.kind,
+                                TokenKind::Int
+                                    | TokenKind::Double
+                                    | TokenKind::Hexadecimal
+                                    | TokenKind::String
+                            )
+                    })
+            });
+        if literal_junk_head {
+            for decl in &mut self.locals[mark..] {
+                if matches!(decl.kind, LocalKind::CatchStack) {
+                    decl.kind = LocalKind::Parameter { site: None };
+                }
+            }
+            return;
+        }
         for (i, decl) in self.locals[mark..].iter().enumerate() {
             if matches!(decl.kind, LocalKind::CatchStack) {
                 if self.is_nameless(decl.name) {
@@ -1646,6 +1689,21 @@ impl<'a> Engine<'a> {
         // verdicts against `'_'`: the read arm reports the whole-span
         // `missing_context` and the invocation arm the empty schema text,
         // exactly the declaration-window answers.
+        // A shorthand NESTED in a relational pattern's operand subtree
+        // (`case == (.missing)`, `case == (k ? .m1 : .m2)`) resolves
+        // against `Object` — the `Object.==(Object)` parameter face the
+        // oracle arms for the pattern's `==` invocation for every
+        // scrutinee family (oracle-pinned, dart analyze 3.13.7:
+        // `case == (.x)` reports 'Object'). This claim runs BEFORE the
+        // equality-operand guards below: the pattern's `case ==` prefix
+        // is not an expression equality — its nested subtrees read the
+        // invocation's parameter face, not the `'_'` an ordinary
+        // `x == (.a)` operand gets; the DIRECT `case == .x` operand
+        // keeps the matched type the EqEq arm answers (the walk returns
+        // to the `case` keyword there and declines).
+        if let Some(ctx) = self.relational_pattern_operand_ctx(prev_idx) {
+            return Some((Some(ctx), self.ty_display(ctx)));
+        }
         if self.shorthand_roots_equality_lhs(name_idx, prev_idx) {
             return Some((None, "_".to_string()));
         }
@@ -1966,6 +2024,58 @@ impl<'a> Engine<'a> {
             return false;
         };
         matches!(self.tokens.as_slice()[before].kind, TK::EqEq | TK::BangEq)
+    }
+
+    /// The `Object` context a shorthand NESTED in a relational pattern's
+    /// operand subtree resolves against (`case == (.missing)`,
+    /// `case == (k ? .m1 : .m2)`): the pattern's `==` desugars to an
+    /// invocation of the scrutinee's `Object.==(Object)` member, and the
+    /// oracle arms the nested operand against the method's parameter face
+    /// for every scrutinee family (dart analyze 3.13.7: `case == (.x)`
+    /// reports 'Object'). Walks backward from the token before the
+    /// shorthand's `.` to the operand group's own opener: closers deepen,
+    /// an opener past a closer closes an inner completed group, and the
+    /// FIRST opener at depth 0 is the subtree's own edge — the group
+    /// counts as a relational-pattern operand only when the operator
+    /// before it is the `==`/`!=` of a `case` clause (an ordinary
+    /// expression equality — `x == (.a)` — keeps the `'_'` the rhs guard
+    /// answers). The DIRECT `case == .x` shape declines here: the walk's
+    /// first step past the `==` lands on the `case` keyword itself.
+    fn relational_pattern_operand_ctx(&self, prev_idx: usize) -> Option<Ty> {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let toks = self.tokens.as_slice();
+        let mut depth = 0i32;
+        let mut idx = prev_idx;
+        while idx > 0 {
+            match toks[idx].kind {
+                TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth += 1,
+                TK::OpenParen | TK::OpenSquare | TK::OpenCurly => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                // The clause's own edge reached mid-walk: the shorthand is
+                // the operator's DIRECT operand (the walk's first step
+                // past `==` lands here) — the EqEq arm below owns it.
+                TK::Keyword(Kw::Case) | TK::Semicolon => return None,
+                _ => {}
+            }
+            idx -= 1;
+        }
+        let opener = idx;
+        let operator = opener.checked_sub(1)?;
+        if !matches!(toks[operator].kind, TK::EqEq | TK::BangEq) {
+            return None;
+        }
+        if !matches!(toks[operator - 1].kind, TK::Keyword(Kw::Case)) {
+            return None;
+        }
+        Some(Ty::Named {
+            name: self.intern("Object"),
+            nullable: false,
+            args: ArgListId::EMPTY,
+        })
     }
 
     /// The index of the opener matching the closer at `close_idx` — the
@@ -4054,6 +4164,18 @@ impl<'a> Engine<'a> {
                     lo += 1;
                 }
                 if lo >= hi {
+                    return;
+                }
+                // An inferred declared-variable leaf — a single identifier
+                // with no written annotation (a bare `final x` head, the
+                // `v6` of `Square(area: v6)`): the variable's type IS the
+                // matched value's type and no match check fires
+                // (`analyzeDeclaredVariablePattern` with no type written;
+                // a wildcard `_` declares nothing, and `bind_var_type`
+                // already enforces that through `declares_nothing`).
+                if lo + 1 == hi && toks[lo].kind == TokenKind::Identifier {
+                    let name = self.intern(&self.source[toks[lo].byte_range()]);
+                    self.bind_var_type(name, matched);
                     return;
                 }
                 // Typed leaf `T x` / `T _` vs object head `Name(...)`.
@@ -7337,7 +7459,8 @@ impl<'a> Engine<'a> {
                 .top_level_decl(name)
                 .and_then(|d| d.formals.as_deref().cloned())
                 .or_else(|| self.ctor_schema_formals(name, name))
-                .or_else(|| self.factory_ctor_formals(name, name)),
+                .or_else(|| self.factory_ctor_formals(name, name))
+                .or_else(|| self.primary_ctor_formals(name)),
             // A prefixed callee resolves through the prefix's import table,
             // never this unit's unprefixed constructor tables — a local
             // class `C` must not supply `p.C(`'s formals. The prefix
@@ -7521,6 +7644,37 @@ impl<'a> Engine<'a> {
         Some(formals)
     }
 
+    /// An extension type's primary-constructor formals
+    /// ([`Container::primary_formals`] — the representation-field facts):
+    /// `E(a)` over `extension type E(int i)` checks `a` against the
+    /// representation field's declared type (the oracle's
+    /// `test_extensionTypePrimaryConstructor` strict-casts row; the
+    /// selector tables above carry nothing for an extension type, so the
+    /// bare-creation callee would otherwise check no argument at all).
+    pub(crate) fn primary_ctor_formals(&self, class: StringId) -> Option<Formals> {
+        let (container, owner) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            class,
+        )?;
+        if container.kind != ContainerKind::ExtensionType {
+            return None;
+        }
+        let mut formals = Formals {
+            positional: container
+                .primary_formals
+                .iter()
+                .map(|rep| rep.formal)
+                .collect(),
+            named: Box::new([]),
+        };
+        self.project_formals(owner, &mut formals);
+        Some(formals)
+    }
+
     /// The argument-slot context's creation-head formal table: the callee
     /// transport drops the row for a keyword creation (`new F0([...])`) and
     /// a written-group head (`F0<int>(`, `C<int>.named(`), so
@@ -7557,7 +7711,7 @@ impl<'a> Engine<'a> {
         };
         // A `p.` before the class segment resolves through the prefix's
         // import table, never this unit's own scope.
-        let (container, owner) = match self.slot_head_prefix(class_offset) {
+        let resolved = match self.slot_head_prefix(class_offset) {
             Some(prefix) => prefixed_container(
                 self.graph,
                 self.namespaces,
@@ -7565,7 +7719,7 @@ impl<'a> Engine<'a> {
                 self.lib,
                 prefix,
                 class,
-            )?,
+            ),
             None => resolve_container(
                 self.graph,
                 self.namespaces,
@@ -7573,13 +7727,22 @@ impl<'a> Engine<'a> {
                 self.lib,
                 self.file,
                 class,
-            )?,
+            ),
         };
-        let mut formals = (**container
+        let Some((container, owner)) = resolved else {
+            return self.core_unindexed_future_formals(class, class_offset);
+        };
+        let mut formals = match container
             .ctor_formals
             .get(&selector)
-            .or_else(|| container.factory_formals.get(&selector))?)
-        .clone();
+            .or_else(|| container.factory_formals.get(&selector))
+        {
+            Some(formals) => (**formals).clone(),
+            // A resolved names-only container carries no ctor table at
+            // all (the SDK projection's unindexed grade) — the same
+            // unindexed-factory fallback answers.
+            None => return self.core_unindexed_future_formals(class, class_offset),
+        };
         self.project_formals(owner, &mut formals);
         self.patch_field_formals(class, &mut formals);
         // The class segment's own written group (`F0<int>`) instantiates
@@ -7627,6 +7790,53 @@ impl<'a> Engine<'a> {
             }
         }
         Some(formals)
+    }
+
+    /// The unindexed dart:async factory's computation formal
+    /// (`Future<Null>(() => 1)`): the SDK projection leaves `Future`
+    /// names-only (no element ctor table), but the unnamed factory's
+    /// formal is fixed — `Future(FutureOr<T> computation())` (upstream
+    /// Dart SDK source, sdk/lib/async/future.dart, the unnamed
+    /// factory). The head's written group instantiates the parameter
+    /// (`Future<Null>` reads `FutureOr<Null>`), so the closure-context
+    /// lane renders the oracle's `FutureOr<…>` face (probed 3.13.7:
+    /// `Future<Null>(() => 1)` reports `'int' isn't returnable from a
+    /// 'FutureOr<Null>' function`, the nested `Future<Future<Null>>`
+    /// and `Future<Never>` spellings alike). Only `Future` answers —
+    /// an arbitrary unindexed head keeps the context-free miss (no
+    /// invented formals).
+    fn core_unindexed_future_formals(
+        &mut self,
+        class: StringId,
+        class_offset: u32,
+    ) -> Option<Formals> {
+        if self.strings.resolve(class) != "Future" {
+            return None;
+        }
+        let arg = self
+            .slot_head_group_args(class, class_offset)?
+            .first()
+            .copied()?;
+        let future_or = Ty::Named {
+            name: self.intern("FutureOr"),
+            nullable: false,
+            args: self.boundary.intern_list(&[arg]),
+        };
+        let computation = self
+            .boundary
+            .args
+            .borrow_mut()
+            .function_generic(&[], future_or, &[], &[], false);
+        Some(Formals {
+            positional: Box::from([Formal {
+                name: self.intern("computation"),
+                ty: computation,
+                required: true,
+                covariant: false,
+                default_value: None,
+            }]),
+            named: Box::default(),
+        })
     }
 
     /// The class segment a named-selector creation head spells
@@ -8165,22 +8375,25 @@ impl<'a> Engine<'a> {
                 } else {
                     Receiver::Unknown
                 };
-                (recv, callee.name, Some(callee_row), None)
+                // A bare unqualified callee IS the unnamed creation head
+                // (`Future<Null>(() => 1)`), whether the container row
+                // resolved (`Container`) or fell to the names-only stub
+                // grade (`Plain` with `Unknown` — the unindexed
+                // dart:async face): when the element tables miss there,
+                // the written-group head's own lane answers below —
+                // `slot_creation_formals`' unindexed fallback reads the
+                // head's `<…>` group and only a `Future` head answers.
+                let bare_creation =
+                    (!callee.qualified && matches!(callee.shape, RowShape::Bare(_)))
+                        .then_some((callee.range, false));
+                (recv, callee.name, Some(callee_row), bare_creation)
             }
             None if enum_const => return None,
             None => match (unnamed_head, named_head) {
-                (Some((head, range)), _) => (
-                    Receiver::Unknown,
-                    head,
-                    None,
-                    self.slot_creation_formals(head, range, false),
-                ),
-                (None, Some((selector, range))) => (
-                    Receiver::Unknown,
-                    selector,
-                    None,
-                    self.slot_creation_formals(selector, range, true),
-                ),
+                (Some((head, range)), _) => (Receiver::Unknown, head, None, Some((range, false))),
+                (None, Some((selector, range))) => {
+                    (Receiver::Unknown, selector, None, Some((range, true)))
+                }
                 (None, None) => return None,
             },
         };
@@ -8192,7 +8405,12 @@ impl<'a> Engine<'a> {
         // the literal's context from `F0(List<int> a)`); the written
         // group's type arguments instantiate the class's own parameters
         // there (`F0<int>([...])` reads `List<int>`, never `List<T>`).
-        let slot_formals = head_formals.or_else(|| self.callee_formals(&recv, callee_name));
+        let slot_formals = if let Some((range, named)) = head_formals {
+            self.slot_creation_formals(callee_name, range, named)
+                .or_else(|| self.callee_formals(&recv, callee_name))
+        } else {
+            self.callee_formals(&recv, callee_name)
+        };
         let slot_ty = match slot {
             SchemaSlot::Positional(index) => slot_formals
                 .as_ref()
@@ -9217,6 +9435,20 @@ impl<'a> Engine<'a> {
     /// type parameters, real declarations — keeps its written face.
     fn invalid_return_fold(&self, ty: Ty) -> Ty {
         match ty {
+            // The builtin bottom is never the invalid face: `Never`
+            // resolves through the implicit dart:core import (the type
+            // provider owns it, imports or not), and a same-spelled
+            // shadowing declaration still answers the twin with the same
+            // code and display text (oracle 3.13.7) — the fold to the
+            // dedicated shape serves both. Alias and type-parameter faces
+            // already resolved in `completion_declared_ty` before this
+            // point; a nullable `Never?` keeps the written spelling below
+            // (the silent invalid face, matching the oracle).
+            Ty::Named {
+                name,
+                nullable: false,
+                args: ArgListId::EMPTY,
+            } if name == self.intern("Never") => Ty::Never,
             Ty::Named { name, .. } if !self.named_type_is_type(name) => Ty::UNKNOWN,
             _ => ty,
         }

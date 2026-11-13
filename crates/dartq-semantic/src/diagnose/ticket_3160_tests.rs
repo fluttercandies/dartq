@@ -31,14 +31,15 @@ fn nullable_receiver_quiet() {
     assert_eq!(rows(source), Vec::<(u32, u32, String)>::new());
 }
 
-/// A non-nullable receiver's `?.` reports at the operator (oracle len 2).
+/// A non-nullable receiver's `?.` reports at the operator token (oracle
+/// row at 2:4 — the `?` of `?.`, len 2).
 #[test]
 fn non_nullable_access_reports() {
     let source = "f(String s) {\n  s?.length;\n}\n";
     assert_eq!(
         rows(source),
         vec![(
-            15,
+            17,
             2,
             "The receiver can't be null, so the null-aware operator '?.' is unnecessary."
                 .to_string()
@@ -65,14 +66,17 @@ fn static_qualifier_reports_unconditionally() {
 
 /// The second `?.` of a shorted chain takes the `after_short_circuit`
 /// message — its receiver is non-null only because the first `?.` shorted
-/// it (`previousShortCircuitingOperator` :7679-7697).
+/// it (`previousShortCircuitingOperator` :7679-7697). The fixture declares
+/// its member (the bare rig reads no dart:core members, so a builtin
+/// `String` receiver would starve the pre-lift face); the row is the
+/// verbatim 3.13.7 oracle output for this shape.
 #[test]
 fn short_circuit_second_operator_reports_variant() {
-    let source = "f(String? s) {\n  s?.length?.isEven;\n}\n";
+    let source = "class A {\n  int get length => 0;\n}\nf(A? s) {\n  s?.length?.isEven;\n}\n";
     assert_eq!(
         rows(source),
         vec![(
-            26,
+            56,
             2,
             "The receiver can't be 'null' because of short-circuiting, so the null-aware operator '?.' can't be used."
                 .to_string()

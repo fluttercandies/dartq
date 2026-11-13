@@ -139,16 +139,29 @@ fn bound_param_existing_member_stays_silent() {
     );
 }
 
-/// An unbounded `T` resolves against the implicit `Object?` bound —
-/// `t.noSuchMember` reports, `t.toString()`/`t.hashCode` don't.
+/// An unbounded `T` reads potentially nullable through the implicit
+/// `Object?` bound (`isNonNullable`'s `TypeParameterType` arm: a null
+/// element bound answers non-nullable=false), so the property resolver's
+/// nullable branch owns the face — `t.noSuchMember` reports
+/// `unchecked_use_of_nullable_value` (the Object-interface lookup
+/// happens inside that branch, so `t.toString()`/`t.hashCode` resolve
+/// and stay silent). Re-pinned 3.13.7 against the live oracle: the
+/// original `undefined_getter` expectation was disproven
+/// (dart analyze on `void f<T>(T t) { t.noSuchMember; }` emits the
+/// unchecked row alone).
 #[test]
 fn unbounded_param_uses_object_bound() {
     let report = report_ops(
         "void f<T>(T t) { t.noSuchMember; }\n\
          void main() {}\n",
     );
-    let getters = rows_named(&report, "undefined_getter");
-    assert_eq!(getters.len(), 1, "Object face still reports: {getters:?}");
+    let unchecked = rows_named(&report, "unchecked_use_of_nullable_value");
+    assert_eq!(unchecked.len(), 1, "nullable-branch face reports: {unchecked:?}");
+    assert!(
+        rows_named(&report, "undefined_getter").is_empty(),
+        "the nullable branch owns the face: {:?}",
+        rows_named(&report, "undefined_getter")
+    );
 }
 
 /// A `T` receiver used from a nested executable still escapes the

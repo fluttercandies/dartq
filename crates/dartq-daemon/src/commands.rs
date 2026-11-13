@@ -1788,7 +1788,9 @@ fn memory_answer(drain: &Drain<'_>) -> Value {
             .engine
             .memory_report_full()
             .into_iter()
-            .map(|(family, bytes, kind)| json!({"family": family, "bytes": bytes, "kind": kind}))
+            .map(|(family, bytes, kind)| {
+                json!({"family": family, "bytes": bytes, "kind": kind})
+            })
             .collect();
         answer["decomposition"] = Value::Array(rows);
     }

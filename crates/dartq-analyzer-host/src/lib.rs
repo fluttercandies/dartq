@@ -74,7 +74,9 @@ pub enum Aim {
 pub fn covered(path: &Path, aims: &[Aim]) -> bool {
     aims.iter().any(|aim| match aim {
         Aim::Dir(dir) => path.starts_with(dir),
-        Aim::File(file) => path == file && file.extension().is_some_and(|ext| ext == "dart"),
+        Aim::File(file) => {
+            path == file && file.extension().is_some_and(|ext| ext == "dart")
+        }
     })
 }
 
@@ -103,6 +105,17 @@ pub struct Spec {
     /// The most worktrees a pooled daemon serves (1–64; `0` defaults 3).
     #[serde(default)]
     pub max_roots: u32,
+    /// The warm-standby posture: `0` (the serde default, i.e. unset by an
+    /// older client) resolves daemon-side to the default — warm on. The
+    /// daemon also honors `DARTQ_WARM_SERVERS` over whatever the spec
+    /// carries, so A/B arms need no CLI wiring. More than one standby is
+    /// meaningless for a daemon with one server at a time; `> 0` is on.
+    #[serde(default)]
+    pub warm: u32,
+    /// How long an idle daemon keeps its standby before exiting (Tier 3);
+    /// `0` resolves daemon-side to the default (900 s).
+    #[serde(default)]
+    pub warm_ttl_secs: u32,
 }
 
 impl Spec {
@@ -226,13 +239,14 @@ impl Files {
     }
 
     /// Emits one always-on observability line (an analysis server's
-    /// start or stop, with its reason): to stderr for a hand-run
-    /// foreground `--resident-serve`, and appended to the daemon dir's
-    /// `events.log` — the client spawns the daemon with its stderr
-    /// discarded, so the file is the only copy that reaches anyone. The
-    /// log restarts with the current line once it passes 64 KiB: bounded,
-    /// no rotation machinery. Both sinks are best effort; an event that
-    /// cannot be written never blocks the daemon.
+    /// start or stop with its reason, or a job-gate wait's enter/exit —
+    /// `gate-wait` / `gate-admit` / `gate-fault`): to stderr for a
+    /// hand-run foreground `--resident-serve`, and appended to the
+    /// daemon dir's `events.log` — the client spawns the daemon with its
+    /// stderr discarded, so the file is the only copy that reaches
+    /// anyone. The log restarts with the current line once it passes
+    /// 64 KiB: bounded, no rotation machinery. Both sinks are best
+    /// effort; an event that cannot be written never blocks the daemon.
     pub(crate) fn event(&self, line: &str) {
         use std::io::Write as _;
         eprintln!("{line}");
@@ -336,31 +350,13 @@ mod tests {
         let file = Aim::File(PathBuf::from("/p/lib/a.dart"));
         let yaml = Aim::File(PathBuf::from("/p/pubspec.yaml"));
         assert!(covered(Path::new("/p/lib/a.dart"), &[dir.clone()]));
-        assert!(covered(
-            Path::new("/p/lib/deep/b.dart"),
-            std::slice::from_ref(&dir)
-        ));
+        assert!(covered(Path::new("/p/lib/deep/b.dart"), std::slice::from_ref(&dir)));
         assert!(!covered(Path::new("/p/lib2/c.dart"), &[dir.clone()]));
-        assert!(!covered(
-            Path::new("/p/test/t.dart"),
-            std::slice::from_ref(&dir)
-        ));
-        assert!(covered(
-            Path::new("/p/lib/a.dart"),
-            std::slice::from_ref(&file)
-        ));
-        assert!(!covered(
-            Path::new("/p/lib/b.dart"),
-            std::slice::from_ref(&file)
-        ));
-        assert!(covered(
-            Path::new("/p/pubspec.yaml"),
-            &[Aim::Dir(PathBuf::from("/p"))]
-        ));
-        assert!(!covered(
-            Path::new("/p/pubspec.yaml"),
-            std::slice::from_ref(&yaml)
-        ));
+        assert!(!covered(Path::new("/p/test/t.dart"), std::slice::from_ref(&dir)));
+        assert!(covered(Path::new("/p/lib/a.dart"), std::slice::from_ref(&file)));
+        assert!(!covered(Path::new("/p/lib/b.dart"), std::slice::from_ref(&file)));
+        assert!(covered(Path::new("/p/pubspec.yaml"), &[Aim::Dir(PathBuf::from("/p"))]));
+        assert!(!covered(Path::new("/p/pubspec.yaml"), std::slice::from_ref(&yaml)));
     }
 
     /// The pooled spec's daemon directory is the pool's rendezvous: it
@@ -382,6 +378,8 @@ mod tests {
             max_concurrent: 0,
             pool,
             max_roots: 3,
+            warm: 0,
+            warm_ttl_secs: 0,
         };
         let a = spec("/sdks/a", &["/w/a"], true);
         let b = spec("/sdks/a", &["/w/b"], true);
@@ -412,6 +410,8 @@ mod tests {
             max_concurrent: 0,
             pool: true,
             max_roots: 3,
+            warm: 0,
+            warm_ttl_secs: 0,
         };
         let mut override_1 = plain.clone();
         override_1.packages = Some(PathBuf::from("/w/a/.dart_tool/package_config.json"));
@@ -426,6 +426,32 @@ mod tests {
         assert_eq!(override_1.dir(), joined.dir());
         plain.packages = Some(PathBuf::from("/w/a/.dart_tool/package_config.json"));
         assert_eq!(plain.dir(), override_1.dir());
+    }
+
+    /// The warm knobs are absent in every spec an older client writes:
+    /// such a spec parses to `0` ("not declared") and round-trips — the
+    /// daemon resolves `0` to the warm-on default, so old specs behave
+    /// as the new default, never as a silent opt-out.
+    #[test]
+    fn an_old_spec_parses_without_the_warm_knobs_and_round_trips() {
+        let old = r#"{
+            "sdk_root": "/sdks/a",
+            "sdk_version": "3.13.7",
+            "roots": ["/w/a"],
+            "packages": null,
+            "budget": 0,
+            "idle_secs": 60,
+            "max_percent": 90,
+            "max_concurrent": 0,
+            "pool": true,
+            "max_roots": 3
+        }"#;
+        let spec: Spec = serde_json::from_str(old).expect("the old spec parses");
+        assert_eq!(spec.warm, 0, "unset means not-declared");
+        assert_eq!(spec.warm_ttl_secs, 0);
+        let back = serde_json::to_string(&spec).expect("serializes");
+        let again: Spec = serde_json::from_str(&back).expect("round-trips");
+        assert_eq!(again, spec);
     }
 }
 

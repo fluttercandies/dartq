@@ -28,51 +28,56 @@ fn subtype_rows(report: &super::FileReport) -> Vec<String> {
 }
 
 /// The four clause faces report once each with the clause's own problem
-/// text (messages.yaml :17297/:17358/:17374/:17366).
+/// text (messages.yaml :17297/:17358/:17374/:17366). Oracle receipt
+/// (`dart analyze` 3.13.7, machine format) anchors every row at the
+/// WRITTEN TYPE NAME in the clause — `class B extends Null {}` reports
+/// `1|17|4|Classes can't extend 'Null'.` over `Null` — never the
+/// declaring name.
 #[test]
 fn disallowed_subtype_reports_per_clause_face() {
     let extends = report_ops_bare("class B extends Null {}");
     assert_eq!(
         subtype_rows(&extends),
-        ["Classes can't extend 'Null'. @6"],
+        ["Classes can't extend 'Null'. @16"],
         "{:?}",
         subtype_rows(&extends)
     );
     let with = report_ops_bare("class C with Record {}");
     assert_eq!(
         subtype_rows(&with),
-        ["Classes can't mixin 'Record'. @6"],
+        ["Classes can't mixin 'Record'. @13"],
         "{:?}",
         subtype_rows(&with)
     );
     let implements = report_ops_bare("class D implements FutureOr {}");
     assert_eq!(
         subtype_rows(&implements),
-        ["Classes and mixins can't implement 'FutureOr'. @6"],
+        ["Classes and mixins can't implement 'FutureOr<dynamic>'. @19"],
         "{:?}",
         subtype_rows(&implements)
     );
     let on = report_ops_bare("mixin M on Null {}");
     assert_eq!(
         subtype_rows(&on),
-        ["'Null' can't be used as a superclass constraint. @6"],
+        ["'Null' can't be used as a superclass constraint. @11"],
         "{:?}",
         subtype_rows(&on)
     );
 }
 
 /// One declaration's every clause face reports, in source order of the
-/// declaring names: a mixin's `on` constraint beside its `implements`
+/// clause type names: a mixin's `on` constraint beside its `implements`
 /// entry, and an enum's `with` entry beside its own `implements` (the
-/// per-kind clause split, error_verifier.dart:855-864/:7816-7817).
+/// per-kind clause split, error_verifier.dart:855-864/:7816-7817;
+/// anchor convention per the oracle receipt on the clause faces test).
 #[test]
 fn disallowed_subtype_covers_every_entry_per_kind() {
     let mixin = report_ops_bare("mixin M on Null implements Record {}");
     assert_eq!(
         subtype_rows(&mixin),
         [
-            "'Null' can't be used as a superclass constraint. @6",
-            "Classes and mixins can't implement 'Record'. @6",
+            "'Null' can't be used as a superclass constraint. @11",
+            "Classes and mixins can't implement 'Record'. @27",
         ],
         "{:?}",
         subtype_rows(&mixin)
@@ -81,8 +86,8 @@ fn disallowed_subtype_covers_every_entry_per_kind() {
     assert_eq!(
         subtype_rows(&enumeration),
         [
-            "Classes can't mixin 'FutureOr'. @5",
-            "Classes and mixins can't implement 'Null'. @5",
+            "Classes can't mixin 'FutureOr<dynamic>'. @12",
+            "Classes and mixins can't implement 'Null'. @32",
         ],
         "{:?}",
         subtype_rows(&enumeration)
@@ -105,32 +110,47 @@ fn disallowed_subtype_shadowed_by_user_declaration() {
     assert_silent(&report);
 }
 
-/// The core `Enum` in a `with` clause rides the `!mixinType.isDartCoreEnum`
-/// exemption (error_verifier.dart:2461-2463): the subtype row never fires
-/// there, while `implements Enum` keeps reporting.
+/// The core `Enum` never reports the subtype row on ANY clause face —
+/// neither the `with` exemption face (`!mixinType.isDartCoreEnum`,
+/// error_verifier.dart:2461-2463) nor a concrete class's other clauses.
+/// Oracle receipt (`dart analyze` 3.13.7, machine format): the `Enum`
+/// row is the SEPARATE `concrete_class_has_enum_superinterface` code
+/// (`class A implements Enum {}` reports
+/// `1|20|4|Concrete classes can't have 'Enum' as a superinterface.`,
+/// `extends` at the same face, `with` beside `class_used_as_mixin`),
+/// while `mixin M on Enum {}` / `mixin M implements Enum {}` /
+/// `abstract class A implements Enum {}` stay silent — this engine does
+/// not spell that code, so the subtype table stays silent for `Enum`.
 #[test]
-fn disallowed_subtype_core_enum_exempt_in_with_only() {
-    let with = report_ops_bare("class B with Enum {}");
-    assert!(subtype_rows(&with).is_empty(), "{:?}", subtype_rows(&with));
-    let implements = report_ops_bare("class B implements Enum {}");
-    assert_eq!(
-        subtype_rows(&implements),
-        ["Classes and mixins can't implement 'Enum'. @6"],
-        "{:?}",
-        subtype_rows(&implements)
-    );
+fn disallowed_subtype_core_enum_never_fires() {
+    for src in [
+        "class B with Enum {}",
+        "class B implements Enum {}",
+        "mixin M on Enum {}",
+        "abstract class B implements Enum {}",
+    ] {
+        let report = report_ops_bare(src);
+        assert!(
+            subtype_rows(&report).is_empty(),
+            "{src:?}: {:?}",
+            subtype_rows(&report)
+        );
+    }
 }
 
 /// A non-generic bare alias to a restricted spelling chases one level: the
 /// classification reads the alias's head, the report keeps the written
 /// alias name (`Classes can't mixin 'T'.`, messages.yaml :17358 — the
-/// oracle's `{0}` is the written type).
+/// oracle's `{0}` is the written type). Oracle receipt (`dart analyze`
+/// 3.13.7): `typedef T = Null; class W with T {}` reports
+/// `7|14|1|Classes can't mixin 'T'.` — the `T` IN THE CLAUSE, not the
+/// alias declaration and not the class name.
 #[test]
 fn disallowed_subtype_chases_bare_alias() {
     let report = report_ops_bare("typedef T = Null;\nclass B with T {}");
     assert_eq!(
         subtype_rows(&report),
-        ["Classes can't mixin 'T'. @24"],
+        ["Classes can't mixin 'T'. @31"],
         "{:?}",
         subtype_rows(&report)
     );

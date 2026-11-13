@@ -1285,8 +1285,26 @@ impl<'a> Engine<'a> {
     pub(crate) fn resolve_rows(&mut self, promotions: &PromotionStaging) {
         self.apply_deferred_rebinds();
         self.apply_deferred_invocation_faces();
+        // #3593: the if-null composite joins re-decide over the
+        // flow-confirmed function promotions before any row resolves
+        // (the bounds face reads the composite's face), and the
+        // extension-bounds checks the parse walk deferred over a
+        // degraded join re-run on the re-decided face.
+        self.redecide_promoted_if_null_faces();
+        self.run_deferred_if_null_bounds();
         self.build_ur_sites();
         let rows = std::mem::take(&mut self.rows);
+        // The typed closure-literal faces the walk's `&self` re-derivations
+        // read (`closure_init_ty`'s short-circuit): `self.rows` is empty
+        // from here on, so the literal rows stage into the side table
+        // first — keyed by the literal's own offset (its `(`).
+        self.closure_lit_rows = rows
+            .iter()
+            .filter(|row| {
+                matches!(row.shape, RowShape::Value) && matches!(row.ty, Ty::Function { .. })
+            })
+            .map(|row| (row.range.offset, row.ty))
+            .collect();
         // The anonymous-method bodies' receiver faces join the read-type
         // table before the walk (#3419): the `this` keywords and injected
         // formals inside them resolve members through the shared
@@ -1606,7 +1624,78 @@ impl<'a> Engine<'a> {
             RowShape::Receiver(recv) => self.resolve_receiver_row(row, *recv),
             RowShape::TypeUse(..) => self.resolve_type_row(row),
             RowShape::Record(fields) => self.resolve_record_row(row, fields),
-            RowShape::Value => {}
+            RowShape::Value => {
+                // A `unary-`/`~` applied to a resolved VALUE (a primitive
+                // literal, a call result) still owes its definedness check:
+                // the bare-read arm owns identifier operands (`-i`), the
+                // member-adjacent arm member tails (`-c.bad`), and this arm
+                // the value shapes — `-'a'` reports `undefined_operator`
+                // beside its const-eval row (probed 3.13.7: the oracle
+                // pairs `CONST_EVAL_TYPE_NUM`/`UNDEFINED_OPERATOR` at the
+                // operator), while a scalar-spelled value keeps the core
+                // operator matrix (see the matrix arm below). The
+                // increments and compounds stay with the staging pass's
+                // faces; a nullable operand's unchecked row is that layer's
+                // too.
+                if let Some((op_text, op_range, _, compound)) = self.adjacent_operator(row)
+                    && !compound
+                    && matches!(op_text, "unary-" | "~")
+                {
+                    let ty = self.expression_row_ty(row);
+                    if let Ty::Named { name, .. } = self.fold_alias_ty(ty) {
+                        // A VALUE operand with a scalar spelling decides by
+                        // the CORE operator matrix — the oracle's value-state
+                        // face: a literal or const-variable read keeps the
+                        // literal's core type even under a file-local shadow
+                        // (`class int {}` + `const a = 1 + 2; const neg =
+                        // -a` stays silent, probed 3.13.7 — while an
+                        // ANNOTATED variable keeps the shadow's face and
+                        // reports; that face is the bare-read arm's, never
+                        // this one). `int`/`double`/`num` carry `unary-`,
+                        // only `int` carries `~`, and `bool` carries neither
+                        // (`-true`/`~true`/`~1.5` all report beside their
+                        // const-eval rows). Every other spelling walks the
+                        // indexed member tables.
+                        let core_verdict = match self.strings.resolve(name) {
+                            "int" => Some(true),
+                            "double" | "num" => Some(op_text == "unary-"),
+                            "bool" => Some(false),
+                            _ => None,
+                        };
+                        match core_verdict {
+                            Some(true) => {}
+                            Some(false) => {
+                                let type_text = self.ty_display(self.fold_alias_ty(ty));
+                                self.emit(
+                                    SemanticCode::UndefinedOperator,
+                                    op_range,
+                                    op_text,
+                                    &type_text,
+                                );
+                            }
+                            None => match self.adjacent_operator_defined_in(ty, row, op_text, None)
+                            {
+                                // The ambiguous application replaces the miss —
+                                // the same verdict the bare-read arm takes.
+                                AdjacentOp::Ambiguous(displays) => {
+                                    let member = self.intern(op_text);
+                                    self.emit_extension_ambiguity(member, op_range, displays);
+                                }
+                                AdjacentOp::Missing => {
+                                    let type_text = self.ty_display(self.fold_alias_ty(ty));
+                                    self.emit(
+                                        SemanticCode::UndefinedOperator,
+                                        op_range,
+                                        op_text,
+                                        &type_text,
+                                    );
+                                }
+                                AdjacentOp::Defined => {}
+                            },
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2982,36 +3071,35 @@ impl<'a> Engine<'a> {
                                     RefTarget::Member { container } => Some(container),
                                     _ => None,
                                 });
-                            match self.adjacent_operator_defined_in(
-                                ty,
-                                row,
-                                op_text,
-                                member_container,
+                            // A const-variable read whose folded value is a
+                            // primitive state keeps the literal's CORE face
+                            // upstream — the const's inferred type is the
+                            // literal's, even under a file-local shadow
+                            // (`class int {}` + `const a = 1 + 2; const neg
+                            // = -a` stays silent, probed 3.13.7, while an
+                            // ANNOTATED variable keeps the shadow's face and
+                            // reports). The value state answers the operator
+                            // matrix directly (`Int` carries `unary-` and
+                            // `~`, `Double` only `unary-`, `Bool` neither);
+                            // every other operand walks the indexed tables.
+                            let const_state = match crate::const_eval::ConstLookup::ident(
+                                self,
+                                row.name,
                             ) {
-                                AdjacentOp::Defined => {}
-                                // The ambiguous application replaces the
-                                // operator miss (the oracle reports the
-                                // ambiguity at the operator token, never
-                                // `undefined_operator`).
-                                AdjacentOp::Ambiguous(displays) => {
-                                    let member = self.intern(op_text);
-                                    self.emit_extension_ambiguity(member, op_range, displays);
-                                }
-                                AdjacentOp::Missing => {
-                                    // The undefined-operator face (the
-                                    // increment/compound consults —
-                                    // postfix_expression_resolver.dart:159
-                                    // and the assignment resolver's
-                                    // operator twin): the operand's static
-                                    // type answers the base operator's
-                                    // definedness, a miss reports at the
-                                    // operator token with the operand's
-                                    // display name (dynamic/unknown
-                                    // dispatch dynamically — silent).
+                                crate::const_eval::IdentVerdict::Value(
+                                    crate::const_eval::ConstantValue::Int(_),
+                                ) => Some(true),
+                                crate::const_eval::IdentVerdict::Value(
+                                    crate::const_eval::ConstantValue::Double(_),
+                                ) => Some(op_text == "unary-"),
+                                crate::const_eval::IdentVerdict::Value(
+                                    crate::const_eval::ConstantValue::Bool(_),
+                                ) => Some(false),
+                                _ => None,
+                            };
+                            match const_state {
+                                Some(false) => {
                                     let type_text = match self.fold_alias_ty(ty) {
-                                        face @ (Ty::Record { .. } | Ty::Function { .. }) => {
-                                            Some(face.render(&self.strings, &self.boundary.pool()))
-                                        }
                                         face @ Ty::Named { .. } => Some(self.ty_display(face)),
                                         _ => None,
                                     };
@@ -3022,6 +3110,50 @@ impl<'a> Engine<'a> {
                                             op_text,
                                             &type_text,
                                         );
+                                    }
+                                }
+                                Some(true) => {}
+                                None => match self.adjacent_operator_defined_in(
+                                    ty,
+                                    row,
+                                    op_text,
+                                    member_container,
+                                ) {
+                                    AdjacentOp::Defined => {}
+                                    // The ambiguous application replaces the
+                                    // operator miss (the oracle reports the
+                                    // ambiguity at the operator token, never
+                                    // `undefined_operator`).
+                                    AdjacentOp::Ambiguous(displays) => {
+                                        let member = self.intern(op_text);
+                                        self.emit_extension_ambiguity(member, op_range, displays);
+                                    }
+                                    AdjacentOp::Missing => {
+                                        // The undefined-operator face (the
+                                        // increment/compound consults —
+                                        // postfix_expression_resolver.dart:159
+                                        // and the assignment resolver's
+                                        // operator twin): the operand's static
+                                        // type answers the base operator's
+                                        // definedness, a miss reports at the
+                                        // operator token with the operand's
+                                        // display name (dynamic/unknown
+                                        // dispatch dynamically — silent).
+                                        let type_text = match self.fold_alias_ty(ty) {
+                                            face @ (Ty::Record { .. } | Ty::Function { .. }) => {
+                                                Some(face.render(&self.strings, &self.boundary.pool()))
+                                            }
+                                            face @ Ty::Named { .. } => Some(self.ty_display(face)),
+                                            _ => None,
+                                        };
+                                        if let Some(type_text) = type_text {
+                                            self.emit(
+                                                SemanticCode::UndefinedOperator,
+                                                op_range,
+                                                op_text,
+                                                &type_text,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -3076,13 +3208,19 @@ impl<'a> Engine<'a> {
                 // arm and the flow layer's `call_head_unresolved` consult
                 // through [`types::CORE_TOP_LEVEL_FNS`]. Reaching the miss
                 // arm means no local, member, or import shadowed the name,
-                // so the facade answers the unqualified lookup outright —
-                // a resolved reference, never a miss row. The accepted
-                // limit matches the existing facade posture: an explicit
-                // `hide print` on a broken import is indistinguishable
-                // here from the resolved dart:core import (the guard
-                // suppresses only BROKEN imports).
-                if types::CORE_TOP_LEVEL_FNS.contains(&self.strings.resolve(row.name)) {
+                // so the facade answers the unqualified INVOCATION face
+                // outright — a resolved callee, never a miss row. A bare
+                // READ (the tear-off `c(print)`) rides the signature stand
+                // for its argument faces while the name itself still
+                // misses without a core element, so the read falls through
+                // to the undefined row beside the assignability face. The
+                // accepted limit matches the existing facade posture: an
+                // explicit `hide print` on a broken import is
+                // indistinguishable here from the resolved dart:core
+                // import (the guard suppresses only BROKEN imports).
+                if types::CORE_TOP_LEVEL_FNS.contains(&self.strings.resolve(row.name))
+                    && row.intent == Intent::Invoke
+                {
                     if !self.self_scope_rows.contains(&row.range.offset) {
                         self.used_names.insert(row.name);
                     }
@@ -3975,7 +4113,24 @@ impl<'a> Engine<'a> {
         let toks = self.tokens.as_slice();
         let mut scopes = Vec::new();
         for (index, token) in toks.iter().enumerate() {
-            if !matches!(token.kind, TokenKind::Identifier | TokenKind::Keyword(_)) {
+            // A reserved word can never be a declared name: its
+            // `name ( … ) {` shape is a control clause, not a declaration.
+            // The recovery face makes this load-bearing — a `catch (e) {}`
+            // parsed as an expression statement after `try/finally` would
+            // otherwise register as a local function whose block-wide scope
+            // contains its own bare invocation, and `local_fn_scope_hit`
+            // would swallow the oracle's `undefined_function` on `catch`
+            // (dart analyze 3.13.7 reports it at the `catch` token).
+            // Built-in and pseudo spellings (`get`, `on`, `when`, …) stay
+            // candidates — they are legal identifiers.
+            let name_candidate = match token.kind {
+                TokenKind::Identifier => true,
+                TokenKind::Keyword(k) => {
+                    k.style() != dartq_scanner::KeywordStyle::Reserved
+                }
+                _ => false,
+            };
+            if !name_candidate {
                 continue;
             }
             // A declaration's name never follows a creation keyword or a
@@ -4292,10 +4447,11 @@ impl<'a> Engine<'a> {
         head: StringId,
         spelling: StringId,
         hint: Option<StringId>,
+        at: Option<u32>,
     ) -> bool {
         let bound = self
             .param_bound(head)
-            .or_else(|| self.param_bound_of(head))
+            .or_else(|| self.param_bound_of_at(head, at))
             .or_else(|| {
                 let container = hint?;
                 self.bounds
@@ -4367,7 +4523,9 @@ impl<'a> Engine<'a> {
                 } else {
                     matches!(self.frozen_member_verdict(name, probe), FrozenFace::Absent)
                 };
-                if !member_missing || self.bound_defines_operator_in(name, probe, hint) {
+                if !member_missing
+                    || self.bound_defines_operator_in(name, probe, hint, Some(row.range.offset))
+                {
                     return AdjacentOp::Defined;
                 }
                 match self.extension_application(name, ty, probe, false, false) {
@@ -5594,13 +5752,37 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|formal| self.fold_alias_ty(formal.ty))
                     .collect();
-                Some(self.boundary.intern_function_ty(
-                    0,
-                    self.fold_alias_ty(entry.return_ty),
-                    &positional,
-                    &named,
-                    false,
-                ))
+                // The method's own `<T extends B>` group rides the tear-off
+                // verbatim (the oracle's FunctionType carries the method's
+                // typeFormals — display_string_builder's
+                // `_writeTypeParameters` spells them; probed dart analyze
+                // 3.13.7: `c.m < c.m` over `void m<T extends Num>(T a)`
+                // renders 'void Function<T extends Num>(T)'). An absent
+                // bound is the model's `Ty::Dynamic` sentinel — the
+                // anonymous entry, never a spelled `extends dynamic`.
+                let params: Vec<(StringId, Option<Ty>)> = entry
+                    .type_param_names
+                    .iter()
+                    .zip(entry.type_param_bounds.iter())
+                    .map(|(name, bound)| match self.fold_alias_ty(*bound) {
+                        Ty::Dynamic => (*name, None),
+                        bound => (*name, Some(bound)),
+                    })
+                    .collect();
+                let sig = FnVarSig {
+                    params: params.into(),
+                    required_positional: u16::try_from(
+                        formals.positional.iter().filter(|f| f.required).count(),
+                    )
+                    .unwrap_or(u16::MAX),
+                    positional: positional.into(),
+                    named: named
+                        .iter()
+                        .map(|(name, ty)| (*name, *ty, false))
+                        .collect(),
+                    return_ty: self.fold_alias_ty(entry.return_ty),
+                };
+                Some(self.fn_sig_ty(&sig))
             }
             MemberKind::Getter if entry.return_ty != Ty::Unknown => {
                 Some(self.fold_alias_ty(entry.return_ty))
@@ -7408,6 +7590,33 @@ impl<'a> Engine<'a> {
     /// miss reports the getter read (the operator's invalid type never
     /// cascades). Mixin `on` constraints and extension `on` types are
     /// invisible to the model, so bodies of those containers record only.
+    /// The flow-promoted receiver face for the member row at `member`:
+    /// upstream's property resolver reads the receiver's PROMOTED static
+    /// type, so an `is` refinement rewrites the whole face — a raw
+    /// `Expression` receiver promoted by `is Expression<DateTime>`
+    /// (#2285 item 5, the assignment window `outer = outer.julianday`)
+    /// consults the extension `on`-gate with the refined arguments, not
+    /// the declared face. Only a concrete promoted `Named` face
+    /// substitutes (an opaque marker carries nullability alone — the
+    /// #2241 stand-down owns that half — and a member selector read
+    /// never promotes, #2815 R3); everything else answers `None`.
+    fn promoted_recv_face(&self, promotions: &PromotionStaging, member: u32) -> Option<Ty> {
+        let read_span = self
+            .promoted_recv_reads
+            .binary_search_by(|(at, _)| at.cmp(&member))
+            .ok()
+            .map(|index| self.promoted_recv_reads[index].1);
+        let read_span = read_span?;
+        match promotions.promoted(read_span) {
+            Some(promoted @ Ty::Named { .. }) => {
+                Some(promoted)
+            }
+            other => {
+                None
+            }
+        }
+    }
+
     pub(crate) fn check_instance_member(
         &mut self,
         promotions: &PromotionStaging,
@@ -7431,7 +7640,9 @@ impl<'a> Engine<'a> {
         let (container, this_kind) = match recv {
             Receiver::This { container, kind } => (container, Some(kind)),
             Receiver::Typed { type_name, .. } => (type_name, None),
-            _ => return,
+            _ => {
+                return;
+            }
         };
         // A receiver whose class came from the closure-formal inference
         // (the solved callee-own parameter — the type is OUR approximation
@@ -7819,6 +8030,21 @@ impl<'a> Engine<'a> {
                             Self::member_result_ty(&entry),
                         )
                         .unwrap_or_else(|| Self::member_result_ty(&entry));
+                    // A METHOD read under the operator is the TEAR-OFF:
+                    // `member_result_ty`'s Unknown under-report would
+                    // suppress the check, but the read's static type is
+                    // the method's own function shape (`c.m < c.m` over
+                    // `void m<T extends B>(T a)` reports `undefined_
+                    // operator '<'` naming 'void Function<T extends
+                    // B>(T)', binary_expression_resolver.dart:425-478's
+                    // operand static type — the same face the bare
+                    // top-level tear-off's `receiver_decl_shape` leg
+                    // answers for `f < f`).
+                    let ty = if ty == Ty::UNKNOWN && matches!(entry.kind, MemberKind::Method) {
+                        self.member_entry_shape_ty(&entry).unwrap_or(ty)
+                    } else {
+                        ty
+                    };
                     self.check_operator_expr_in(ty, row, Some(container));
                     return;
                 }
@@ -7913,7 +8139,9 @@ impl<'a> Engine<'a> {
         // container's instance type (an extension body's `this` is the
         // extended type). A bare head skips the gate either way.
         let receiver_ty = match recv {
-            Receiver::Typed { ty, .. } => ty,
+            Receiver::Typed { ty, .. } => self
+                .promoted_recv_face(promotions, row.range.offset)
+                .unwrap_or(ty),
             Receiver::This { container, kind } => self.this_static_ty(container, kind),
             _ => Ty::UNKNOWN,
         };
@@ -8175,7 +8403,8 @@ impl<'a> Engine<'a> {
                     // other`/`t.toString()` stay silent even over the
                     // implicit `Object?` (the `Null` face's member map
                     // answers them).
-                    if self.member_defined(bound_head, bound, row, false, receiver_nullable) {
+                    let md = self.member_defined(bound_head, bound, row, false, receiver_nullable);
+                    if md {
                         return;
                     }
                     // A bound spelling a core interface/type-table head
@@ -9420,11 +9649,6 @@ impl<'a> Engine<'a> {
         receiver_nullable: bool,
     ) {
         let container_text = self.strings.resolve(container);
-        // `Symbol` rides the same face: every symbol literal is
-        // `Symbol`-typed (`#void.foo;` resolves `.foo` against it —
-        // symbols.dart) and the class declares none of the user selectors.
-        const SYMBOL_MEMBERS: [&str; 0] = [];
-        let symbol_face = container_text == "Symbol";
         // The `Function` interface's own instance surface: `call` is the
         // one selector the core `Function` type resolves (the
         // `isDartCoreFunction` arm, type_property_resolver.dart:194-198 —
@@ -9439,7 +9663,6 @@ impl<'a> Engine<'a> {
             .find(|(name, _)| container_text == *name)
             .map(|(name, members)| (*name, *members));
         let Some((_, members)) = core
-            .or_else(|| symbol_face.then_some(("", &SYMBOL_MEMBERS[..])))
             .or_else(|| function_face.then_some(("", &FUNCTION_MEMBERS[..])))
         else {
             // Not a known primitive — an UNDECIDABLE receiver head (`Never`
@@ -9535,7 +9758,7 @@ impl<'a> Engine<'a> {
         let name_text = self.strings.resolve(row.name);
         // A recovery-spliced synthetic selector never reports on the Symbol
         // face (the oracle's `#foo.void` keeps the keyword error only).
-        if symbol_face && name_text.is_empty() {
+        if container_text == "Symbol" && name_text.is_empty() {
             return;
         }
         if members.contains(&name_text)
@@ -11285,6 +11508,16 @@ impl<'a> Engine<'a> {
         let literal_core = Self::primitive_literal(row, &self.members.primitive_ids);
         let mut missing: Vec<String> = Vec::new();
         for spelling in [read, write].into_iter().flatten() {
+            // A pre-2.14 library's recovery-shaped `operator >>>`
+            // declaration contributes no consultable member (the oracle's
+            // element model leaves the split declaration unnamed — probe
+            // 3.13.7: the use reports `undefined_operator '>>>'` beside the
+            // declaration's own `experiment_not_enabled`), so the `>>>`
+            // consult always misses while the feature is off.
+            if spelling == self.intern(">>>") && !self.triple_shift_enabled {
+                missing.push(self.strings.resolve(spelling).to_string());
+                continue;
+            }
             let mut walk_missing = if literal_core {
                 !Self::frozen_face_hit(self.strings.resolve(name), self.strings.resolve(spelling))
             } else if indexed {
@@ -11298,8 +11531,32 @@ impl<'a> Engine<'a> {
             // A scope-parameter receiver answers on its bound (the
             // upstream `resolveToBound` consult) — `T extends num`
             // resolves `+` through `num`'s face.
-            if walk_missing && self.bound_defines_operator_in(name, spelling, param_hint) {
+            if walk_missing
+                && self.bound_defines_operator_in(name, spelling, param_hint, Some(op_range.offset))
+            {
                 walk_missing = false;
+            }
+            // The reverse posture: a receiver head a captured window
+            // declares is a scope parameter — a VALID receiver type, never
+            // the InvalidType anchor whose `Unknown` frozen verdict the
+            // walk above silences. The bound consult is the whole decision
+            // (`resolveToBound`): the nearest window at or before the use
+            // decides — `void f<T extends num>(T t)` silences `t + 1` on
+            // `num`'s face while `void g<T>(T t)` reads the implicit
+            // `Object?` bound and the miss reports (the parameter's own
+            // spelling renders, `undefined_operator '+'` for 'T').
+            if !walk_missing
+                && self
+                    .param_bound_of_at(name, Some(op_range.offset))
+                    .is_some()
+                && !self.bound_defines_operator_in(
+                    name,
+                    spelling,
+                    param_hint,
+                    Some(op_range.offset),
+                )
+            {
+                walk_missing = true;
             }
             if walk_missing {
                 // `[]` and `[]=` are ONE extension family (upstream
@@ -11404,6 +11661,8 @@ impl<'a> Engine<'a> {
         target: Option<(FileId, StringId, StringId)>,
     ) {
         if let Some((target_file, target_name, target_container)) = target {
+            if row.range.offset == 0 && row.range.length == 0 {
+            }
             self.report.member_refs.push(MemberRef {
                 range: row.range,
                 kind,
@@ -12817,12 +13076,29 @@ impl<'a> Engine<'a> {
             // field (no induced setter) or an explicit getter (no setter at
             // all). The oracle's `AssignmentVerifier.verify` reports there
             // instead of a member miss, so the row is claimed here and the
-            // caller's miss tail never sees it.
-            if !setter_hit
-                && let Some((landing, kind, is_final, name_range)) = named_hit
-                && self.report_setter_less_write(row, kind, is_final, name_range, landing)
-            {
-                return true;
+            // caller's miss tail never sees it — but the family owns the
+            // SIMPLE assignment alone: a compound write (`+=`) resolves the
+            // read through the getter first and its write half's `name=`
+            // miss reports `undefined_setter` (#3158: `c.foo += 1` over a
+            // getter-only `C` is the setter row alone).
+            if !setter_hit && let Some((landing, kind, is_final, name_range)) = named_hit {
+                if row.intent == Intent::ReadWrite && matches!(kind, MemberKind::Getter) {
+                    let name_text = self.strings.resolve(row.name);
+                    let class_text =
+                        landing.map_or_else(String::new, |(_, origin)| {
+                            self.strings.resolve(origin).to_string()
+                        });
+                    self.emit(
+                        SemanticCode::UndefinedSetter,
+                        row.range,
+                        name_text,
+                        &class_text,
+                    );
+                    return true;
+                }
+                if self.report_setter_less_write(row, kind, is_final, name_range, landing) {
+                    return true;
+                }
             }
             matches!(named, Walk::Found(_)) || setter_hit
         } else {
@@ -12863,6 +13139,8 @@ impl<'a> Engine<'a> {
                     self.check_member_callee_function_nullable(row);
                 }
             }
+            if matches!(walk, Walk::Missing) {
+            }
             let core_claim = matches!(walk, Walk::Missing)
                 && crate::member_face::core_member_return(
                     self.strings.resolve(container),
@@ -12897,6 +13175,27 @@ impl<'a> Engine<'a> {
                 // defined upstream).
                 if matches!(row.intent, Intent::Invoke) {
                     self.check_member_callee_function_nullable(row);
+                }
+                // The SDK accessor the core table claims resolves exactly
+                // like a found member: a merely-nullable receiver still
+                // reads a possibly-null receiver, and the
+                // nullable-dereference face reports at the selector
+                // (`nullable_dereference_verifier.dart`) — the claim
+                // suppresses only the `undefined_*` miss, never the
+                // unchecked face beside it (`int? x; x.isEven` reports the
+                // property variant while `isEven` stays off the rig's
+                // stub model).
+                if receiver_nullable {
+                    let extension_wins = matches!(
+                        self.extension_application(container, receiver_ty, row.name, write, true),
+                        ExtensionApp::Single
+                    );
+                    if !extension_wins {
+                        let name_text = self.strings.resolve(row.name);
+                        self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
+                    } else {
+                        self.extension_nullable_resolved.insert(row.range.offset);
+                    }
                 }
                 return true;
             }
@@ -13556,7 +13855,16 @@ impl<'a> Engine<'a> {
                     if arg_args != ArgListId::EMPTY || receiver_args != ArgListId::EMPTY {
                         return true;
                     }
-                    reaches(receiver_head, arg_head)
+                    // An `on` argument the unit's TypeUse rows snapshotted
+                    // `Missing`/`NonType` is the oracle's `InvalidType`
+                    // (`extension E on List<T>` over a `T` leaked from an
+                    // earlier declaration): `subtype.dart`'s invalid arm
+                    // subtypes every type, so the covariant check admits
+                    // any receiver argument and the face still applies —
+                    // the leaked `T` itself already reported through its
+                    // own type-argument row (probed against the 3.13
+                    // oracle: `x.m()` stays clean).
+                    reaches(receiver_head, arg_head) || invalid_head(arg_head)
                 })
         };
         // The receiver-container provenance gate (#2504): the oracle's
@@ -17059,13 +17367,14 @@ mod tests {
     /// not the boolish latch's `bool` (the `AsExpression.staticType` face):
     /// an `int` return position accepts a `dynamic` expression silently,
     /// where a `bool`-collapsed row would report `return_of_invalid_type`.
-    /// The `bool`-target control: `bool` is undeclared in the harness, so
-    /// the cast reports `cast_to_non_type` and the expression's static type
-    /// is the oracle's `InvalidType` — assignable into the `int` return
-    /// position, so no `return_of_invalid_type` stacks on top. The
-    /// trailing bare-statement shape guards the #2225 face-4 false
-    /// positive: a discarded `(x as dynamic);` asks no type question at
-    /// all.
+    /// The `bool`-target control: `bool` resolves as dart:core's final
+    /// primitive in every rig (`type_resolution`'s primitive lane), so the
+    /// cast is statically `bool` and the `int` return position reports the
+    /// genuine `return_of_invalid_type` — the live 3.13 oracle's single
+    /// row for this fixture (`A value of type 'bool' can't be returned
+    /// from the function 'g' …`). The trailing bare-statement shape guards
+    /// the #2225 face-4 false positive: a discarded `(x as dynamic);`
+    /// asks no type question at all.
     #[test]
     fn dynamic_cast_paren_keeps_the_dynamic_type() {
         let report = report_units(
@@ -17083,7 +17392,7 @@ mod tests {
         );
         assert_eq!(
             code_names(&report),
-            ["cast_to_non_type"],
+            ["return_of_invalid_type"],
             "{:?}",
             code_names(&report)
         );
@@ -17093,9 +17402,9 @@ mod tests {
     /// in a condition context still spares `non_bool_condition` (a `bool`
     /// cast is statically `bool`), and `x as dynamic` stays spared through
     /// the `dynamic`-assignable arm rather than the latch — same oracle
-    /// verdict, no collapsed row. `bool` is undeclared in the harness, so
-    /// each `as bool` site carries its `cast_to_non_type` row — the
-    /// condition faces must not join them.
+    /// verdict, no collapsed row. `bool` resolves as dart:core's final
+    /// primitive in every rig, so no `cast_to_non_type` joins — the live
+    /// 3.13 oracle answers all four conditions clean.
     #[test]
     fn bool_cast_condition_sparing_holds() {
         let report = report_units(
@@ -17112,7 +17421,7 @@ mod tests {
         );
         assert_eq!(
             code_names(&report),
-            ["cast_to_non_type", "cast_to_non_type"],
+            Vec::<&str>::new(),
             "{:?}",
             code_names(&report)
         );
@@ -17151,9 +17460,10 @@ mod tests {
     /// The deep-chain shape: `class C implements Match` breaks the member
     /// walk on the interface hop (`Match` resolves to the unindexed unit) —
     /// the frozen face still answers, so `c.absent` reports and `c.group`
-    /// stays silent. The rig has no dart:core, so `C`'s own member type
-    /// spellings (`int`, `String`, `int`) carry their `undefined_class`
-    /// rows beside the access miss.
+    /// stays silent. `C`'s own member type spellings (`int`, `String`,
+    /// `int`) resolve through dart:core's final-primitive lane in every
+    /// rig, so no `undefined_class` noise joins the access miss — the
+    /// live oracle's posture for the same declarations.
     #[test]
     fn unindexed_interface_hop_reports_absent_members() {
         let report = report_unindexed_unit(
@@ -17170,12 +17480,7 @@ mod tests {
         );
         assert_eq!(
             code_names(&report),
-            [
-                "undefined_class",
-                "undefined_class",
-                "undefined_class",
-                "undefined_getter"
-            ],
+            ["undefined_getter"],
             "{:?}",
             code_names(&report)
         );
@@ -17261,9 +17566,14 @@ mod tests {
     /// `named_formal_for`): a `this._x` field formal's element carries the
     /// public `x` (`correspondingPublicName`, token_impl.dart:364), so
     /// `super(x: 0)` binds silently while `super(y: 0)` keeps its
-    /// `undefined_named_parameter` miss. The fixture's `_x` is written by
-    /// the field formals and never read — the private field carries its
-    /// `unused_field` row beside the named miss.
+    /// `undefined_named_parameter` miss — and, the named miss leaving the
+    /// required formal uncovered, its `missing_required_argument` row at
+    /// the super call naming the public spelling (re-recorded from the
+    /// pinned oracle 3.13.7, probe59: three rows — the required row's
+    /// message is "The named parameter 'x' is required, but there's no
+    /// corresponding argument."). The fixture's `_x` is written by the
+    /// field formals and never read — the private field carries its
+    /// `unused_field` row beside the two named misses.
     #[test]
     fn super_named_argument_binds_the_public_formal_name() {
         let report = report_units(
@@ -17284,9 +17594,18 @@ mod tests {
         );
         assert_eq!(
             code_names(&report),
-            ["unused_field", "undefined_named_parameter"],
+            ["unused_field", "undefined_named_parameter", "missing_required_argument"],
             "{:?}",
             code_names(&report)
+        );
+        let missing = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "missing_required_argument")
+            .expect("the required row");
+        assert_eq!(
+            missing.message,
+            "The named parameter 'x' is required, but there's no corresponding argument."
         );
     }
 

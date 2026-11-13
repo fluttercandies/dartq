@@ -147,10 +147,13 @@ fn probe_function_type_arity() {
     let rows = rows_named(&report, "argument_type_not_assignable");
     assert_eq!(rows.len(), 1, "the arity face reports: {rows:?}");
     let (_, _, message) = &rows[0];
+    // The oracle's machine-format row ends at `'. ` — the empty
+    // `#additionalInfo` appendix keeps its separating space (live 3.13.7
+    // `dart analyze --format=machine`, byte-confirmed by od).
     assert_eq!(
         message,
         "The argument type 'void Function()' can't be assigned to the \
-         parameter type 'void Function(int)'.",
+         parameter type 'void Function(int)'. ",
         "the arity message face: {rows:?}"
     );
 }

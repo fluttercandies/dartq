@@ -6,14 +6,16 @@ use super::*;
 /// twin): the predicate visits the bounded reverse scan spent across
 /// every call (the new walk's total), and the widest post-operator tail
 /// any call saw (`rows_len - bound` — every row the old `.rev().find`
-/// would have walked past before reaching the prefix).
+/// would have walked past before reaching the prefix). Thread-local, not
+/// a process global: the harness runs sibling tests on other threads
+/// inside one reset→read window, and every engine run increments — a
+/// shared counter would bill their scans to this pin.
 #[cfg(test)]
-static ASSIGNMENT_TARGET_VISITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-/// See [`ASSIGNMENT_TARGET_VISITS`].
-#[cfg(test)]
-static ASSIGNMENT_TARGET_MAX_TAIL: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static ASSIGNMENT_TARGET_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// See [`ASSIGNMENT_TARGET_VISITS`].
+    static ASSIGNMENT_TARGET_MAX_TAIL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The structural-descent budget of the shared assignability verdict
 /// (#3333): the nesting depth of [`Engine::assignable`] frames one ask may
@@ -535,7 +537,14 @@ impl<'a> Engine<'a> {
             // contributes nothing.
             let mut window_start = start as u32;
             let trimmed = seg_text.trim_start();
-            if trimmed.starts_with("if") || trimmed.starts_with("for") {
+            // A control segment's multi-arm body (`e1 else e2`) never folds
+            // to one row — the leaf-grab fallback in the None arm would
+            // type the element from a single arm's inner row, a question
+            // the oracle's element resolver never asks (probed 3.13.7: a
+            // leaked case-scope binder arm reports only its
+            // `undefined_identifier`, never a list-element row).
+            let control = trimmed.starts_with("if") || trimmed.starts_with("for");
+            if control {
                 if let Some(open) = seg_text.find('(') {
                     let mut depth = 0usize;
                     let bytes_head = seg_text.as_bytes();
@@ -777,7 +786,12 @@ impl<'a> Engine<'a> {
                         // No single row spans the window (a composite
                         // operand the row model leaves unfolded): keep the
                         // legacy last-typed-row posture — the element's
-                        // inner row is the best face available.
+                        // inner row is the best face available. A control
+                        // segment's multi-arm body never folds to one row,
+                        // so the leaf grab stays off it entirely.
+                        if control {
+                            continue;
+                        }
                         let stop16 = e16;
                         let Some((row_ty, row_range, row_lit)) = self
                             .rows
@@ -2915,7 +2929,42 @@ impl<'a> Engine<'a> {
                         *member == &self.strings.resolve(row.name)[..]
                             && self.intern(recv) == container
                     })
-                    .map_or(Ty::UNKNOWN, |(_, _, head)| Ty::named(self.intern(*head)))
+                    .map_or(Ty::UNKNOWN, |(_, _, head)| {
+                        let name = self.intern(head);
+                        // A GENERIC container's factory send is
+                        // call-site instantiated: `Future.error(e)`
+                        // (`factory Future.error` over `Future<T>`,
+                        // future.dart:392) infers `T` from the return
+                        // or assignment context, so `Future<int> f()
+                        // => Future.error(e);` is clean while a bare
+                        // head would read as the raw type
+                        // (`Future<dynamic>` through the
+                        // instantiate-to-bounds fill) and reject.
+                        // `Unknown` arguments keep the same-head ask
+                        // undecided (the context-instantiation
+                        // silence) while a distinct-head ask — `int y
+                        // = Future.error(e)`, whose oracle row spells
+                        // `Future<dynamic>` — still walks the nominal
+                        // negative (probed 3.13.7
+                        // `dart analyze --format machine`: the
+                        // `Future<int>`/`Future<String>` assignments
+                        // stay silent, only the `int` one reports).
+                        let arity = CORE_CONTAINER_PARAMS
+                            .iter()
+                            .find(|(table_head, _)| *table_head == *head)
+                            .map_or(0, |(_, params)| params.len());
+                        if arity == 0 {
+                            Ty::named(name)
+                        } else {
+                            Ty::Named {
+                                name,
+                                nullable: false,
+                                args: self
+                                    .boundary
+                                    .intern_list(&vec![Ty::Unknown; arity]),
+                            }
+                        }
+                    })
             }
         }
     }
@@ -3151,8 +3200,22 @@ impl<'a> Engine<'a> {
                 _ => Ty::UNKNOWN,
             },
             RowShape::Receiver(recv) => match recv {
-                Receiver::This { container, .. } | Receiver::Super { container, .. } => {
-                    Ty::named(*container)
+                Receiver::This { container, .. } => Ty::named(*container),
+                // A null-asserted `super!` row carries the resolver's
+                // dynamic rewrite (`_resolveNullCheck`'s SuperExpression
+                // arm types the whole node dynamic —
+                // [`Self::check_null_assert`]), and that postfix upgrade
+                // wins over the container face exactly like
+                // [`Self::receiver_static_ty`]'s "row type wins" rule: the
+                // `?[`/`?.` faces after `super!` read a `dynamic` receiver
+                // and stay silent. The bare `super` row pushes with
+                // `ty: UNKNOWN`, so only the asserted form takes this arm.
+                Receiver::Super { container, .. } => {
+                    if row.ty != Ty::UNKNOWN {
+                        row.ty
+                    } else {
+                        Ty::named(*container)
+                    }
                 }
                 Receiver::Typed { ty, .. } => *ty,
                 _ => Ty::UNKNOWN,
@@ -3746,7 +3809,15 @@ impl<'a> Engine<'a> {
             // thousand `use_of_void_result` extras (#3861's reverted
             // attempt) — its face is a recorded residue, not a silent
             // drop.
-            return !self.spells_keyword_dynamic(name);
+            //
+            // A compiler-known core container (`Future`, `Iterable`, …) is
+            // exempt the same way: the oracle resolves it through the
+            // implicit dart:core import every library carries, so a
+            // synthetic unit without the SDK must not read `Future<int>`
+            // as `InvalidType` — the teardown's invalid-poison face already
+            // exempts them at its own site; owning the exemption here
+            // covers the nested spellings too (`C<Future<int>>`).
+            return !self.spells_keyword_dynamic(name) && !self.core_head(name);
         }
         self.boundary
             .pool()
@@ -4115,12 +4186,9 @@ impl<'a> Engine<'a> {
     fn assignment_target_index(&self, limit: u32) -> Option<usize> {
         let index_op = self.intern("[]");
         let bound = self.rows.partition_point(|row| row.range.offset <= limit);
-        ASSIGNMENT_TARGET_MAX_TAIL.fetch_max(
-            self.rows.len() - bound,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        ASSIGNMENT_TARGET_MAX_TAIL.with(|tail| tail.set(tail.get().max(self.rows.len() - bound)));
         self.rows[..bound].iter().rposition(|row| {
-            ASSIGNMENT_TARGET_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ASSIGNMENT_TARGET_VISITS.with(|visits| visits.set(visits.get() + 1));
             row.range.end() <= limit
                 && (!matches!(row.shape, RowShape::Value)
                     || matches!(&row.intent, Intent::Operator(op, _) if *op == index_op))
@@ -4170,20 +4238,17 @@ impl<'a> Engine<'a> {
             return None;
         }
         // A `:` between the operands is a conditional's else marker only
-        // when its matching `?` precedes the left row (named-argument
-        // labels, map-literal pairs, and switch-case colons pair no `?`).
-        let before = self.rows[..index]
-            .iter()
-            .rev()
-            .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
-            .filter(|row| !self.interpolation_child_rows.contains(&row.range.offset))
-            .nth(1)
-            .map_or(0, |row| row.range.end());
-        let lo = toks.partition_point(|t| t.utf16_offset < before);
-        toks[lo..]
-            .iter()
-            .take_while(|t| t.utf16_offset < left.range.offset)
-            .any(|t| t.kind == dartq_scanner::TokenKind::Question)
+        // when the then-arm's `?` DIRECTLY precedes the left row — nothing
+        // sits between `?` and the conditional's then operand. A window
+        // scan would also match a nullability `?` inside an earlier type
+        // annotation (`final V? a, b;` before `P(a: V())` misread the
+        // named-argument label's `:` as an else and joined `LUB(P, V)` =
+        // `Object`); named-argument labels, map-literal pairs, and
+        // switch-case colons pair no adjacent `?`.
+        let at = toks.partition_point(|t| t.utf16_offset < left.range.offset);
+        at.checked_sub(1)
+            .and_then(|i| toks.get(i))
+            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Question)
             .then_some((left, false))
     }
 
@@ -6311,9 +6376,12 @@ impl<'a> Engine<'a> {
         // invalid host). `Null` into any non-nullable named target is
         // decidable-false from nullability alone, so an unresolved head must
         // gate before the matrix — the gated-off `augment`-typed getters
-        // emit no `return_of_invalid_type` (#1445).
+        // emit no `return_of_invalid_type` (#1445). A compiler-known core
+        // container head (`Future<int>`, the implicit dart:core import's
+        // own) never gates: the oracle resolves it always.
         if let Ty::Named { name: head, .. } = to
             && !self.named_type_is_type(head)
+            && !self.core_head(head)
         {
             return;
         }
@@ -6448,6 +6516,26 @@ impl<'a> Engine<'a> {
         // assignability question.
         if let Ty::Named { name: head, .. } = to
             && !self.named_type_is_type(head)
+        {
+            return;
+        }
+        // A context return whose head is a FOREIGN type parameter — the
+        // callee's own generic parameter reaching the closure through an
+        // uninferred formal signature (`C((double x) => 0)` over
+        // `C(T Function(T) f)`) — is call-site-inference-pending: the
+        // oracle answers the return ask only AFTER the generic solve
+        // (probed 3.13.7: the same shape over a top-level
+        // `g<T>(T Function(T) f)` reports `could_not_infer` +
+        // `argument_type_not_assignable`, never this row). A parameter of
+        // the LIVE frame — the enclosing class's own `T` in
+        // `class C<T> { void m(T Function(T) f) {} void n() { m((x) =>
+        // 0); } }` — IS decided (same probe: the closure row reports),
+        // so the gate keys on live-frame membership, not the file decl
+        // table (a foreign `T` is also a file-level `TypeParam` decl).
+        if let Ty::Named { name: head, .. } = to
+            && !self.type_params.contains(&head)
+            && !self.pending_type_params.contains(&head)
+            && self.declared_head_is_type_param(head)
         {
             return;
         }
@@ -7424,6 +7512,26 @@ impl<'a> Engine<'a> {
                             .unwrap_or_else(|| self.instantiated_head_ty(Ty::named(*name)))
                     }
                 }
+                RowShape::Member {
+                    recv: Receiver::Created { name, kind, .. },
+                } if *kind != ContainerKind::Extension
+                    && row.ty == Ty::UNKNOWN
+                    && matches!(row.intent, Intent::Read) =>
+                {
+                    // A member read on a creation receiver asks the
+                    // member's own declared face at the window's tail
+                    // (`return B().x` reads `x`'s `int` exactly like the
+                    // initializer position does — the oracle's
+                    // property-read static type, `visitPropertyAccess`'s
+                    // element face). Everything the walk cannot spell
+                    // keeps the `Unknown` under-report posture.
+                    let declared = self.member_declared_ty(*name, row.name);
+                    if declared == Ty::UNKNOWN {
+                        row.ty
+                    } else {
+                        declared
+                    }
+                }
                 _ => row.ty,
             }
         };
@@ -7484,6 +7592,28 @@ impl<'a> Engine<'a> {
         if iterable_name.is_some_and(|n| self.fn_var_sigs.contains_key(&n)) {
             return None;
         }
+        let ty = if ty == Ty::UNKNOWN {
+            // An untyped collection literal's completed row is opaque at
+            // the row level (`[]` pushes a bare `Value`); its static type
+            // is the literal's own `List<...>`/`Set<...>`/`Map<...>`
+            // inference (`ListLiteralImpl.staticType`), the same
+            // no-context face the `is`-operand check re-types through
+            // `collection_operand_ty`. The tail row carries the literal's
+            // `]`-keyed `untyped_literals` entry, so the for-in element
+            // face reads it here: `for (var x in [c])` iterates `c`'s
+            // face, never the unknown the row holds.
+            let tail = self
+                .rows
+                .iter()
+                .skip(mark)
+                .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+                .filter(|row| !self.interpolation_child_rows.contains(&row.range.offset))
+                .next_back();
+            tail.and_then(|row| self.collection_operand_ty(row))
+                .unwrap_or(ty)
+        } else {
+            ty
+        };
         let Ty::Named {
             name,
             nullable: false,
@@ -7956,7 +8086,9 @@ impl<'a> Engine<'a> {
                 self.file,
                 *to_name,
             );
-            return to_container.map(|_| false);
+            return to_container
+                .map(|_| false)
+                .or_else(|| self.primitive_target_negative(*from_name, *to_name, false));
         }
         let to_container = resolve_container(
             self.graph,
@@ -7967,7 +8099,7 @@ impl<'a> Engine<'a> {
             *to_name,
         );
         if to_container.is_none() {
-            return None;
+            return self.primitive_target_negative(*from_name, *to_name, true);
         }
         let alias_hop =
             |name: StringId, file: FileId, lib: LibraryId| self.alias_clause_hop(name, file, lib);
@@ -7988,6 +8120,44 @@ impl<'a> Engine<'a> {
             .iter()
             .any(|(_, name)| *name == *to_name);
         (!found).then_some(false)
+    }
+
+    /// The final-primitive-target face of the nominal negative: `int`,
+    /// `double`, `num`, `bool`, `String` are `final` in dart:core, so no
+    /// user declaration ever joins their subtype closure (`class A extends
+    /// int` is the compiler's own error face, never an edge), and the only
+    /// core-side paths in are the equal head and the
+    /// [`crate::switch_tracker::CORE_SUPERTYPES`] lattice (`int <: num`,
+    /// `double <: num`). A source the scope resolves — a user container
+    /// (`from_resolved`), a primitive with no lattice edge, or a
+    /// compiler-known core container whose closure is core-side only
+    /// (`Future`/`Iterable`/… — `Future<int> <: int` is the oracle's
+    /// report) — is the decidable negative. A type-parameter source keeps
+    /// the question open (`T extends num` may one day be `int`), and an
+    /// unresolved head or a union face (`FutureOr`) stays under-reported.
+    fn primitive_target_negative(
+        &self,
+        from: StringId,
+        to: StringId,
+        from_resolved: bool,
+    ) -> Option<bool> {
+        if !self.members.primitive_ids.contains(&to)
+            || from == to
+            || self.declared_head_is_type_param(from)
+        {
+            return None;
+        }
+        let from_primitive = self.members.primitive_ids.contains(&from);
+        if from_primitive
+            && crate::switch_tracker::CORE_SUPERTYPES.iter().any(|&(sub, sup)| {
+                self.strings.resolve(from) == sub && self.strings.resolve(to) == sup
+            })
+        {
+            // The lattice's own accept (`int <: num`) — the caller's matrix
+            // answers the positive; the negative never overturns it.
+            return None;
+        }
+        (from_resolved || from_primitive || self.core_head(from)).then_some(false)
     }
 
     /// Enters an enum constant: its constructor type arguments check against
@@ -8202,7 +8372,12 @@ impl<'a> Engine<'a> {
         // solved face. Any other scrutinee keeps its own type.
         let scrutinee =
             crate::switch_tracker::enum_bound_scrutinee(&world, &ctx).unwrap_or(ctx.scrutinee);
-        let value = NameTy::from_semantic(scrutinee);
+        // An in-scope parameter's SPACE delegates to its bound
+        // (`param_bound_scrutinee`); the row's type text below keeps the
+        // parameter spelling — `scrutinee` stays the text source.
+        let value = NameTy::from_semantic(
+            crate::switch_tracker::param_bound_scrutinee(&world, scrutinee).unwrap_or(scrutinee),
+        );
         let cases: Vec<Case<NameTy>> = ctx
             .cases
             .iter()
@@ -8735,22 +8910,26 @@ impl<'a> Engine<'a> {
             return Some(true);
         }
         if sub == Ty::Dynamic || sub == Ty::Void {
-            // A top source subtypes only the top faces (the nullable
-            // projections included) — never a concrete named head. The
+            // A top source subtypes only the top faces: `dynamic`/`void`
+            // themselves, `Object?`, and the composite `FutureOr` tops —
+            // never a concrete head, nullable or not. The recursion is
+            // upstream's chain (Left Top, subtype.dart:63-68: `dynamic <:
+            // T` asks `Object? <: T`; Left Nullable :347-355: `Object? <:
+            // T` needs BOTH `Object <: T` and `Null <: T` — the AND is the
+            // load-bearing half, a nullable concrete target fails the
+            // `Object <: T` conjunct), so `dynamic <: int?` is FALSE and
+            // the oracle's `dynamic d; d is int?` stays informative while
+            // `d is Object?` reports always-true (SDK 3.13.7 probes). The
             // `FutureOr` UNION is a composite top the spelling test misses:
             // upstream's Left Top leg answers `dynamic <: T1` by recursing
-            // `Object? <: T1` (subtype.dart:63-68), so `dynamic <:
-            // FutureOr<Object?>` holds through the union's value leg even
-            // though the target spells no `?` — a `dynamic Function()`
-            // member must not drop out of the interface merge's valid-
-            // override set against a `FutureOr<top> Function()` sibling
-            // (#3999).
+            // `Object? <: T1`, so `dynamic <: FutureOr<Object?>` holds
+            // through the union's value leg even though the target spells
+            // no `?` — a `dynamic Function()` member must not drop out of
+            // the interface merge's valid-override set against a
+            // `FutureOr<top> Function()` sibling (#3999).
             return Some(match sup {
-                Ty::Dynamic
-                | Ty::Void
-                | Ty::Named { nullable: true, .. }
-                | Ty::Record { nullable: true, .. }
-                | Ty::Function { nullable: true, .. } => true,
+                Ty::Dynamic | Ty::Void => true,
+                Ty::Named { name, nullable: true, .. } if name == self.intern("Object") => true,
                 Ty::Named { name, .. } if name == self.intern("FutureOr") => {
                     self.slot_subtype(
                         Ty::Named {
@@ -8829,12 +9008,53 @@ impl<'a> Engine<'a> {
         // `relateTypeParameters` relating the quantified leaves). Excluding
         // the params' names keeps the refined face read below from reading
         // a quantifier as an unresolved head.
-        let quantified: FxHashSet<StringId> = sig
+        let mut quantified: FxHashSet<StringId> = sig
             .params
             .iter()
             .filter(|(name, _)| *name != StringId::NONE)
             .map(|(name, _)| *name)
             .collect();
+        // A NESTED function-type slot carries its own binder group
+        // (`int Function(void Function<V extends num>(V))` — the inner `V`
+        // is quantified by the inner shape, not the outer signature): a
+        // pre-pass collects every reachable shape's binder names so the
+        // leaf walk below reads a nested quantifier as a variable, not an
+        // unresolved head (#3886's binder-scoped argument face).
+        let mut binders: Vec<Ty> = Vec::with_capacity(sig.positional.len() + 2);
+        binders.push(sig.return_ty);
+        binders.extend(sig.positional.iter().copied());
+        binders.extend(sig.named.iter().map(|(_, t, _)| *t));
+        binders.extend(sig.params.iter().filter_map(|(_, b)| *b));
+        let mut seen_binders = FxHashSet::default();
+        while let Some(ty) = binders.pop() {
+            if !seen_binders.insert(ty) {
+                continue;
+            }
+            let pool = self.boundary.pool();
+            match ty {
+                Ty::Function { shape, .. } => {
+                    let shape = pool.function_shape(shape);
+                    for (name, bound) in shape.type_params_named.iter() {
+                        if *name != StringId::NONE {
+                            quantified.insert(*name);
+                        }
+                        if let Some(bound) = bound {
+                            binders.push(*bound);
+                        }
+                    }
+                    binders.push(shape.return_ty);
+                    binders.extend(shape.positional.iter().copied());
+                    binders.extend(shape.named.iter().map(|(_, t)| *t));
+                }
+                Ty::Named { args, .. } => binders.extend(pool.get(args).iter().copied()),
+                Ty::Record { shape, .. } => {
+                    let shape = pool.record_shape(shape);
+                    binders.extend(shape.positional.iter().copied());
+                    binders.extend(shape.named.iter().map(|(_, t)| *t));
+                }
+                _ => {}
+            }
+        }
         let mut slots: Vec<Ty> = Vec::with_capacity(sig.positional.len() + 2);
         slots.push(sig.return_ty);
         slots.extend(sig.positional.iter().copied());
@@ -8842,13 +9062,28 @@ impl<'a> Engine<'a> {
         slots.extend(sig.params.iter().filter_map(|(_, b)| *b));
         let mut seen = FxHashSet::default();
         while let Some(ty) = slots.pop() {
+            // The dart:core collection heads are never the oracle's
+            // `InvalidType`: the implicit `dart:core` import resolves
+            // `List`/`Set`/`Map`/`Iterable` in every library (the same law
+            // the type-position primitive fallback models,
+            // resolution.rs's NotFound arm, and the value-position
+            // `<dart:core>` stub of `sdk_collection_type_literal`), so a
+            // signature spelling them is not the suspect face this gate
+            // abstains on — a rig without a core mock still names a real
+            // class there, and the slot lattice's same-head structural
+            // comparison decides it. The head's ARGUMENTS still walk (a
+            // `List<X>` over an unresolved `X` keeps the abstention).
+            let collection_head = match ty {
+                Ty::Named { name, .. } => self.collection_heads.contains(&name),
+                _ => false,
+            };
             // The InvalidType face, not the bare sentinel: the rendered
             // `InvalidType` of an untyped formal is an UNRESOLVABLE `Named`
             // head (`void Function(x)` over an out-of-scope `x`), which the
             // sentinel equality alone never answers — the same predicate
             // the message's `InvalidType` spelling reads
             // ([`Engine::is_invalid_ty`], `Ty::Unknown` included).
-            if self.is_invalid_ty(ty) {
+            if !collection_head && self.is_invalid_ty(ty) {
                 let Ty::Named { name, .. } = ty else {
                     return true;
                 };

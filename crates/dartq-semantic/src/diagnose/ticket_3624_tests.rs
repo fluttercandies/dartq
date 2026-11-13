@@ -170,17 +170,61 @@ fn spread_decided_set_literal_with_a_nonconstant_operand_reports() {
 }
 
 /// `const l = [if (false) nonConst]`: the `if` condition evaluates to a
-/// known `false`, so the oracle's verifier scans the dead then-branch's
-/// not-potentially-constant shapes — `nonConst` reports the element code
-/// (`non_constant_list_element`) at its own leaf, and the literal's own
-/// verdict stays silent (the live branch contributes nothing). The dead
-/// branch itself also reads `dead_code` at its expression (upstream
+/// known `false`, so the value computation SKIPS the dead branch outright
+/// (`_buildListConstant`'s `branchResult` stays null for a false condition
+/// with no else — no npc scan, no failure propagation; probed 3.13.7).
+/// `nonConst` still reports the element code (`non_constant_list_element`)
+/// at its own leaf — the literal verifier walks elements syntactically —
+/// and the declaration's verdict stays silent. The dead branch itself also
+/// reads `dead_code` at its expression (upstream
 /// `test_deadBlock_ifElement`: the flow layer marks the skipped element's
 /// whole subtree dead — `dead_code` at `nonConst`, not the element-code
 /// alone).
 #[test]
 fn dead_if_branch_reports_the_element_code_only() {
     let fixture = "var nonConst = 1;\nconst l = [if (false) nonConst];\n";
+    let source = format!("{CORE_PRELUDE}{fixture}");
+    let operand = source.find("nonConst]").expect("fixture has the leaf") as u32;
+    let rep = report_ops_bare(&source);
+    assert_eq!(
+        oracle_rows(&rep, &source),
+        vec![
+            ("dead_code", operand, "nonConst"),
+            ("non_constant_list_element", operand, "nonConst"),
+        ],
+        "{:#?}",
+        oracle_rows(&rep, &source)
+    );
+}
+
+/// `const l = [if (false) nonConst else 1]`: the dead then-branch is
+/// skipped the same way — the else folds a clean `1`, so the element code
+/// and `dead_code` report at `nonConst` while the declaration stays silent
+/// (probed 3.13.7 — probe41 line 3).
+#[test]
+fn dead_then_branch_with_else_stays_silent_on_the_declaration() {
+    let fixture = "var nonConst = 1;\nconst l = [if (false) nonConst else 1];\n";
+    let source = format!("{CORE_PRELUDE}{fixture}");
+    let operand = source.find("nonConst else").expect("fixture has the leaf") as u32;
+    let rep = report_ops_bare(&source);
+    assert_eq!(
+        oracle_rows(&rep, &source),
+        vec![
+            ("dead_code", operand, "nonConst"),
+            ("non_constant_list_element", operand, "nonConst"),
+        ],
+        "{:#?}",
+        oracle_rows(&rep, &source)
+    );
+}
+
+/// `const l = [if (true) 1 else nonConst]`: the dead ELSE branch is
+/// skipped too — the live then folds `1`, the element code and `dead_code`
+/// report at `nonConst`, and no declaration row fires (probed 3.13.7 —
+/// probe41 line 4).
+#[test]
+fn dead_else_branch_stays_silent_on_the_declaration() {
+    let fixture = "var nonConst = 1;\nconst l = [if (true) 1 else nonConst];\n";
     let source = format!("{CORE_PRELUDE}{fixture}");
     let operand = source.find("nonConst]").expect("fixture has the leaf") as u32;
     let rep = report_ops_bare(&source);

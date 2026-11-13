@@ -803,6 +803,18 @@ impl<'a> Engine<'a> {
         // (the `?..`'s target IS `E?`), so this answer stays scoped to the
         // access operators' continuation face.
         let mut shorted_elem_ty = None;
+        // The member-root pre-lift face (the `?[` analogue above): a
+        // DIRECT `?.`-merged receiver row stored its member's declared
+        // type and re-arms the lift at read time
+        // (`receiver_static_ty`'s `nullable_form` over
+        // `null_aware_members`), so the chained operator's gate reads the
+        // stored face — upstream's null shorting strips the SHORT's
+        // appended null, never the member's own (`s?.length?.isEven`
+        // decides the second `?.` on `int`; an `A? get a` keeps `A?` and
+        // stays quiet — probe 3.13.7). The record arm bakes the shorted
+        // face into the row, so its pre-lift answers from
+        // `record_short_fields`.
+        let mut shorted_member_ty = None;
         let recv = match popped_receiver {
             Some(mut popped) => {
                 // The parenthesized group's bool collapse: `(x as dynamic)`'s
@@ -857,6 +869,16 @@ impl<'a> Engine<'a> {
                 // re-derives through the indexed receiver's own row.
                 if !self.in_cascade {
                     shorted_elem_ty = self.shorted_index_elem_ty(popped.range.offset);
+                    shorted_member_ty = self
+                        .null_aware_member_ops
+                        .get(&popped.range.offset)
+                        .map(|_| {
+                            self.record_short_fields
+                                .get(&popped.range.offset)
+                                .copied()
+                                .unwrap_or(popped.ty)
+                        })
+                        .filter(|ty| *ty != Ty::UNKNOWN);
                 }
                 self.stage_receiver_of_type_never(popped.range, receiver_ty);
                 recv_span = popped.range;
@@ -1671,6 +1693,11 @@ impl<'a> Engine<'a> {
                 // `a?[0]?.b` decides on `E` (the `?[` already shorted the
                 // receiver), never the `E?` the result row stores.
                 elem
+            } else if let Some(pre) = shorted_member_ty {
+                // The `?.` continuation reads the pre-lift member face —
+                // the same shorted-chain law over a member root
+                // (`s?.length?.isEven` decides on `int`).
+                pre
             } else if merged_receiver_ty != Ty::UNKNOWN {
                 merged_receiver_ty
             } else {
@@ -1723,7 +1750,14 @@ impl<'a> Engine<'a> {
             // The bound-aware strictly face: an in-scope parameter
             // receiver decides through its written bound (`T extends
             // AstNodeImpl?` keeps `?.` legal, `T extends C` reports).
-            } else if self.strictly_non_nullable(receiver_ty) {
+            } else if {
+                // The resolved face decides: an alias use's static type is
+                // the aliased type (`typedef R1 = (int, String)?;` keeps
+                // `r1?.$1` legal), so the strict-nullability question folds
+                // the alias before it answers.
+                let strictly = self.strictly_non_nullable(self.fold_alias_ty(receiver_ty));
+                strictly
+            } {
                 // The short-circuit variant
                 // (`_checkForUnnecessaryNullAware`'s
                 // `previousShortCircuitingOperator` walk): a `?.`/`?..`/`?[`
@@ -1744,28 +1778,15 @@ impl<'a> Engine<'a> {
                 // `previousShortCircuitingOperator`'s IndexExpression arm
                 // answers the question TOKEN, error_verifier.dart:7314-7318).
                 let prior = self
-                    .dead_null_chains
-                    .iter()
-                    .find(|(op, end, ..)| *op <= op_range.offset && op_range.offset <= *end)
-                    .map(|(op, _, _, prior_kind, _)| match prior_kind {
-                        // The member face answers the written `?.` token;
-                        // the INDEX face answers the index expression's
-                        // `question` token alone (`?`, 1 column) —
-                        // `previousShortCircuitingOperator`'s
-                        // IndexExpression arm (:7314-7318) never returns the
-                        // `[` its anchor pair carries.
-                        crate::diagnose::types::DeadChainKind::Member => (*op, "?.", 2u32),
-                        crate::diagnose::types::DeadChainKind::Index => (*op, "?", 1u32),
-                        crate::diagnose::types::DeadChainKind::CascadeMember
-                        | crate::diagnose::types::DeadChainKind::CascadeIndex => (*op, "?..", 3u32),
-                    })
+                    .null_aware_member_ops
+                    .get(&recv_span.offset)
+                    .map(|&op| (op, "?.", 2u32))
                     // A `?[` receiver's own question is the prior
-                    // short-circuiter when no latched chain covers this
-                    // operator — `l?[0]?.length`'s `?.` reads the pre-lift
-                    // element, so the causing operator is the `?[` whose
-                    // dead-chain extent already ended at `]`. The context
-                    // anchors the question token itself, so whitespace
-                    // ahead of the `?` stays outside it.
+                    // short-circuiter — `l?[0]?.length`'s `?.` reads the
+                    // pre-lift element, so the causing operator is the
+                    // receiver's `?` token. The context anchors the
+                    // question token itself, so whitespace ahead of the `?`
+                    // stays outside it.
                     .or_else(|| {
                         if shorted_elem_ty.is_some() && !self.in_cascade {
                             receiver_offset.and_then(|offset| {
@@ -1780,6 +1801,27 @@ impl<'a> Engine<'a> {
                         } else {
                             None
                         }
+                    })
+                    // A cascade-rooted window keeps its `?..` mapping (the
+                    // section-internal access faces); the member/index
+                    // window kinds are NOT priors — upstream's
+                    // `previousShortCircuitingOperator` reads the TARGET's
+                    // own operator (`s?.a.b?.c`'s target `s?.a.b` carries a
+                    // plain `.`), so only the direct row map above answers
+                    // those (probe 3.13.7: the plain message fires there).
+                    .or_else(|| {
+                        self.dead_null_chains
+                            .iter()
+                            .find(|(op, end, _, kind, _)| {
+                                *op <= op_range.offset
+                                    && op_range.offset <= *end
+                                    && matches!(
+                                        kind,
+                                        crate::diagnose::types::DeadChainKind::CascadeMember
+                                            | crate::diagnose::types::DeadChainKind::CascadeIndex
+                                    )
+                            })
+                            .map(|(op, _, _, _, _)| (*op, "?..", 3u32))
                     });
                 let (op, replacement) = kind.lexemes();
                 if let Some((prior_offset, prior_lexeme, prior_len)) = prior {
@@ -1966,10 +2008,27 @@ impl<'a> Engine<'a> {
                     // `_executeGetter`/field-read face), so the bare `K`
                     // would leak into every downstream member solve — an
                     // uninstantiable receiver keeps `Unknown` (under-report).
-                    if declared == Ty::UNKNOWN {
-                        declared
-                    } else {
+                    if declared != Ty::UNKNOWN {
                         self.instantiate_accessor_static(*type_name, &recv, declared)
+                    } else {
+                        // A receiver whose written annotation is a record
+                        // ALIAS (`typedef R = ({bool? strict}); r.strict`)
+                        // has no container face — the record consult below
+                        // folds the alias and answers the shape's own field
+                        // getter (its `Named` leg re-asks this same declared
+                        // face, so a genuine class head keeps `Unknown`).
+                        match self.record_field_ty(merged_receiver_ty, member.name, is_null_aware)
+                        {
+                            Some(field) if is_null_aware => {
+                                if !Self::is_nullable_ty(field) {
+                                    self.record_short_fields
+                                        .insert(member.range.offset, field);
+                                }
+                                Self::nullable_form(field)
+                            }
+                            Some(field) => field,
+                            None => Ty::UNKNOWN,
+                        }
                     }
                 }
                 // A record-typed receiver (`config.strict`, `pair.$1`): the
@@ -2090,6 +2149,8 @@ impl<'a> Engine<'a> {
         }
         if is_null_aware {
             self.null_aware_members.insert(member.range.offset);
+            self.null_aware_member_ops
+                .insert(member.range.offset, op_range.offset);
         } else if let Some(receiver_offset) = receiver_offset {
             // The `?.` short-circuit's chain continuation (`a?.b.c`'s `.c`,
             // `a?.b.c.d`'s `.d`): the guarded `?.` makes the WHOLE chain
@@ -5325,6 +5386,18 @@ impl<'a> Engine<'a> {
     fn argument_row_ty(&self, row: &Row) -> Ty {
         let ty = self.expression_row_ty(row);
         if ty == Ty::UNKNOWN {
+            // A bare `this` argument offers the enclosing container's
+            // instantiation — upstream records the keyword's
+            // `staticType` as the class's `thisType` on resolution
+            // (resolver.dart's `visitThisExpression`), the same face the
+            // receiver classification reads. The row keeps `Unknown` so
+            // the pass-2 enum handle stays the single authority; the
+            // argument ask resolves it on demand (#3628:
+            // `deconstruct(this)` starved its whole constrain round —
+            // no face, no gather, no topMerge).
+            if let RowShape::Receiver(Receiver::This { container, kind }) = &row.shape {
+                return self.this_static_ty(*container, *kind);
+            }
             self.rhs_row_ty(row)
         } else {
             ty
@@ -5483,6 +5556,11 @@ impl<'a> Engine<'a> {
         // a send's callee/result pair overlaps, sibling arguments never
         // touch): the named value keeps run 0 and every later run re-enters
         // as its own positional. A single-run window flushes unchanged.
+        // A row starting INSIDE a closed collection/record literal
+        // ([`Engine::literal_extents`]) is a part of that one node (a
+        // for-element's iterable, a map entry's key/value), never a sibling
+        // argument — the extent gate keeps such rows in the run they
+        // belong to.
         let mut runs: Vec<(usize, usize)> = Vec::new();
         if name.is_some() && hi > mark + 1 {
             let mut start = mark;
@@ -5491,7 +5569,13 @@ impl<'a> Engine<'a> {
                 let Some(row) = self.rows.get(index) else {
                     break;
                 };
-                if row.range.offset >= end && row.range.offset > 0 {
+                if row.range.offset >= end
+                    && row.range.offset > 0
+                    && !self
+                        .literal_extents
+                        .iter()
+                        .any(|&(open, close)| open < row.range.offset && row.range.offset < close)
+                {
                     runs.push((start, index));
                     start = index;
                 }
@@ -6311,6 +6395,40 @@ impl<'a> Engine<'a> {
             if gate_passes {
                 push(round, index, p, Ty::Unknown);
             }
+            return true;
+        }
+        // Q is a NULLABLE inference parameter (`T?` formal): `P <: T?`
+        // lowers to `P0 <: T` with the argument's own `?` stripped —
+        // upstream constraint generation's `P is P0?` arm (`S <: T?` iff
+        // `S <: T` or `S <: Null`; the Null disjunct constrains nothing,
+        // so a `Null` argument satisfies without binding). A bound-gate
+        // failure REJECTS the gather whole: the constraint is
+        // unsatisfiable against the parameter's declared bound, the
+        // solver fails upstream, and the argument row stays suppressed
+        // (#3794's pinned silence over `f<T extends num>(T? v)` fed a
+        // `String`) — the poison the failed send round reads.
+        if let Ty::Named {
+            name,
+            nullable: true,
+            args: ArgListId::EMPTY,
+        } = q
+            && let Some(index) = param_index(name)
+        {
+            if p == Ty::Null {
+                return true;
+            }
+            let p0 = Self::non_nullable_ty(p);
+            let gate_passes = match params[index].1 {
+                None => true,
+                Some(bound) => {
+                    let closed = self.infer_closure(bound, params, true);
+                    self.assignable(p0, closed, false) == Some(true)
+                }
+            };
+            if !gate_passes {
+                return false;
+            }
+            push(round, index, p0, Ty::Unknown);
             return true;
         }
         if p == q {
@@ -7246,49 +7364,11 @@ impl<'a> Engine<'a> {
                         .find(|(start, end, _)| range.offset >= *start && range.offset <= *end)
                         .map(|(.., sig)| sig.clone())
                 });
-            let arg_ty = if *ty != Ty::Unknown {
+            let mut arg_ty = if *ty != Ty::Unknown {
                 *ty
             } else {
                 match &arg_sig {
-                    Some(sig) => {
-                        let mut fty = self.fn_sig_ty(sig);
-                        // The literal closure's `void` STUB return is
-                        // never a real inference — upstream's
-                        // `staticType` reads the body's inferred return
-                        // (`(double x) => 0` is `int Function(double)`,
-                        // and the oracle's origin column prints THAT).
-                        // The tear-off arm keeps its written signature.
-                        if sig.return_ty == Ty::Void
-                            && let Some((lit_start, lit_end)) = level
-                                .closures
-                                .iter()
-                                .find(|(start, end, _)| {
-                                    range.offset >= *start && range.offset <= *end
-                                })
-                                .map(|(start, end, _)| (*start, *end))
-                            && let Some(ret) = self.literal_inferred_return(lit_start, lit_end)
-                            && let Ty::Function {
-                                shape: fn_shape,
-                                nullable: fn_nullable,
-                            } = fty
-                        {
-                            let shape = {
-                                let pool = self.boundary.pool();
-                                pool.function_shape(fn_shape).clone()
-                            };
-                            let positional: Vec<Ty> = shape.positional.to_vec();
-                            let named: Vec<(StringId, Ty)> =
-                                shape.named.iter().map(|(n, t)| (*n, *t)).collect();
-                            fty = self.boundary.args.borrow_mut().function_generic(
-                                &shape.type_params_named,
-                                ret,
-                                &positional,
-                                &named,
-                                fn_nullable,
-                            );
-                        }
-                        fty
-                    }
+                    Some(sig) => self.fn_sig_ty(sig),
                     // #2516: the solve-only member-read answer — an
                     // element-bearing accessor/getter argument constrains
                     // the call's parameters through its resolved return,
@@ -7299,6 +7379,43 @@ impl<'a> Engine<'a> {
                     },
                 }
             };
+            // The literal closure's `void` STUB return is never a real
+            // inference — upstream's `staticType` reads the body's
+            // inferred return (`(double x) => 0` is `int Function(double)`,
+            // and the oracle's origin column prints THAT). Both carriers
+            // of the stub need the patch: the signature face the Unknown
+            // branch rebuilt above AND the `Function` face the upward
+            // walk registered for a formal-bearing literal (its shape
+            // keeps the stub return until patched here). A tear-off
+            // argument is never inside `level.closures`, so its written
+            // signature stands.
+            if let Ty::Function { shape, nullable } = arg_ty
+                && let Some((lit_start, lit_end)) = level
+                    .closures
+                    .iter()
+                    .find(|(start, end, _)| range.offset >= *start && range.offset <= *end)
+                    .map(|(start, end, _)| (*start, *end))
+                && let Some(ret) = self.literal_inferred_return(lit_start, lit_end)
+                && {
+                    let pool = self.boundary.pool();
+                    pool.function_shape(shape).return_ty != ret
+                }
+            {
+                let shape = {
+                    let pool = self.boundary.pool();
+                    pool.function_shape(shape).clone()
+                };
+                let positional: Vec<Ty> = shape.positional.to_vec();
+                let named: Vec<(StringId, Ty)> =
+                    shape.named.iter().map(|(n, t)| (*n, *t)).collect();
+                arg_ty = self.boundary.args.borrow_mut().function_generic(
+                    &shape.type_params_named,
+                    ret,
+                    &positional,
+                    &named,
+                    nullable,
+                );
+            }
             if arg_ty == Ty::Unknown {
                 continue;
             }
@@ -7338,7 +7455,25 @@ impl<'a> Engine<'a> {
                 argument: arg_ty,
             });
             let mut raw = Vec::new();
-            self.infer_gather(arg_ty, formal.ty, params, false, &mut raw);
+            let gathered = self.infer_gather(arg_ty, formal.ty, params, false, &mut raw);
+            if !gathered {
+                // A ground subtype failure rewinds the whole round
+                // (`_tryMatchSubtypeOf`'s `success` gate): the oracle's
+                // solver then reports `couldNotInfer` at the send and the
+                // `argumentTypeNotAssignable` walk suppresses the failed
+                // slot (#3794's pinned silence over `f<T extends num>(T?
+                // v)` fed a `String`). The parameters the failed formal
+                // spells are poisoned — the effective-formal face reads
+                // them as undecidable instead of falling to the declared
+                // bound, which would fabricate the row the oracle never
+                // emits.
+                for (param, _) in params {
+                    if self.formal_mentions_param(formal.ty, *param) {
+                        self.infer_poisoned_params.insert(*param);
+                    }
+                }
+                continue;
+            }
             self.infer_merge_round(params, &raw, origin, &mut constraints, &fixed);
         }
 
@@ -8563,7 +8698,110 @@ impl<'a> Engine<'a> {
         if self.receiver_face_ungrounded(callee) {
             return;
         }
+        // #3593 — the degraded if-null join band: the staged join folded
+        // a signature spelling and the bare interface onto the same
+        // `Function` face, so this parse-time verdict would read a face
+        // the flow-proven promotion may re-decide
+        // (`redecide_promoted_if_null_faces` at pass 2 — the signature
+        // twin the parse walk cannot see). Defer the whole check past
+        // the re-decide instead of deciding on the degraded face: this
+        // abstain runs before `call_args_for` consumes the written
+        // group, so the pass-2 re-run (`run_deferred_if_null_bounds`)
+        // reads the same staged arguments and the re-decided row
+        // receiver, deciding exactly as the oracle's promoted join
+        // does; a shape the re-decide leaves unchanged re-emits the
+        // parse face's verdict there (the row this seam produced before
+        // the band existed).
+        if self.receiver_if_null_fn_degraded(callee) {
+            self.deferred_if_null_bounds
+                .push((self.rows[callee].range.offset, args.clone()));
+            return;
+        }
         if let Some(params) = self.extension_member_bounds(&recv, member) {
+            self.check_call_type_arg_bounds(&params, &args);
+        }
+    }
+
+    /// Whether the send's receiver is an if-null composite whose staged
+    /// join degraded to the bare `Function` interface (#3593): the
+    /// signature-vs-interface collapse of the parse-time
+    /// `composite_lub` — exactly the join the pass-2 re-decide may
+    /// replace with the promoted signature join. The extent walk is
+    /// [`Self::receiver_if_null_s_pending`]'s (a top-level `??`/`??=`
+    /// over the receiver's token extent; nested operators stay at
+    /// depth and never claim the band).
+    fn receiver_if_null_fn_degraded(&self, callee: usize) -> bool {
+        use dartq_scanner::TokenKind as K;
+        let Some(member) = self.rows.get(callee) else {
+            return false;
+        };
+        let Some((lo, hi)) = self.receiver_extent_tokens(member.range.offset) else {
+            return false;
+        };
+        let tokens = self.tokens.as_slice();
+        let (start, end) = (tokens[lo].utf16_offset, tokens[hi].utf16_offset);
+        let function = self.intern("Function");
+        let mut depth = 0usize;
+        for i in lo..=hi {
+            match tokens[i].kind {
+                K::OpenParen | K::OpenSquare | K::OpenCurly => depth += 1,
+                K::CloseParen | K::CloseSquare | K::CloseCurly => depth = depth.saturating_sub(1),
+                K::QuestionQuestion | K::QuestionQuestionEq if depth == 0 => {
+                    return self.if_null_results.iter().any(|(rhs, (_, ty))| {
+                        start <= *rhs && *rhs <= end
+                            && matches!(
+                                self.fold_alias_ty(*ty),
+                                Ty::Named { name, .. } if name == function
+                            )
+                    });
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The pass-2 half of the #3593 deferral band: re-run the
+    /// extension-member bounds checks the parse walk deferred over a
+    /// degraded if-null join. [`Self::redecide_promoted_if_null_faces`]
+    /// has already rewritten the join and the rows that captured it, so
+    /// the re-pair here reads the promoted signature join the oracle's
+    /// receiver carries — `extension_member_send` re-binds the
+    /// extension's parameters from the re-decided receiver exactly as
+    /// the parse walk's `ext_member_params` did; a composite the
+    /// re-decide left unchanged re-pairs the same parse face and
+    /// re-emits the row that face always produced.
+    pub(crate) fn run_deferred_if_null_bounds(&mut self) {
+        if self.deferred_if_null_bounds.is_empty() {
+            return;
+        }
+        let deferred = std::mem::take(&mut self.deferred_if_null_bounds);
+        for (offset, args) in deferred {
+            let Some(callee) = self
+                .rows
+                .iter()
+                .position(|row| row.range.offset == offset)
+            else {
+                continue;
+            };
+            let Some(row) = self.rows.get(callee) else {
+                continue;
+            };
+            let member = row.name;
+            // The receiver: the merged member row's own receiver when the
+            // dot-access merge claimed the send, else the placeholder's
+            // row below (the classification the send close ran).
+            let recv = match &row.shape {
+                RowShape::Member { recv } => *recv,
+                RowShape::Bare(BareInfo::Plain { .. }) => callee
+                    .checked_sub(1)
+                    .and_then(|index| self.rows.get(index))
+                    .map_or(Receiver::Unknown, |below| self.argument_receiver(below)),
+                _ => continue,
+            };
+            let Some((_, params)) = self.extension_member_send(&recv, member) else {
+                continue;
+            };
             self.check_call_type_arg_bounds(&params, &args);
         }
     }
@@ -8590,19 +8828,19 @@ impl<'a> Engine<'a> {
     /// Only TOP-LEVEL operators count: an if-null or arithmetic nested
     /// inside an argument (`f(a ?? b)..m()`) leaves the receiver face the
     /// send's own return.
-    fn receiver_face_ungrounded(&self, callee: usize) -> bool {
+    /// The receiver expression's token extent (stripped of its own
+    /// wrapping groups) for the member at or after `member_offset`: a
+    /// backward walk from the member's separator (`.`/`..`) over the
+    /// maximal balanced postfix expression — closers deepen, the depth-0
+    /// opener that closes the walk starts it, and any token that cannot
+    /// continue a primary backward (a statement/argument/operator
+    /// boundary) ends it just past itself. The parenthesized receiver
+    /// `(a ??= b)`, double-wrapped `((a ?? b))`: the pair IS the
+    /// expression, not a nesting level.
+    fn receiver_extent_tokens(&self, member_offset: u32) -> Option<(usize, usize)> {
         use dartq_scanner::TokenKind as K;
-        let Some(member) = self.rows.get(callee) else {
-            return false;
-        };
         let tokens = self.tokens.as_slice();
-        // The receiver expression's extent: a backward walk from the
-        // member's separator (`.`/`..`) over the maximal balanced
-        // postfix expression — closers deepen, the depth-0 opener that
-        // closes the walk starts it, and any token that cannot continue
-        // a primary backward (a statement/argument/operator boundary)
-        // ends it just past itself.
-        let after = tokens.partition_point(|t| t.utf16_offset < member.range.offset);
+        let after = tokens.partition_point(|t| t.utf16_offset < member_offset);
         let mut sep = after;
         while sep > 0
             && matches!(
@@ -8617,7 +8855,7 @@ impl<'a> Engine<'a> {
             sep -= 1;
         }
         if sep == 0 {
-            return false;
+            return None;
         }
         let last = sep - 1;
         let mut depth = 0usize;
@@ -8630,7 +8868,22 @@ impl<'a> Engine<'a> {
                     first = i;
                     break;
                 }
-                K::OpenParen | K::OpenSquare | K::OpenCurly => depth -= 1,
+                K::OpenParen | K::OpenSquare | K::OpenCurly => {
+                    depth -= 1;
+                    // The opener that unwound a balanced group either
+                    // heads a postfix chain (`b(x)` — the token before it
+                    // names the call, keep walking) or IS the
+                    // expression's own wrapping (`contextB1((e)..m` —
+                    // the argument paren before it is a boundary; without
+                    // this stop the walk overshoots to the CALL's paren
+                    // and the unbalanced extent reads as no composite at
+                    // all).
+                    if depth == 0 && (i == 0 || !continues_primary_backward(tokens[i - 1].kind))
+                    {
+                        first = i;
+                        break;
+                    }
+                }
                 _ if depth == 0 && !continues_primary_backward(tokens[i].kind) => {
                     first = i + 1;
                     break;
@@ -8638,13 +8891,10 @@ impl<'a> Engine<'a> {
                 _ => {}
             }
             if i == 0 {
-                return false;
+                return None;
             }
             i -= 1;
         }
-        // Strip the extent's own wrapping groups (the parenthesized
-        // receiver `(a ??= b)`, double-wrapped `((a ?? b))`): the pair
-        // IS the expression, not a nesting level.
         let (mut lo, mut hi) = (first, last);
         while hi > lo
             && matches!(tokens[lo].kind, K::OpenParen | K::OpenSquare | K::OpenCurly)
@@ -8653,6 +8903,52 @@ impl<'a> Engine<'a> {
             lo += 1;
             hi -= 1;
         }
+        Some((lo, hi))
+    }
+
+    /// The send's receiver is an if-null composite whose context S-branch
+    /// is promotion-pending (#3820): every bounds verdict over the
+    /// parse-time join face is provisional there (the flow replay
+    /// publishes the target's promoted read, and the context-stamped
+    /// composite, only at the executable's end) — the same under-report
+    /// posture [`Self::receiver_face_ungrounded`] grants the never-staged
+    /// shape, applied at every bounds seam that reads the face.
+    fn receiver_if_null_s_pending(&self, callee: usize) -> bool {
+        use dartq_scanner::TokenKind as K;
+        let Some(member) = self.rows.get(callee) else {
+            return false;
+        };
+        let Some((lo, hi)) = self.receiver_extent_tokens(member.range.offset) else {
+            return false;
+        };
+        let tokens = self.tokens.as_slice();
+        let (start, end) = (tokens[lo].utf16_offset, tokens[hi].utf16_offset);
+        let mut depth = 0usize;
+        for i in lo..=hi {
+            match tokens[i].kind {
+                K::OpenParen | K::OpenSquare | K::OpenCurly => depth += 1,
+                K::CloseParen | K::CloseSquare | K::CloseCurly => depth = depth.saturating_sub(1),
+                K::QuestionQuestion | K::QuestionQuestionEq if depth == 0 => {
+                    return self
+                        .if_null_s_pending
+                        .iter()
+                        .any(|rhs| start <= *rhs && *rhs <= end);
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn receiver_face_ungrounded(&self, callee: usize) -> bool {
+        use dartq_scanner::TokenKind as K;
+        let Some(member) = self.rows.get(callee) else {
+            return false;
+        };
+        let tokens = self.tokens.as_slice();
+        let Some((lo, hi)) = self.receiver_extent_tokens(member.range.offset) else {
+            return false;
+        };
         let mut depth = 0usize;
         let mut composite = false;
         for i in lo..=hi {
@@ -8661,10 +8957,19 @@ impl<'a> Engine<'a> {
                 K::CloseParen | K::CloseSquare | K::CloseCurly => depth = depth.saturating_sub(1),
                 K::QuestionQuestion | K::QuestionQuestionEq if depth == 0 => {
                     let (start, end) = (tokens[lo].utf16_offset, tokens[hi].utf16_offset);
-                    return !self
+                    // #3820's promotion-pending band rides the same
+                    // abstention (see
+                    // [`Self::receiver_if_null_s_pending`]): a staged join
+                    // whose context S-branch is still waiting on the
+                    // target's promoted read carries a PROVISIONAL face
+                    // here — the bounds check over it is exactly the
+                    // fabricated-row shape the oracle's context-stamped
+                    // composite never sees.
+                    let staged = self
                         .if_null_results
                         .keys()
                         .any(|rhs| start <= *rhs && *rhs <= end);
+                    return !staged || self.receiver_if_null_s_pending(callee);
                 }
                 kind if depth == 0 && is_arithmetic_or_assignment(kind) => composite = true,
                 _ => {}
@@ -9593,6 +9898,8 @@ impl<'a> Engine<'a> {
             .own_exec_window(outer_name, false)
             .map(|window| &window.params)
             .filter(|params| !params.is_empty())
+        .inspect(|_| {
+        })
         else {
             return;
         };
@@ -10687,6 +10994,7 @@ impl<'a> Engine<'a> {
     pub(crate) fn check_annotation_arguments(
         &mut self,
         annotation: StringId,
+        close: SourceRange,
         args: &[(Option<StringId>, Ty, bool, SourceRange)],
     ) {
         let text = self.strings.resolve(annotation).to_string();
@@ -10792,55 +11100,21 @@ impl<'a> Engine<'a> {
                 );
             }
         }
-        // The count and required faces mirror `resolveArgumentsToParameters`
-        // (resolver.dart:4978-5009 — the deficit/surplus blocks are
-        // unconditional once a parameter element resolved) and
-        // `_checkRequired` (required_parameters_verifier.dart:134-218 —
-        // `visitAnnotation` runs it with `errorEntity` on the constructor
-        // identifier). A metadata invocation carries no callee row, so the
-        // generic `check_arguments` never saw this argument list; the
-        // resolved formals above are the only verdict source. The anchor is
-        // the first argument's span, or the annotation head's (reconstructed
-        // from the written text's start) when the list is empty — position
-        // is load-bearing only for the (severity, code, file) key.
-        let given = args.iter().take_while(|(name, ..)| name.is_none()).count();
-        let required = formals.positional.iter().filter(|f| f.required).count();
+        // The required-named faces mirror `_checkRequired`
+        // (required_parameters_verifier.dart:134-218 — `visitAnnotation`
+        // runs it with `errorEntity` on the constructor identifier); the
+        // anchor is the first argument's span, else the list's close. The
+        // deficit/surplus COUNT faces are NOT emitted here: the const
+        // capture's own annotation walk (const_eval_faces.rs's
+        // `close_ctor_invocation` pairing) owns them with the
+        // oracle-probed anchors (deficit at `)`, surplus at the first
+        // extra positional, the `.new` name face); emitting them here too
+        // reported every same-file annotation's count rows twice.
         let anchor = args
             .iter()
             .map(|(.., range)| *range)
             .next()
-            .unwrap_or(SourceRange {
-                offset: 0,
-                length: 0,
-            });
-        if given < required {
-            let ctor_text =
-                selector.map_or_else(|| head.to_string(), |sel| format!("{head}.{sel}"));
-            let (shape, a0, a1) = if required == 1 {
-                (
-                    ArgCountShape::NameSingular,
-                    ctor_text.clone(),
-                    String::new(),
-                )
-            } else {
-                (
-                    ArgCountShape::NamePlural,
-                    required.to_string(),
-                    given.to_string(),
-                )
-            };
-            let code = SemanticCode::NotEnoughPositionalArguments(shape);
-            let message = match shape {
-                ArgCountShape::NamePlural => code.message3(&a0, &a1, &ctor_text),
-                _ => code.message(&a0, &a1),
-            };
-            self.emit_message_with_correction(code, anchor, message);
-        } else if given > formals.positional.len() {
-            let capacity = formals.positional.len();
-            let code = SemanticCode::ExtraPositionalArguments;
-            let message = code.message(&capacity.to_string(), &given.to_string());
-            self.emit_message_with_correction(code, anchor, message);
-        }
+            .unwrap_or(close);
         self.emit_missing_required(&formals, args, &[], anchor);
     }
 
@@ -12741,6 +13015,11 @@ impl<'a> Engine<'a> {
     /// merges into it) — `D0 extends A<dynamic> implements B<Object?>`
     /// answers `A<Object?>`, not the first-found `A<dynamic>`.
     fn super_instantiation(&self, container: StringId, target: StringId) -> Option<Vec<Ty>> {
+        let out = self.super_instantiation_inner(container, target);
+        out
+    }
+
+    fn super_instantiation_inner(&self, container: StringId, target: StringId) -> Option<Vec<Ty>> {
         if container == target {
             return None;
         }
@@ -13012,12 +13291,17 @@ impl<'a> Engine<'a> {
                 // saw the argument list — its own count faces run here
                 // before the miss handler (upstream
                 // `visitInstanceCreationExpression` →
-                // `resolveArgumentsToParameters`).
+                // `resolveArgumentsToParameters`). An armed
+                // `pending_annotations` marks this group as a metadata
+                // argument list — `check_annotation_arguments` already
+                // walked its faces (the same gate the named-selector
+                // creation takes at the close).
                 if let Some((head, head_range)) = level.unnamed_head
                     // A `const p.C(...)` head resolves through the import
                     // prefix — `resolve_container` on the bare spelling
                     // would read a same-named local class's formals; the
                     // prefixed fold's own face handles it.
+                    && self.pending_annotations.is_empty()
                     && self
                         .written_prefix_before(head_range.offset)
                         .is_none()
@@ -13127,6 +13411,29 @@ impl<'a> Engine<'a> {
             })) => Some(*name),
             _ => None,
         };
+        if let Some(name) = extension_override
+            && self.container_kind_of(name) == Some(ContainerKind::ExtensionType)
+        {
+            // The extension-type head IS its unnamed constructor
+            // (`E(a)` over `extension type E(int i)` — the callee row
+            // carries the conflated `Extension` tag, but the invocation
+            // is a CREATION upstream: `constructor_invocation_resolver`
+            // pairs the arguments against the representation formal and
+            // reports `argument_type_not_assignable` at the argument's
+            // own span, never the plain extension's override face).
+            // The strict-casts posture rides the ordinary argument
+            // verdict: a `dynamic` argument into the representation's
+            // `int` is a rejected downcast under the option
+            // (`test_extensionTypePrimaryConstructor#0`'s oracle row,
+            // dart analyze 3.13.7).
+            // The pairing is ADDITIVE: the send walk's own downstream
+            // faces — the written type-argument bounds
+            // (`E<String>(0)` over `E<T extends num>`) and the
+            // named-only head's `new_with_undefined_constructor_default`
+            // — keep running after it (their checks live below this
+            // arm; an early return here would swallow both).
+            self.check_explicit_creation_arguments(&level, positional, close, name);
+        }
         if let Some(name) = extension_override {
             // The void-receiver face is upstream's first arm
             // (`extension_member_resolver.dart:287-288` — `if (receiverType
@@ -14417,7 +14724,26 @@ impl<'a> Engine<'a> {
         // seeds: an `own_bound`-gated `None` is not an absent bound, and
         // an inference-seeded bound is not the declared one.
         if let (Some(params), Some(args)) = (&decl_bounds, &explicit_args) {
-            self.check_call_type_arg_bounds(&params[..], args);
+            // The #3820 pending band abstains here too — the bounds read
+            // the receiver's composite face, which is provisional while
+            // the context S-branch waits on the flow replay's promoted
+            // read (the extension seam's
+            // [`Self::receiver_face_ungrounded`] grants the same
+            // under-report).
+            //
+            // The #3593 degraded band DEFERS instead: the parse join
+            // folded the signature and the interface spellings onto the
+            // same `Function` face, so a verdict here would read the
+            // stale face — the pass-2 re-run
+            // (`run_deferred_if_null_bounds`) re-pairs the written group
+            // with the re-decided receiver's face and emits the oracle's
+            // promoted bound.
+            if self.receiver_if_null_fn_degraded(callee) {
+                self.deferred_if_null_bounds
+                    .push((self.rows[callee].range.offset, args.clone()));
+            } else if !self.receiver_if_null_s_pending(callee) {
+                self.check_call_type_arg_bounds(&params[..], args);
+            }
         }
         // #2890 — the super-send bounds face: `super.m<int>(...)` resolves
         // through the SUPERCLASS's member table, which neither
@@ -14704,6 +15030,7 @@ impl<'a> Engine<'a> {
             // fill the still-open slots (the substituted formals the
             // argument walk checks and the instantiated return write
             // consume them).
+            self.infer_poisoned_params.clear();
             if explicit_args.is_none() {
                 let infer_below = self
                     .rows
@@ -14824,6 +15151,12 @@ impl<'a> Engine<'a> {
                 .map(
                     |(index, ((param, bound), solution))| match (solution, bound) {
                         _ if disagreed.contains(&index) => Ty::UNKNOWN,
+                        // A parameter whose argument round failed the ground
+                        // match is the failed slot the oracle's ATNA walk
+                        // suppresses (`infer_gather`'s rewind, #3794) — the
+                        // effective face stays undecidable instead of
+                        // falling to the declared bound.
+                        _ if self.infer_poisoned_params.contains(param) => Ty::UNKNOWN,
                         (Some(ty), _) if explicit_fixed.contains(&index) => *ty,
                         (Some(ty), None) => *ty,
                         (Some(ty), Some(bound))
@@ -15262,11 +15595,19 @@ impl<'a> Engine<'a> {
                         } => {
                             !self.type_params.contains(&name)
                                 && !self.pending_type_params.contains(&name)
-                                // The final primitives never resolve as
-                                // containers (the harness's bare world, and
-                                // the unindexed SDK units) — their formals
-                                // keep the face.
-                                && !self.members.primitive_ids.contains(&name)
+                            // The final primitives never resolve as
+                            // containers (the harness's bare world, and
+                            // the unindexed SDK units) — their formals
+                            // keep the face. The compiler-known core
+                            // heads (`Object`, `Function`, …) share the
+                            // exemption for the same reason the
+                            // invalid-poison face grants it: they are
+                            // never `InvalidType`, so an `Object? →
+                            // Object` argument rejection stands
+                            // (#3628's `takesObject(x)` over the merged
+                            // `Object?`).
+                            && !self.members.primitive_ids.contains(&name)
+                            && !self.core_head(name)
                                 && resolve_container(
                                     self.graph,
                                     self.namespaces,

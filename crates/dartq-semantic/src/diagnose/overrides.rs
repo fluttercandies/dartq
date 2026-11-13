@@ -8857,10 +8857,17 @@ impl<'a> Engine<'a> {
             // `named_type_resolver.dart:673-680`). Every other face
             // silences the resolver row with the clause code
             // (`hasErrorReported`, `resolution_visitor.dart:1178-1180`).
-            let additive = matches!(
-                (kind, entry.tag),
-                (ContainerKind::Mixin, SuperTag::On) | (ContainerKind::Mixin, SuperTag::Extends)
-            );
+            // A keyword head (`void`/`dynamic`) never reports a name error
+            // upstream — the builtins resolve (`VoidTypeImpl`/
+            // `DynamicTypeImpl`), so `on void` keeps the constraint row
+            // alone (live 3.13.7 oracle; `on Und` keeps both rows) — the
+            // scanner marks those heads `StringId::NONE`.
+            let keyword_head = entry.head == StringId::NONE;
+            let additive = !keyword_head
+                && matches!(
+                    (kind, entry.tag),
+                    (ContainerKind::Mixin, SuperTag::On) | (ContainerKind::Mixin, SuperTag::Extends)
+                );
             if additive {
                 self.remove_clause_miss(span.offset);
             } else {
@@ -10029,20 +10036,37 @@ impl<'a> Engine<'a> {
             return Some(true);
         }
         if matches!(from_ty, Ty::Dynamic | Ty::Void) {
-            let object_question = Ty::Named {
-                name: self.intern("Object"),
-                nullable: true,
-                args: crate::model::ArgListId::EMPTY,
-            };
-            return self.override_decide(
-                object_question,
-                from_scope,
-                from_entry,
-                to_ty,
-                to_scope,
-                to_entry,
-                world,
-            );
+            // `Left Top` — subtype.dart:63-68: a `dynamic`/`void` source is
+            // a subtype of `T1` exactly when `Object? <: T1`, and the
+            // canonical top's subtypes are only the tops: the spelled tops
+            // above plus `FutureOr<T>` whose argument is itself top
+            // (type_system.dart:1312-1317 `isTop(FutureOr<T>) ==
+            // isTop(T)` — `dynamic m()` overrides `FutureOr<Object?> m()`
+            // but not `int m()`). Answering by that lattice directly,
+            // never through the generic tail: the recursion this arm used
+            // to take ended in `assignable`, whose assignment-face
+            // leniency passed every target and fabricated silence for
+            // exactly the dynamic faces (probed 3.13.7: a `dynamic` face
+            // breaks against `int`, `String`, and `Object` while
+            // `Object?`/`dynamic`/`FutureOr<top>` targets stay silent).
+            let future_or = self.intern("FutureOr");
+            let mut target = to_ty;
+            for _ in 0..8 {
+                let Ty::Named { name, args, .. } = target else {
+                    return Some(false);
+                };
+                if name == future_or
+                    && let Some(arg) = self.boundary.args.borrow().get(args).first().copied()
+                {
+                    target = self.fold_alias_ty(arg);
+                    if is_top(target) {
+                        return Some(true);
+                    }
+                } else {
+                    return Some(false);
+                }
+            }
+            return Some(false);
         }
         // A MEMBER's own type parameter (`subtype.dart:300-320`'s Variable
         // arms): `T <: X` holds iff `T`'s bound is a subtype of `X`

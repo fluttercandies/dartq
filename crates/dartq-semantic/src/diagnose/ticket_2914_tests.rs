@@ -247,6 +247,11 @@ fn wildcard_formal_parameters_pre_feature_duplicate() {
 
 /// `this._` is a FieldFormalParameterElement — never a wildcard, so the
 /// second `this._` duplicates even under the feature (upstream :444-457).
+/// Two initializing formals pair on `duplicate_field_formal_parameter`, not
+/// `duplicate_definition` (`getDiagnostic` reads both nodes' kinds,
+/// duplicate_definition_verifier.dart:437-441); the live 3.13.7 oracle on
+/// this exact fixture reports the field-formal row on the second formal —
+/// a wildcard reading would emit nothing, so this row is the discriminator.
 #[test]
 fn this_underscore_formal_is_not_a_wildcard() {
     let report = report_ops_wildcards(
@@ -256,11 +261,19 @@ fn this_underscore_formal_is_not_a_wildcard() {
          }\n",
         /* wildcards enabled */ true,
     );
-    let dups = dup_messages(&report);
+    let rows: Vec<String> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "duplicate_field_formal_parameter")
+        .map(|d| d.message.to_string())
+        .collect();
     assert_eq!(
-        dups,
-        vec!["The name '_' is already defined.".to_string()],
-        "this._ is a FieldFormal, not a wildcard: {dups:?}"
+        rows,
+        vec![
+            "The field '_' can't be initialized by multiple parameters in the same constructor."
+                .to_string()
+        ],
+        "this._ is a FieldFormal, not a wildcard: {rows:?}"
     );
 }
 
@@ -366,10 +379,11 @@ fn conflicting_static_method_over_instance_member() {
     );
 }
 
-/// `values` is exempt on ACCESSORS only — a `static int get values` on a
-/// class stays silent (the accessor arm of
-/// `member_duplicate_definition_verifier.dart` — the class face exempts
-/// the `values` name).
+/// `values` carries no class-face exemption — a `static int get values`
+/// over an instance `values` accessor reports the plain row (the live
+/// 3.13.7 oracle fires `conflicting_static_and_instance` on this exact
+/// fixture; the `values` carve-outs live in the enhanced-enum machinery,
+/// not in the generic member verifier).
 #[test]
 fn conflicting_static_values_getter_exempt() {
     let report = report_ops(
@@ -379,7 +393,15 @@ fn conflicting_static_values_getter_exempt() {
          }\n",
     );
     let rows = conflicting_messages(&report);
-    assert!(rows.is_empty(), "values accessor is exempt: {rows:?}");
+    assert_eq!(
+        rows,
+        vec![
+            "Class 'C' can't define static member 'values' and have instance member \
+             'C.values' with the same name."
+                .to_string()
+        ],
+        "a class's values accessor pair conflicts: {rows:?}"
+    );
 }
 
 // —— conflicting_static_and_instance: extension ——
@@ -408,9 +430,9 @@ fn extension_conflicting_static_and_instance() {
 
 // —— conflicting_static_and_instance: enum getMember + implicit faces ——
 
-/// An enum's static member over its own constant reports `'E.{name}'`
-/// (the getMember face — `enhanced_enums_error_test`'s
-/// `ConflictStaticInstanceEnumValue`/`ConflictEnumValueInherited*` rows).
+/// An enum's static member over its own constant is a plain
+/// same-container duplicate — the pair reports `duplicate_definition`,
+/// not the static/instance row (the live 3.13.7 oracle on this fixture).
 #[test]
 fn enum_static_over_own_constant() {
     let report = report_ops(
@@ -420,19 +442,28 @@ fn enum_static_over_own_constant() {
          }\n",
     );
     let rows = conflicting_messages(&report);
+    // Live 3.13.7 oracle on this fixture: `duplicate_definition` "The name
+    // 'e1' is already defined." — the enum constant and the static field
+    // are same-container same-name declarations, and the member-duplicate
+    // face answers before any static/instance classification, so no
+    // `conflicting_static_and_instance` row rides on top.
+    let all: Vec<String> = report
+        .diagnostics
+        .iter()
+        .map(|d| d.message.to_string())
+        .collect();
+    assert_eq!(rows, Vec::<String>::new(), "no static/instance row: {rows:?}");
     assert_eq!(
-        rows,
-        vec![
-            "Class 'E' can't define static member 'e1' and have instance member \
-             'E.e1' with the same name."
-                .to_string()
-        ],
-        "enum constant is an instance member: {rows:?}"
+        all,
+        vec!["The name 'e1' is already defined.".to_string()],
+        "the pair reports as a plain member duplicate: {all:?}"
     );
 }
 
-/// An enum's static `index` collides with the implicit `Enum.index`
-/// (the `dartCoreEnum_*` rows — `getInterfaceMember` answers `Enum`).
+/// An enum's static `index` collides with the induced instance `index`
+/// — the live 3.13.7 oracle renders the owner as `E.index` (the induced
+/// getter presents as the enum's own member, not a spelled-out `Enum.`
+/// qualifier).
 #[test]
 fn enum_static_over_implicit_enum_index() {
     let report = report_ops(
@@ -446,10 +477,10 @@ fn enum_static_over_implicit_enum_index() {
         rows,
         vec![
             "Class 'E' can't define static member 'index' and have instance member \
-             'Enum.index' with the same name."
+             'E.index' with the same name."
                 .to_string()
         ],
-        "implicit Enum.index answers: {rows:?}"
+        "the induced index getter renders under the enum's own name: {rows:?}"
     );
 }
 

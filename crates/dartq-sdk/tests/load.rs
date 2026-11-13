@@ -615,7 +615,12 @@ fn experiment_whitelist_maps_to_feature_sets() {
 fn flutter_files() -> Vec<(String, String)> {
     standard_files()
         .into_iter()
-        .map(|(path, content)| (format!("flutter/bin/cache/{path}"), content.to_string()))
+        .map(|(path, content)| {
+            (
+                format!("flutter/bin/cache/{path}"),
+                content.to_string(),
+            )
+        })
         .collect::<Vec<_>>()
 }
 

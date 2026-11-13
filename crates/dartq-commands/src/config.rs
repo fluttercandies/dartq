@@ -127,6 +127,26 @@ impl DartqConfig {
             .clamp(1, 64);
         (enabled, max_roots)
     }
+
+    /// The warm-standby posture beside [`Self::pool`]: `warm_servers`
+    /// (default off since 0.1.23 — the prewarm balloon is transient
+    /// extra spawn-time memory pressure, the wrong default on
+    /// memory-tight hosts; opt in with `warm_servers: true` or
+    /// `DARTQ_WARM_SERVERS=1`), and `warm_ttl_secs` — how long an idle
+    /// daemon keeps its standby server before exiting (default 900,
+    /// floor 1). The resident daemon resolves the same knobs through the
+    /// `DARTQ_WARM_SERVERS` / `DARTQ_WARM_TTL_SECS` overrides, so a
+    /// config-less A/B works too.
+    #[must_use]
+    pub fn warm(&self) -> (bool, u64) {
+        let pool = self.analyzer.and_then(|analyzer| analyzer.pool);
+        let warm = pool.and_then(|pool| pool.warm_servers).unwrap_or(false);
+        let ttl = pool
+            .and_then(|pool| pool.warm_ttl_secs)
+            .unwrap_or(900)
+            .max(1);
+        (warm, ttl)
+    }
 }
 
 /// Which analyzer `dartq analyze` runs.
@@ -164,6 +184,16 @@ pub struct PoolConfig {
     pub enabled: Option<bool>,
     /// The most worktrees one pooled server serves (default 3, 1–64).
     pub max_roots: Option<u64>,
+    /// Keep a warm standby server behind the resident daemon — an idle
+    /// daemon holds a spawned, rootless analysis server (slotless,
+    /// memory-only lease) that the next borrower adopts instead of paying
+    /// a cold spawn (default false: the prewarm's transient balloon is
+    /// the wrong default on memory-tight hosts; `DARTQ_WARM_SERVERS=1`
+    /// is the env arm of the same opt-in).
+    pub warm_servers: Option<bool>,
+    /// Seconds an idle daemon keeps its standby before exiting
+    /// (default 900).
+    pub warm_ttl_secs: Option<u64>,
 }
 
 /// The `analyzer.official:` section.
@@ -593,7 +623,10 @@ pub fn resolve_locator(
 /// own refusals (empty version/dir, `system` without `$DART_SDK`, no HOME
 /// for `fvm:`).
 pub fn sdk_locator_root(locator: &str, config_root: &Path) -> Result<PathBuf, ConfigError> {
-    if locator == "system" || locator.starts_with("fvm:") || locator.starts_with("path:") {
+    if locator == "system"
+        || locator.starts_with("fvm:")
+        || locator.starts_with("path:")
+    {
         return locator_root(locator, config_root, "`sdk`");
     }
     if locator.is_empty() {
@@ -616,7 +649,11 @@ pub fn sdk_locator_root(locator: &str, config_root: &Path) -> Result<PathBuf, Co
 ///
 /// [`ConfigError::Invalid`] for an unsupported form, an empty version or
 /// dir, `system` without `$DART_SDK`, or no HOME for `fvm:`.
-fn locator_root(locator: &str, config_dir: &Path, what: &str) -> Result<PathBuf, ConfigError> {
+fn locator_root(
+    locator: &str,
+    config_dir: &Path,
+    what: &str,
+) -> Result<PathBuf, ConfigError> {
     if locator == "system" {
         return match std::env::var_os("DART_SDK") {
             Some(root) if !root.is_empty() => Ok(PathBuf::from(root)),
@@ -627,7 +664,9 @@ fn locator_root(locator: &str, config_dir: &Path, what: &str) -> Result<PathBuf,
     }
     if let Some(version) = locator.strip_prefix("fvm:") {
         if version.is_empty() {
-            return Err(ConfigError::Invalid(format!("{what}: empty fvm version")));
+            return Err(ConfigError::Invalid(format!(
+                "{what}: empty fvm version"
+            )));
         }
         return fvm_version_root(version);
     }
@@ -1499,5 +1538,51 @@ mod tests {
             "the legacy layout wins when it is the one on disk"
         );
         assert_eq!(fvm_default_root(None), None);
+    }
+
+    /// The warm-standby knobs beside the pool's: warm is off by default
+    /// (with or without a pool section at all — the 0.1.23 default), the
+    /// TTL defaults to 900, and both spell explicitly.
+    #[test]
+    fn warm_standby_knobs_default_off_with_a_900_ttl() {
+        let warm = |project: &Path, home: &Path| {
+            discover_with(project, Some(home))
+                .expect("discover")
+                .expect("config")
+                .warm()
+        };
+        let (home, project) = tiered(None);
+        write_config(project.path(), "version: 1\n");
+        assert_eq!(warm(project.path(), home.path()), (false, 900));
+
+        write_config(
+            project.path(),
+            "version: 1\nanalyzer:\n  pool:\n    enabled: true\n",
+        );
+        assert_eq!(
+            warm(project.path(), home.path()),
+            (false, 900),
+            "a pool section without the warm keys keeps the defaults"
+        );
+
+        write_config(
+            project.path(),
+            "version: 1\nanalyzer:\n  pool:\n    enabled: true\n    warm_servers: true\n    warm_ttl_secs: 300\n",
+        );
+        assert_eq!(
+            warm(project.path(), home.path()),
+            (true, 300),
+            "the explicit opt-in"
+        );
+
+        write_config(
+            project.path(),
+            "version: 1\nanalyzer:\n  pool:\n    warm_ttl_secs: 0\n",
+        );
+        assert_eq!(
+            warm(project.path(), home.path()),
+            (false, 1),
+            "the TTL floors at one second"
+        );
     }
 }

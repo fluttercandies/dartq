@@ -175,7 +175,15 @@ impl<'a> Engine<'a> {
                         nullable: rhs_nullable | head_nullable,
                     };
                 }
-                // `Null`/`void`/`Never`/`Unknown` right-hand sides keep the
+                // A `void` right-hand side IS a modeled face: upstream
+                // resolves an alias use through its aliased type
+                // (`typedef V = void; V x` — the read's `staticType` is
+                // `VoidTypeImpl`), so the fold answers `Ty::Void` and the
+                // void-spelling gates (`emit_use_of_void_result`, the `==`
+                // short-circuit, the for-in element face) read the alias
+                // exactly as the oracle does.
+                Ty::Void => return Ty::Void,
+                // `Null`/`Never`/`Unknown` right-hand sides keep the
                 // written use (an alias to them is not the modeled face).
                 _ => break,
             }
@@ -4732,6 +4740,20 @@ impl<'a> Engine<'a> {
     /// generic literal, a named-formal section, or a brace inside the
     /// formal group refuses.
     pub(crate) fn closure_init_ty(&self, bytes: &[u8], paren_open: usize) -> Ty {
+        // The literal's own parse-time face, when the close staged one
+        // (the context-supplied or bare-initializer `Ty::Function` the
+        // `end_function_expression` push carries), IS the static type —
+        // `resolve_rows` stages it into the side table (its walk-local
+        // `rows` slice is unreadable from here). The source
+        // re-derivation below exists for the literals the close never
+        // typed, and its arrow-return column reads `deferred_miss_rows`,
+        // a queue the walk's opening already drained — alone it would
+        // answer `dynamic Function()` where the oracle holds `int
+        // Function()` (`var g = () => 0; g.bar` over `extension E on int
+        // Function()`).
+        if let Some(&ty) = self.closure_lit_rows.get(&self.utf16_of(paren_open)) {
+            return ty;
+        }
         let Some(paren_close) = matching_bracket_fwd(bytes, paren_open) else {
             return Ty::UNKNOWN;
         };
@@ -6113,6 +6135,28 @@ impl<'a> Engine<'a> {
             other => other,
         };
         match hit {
+            // dart:core's final primitives resolve in every rig the same
+            // way `resolve_bare`'s unindexed synthetic-SDK arm models for
+            // the member lane: an `as`/`is` target, annotation, or type
+            // argument naming `int` is a real type — the official
+            // analyzer's implicit dart:core import answers it, never
+            // `undefined_class` (and an in-file declaration shadowing the
+            // core name already answered above, before this NotFound arm).
+            // The fallback models the implicit import, so it applies only
+            // while no `dart:core` import edge governs the namespace: the
+            // oracle suppresses its synthetic import exactly when the
+            // library declares one of its own (file_state.dart:255-270,
+            // `hasDartCoreImport` at :982-992), and the written edge's
+            // combinators then decide the core names — `import
+            // 'dart:core' show String;` leaves `int` a true miss that
+            // reports `undefined_class` (#4247), while a prefix-only or
+            // filtered edge hides the name the same way.
+            ScopedHit::NotFound
+                if self.members.primitive_ids.contains(&name)
+                    && !self.has_core_import_edge() =>
+            {
+                (TypeResolution::Type, None)
+            }
             ScopedHit::NotFound => (TypeResolution::Missing, None),
             ScopedHit::Local(decl) => self.scoped_resolution(name, self.file, decl.kind),
             ScopedHit::Found(NamespaceEntry::Decl(file)) => {
@@ -6130,6 +6174,23 @@ impl<'a> Engine<'a> {
             // MultiplyDefinedElement → `InvalidType` with no report.
             ScopedHit::Ambiguous(_) => (TypeResolution::Type, None),
         }
+    }
+
+    /// Whether any import edge of the diagnosing library targets
+    /// `dart:core` — implicit or explicit, filtered or prefixed alike: the
+    /// oracle keeps its synthetic core import off `libraryImports` exactly
+    /// when the library declares a `dart:core` import of its own
+    /// (file_state.dart:255-270), so a present edge makes the namespace's
+    /// verdict over the core names authoritative (a miss under `show`/`hide`
+    /// or a prefix-only edge reports, #4247). With no core edge at all —
+    /// a rig's prelude-less graph — the verdict below models the implicit
+    /// import the real analyzer always carries.
+    fn has_core_import_edge(&self) -> bool {
+        self.graph
+            .import_edges(self.lib)
+            .iter()
+            .filter_map(|edge| edge.target)
+            .any(|target| self.graph.uri(target) == "dart:core")
     }
 
     /// The scoped top-level answer with its `not_a_type` anchor: the

@@ -122,6 +122,38 @@ pub(crate) fn session_call(
     params: &Value,
     timeout: Duration,
 ) -> Result<Value, ProxyError> {
+    let body = session_call_frame(socket, method, params, timeout)?;
+    let answer: Value =
+        serde_json::from_slice(&body).map_err(|error| ProxyError::Transport(error.to_string()))?;
+    answer_result(answer)
+}
+
+/// Maps one parsed response frame onto the call's answer: the error
+/// answers become the daemon error, a success answer yields its result
+/// (`{}` when absent).
+fn answer_result(answer: Value) -> Result<Value, ProxyError> {
+    if let Some(error) = answer.get("error") {
+        return Err(ProxyError::Daemon(
+            // The daemon's error answers always carry both fields
+            // (`Response::error`); -32603 is the JSON-RPC fallback tier.
+            error["code"].as_i64().unwrap_or(-32603),
+            error["message"].as_str().unwrap_or_default().to_owned(),
+        ));
+    }
+    Ok(answer.get("result").cloned().unwrap_or_else(|| json!({})))
+}
+
+/// Sends one daemon request and reads until the daemon's response frame,
+/// returning the response frame's raw body bytes — unparsed (#4190):
+/// the routed faces cut the stdout member out of these bytes without
+/// ever materializing a value tree; the parsed face (`session_call`,
+/// the MCP proxy behind it) parses them whole.
+fn session_call_frame(
+    socket: &Path,
+    method: &str,
+    params: &Value,
+    timeout: Duration,
+) -> Result<Vec<u8>, ProxyError> {
     let mut stream =
         UnixStream::connect(socket).map_err(|error| ProxyError::Transport(error.to_string()))?;
     // The bound covers the whole round trip: a wedged engine (or a
@@ -153,29 +185,29 @@ pub(crate) fn session_call(
              the session may be wedged; check `dartq session status`"
         ))
     };
-    let mut answer = match read_frame(&mut stream) {
-        Ok(answer) => answer,
-        Err(ReadError::Wedged) => return Err(wedged()),
-        Err(ReadError::Io(error)) => return Err(ProxyError::Transport(error.to_string())),
-        Err(ReadError::Malformed(message)) => return Err(ProxyError::Transport(message)),
-    };
-    while answer.get("id").is_none() {
-        answer = match read_frame(&mut stream) {
-            Ok(frame) => frame,
+    let mut leftover = Vec::new();
+    loop {
+        let body = match read_frame_body(&mut stream, &mut leftover) {
+            Ok(body) => body,
             Err(ReadError::Wedged) => return Err(wedged()),
             Err(ReadError::Io(error)) => return Err(ProxyError::Transport(error.to_string())),
             Err(ReadError::Malformed(message)) => return Err(ProxyError::Transport(message)),
         };
+        if is_notification(&body) {
+            continue;
+        }
+        return Ok(body);
     }
-    if let Some(error) = answer.get("error") {
-        return Err(ProxyError::Daemon(
-            // The daemon's error answers always carry both fields
-            // (`Response::error`); -32603 is the JSON-RPC fallback tier.
-            error["code"].as_i64().unwrap_or(-32603),
-            error["message"].as_str().unwrap_or_default().to_owned(),
-        ));
-    }
-    Ok(answer.get("result").cloned().unwrap_or_else(|| json!({})))
+}
+
+/// Whether a raw frame is a notification (id-less — read past it): the
+/// daemon's writer encodes every frame compact with `jsonrpc` first and
+/// the notifications' second member `method` (`Message::to_value`'s
+/// insertion order, pinned by `preserve_order`; `write_wire_response`
+/// splices the same response prefix), so the prefix answers without a
+/// parse — the raw twin of the parsed loop's `get("id").is_none()`.
+fn is_notification(body: &[u8]) -> bool {
+    body.starts_with(b"{\"jsonrpc\":\"2.0\",\"method\"")
 }
 
 /// One framed-read failure: the socket timed out (the wedge signal,
@@ -198,30 +230,74 @@ impl std::fmt::Debug for ReadError {
 }
 
 /// Reads one Content-Length framed JSON message (the one transport's
-/// reader — the `mcp` face's frame tests exercise it directly).
-pub(crate) fn read_frame(stream: &mut UnixStream) -> Result<Value, ReadError> {
-    let mut read = |buf: &mut [u8]| {
-        stream.read_exact(buf).map_err(|error| {
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) {
-                ReadError::Wedged
-            } else {
-                ReadError::Io(error)
-            }
-        })
+/// reader — the `mcp` face's frame tests exercise it directly). The
+/// header reads in stack-buffered chunks with a memchr scan for the
+/// `\r\n\r\n` terminator (#4260) — one read syscall per chunk, not the
+/// one-byte-per-syscall walk the terminator walk was. `pending` carries
+/// whatever a chunk read brought past this frame — the next frame's
+/// leading bytes; a caller reading several frames off one connection
+/// passes the same vec to every call, one-shot callers `&mut Vec::new()`.
+pub(crate) fn read_frame(
+    stream: &mut UnixStream,
+    pending: &mut Vec<u8>,
+) -> Result<Value, ReadError> {
+    let body = read_frame_body(stream, pending)?;
+    serde_json::from_slice(&body).map_err(|error| ReadError::Malformed(error.to_string()))
+}
+
+/// Reads one Content-Length framed message's raw body bytes — the
+/// framed reader's unparsed half (#4190): the header scan is the
+/// transport's own (#4260); the body returns without a JSON parse for
+/// the callers that splice the frame instead of materializing it.
+pub(crate) fn read_frame_body(
+    stream: &mut UnixStream,
+    pending: &mut Vec<u8>,
+) -> Result<Vec<u8>, ReadError> {
+    let map_error = |error: std::io::Error| {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            ReadError::Wedged
+        } else {
+            ReadError::Io(error)
+        }
     };
-    let mut header = Vec::new();
-    let mut byte = [0u8; 1];
+    // A frame's header is `Content-Length: N\r\n\r\n` (a couple dozen
+    // bytes); 512 covers any multi-header spelling the daemon sends.
+    let mut buf = [0u8; 512];
+    // The previous call's over-read plays the first chunk's role.
+    let mut filled = pending.len().min(buf.len());
+    buf[..filled].copy_from_slice(&pending[..filled]);
+    let carried_pending = filled;
+    // Bytes already confirmed terminator-free: each pass scans only the
+    // unscanned tail, rewinding three bytes in case the terminator
+    // straddled the pass boundary.
+    let mut scanned = 0usize;
+    let header_end;
     loop {
-        read(&mut byte)?;
-        header.push(byte[0]);
-        if header.ends_with(b"\r\n\r\n") {
+        let look_from = scanned.saturating_sub(3);
+        if let Some(index) = memchr::memmem::find(&buf[look_from..filled], b"\r\n\r\n") {
+            header_end = look_from + index + 4;
             break;
         }
+        scanned = filled;
+        if filled == buf.len() {
+            return Err(ReadError::Malformed("frame header too long".to_owned()));
+        }
+        // One read syscall per pass.
+        let n = match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(ReadError::Io(std::io::Error::from(
+                    std::io::ErrorKind::UnexpectedEof,
+                )));
+            }
+            Ok(n) => n,
+            Err(error) => return Err(map_error(error)),
+        };
+        filled += n;
     }
-    let header = String::from_utf8_lossy(&header);
+    let header = String::from_utf8_lossy(&buf[..header_end]);
     let length: usize = header
         .lines()
         .find_map(|line| {
@@ -232,9 +308,321 @@ pub(crate) fn read_frame(stream: &mut UnixStream) -> Result<Value, ReadError> {
             })
         })
         .ok_or_else(|| ReadError::Malformed("missing Content-Length".to_owned()))?;
+    // The chunk may already carry body bytes — this frame's start, and
+    // (rarely, when a read spans a frame boundary) the next frame's
+    // leading bytes, which return to `pending`.
+    let mut consumed = header_end;
+    if carried_pending > 0 {
+        pending.clear();
+    }
+    let carried = filled - consumed;
+    let take = carried.min(length);
     let mut body = vec![0u8; length];
-    read(&mut body)?;
-    serde_json::from_slice(&body).map_err(|error| ReadError::Malformed(error.to_string()))
+    body[..take].copy_from_slice(&buf[consumed..consumed + take]);
+    consumed += take;
+    if consumed < filled {
+        pending.clear();
+        pending.extend_from_slice(&buf[consumed..filled]);
+    }
+    stream.read_exact(&mut body[take..]).map_err(map_error)?;
+    Ok(body)
+}
+
+// ---------------------------------------------------------------------------
+// The routed answer (#4190): splice the frame, never parse it
+// ---------------------------------------------------------------------------
+
+/// One routed answer cut from the daemon's raw response frame (#4190).
+/// The frame's one expensive member — the rendered stdout — is located
+/// by scan and unescaped **in place** into the frame's own buffer (every
+/// JSON escape encodes at least as many bytes as it decodes to, so the
+/// write cursor never passes the read cursor: no allocation beyond the
+/// frame itself, no value tree, no second payload copy). Every other
+/// member — `counts`, `advisory`, the universe stamp — parses as a small
+/// value over the frame with the stdout body spliced empty: a few
+/// hundred bytes.
+///
+/// The scan is structural by construction: a JSON string escapes every
+/// quote it contains, so the byte sequence `"stdout"` can only be a
+/// member's key — no payload can forge one — and the spliced-empty
+/// parse fails closed (the malformed transport error, the cold fallback
+/// behind it) if any span were wrong. Frames without a stdout member —
+/// error answers, or a result without the rendered face — parse whole:
+/// stdout is the protocol's only large member, so the no-stdout arm is
+/// small by shape.
+#[derive(Debug)]
+struct RoutedAnswer {
+    /// The response frame, its stdout body unescaped in place.
+    frame: Vec<u8>,
+    /// The stdout member's unescaped span; `None` when the answer
+    /// carried no rendered face (the caller's fallback arm).
+    stdout: Option<std::ops::Range<usize>>,
+    /// The frame with the stdout body spliced empty, parsed: the
+    /// envelope's small members exactly as the parsed path reads them.
+    small: Value,
+}
+
+impl RoutedAnswer {
+    /// The small parsed result object (the parsed path's answer — an
+    /// absent result indexes as null, the parsed `{}`'s own posture).
+    fn result(&self) -> &Value {
+        match self.small.get("result") {
+            Some(result) => result,
+            None => &Value::Null,
+        }
+    }
+
+    /// The unescaped rendered stdout. The callers gate on presence (the
+    /// `stdout` member's absence is the fallback arm, never a print) —
+    /// a missing field here is a program bug, not a runtime case.
+    fn stdout(&self) -> &[u8] {
+        let span = self
+            .stdout
+            .clone()
+            .expect("the routed answer carries the rendered stdout");
+        &self.frame[span]
+    }
+}
+
+/// One routed daemon round trip: the raw response frame cut into a
+/// [`RoutedAnswer`] (the routed faces' `session_call` — the answer's
+/// cost is the splice, never a parse).
+fn session_call_routed(
+    socket: &Path,
+    method: &str,
+    params: &Value,
+    timeout: Duration,
+) -> Result<RoutedAnswer, ProxyError> {
+    routed_answer(session_call_frame(socket, method, params, timeout)?)
+}
+
+/// Cuts one routed answer out of the daemon's raw response frame. A
+/// frame with a stdout member yields the spliced answer; one without
+/// parses whole and keeps the parsed transport's semantics — the error
+/// answers map to the daemon error, a stdout-less result is the
+/// caller's fallback arm.
+fn routed_answer(mut frame: Vec<u8>) -> Result<RoutedAnswer, ProxyError> {
+    let malformed = |why: String| ProxyError::Transport(format!("malformed answer frame: {why}"));
+    let (span, small) = match locate_stdout_string(&frame) {
+        Some(span) => {
+            // The small frame: the envelope with the stdout body spliced
+            // empty (both quotes kept), parsed — the structural check
+            // that the spans were right: a wrong span breaks the JSON
+            // and the frame fails closed, the parsed path's own
+            // malformed answer.
+            let mut cut = Vec::with_capacity(frame.len() - span.len());
+            cut.extend_from_slice(&frame[..span.start]);
+            cut.extend_from_slice(&frame[span.end..]);
+            let small: Value =
+                serde_json::from_slice(&cut).map_err(|error| malformed(error.to_string()))?;
+            (Some(span), small)
+        }
+        None => (
+            None,
+            serde_json::from_slice(&frame).map_err(|error| malformed(error.to_string()))?,
+        ),
+    };
+    if let Some(error) = small.get("error") {
+        return Err(ProxyError::Daemon(
+            // The daemon's error answers always carry both fields
+            // (`Response::error`); -32603 is the JSON-RPC fallback tier.
+            error["code"].as_i64().unwrap_or(-32603),
+            error["message"].as_str().unwrap_or_default().to_owned(),
+        ));
+    }
+    let stdout = match span {
+        Some(span) => Some(unescape_in_place(&mut frame, span).map_err(malformed)?),
+        None => None,
+    };
+    Ok(RoutedAnswer {
+        frame,
+        stdout,
+        small,
+    })
+}
+
+/// Locates the stdout member's string body — the span between the
+/// quotes — in the raw response frame. The daemon's writer spells every
+/// string's quotes escaped, so the byte sequence `"stdout"` can only be
+/// a member's key; a candidate that does not read `"stdout"` `:` `"`
+/// (whitespace tolerated — the writer is compact) is skipped, so
+/// payload text can neither forge nor derail the scan. `None` when the
+/// frame carries no stdout string.
+fn locate_stdout_string(frame: &[u8]) -> Option<std::ops::Range<usize>> {
+    const KEY: &[u8] = b"\"stdout\"";
+    let mut from = 0;
+    while let Some(hit) = memchr::memmem::find(&frame[from..], KEY) {
+        let key = from + hit;
+        let mut at = key + KEY.len();
+        let whitespace = |at: &mut usize| {
+            while matches!(
+                frame.get(*at),
+                Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+            ) {
+                *at += 1;
+            }
+        };
+        whitespace(&mut at);
+        if frame.get(at) != Some(&b':') {
+            from = key + 1;
+            continue;
+        }
+        at += 1;
+        whitespace(&mut at);
+        if frame.get(at) != Some(&b'"') {
+            from = key + 1;
+            continue;
+        }
+        // The value's opening quote: the body runs to the first
+        // unescaped quote.
+        if let Some(close) = closing_quote(frame, at) {
+            return Some(at + 1..close);
+        }
+        from = key + 1;
+    }
+    None
+}
+
+/// The string's closing quote: the first quote with an even run of
+/// backslashes before it (a quote behind an odd run is escaped — the
+/// standard parity rule; a `\uXXXX` escape never spells a raw quote).
+fn closing_quote(frame: &[u8], open: usize) -> Option<usize> {
+    let mut at = open + 1;
+    while let Some(hit) = memchr::memchr(b'"', &frame[at..]) {
+        let quote = at + hit;
+        let mut slashes = 0;
+        while slashes < quote && frame[quote - 1 - slashes] == b'\\' {
+            slashes += 1;
+        }
+        if slashes % 2 == 0 {
+            return Some(quote);
+        }
+        at = quote + 1;
+    }
+    None
+}
+
+/// Unescapes one JSON string body — the span between the quotes — in
+/// place and truncates the buffer to the result: the write cursor
+/// starts at the read cursor and never passes it (`\"` spends two bytes
+/// for one, `\uXXXX` six for at most three, a surrogate pair twelve for
+/// four), so the frame's single allocation becomes the stdout buffer.
+/// Verbatim runs validate as UTF-8 while they copy — the check the
+/// whole-frame parse used to pay — and a malformed escape, an unpaired
+/// surrogate, or invalid UTF-8 is an error (the malformed transport the
+/// parsed path answers, never wrong bytes printed).
+fn unescape_in_place(
+    frame: &mut Vec<u8>,
+    body: std::ops::Range<usize>,
+) -> Result<std::ops::Range<usize>, String> {
+    let (from, to) = (body.start, body.end);
+    let mut read = from;
+    let mut write = from;
+    while read < to {
+        let run_end = match memchr::memchr(b'\\', &frame[read..to]) {
+            Some(hit) => read + hit,
+            None => to,
+        };
+        // The verbatim run validates as UTF-8 as it lands (escapes only
+        // ever encode whole code points, so run boundaries fall on
+        // sequence boundaries).
+        if std::str::from_utf8(&frame[read..run_end]).is_err() {
+            return Err("invalid UTF-8 in the stdout body".to_owned());
+        }
+        if write != read {
+            frame.copy_within(read..run_end, write);
+        }
+        write += run_end - read;
+        if run_end == to {
+            break;
+        }
+        // One escape at `run_end`; `skip` covers its whole spelling.
+        let escape_at = run_end;
+        let skip;
+        match *frame.get(escape_at + 1).ok_or("a truncated escape")? {
+            b'"' => {
+                frame[write] = b'"';
+                write += 1;
+                skip = 2;
+            }
+            b'\\' => {
+                frame[write] = b'\\';
+                write += 1;
+                skip = 2;
+            }
+            b'/' => {
+                frame[write] = b'/';
+                write += 1;
+                skip = 2;
+            }
+            b'b' => {
+                frame[write] = 0x08;
+                write += 1;
+                skip = 2;
+            }
+            b'f' => {
+                frame[write] = 0x0C;
+                write += 1;
+                skip = 2;
+            }
+            b'n' => {
+                frame[write] = 0x0A;
+                write += 1;
+                skip = 2;
+            }
+            b'r' => {
+                frame[write] = 0x0D;
+                write += 1;
+                skip = 2;
+            }
+            b't' => {
+                frame[write] = 0x09;
+                write += 1;
+                skip = 2;
+            }
+            b'u' => {
+                let hex = |at: usize| -> Result<u16, String> {
+                    let digits = frame.get(at..at + 4).ok_or("a truncated \\u escape")?;
+                    let digits = std::str::from_utf8(digits)
+                        .ok()
+                        .and_then(|digits| u16::from_str_radix(digits, 16).ok())
+                        .ok_or("an invalid \\u escape")?;
+                    Ok(digits)
+                };
+                let code = hex(escape_at + 2)?;
+                let (code_point, escape_len) = if (0xD800..=0xDBFF).contains(&code) {
+                    // A leading surrogate must pair with a trailing one
+                    // — the pair spells one astral code point.
+                    if frame.get(escape_at + 6) != Some(&b'\\')
+                        || frame.get(escape_at + 7) != Some(&b'u')
+                    {
+                        return Err("a lone leading surrogate in a \\u escape".to_owned());
+                    }
+                    let low = hex(escape_at + 8)?;
+                    if !(0xDC00..=0xDFFF).contains(&low) {
+                        return Err("a lone leading surrogate in a \\u escape".to_owned());
+                    }
+                    let code_point =
+                        0x10000 + (u32::from(code) - 0xD800) * 0x400 + (u32::from(low) - 0xDC00);
+                    (code_point, 12)
+                } else if (0xDC00..=0xDFFF).contains(&code) {
+                    return Err("a lone trailing surrogate in a \\u escape".to_owned());
+                } else {
+                    (u32::from(code), 6)
+                };
+                let decoded =
+                    char::from_u32(code_point).ok_or("an unpaired surrogate in a \\u escape")?;
+                // Safe by the cursor invariant: `write` trails the read
+                // cursor by at least the escape's surplus.
+                write += decoded.encode_utf8(&mut frame[write..write + 4]).len();
+                skip = escape_len;
+            }
+            _ => return Err("an invalid escape".to_owned()),
+        }
+        read = escape_at + skip;
+    }
+    frame.truncate(write);
+    Ok(from..write)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,23 +664,26 @@ pub(crate) fn route_analyze(
     targets: &[crate::TargetKind],
     out: &mut impl Write,
     spawn: &dyn Fn(&Layout, &SessionTriple) -> io::Result<()>,
+    roots: &mut crate::RootMemo,
 ) -> Option<u8> {
     if !analyze_routable(args) {
         return None;
     }
     // The session is per workspace root; a run spanning several stays
-    // in-process (one engine per root is the cold face's own shape).
-    let roots: Vec<PathBuf> = targets
+    // in-process (one engine per root is the cold face's own shape). The
+    // walks share the invocation's root memo (#4260) with the cold path's
+    // grouping below.
+    let targets_roots: Vec<PathBuf> = targets
         .iter()
         .map(|target| match target {
-            crate::TargetKind::Dir(dir) => crate::workspace_root_of(dir),
+            crate::TargetKind::Dir(dir) => roots.workspace_root(dir),
             crate::TargetKind::File(file) => {
-                crate::workspace_root_of(&file.parent().map(Path::to_path_buf).unwrap_or_default())
+                roots.workspace_root(&file.parent().map(Path::to_path_buf).unwrap_or_default())
             }
         })
         .collect();
-    let root = roots.first()?.clone();
-    if roots.iter().any(|other| *other != root) {
+    let root = targets_roots.first()?.clone();
+    if targets_roots.iter().any(|other| *other != root) {
         return None;
     }
     // The triple keys on the concrete SDK root: the flag, the env, or
@@ -312,14 +703,14 @@ pub(crate) fn route_analyze(
     });
     let started = Instant::now();
     match ladder(&root, &sdk_root, "dartq/analyze", &params, spawn) {
-        Ok(answer) if answer["stdout"].is_string() => {
+        Ok(answer) if answer.stdout.is_some() => {
             // Belt-and-braces (#2675): the daemon invalidates the universe
             // on a package-config move before answering (the correct fix),
             // and the answer names the package config its universe was
             // assembled from — when the disk holds different bytes NOW,
             // the answer must not be printed; the cold path owns the
             // fresh universe.
-            if !universe_matches_disk(&root, &answer) {
+            if !universe_matches_disk(&root, answer.result().get("packages")) {
                 advisory("the session answered a stale package universe", "analyzing");
                 return None;
             }
@@ -357,7 +748,7 @@ pub(crate) fn route_analyze(
 /// means the answer reflects a universe the caller must not print. An
 /// absent member is no signal (the check face's rendered answer reads
 /// no universe and carries none).
-fn universe_matches_disk(root: &Path, answer: &Value) -> bool {
+fn universe_matches_disk(root: &Path, packages: Option<&Value>) -> bool {
     /// The universe's package config as the daemon's answer names it.
     enum Wire {
         /// No config anywhere at assembly (the BasicWorkspace floor).
@@ -369,7 +760,7 @@ fn universe_matches_disk(root: &Path, answer: &Value) -> bool {
             size: u64,
         },
     }
-    let named = match answer.get("packages") {
+    let named = match packages {
         // An absent member is no signal (the check face's rendered
         // answer reads no universe and carries none).
         None => return true,
@@ -442,8 +833,8 @@ pub(crate) fn route_check(args: &crate::CheckArgs, out: &mut impl Write) -> Opti
         "format": format_word(format),
     });
     let started = Instant::now();
-    match session_call(&socket, "dartq/check", &params, CALL_TIMEOUT) {
-        Ok(answer) if answer["stdout"].is_string() => Some(print_routed(
+    match session_call_routed(&socket, "dartq/check", &params, CALL_TIMEOUT) {
+        Ok(answer) if answer.stdout.is_some() => Some(print_routed(
             out,
             &answer,
             format,
@@ -492,9 +883,9 @@ fn route_answer(
     // the usage error (its assembly resolves the same way).
     let sdk_root = sdk_root_for(root, sdk_path).ok()?;
     let socket = attached_socket_for(root, &sdk_root)?;
-    match session_call(&socket, method, params, CALL_TIMEOUT) {
-        Ok(answer) if answer["stdout"].is_string() => {
-            if !universe_matches_disk(root, &answer) {
+    match session_call_routed(&socket, method, params, CALL_TIMEOUT) {
+        Ok(answer) if answer.stdout.is_some() => {
+            if !universe_matches_disk(root, answer.result().get("packages")) {
                 advisory("the session answered a stale package universe", ANSWERING);
                 return None;
             }
@@ -515,8 +906,8 @@ fn route_answer(
 /// no SDK triple, no universe stamp: the per-query engine reads the disk
 /// fresh).
 fn route_attached(socket: &Path, method: &str, params: &Value, out: &mut impl Write) -> Option<u8> {
-    match session_call(socket, method, params, CALL_TIMEOUT) {
-        Ok(answer) if answer["stdout"].is_string() => print_answer(out, &answer),
+    match session_call_routed(socket, method, params, CALL_TIMEOUT) {
+        Ok(answer) if answer.stdout.is_some() => print_answer(out, &answer),
         Ok(_) => {
             advisory("the session's answer lacked the rendered face", ANSWERING);
             None
@@ -531,18 +922,12 @@ fn route_attached(socket: &Path, method: &str, params: &Value, out: &mut impl Wr
 /// Prints one rendered answer's bytes and finishes the run: the value
 /// faces exit 0 on an answered document — their usage errors are the cold
 /// path's own, re-derived there whenever the route falls back.
-fn print_answer(out: &mut impl Write, answer: &Value) -> Option<u8> {
+fn print_answer(out: &mut impl Write, answer: &RoutedAnswer) -> Option<u8> {
     // The answer shape is this binary generation's own (the attach probe
     // pins the protocol generation by binary stamp): a missing field is a
     // program bug, not a runtime case.
-    let stdout = answer["stdout"]
-        .as_str()
-        .expect("the routed answer carries the rendered stdout");
-    if out
-        .write_all(stdout.as_bytes())
-        .and_then(|()| out.flush())
-        .is_err()
-    {
+    let stdout = answer.stdout();
+    if out.write_all(stdout).and_then(|()| out.flush()).is_err() {
         eprintln!("dartq: internal error: writing the answer failed");
         return Some(exit::INTERNAL_ERROR);
     }
@@ -748,8 +1133,8 @@ fn ladder(
     method: &str,
     params: &Value,
     spawn: &dyn Fn(&Layout, &SessionTriple) -> io::Result<()>,
-) -> Result<Value, String> {
-    let call = |layout: &Layout| session_call(&layout.socket, method, params, CALL_TIMEOUT);
+) -> Result<RoutedAnswer, String> {
+    let call = |layout: &Layout| session_call_routed(&layout.socket, method, params, CALL_TIMEOUT);
     let layout = Layout::new(root);
     match ensure(root, sdk_root, spawn) {
         Ensured::Attached(_) => match call(&layout) {
@@ -846,14 +1231,17 @@ fn check_format(args: &crate::CheckArgs) -> crate::AnalyzeFormat {
 
 /// Prints one routed answer and finishes the run: the workspace advisory
 /// on the stream the cold face uses (stderr for the data faces, the
-/// leading stdout line for text), the daemon-rendered bytes verbatim,
-/// the `--metrics-json` facts (the routed phases: `analyze_ms` is the
-/// round trip, `render_ms` the write; the cold path's discovery/sdk/
-/// assembly/lints/library numbers have no routed counterpart and report
-/// 0), and the severity exit tier over the answer's counts.
+/// leading stdout line for text), the daemon-rendered bytes verbatim
+/// (#4190: the spliced stdout, written straight from the frame buffer —
+/// the `--memory` splice is the one face that edits the tail, and only
+/// it pays a copy), the `--metrics-json` facts (the routed phases:
+/// `analyze_ms` is the round trip, `render_ms` the write; the cold
+/// path's discovery/sdk/assembly/lints/library numbers have no routed
+/// counterpart and report 0), and the severity exit tier over the
+/// answer's counts.
 fn print_routed(
     out: &mut impl Write,
-    answer: &Value,
+    answer: &RoutedAnswer,
     format: crate::AnalyzeFormat,
     memory_key: bool,
     fatal_warnings: bool,
@@ -864,7 +1252,7 @@ fn print_routed(
     // The advisory rides the answer, never the bytes: the cold face
     // prints it on stderr for the data formats and leads stdout with it
     // on the text face.
-    if let Some(advisory) = answer["advisory"].as_object() {
+    if let Some(advisory) = answer.result().get("advisory").and_then(Value::as_object) {
         let line = format!(
             "Info • {} • {}",
             advisory["code"].as_str().unwrap_or_default(),
@@ -882,25 +1270,26 @@ fn print_routed(
     // The answer shape is this binary generation's own (the election
     // pins the protocol generation by binary stamp): a missing field is a
     // program bug, not a runtime case.
-    let mut stdout = answer["stdout"]
-        .as_str()
-        .expect("the routed answer carries the rendered stdout")
-        .to_owned();
+    let stdout = answer.stdout();
+    let render_at = Instant::now();
     // The oracle's hidden `--memory` key (analyze face, json only): the
     // same splice the cold face applies — the peak RSS reported is the
     // calling process's own, the quantity the flag names.
-    if memory_key && format == crate::AnalyzeFormat::Json {
-        crate::splice_memory_key(&mut stdout);
+    let written = if memory_key && format == crate::AnalyzeFormat::Json {
+        let mut line = String::from_utf8(stdout.to_vec()).expect("the writers emit UTF-8");
+        crate::splice_memory_key(&mut line);
+        out.write_all(line.as_bytes())
+    } else {
+        out.write_all(stdout)
     }
-    let render_at = Instant::now();
-    let written = out.write_all(stdout.as_bytes()).and_then(|()| out.flush());
+    .and_then(|()| out.flush());
     let render_ms = u64::try_from(render_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     if let Err(error) = written {
         eprintln!("dartq: internal error: writing diagnostics failed: {error}");
         return exit::INTERNAL_ERROR;
     }
     if let Some(path) = metrics_path {
-        let counts = &answer["counts"];
+        let counts = answer.result().get("counts").unwrap_or(&Value::Null);
         let diagnostics = counts["error"].as_u64().unwrap_or(0)
             + counts["warning"].as_u64().unwrap_or(0)
             + counts["info"].as_u64().unwrap_or(0);
@@ -925,7 +1314,11 @@ fn print_routed(
             return exit::INTERNAL_ERROR;
         }
     }
-    counts_exit(&answer["counts"], fatal_warnings, fatal_infos)
+    counts_exit(
+        answer.result().get("counts").unwrap_or(&Value::Null),
+        fatal_warnings,
+        fatal_infos,
+    )
 }
 
 /// The routed exit tier: the severity arithmetic over the answer's
@@ -952,6 +1345,7 @@ fn counts_exit(counts: &Value, fatal_warnings: bool, fatal_infos: bool) -> u8 {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::RootMemo;
     use crate::session::tests::SIGNAL_SERIALIZATION;
     use crate::{AnalyzeFormat, TargetKind};
 
@@ -1055,6 +1449,123 @@ mod tests {
         }
     }
 
+    /// The splice's exactness pin (#4190): the stdout extractor's
+    /// unescape is byte-exact over every escape class — the ones the
+    /// daemon's writer emits (named escapes, control `\uXXXX`, raw
+    /// multibyte UTF-8) and the ones only a foreign writer might (slash,
+    /// backspace, form feed, `\uXXXX` surrogate pairs) — against the
+    /// serde-parsed equivalent of the very same frame, with the decoy
+    /// spellings (`\"stdout\":`, `\"counts\":`) the payload could try to
+    /// forge a member with.
+    #[test]
+    fn the_stdout_splice_unescapes_every_escape_class_exactly() {
+        // The writer-realistic frame: the payload serialized by the
+        // daemon escaper's own serde machinery, members after stdout
+        // kept (the splice cuts the member, never the tail).
+        let payload = concat!(
+            "quote:\" backslash:\\ newline:\n tab:\t cr:\r bell:\u{7} esc:\u{1b} ",
+            "del:\u{7f} nbsp:λ cjk:漢 emoji:\u{1F600} math:\u{1D54F} ",
+            "decoys:\"stdout\": \"counts\": \"packages\": done",
+        );
+        let frame = format!(
+            concat!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"v":1,"stdout":"#,
+                r#"{},"counts":{{"error":1,"warning":2,"info":3}},"#,
+                r#""advisory":null,"packages":null}}}}"#,
+            ),
+            serde_json::to_string(payload).expect("the payload serializes"),
+        );
+        let answer = routed_answer(frame.clone().into_bytes()).expect("the frame cuts");
+        assert_eq!(
+            answer.stdout(),
+            payload.as_bytes(),
+            "the splice unescapes the writer's classes exactly"
+        );
+        let parsed: Value = serde_json::from_str(&frame).expect("the frame parses");
+        assert_eq!(
+            parsed["result"]["stdout"].as_str().expect("stdout"),
+            payload,
+            "the serde-parsed equivalent agrees"
+        );
+        assert_eq!(answer.result()["counts"]["info"], json!(3));
+        assert!(answer.result()["packages"].is_null());
+
+        // The foreign-writer frame: hand-spelled escapes serde's writer
+        // never emits but the decoder must answer exactly as serde's
+        // parser does.
+        let hand = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"v":1,"stdout":"#,
+            r#""slash:\/ bs:\b ff:\f alpha:\u0041iao emoji:\ud83d\ude00 "#,
+            r#"math:\ud835\udd4f empty:\u0000""#,
+            r#","packages":{"path":"/w/.dart_tool/package_config.json","mtime_ns":1,"size":2}}}"#,
+        );
+        let expected = concat!(
+            "slash:/ bs:\u{8} ff:\u{c} alpha:Aiao emoji:\u{1F600} ",
+            "math:\u{1D54F} empty:\u{0}",
+        );
+        let answer = routed_answer(hand.as_bytes().to_vec()).expect("the hand frame cuts");
+        assert_eq!(
+            answer.stdout(),
+            expected.as_bytes(),
+            "the splice unescapes the foreign classes exactly"
+        );
+        let parsed: Value = serde_json::from_str(hand).expect("the hand frame parses");
+        assert_eq!(
+            parsed["result"]["stdout"].as_str().expect("stdout"),
+            expected,
+            "the serde-parsed equivalent agrees"
+        );
+        // The stamp rides the small members (the universe gate's input).
+        assert_eq!(answer.result()["packages"]["mtime_ns"], json!(1u64));
+    }
+
+    /// The raw arm mapping (#4190): notifications read past by prefix,
+    /// an error answer maps to the daemon error, a stdout-less result
+    /// is the fallback arm, an empty stdout is a present (empty) face,
+    /// and malformed frames — a bad escape, a lone surrogate, a
+    /// truncated string — refuse as transport errors, never print
+    /// wrong bytes.
+    #[test]
+    fn the_raw_arm_mapping_is_the_parsed_paths_semantics() {
+        assert!(is_notification(
+            br#"{"jsonrpc":"2.0","method":"dartq/diagnostics","params":{}}"#
+        ));
+        assert!(!is_notification(
+            br#"{"jsonrpc":"2.0","id":1,"result":{"v":1,"stdout":""}}"#
+        ));
+        // The error answer: the daemon error, code and message.
+        let error = routed_answer(
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#.to_vec(),
+        )
+        .expect_err("the error frame maps to the daemon error");
+        assert!(
+            matches!(error, ProxyError::Daemon(-32000, ref message) if message == "boom"),
+            "{error:?}"
+        );
+        // A stdout-less result: no rendered face (the caller's fallback
+        // arm), the small members still reading.
+        let bare = routed_answer(br#"{"jsonrpc":"2.0","id":1,"result":{"v":1}}"#.to_vec())
+            .expect("the bare result cuts");
+        assert!(bare.stdout.is_none(), "no rendered face");
+        assert_eq!(bare.result()["v"], json!(1));
+        // An empty stdout is a present, empty face.
+        let empty =
+            routed_answer(br#"{"jsonrpc":"2.0","id":1,"result":{"v":1,"stdout":""}}"#.to_vec())
+                .expect("the empty stdout cuts");
+        assert_eq!(empty.stdout(), b"", "the empty face prints nothing");
+        // A malformed escape refuses (the parsed path's malformed
+        // transport, never wrong bytes).
+        let malformed_frames: [&[u8]; 3] = [
+            br#"{"jsonrpc":"2.0","id":1,"result":{"v":1,"stdout":"a\x2b","counts":null}}"#,
+            br#"{"jsonrpc":"2.0","id":1,"result":{"v":1,"stdout":"lone:\ud835"}}"#,
+            br#"{"jsonrpc":"2.0","id":1,"result":{"v":1,"stdout":"trunc"#,
+        ];
+        for frame in malformed_frames {
+            let refused = routed_answer(frame.to_vec()).expect_err("the malformed frame refuses");
+            assert!(matches!(refused, ProxyError::Transport(_)), "{refused:?}");
+        }
+    }
+
     /// The money pin (#2627): the routed answer's stdout is the cold
     /// path's stdout, byte for byte, on every format — the daemon renders
     /// through the same writers the cold face prints with — and the exit
@@ -1079,6 +1590,7 @@ mod tests {
                 &targets,
                 &mut routed,
                 &refused_spawn(),
+                &mut RootMemo::default(),
             )
             .expect("the live session answers");
             assert_eq!(
@@ -1130,6 +1642,7 @@ mod tests {
             &[TargetKind::Dir(root.clone())],
             &mut routed,
             &spawn,
+            &mut RootMemo::default(),
         )
         .expect("the spawned session answers");
         assert_eq!(code, cold_code);
@@ -1151,6 +1664,7 @@ mod tests {
             &[TargetKind::Dir(root.clone())],
             &mut Vec::new(),
             &refused_spawn(),
+            &mut RootMemo::default(),
         );
         assert!(outcome.is_none(), "the failed ladder falls back cold");
         std::fs::remove_dir_all(&root).ok();
@@ -1170,7 +1684,14 @@ mod tests {
         let targets = [TargetKind::Dir(root.clone())];
         let args = routed_args(&root, AnalyzeFormat::Lon);
         let call = |out: &mut Vec<u8>| {
-            route_analyze(&args, &targets, out, &refused_spawn()).expect("the live session answers")
+            route_analyze(
+                &args,
+                &targets,
+                out,
+                &refused_spawn(),
+                &mut RootMemo::default(),
+            )
+            .expect("the live session answers")
         };
 
         let mut before: Vec<u8> = Vec::new();
@@ -1228,8 +1749,14 @@ mod tests {
         let args = routed_args(&root, AnalyzeFormat::Lon);
 
         let mut before: Vec<u8> = Vec::new();
-        let code = route_analyze(&args, &targets, &mut before, &refused_spawn())
-            .expect("the live session answers");
+        let code = route_analyze(
+            &args,
+            &targets,
+            &mut before,
+            &refused_spawn(),
+            &mut RootMemo::default(),
+        )
+        .expect("the live session answers");
         assert_eq!(
             code, 3,
             "the dangling import is an error before the dependency exists"
@@ -1259,8 +1786,14 @@ mod tests {
         .expect("the fresh config");
 
         let mut after: Vec<u8> = Vec::new();
-        let code = route_analyze(&args, &targets, &mut after, &refused_spawn())
-            .expect("the live session answers again");
+        let code = route_analyze(
+            &args,
+            &targets,
+            &mut after,
+            &refused_spawn(),
+            &mut RootMemo::default(),
+        )
+        .expect("the live session answers again");
         assert_eq!(
             code, 0,
             "the once-dangling import now resolves (no stale universe)"
@@ -1293,37 +1826,38 @@ mod tests {
             .expect("post-epoch")
             .as_nanos() as u64;
         let path = config.display().to_string();
-        let stamped = |mtime_ns: u64, size: u64| json!({"packages": {"path": path, "mtime_ns": mtime_ns, "size": size}});
+        let stamped =
+            |mtime_ns: u64, size: u64| json!({"path": path, "mtime_ns": mtime_ns, "size": size});
         assert!(
-            universe_matches_disk(&root, &stamped(mtime_ns, meta.len())),
+            universe_matches_disk(&root, Some(&stamped(mtime_ns, meta.len()))),
             "the exact stamp is current"
         );
         assert!(
-            !universe_matches_disk(&root, &stamped(mtime_ns + 1, meta.len())),
+            !universe_matches_disk(&root, Some(&stamped(mtime_ns + 1, meta.len()))),
             "a moved mtime refuses"
         );
         assert!(
-            !universe_matches_disk(&root, &stamped(mtime_ns, meta.len() + 1)),
+            !universe_matches_disk(&root, Some(&stamped(mtime_ns, meta.len() + 1))),
             "a moved size refuses"
         );
         assert!(
-            !universe_matches_disk(&root, &json!({"packages": null})),
+            !universe_matches_disk(&root, Some(&Value::Null)),
             "a null universe refuses while the disk holds a config"
         );
         assert!(
-            universe_matches_disk(&root, &json!({})),
+            universe_matches_disk(&root, None),
             "an absent member is no signal"
         );
         assert!(
             !universe_matches_disk(
                 &root,
-                &json!({"packages": {"path": "/nonexistent/config.json", "mtime_ns": 1, "size": 1}}),
+                Some(&json!({"path": "/nonexistent/config.json", "mtime_ns": 1, "size": 1})),
             ),
             "a config the daemon read that is gone now refuses"
         );
         std::fs::remove_file(&config).expect("the config leaves");
         assert!(
-            universe_matches_disk(&root, &json!({"packages": null})),
+            universe_matches_disk(&root, Some(&Value::Null)),
             "null over no config is current"
         );
         std::fs::remove_dir_all(&root).ok();
@@ -1424,12 +1958,25 @@ mod tests {
         // Warm the resident: the first routed call pays the daemon's own
         // cold analysis inside the session (and populates this process's
         // binary-hash memo).
-        route_analyze(&args, &targets, &mut Vec::new(), &refused_spawn())
-            .expect("the first routed call answers");
+        route_analyze(
+            &args,
+            &targets,
+            &mut Vec::new(),
+            &refused_spawn(),
+            &mut RootMemo::default(),
+        )
+        .expect("the first routed call answers");
 
         let warm_at = Instant::now();
         let mut warm: Vec<u8> = Vec::new();
-        route_analyze(&args, &targets, &mut warm, &refused_spawn()).expect("the warm call answers");
+        route_analyze(
+            &args,
+            &targets,
+            &mut warm,
+            &refused_spawn(),
+            &mut RootMemo::default(),
+        )
+        .expect("the warm call answers");
         let warm_ms = warm_at.elapsed().as_millis();
 
         let mut cold: Vec<u8> = Vec::new();
@@ -1503,6 +2050,7 @@ mod tests {
             &[TargetKind::Dir(root.clone())],
             &mut Vec::new(),
             &refused_spawn(),
+            &mut RootMemo::default(),
         );
         assert!(outcome.is_none(), "the killed session falls back cold");
 
@@ -1585,6 +2133,7 @@ mod tests {
             &[TargetKind::Dir(root.clone())],
             &mut routed,
             &spawn,
+            &mut RootMemo::default(),
         )
         .expect("the takeover answers");
         assert!(
@@ -1666,6 +2215,7 @@ mod tests {
             &[TargetKind::Dir(root.clone())],
             &mut Vec::new(),
             &refused_spawn(),
+            &mut RootMemo::default(),
         );
         assert!(outcome.is_none(), "the sentinel's refusal falls back cold");
         std::thread::sleep(Duration::from_millis(100));

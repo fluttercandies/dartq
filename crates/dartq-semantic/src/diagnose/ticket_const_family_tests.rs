@@ -195,21 +195,37 @@ fn nested_const_literal_elements_report_per_literal() {
     );
 }
 
-/// An opaque leaf that is NOT an unresolved call stays a valid constant
-/// of unknown value: `as` and index deferrals keep the literal silent
-/// (the probe keys on the bare-miss reference row at the span's head).
+/// An `as` deferral stays a valid constant of unknown value; a STRING
+/// INDEX does not (re-recorded, oracle 3.13.7: `[1 as int]` reports only
+/// `unnecessary_cast` — outside this rig's faces — while `['ab'[0]]`
+/// reports `non_constant_list_element` AND
+/// `const_initialized_with_non_constant_value`, both anchored at the
+/// whole `'ab'[0]` index expression; string indexing is no const-fold
+/// the way a variable-deferred `l[0]` face never was).
 #[test]
 fn opaque_deferrals_stay_constant() {
-    for source in ["const a = [1 as int];", "const a = ['ab'[0]];"] {
-        let rep = report(source);
-        let rows = rows(&rep, source);
-        assert_eq!(count(&rows, "non_constant_list_element"), 0, "{rows:?}");
-        assert_eq!(
-            count(&rows, "const_initialized_with_non_constant_value"),
-            0,
-            "{rows:?}"
-        );
-    }
+    let rep = report("const a = [1 as int];");
+    let as_rows = rows(&rep, "const a = [1 as int];");
+    assert_eq!(count(&as_rows, "non_constant_list_element"), 0, "{as_rows:?}");
+    assert_eq!(
+        count(&as_rows, "const_initialized_with_non_constant_value"),
+        0,
+        "{as_rows:?}"
+    );
+    let source = "const b = ['ab'[0]];";
+    let rep = report(source);
+    let index_rows = rows(&rep, source);
+    assert!(
+        index_rows.contains(&("non_constant_list_element", "'ab'[0]")),
+        "{index_rows:?}"
+    );
+    assert!(
+        index_rows.contains(&(
+            "const_initialized_with_non_constant_value",
+            "'ab'[0]"
+        )),
+        "{index_rows:?}"
+    );
 }
 
 // —— pattern 2: qualified const creation argument validation ——————

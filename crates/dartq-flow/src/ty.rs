@@ -518,8 +518,16 @@ pub(crate) fn name_args_subtype(left_args: u32, right_args: u32, arena: &[Vec<Ar
 /// recursing into each entry's own written arguments.
 fn name_entry_subtype(a: &ArgTy, b: &ArgTy, arena: &[Vec<ArgTy>]) -> bool {
     match (a.base, b.base) {
-        (Base::Dynamic | Base::Unknown | Base::Void, _)
-        | (_, Base::Dynamic | Base::Unknown | Base::Void) => true,
+        // The top faces on the RIGHT admit everything (`X <: dynamic`,
+        // `X <: void`, and the invalid face's mutual arm); on the LEFT a
+        // top admits nothing but another top — `dynamic <: int` is false
+        // upstream, and the old mutual reading refused real promotion
+        // steps (`Expression<DateTime>` over the dynamic-padded declared
+        // `Expression`, #2285 item 5: the no-step check `from <: to`
+        // passed and the `is` test promoted nothing).
+        (_, Base::Dynamic | Base::Unknown | Base::Void) => true,
+        (Base::Unknown, _) => true,
+        (Base::Dynamic | Base::Void, _) => false,
         (Base::Null, _) => b.nullable,
         (_, Base::Null) => false,
         _ => {

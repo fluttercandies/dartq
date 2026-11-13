@@ -7,90 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.20] - 2026-11-11
+## [0.1.23] - 2026-11-13
 
-### Fixed
-
-- `dartq analyze --engine` now converges on the worktree's resident
-  session (elect-or-attach, the same machinery `session start`, MCP and
-  debug ride): warm runs answer from the resident engine instead of
-  paying the full in-process cost every run. On a 100k-file corpus the
-  warm full-tree JSON went from ~30s per run to ~3s (byte-identical
-  output, `--stats` says which path answered); edits and reverts return
-  to the baseline output byte-identically. The in-process path remains
-  as the explicit fallback (`--cold`).
-- One SDK discovery chain everywhere (`--sdk` > `$DART_SDK` >
-  `dartq.yaml`'s `sdk:` > the `dart` on PATH > the fvm default): engine
-  faces no longer error `no Dart SDK root` on a machine whose `dart`
-  comes from PATH, and a Flutter SDK root (fvm default, `<flutter>/bin/
-  dart`) resolves onto its embedded `bin/cache/dart-sdk` instead of
-  failing `Invalid Dart SDK path`. `dartq.yaml` gains a top-level `sdk:`
-  locator (`fvm:<v>`, `path:<dir>`, `system`, or a bare path).
-- `dartq analyze --format=json` no longer deduplicates a plugin's
-  re-report of a built-in finding: the oracle's plugin merge
-  (`result_merger.dart`) keeps duplicates, and the engine face now
-  matches it — plugin rows also omit the `documentation` key exactly
-  like the oracle's plugin-contributed rows.
-- `dartq test` cache keys are comment- and format-insensitive: a lib
-  file whose edit only rewords comments or reflows whitespace no longer
-  invalidates every suite's cached results (keys hash the scanner's
-  token stream — strings kept verbatim — while files a suite reads as
-  data keep their raw-byte key). Suites re-key once after this upgrade;
-  results then replay as before. Editing one test suite still reruns
-  only that suite — its unchanged groupmates replay from cache.
-
-
-## [0.1.19] - 2026-11-10
-
-### Fixed
-
-- `dartq test` cache refused router suites over route-path strings: any
-  absolute literal naming an existing directory read as a directory scan,
-  and on macOS `/home` (an autofs mount) always exists, so a test holding
-  `'/home'` as a route value was rejected with `absolute-directory`. An
-  absolute literal now refuses a suite only when it sits in a file-API
-  argument (`File(...)`, `Directory(...)`, `Link(...)`,
-  `FileSystemEntity.xxx(...)`); every other absolute literal keys as an
-  ordinary input. `--explain-cache`'s nondeterministic remedy now spells
-  the `// dartq: deterministic` attestation a legitimately-drifting
-  helper (e.g. TLS pinning) needs to stop poisoning every suite that
-  reaches it.
+This section consolidates everything unreleased since 1.0.0: the 0.1.18
+through 0.1.22 maintenance releases carried their changes without
+changelog sections (see git history), and 0.1.23 ships the resident
+performance batch (#4220–#4261) on top.
 
 ### Added
 
-- Watcher-degradation visibility for `dartq analyze`: a resident daemon
-  whose freshness checks fall back to full tree scans — sync files
-  unwritable, the event stream lost events, the watcher unavailable —
-  prints one stderr line naming the reason (once per daemon life, after
-  two consecutive degraded checks). Results stay correct in fallback;
-  the note makes the slowdown diagnosable instead of silently slow.
-
-
-## [0.1.18] - 2026-11-10
-
-### Fixed
-
-- `dartq analyze` cold start on large workspaces regressed to ~10x the stock
-  oracle: the resident analysis server launched with `--cache` pointing at a
-  fresh per-worktree directory, so every run re-linked every package cycle
-  into an empty `EvictingFileByteStore`. The flag is dropped; the server
-  shares `~/.dartServer` with every `dart`/`flutter` invocation on the host,
-  the same store the stock oracle uses. Measured on a 49,650-file corpus:
-  798 s -> 82 s (stock warm-cache 80-108 s), warm runs answer in ~0.3-0.5 s,
-  and the JSON report stays byte-identical to `dart analyze --format=json`.
-- `dartq test` cache over-rejection: the dependency scanner marked every
-  member access on dart:io socket types as drift (`TriggerKind::Drift`), so a
-  helper that only configures TLS (`SecureSocket.badCertificateCallback`,
-  `setTrustedCertificates`, `setAlpnProtocols`, `setOption`, `renegotiate`)
-  poisoned every suite reaching it — the "ssl_pinning" pattern. The drift
-  list is narrowed to the members that themselves perform network IO per the
-  dart:io API: `connect`/`startConnect`/`secure`/`secureServer`,
-  `bind`, `WebSocket.connect`/`fromUpgradedSocket`, `InternetAddress.lookup`,
-  `NetworkInterface.list`. Configuration setters and cached connection
-  properties no longer fire.
-
-
-### Added
+- `--scope file|dir`: file and directory aims resolve to the oracle's own
+  analysis universe — the aim paths become the resident server's
+  `included` set verbatim, exactly what `dart analyze <paths>` opens. In
+  single-pubspec repos the default posture picks this tier for file and
+  directory aims automatically (`--scope package` and `--scope workspace`
+  keep their universes; `--scope dir` spells the tier alias). Measured:
+  single-file cold 9.5 s vs 78 s package-tier at a 49k-file corpus (8.2×),
+  32-file module dir aim 0.90 s vs 5.98 s (6.6× median), oracle triple-set
+  parity on nine legs including a 25,903-row whole-repo leg (#4250, #4255,
+  #4261).
+- The answered-turn envelope probe runs before engine assembly on the
+  one-shot `--engine dartq` face: a re-ask over an unchanged tree serves
+  the previous run's rendered stdout without `Engine::new`, the stores, or
+  any later phase ever running; warm one-shot turns 118 → 100 ms (#4260).
 
 - Generated SDK facade tables: `tools/sdk-faces-gen` extracts two checked-in
   tables from the oracle SDK in one pinned run — the flat 50-entry `dart:`
@@ -146,6 +85,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The resident answer path serves wire bytes, not re-serialized values:
+  the session answer cache stores the serialized frame (`Arc<[u8]>`) at
+  store time and splices it verbatim on hits — a hit is an arc bump, the
+  daemon-internal serve cost dropped 2.8× and per-turn megabyte-class
+  clone+serialize allocations are gone (#4240, #4258).
+- Warm freshness: the freshness/discovery walk arms before the server
+  roots leg (background priming, `arm-before-take`) and a continuously
+  healthy stream with an empty journal serves from the journal verdict
+  without the cross-process cookie barrier — the barrier leg is 139 µs
+  (was ~27 ms), and any doubt (timeout, young stream, non-empty journal,
+  stream restart) takes today's full barrier path (#4252, #4259).
+- Daemon bookkeeping: per-answer peak/state file rewrites of identical
+  bytes are elided (peak writes only on change, touches are mtime-only),
+  and one analyze invocation discovers `dartq.yaml` once instead of six
+  times; the resident frame reader consumes headers in one buffered scan
+  (30 reads/turn → 1) and the CLI's root walks are memoized per
+  invocation (4 analytic walks → 2) (#4257, #4260).
+- The CLI consumes the resident answer frame by splicing, never parsing:
+  the routed stdout body is located in the raw frame (memchr) and
+  unescaped in place — warm turns at a 45.9 MB output run 66.7% less CLI
+  RSS (174 → 58 MB) with the syscall-side CPU halved; small aims stay in
+  the 30–50 ms class and the routed==cold money pins hold on every format
+  (#4190).
 - LSP wire types migrated into the daemon crate (#1680).
 - The daemon's `uri` module moved into `dartq-commands`; the daemon re-exports
   it, so `dartq_daemon::uri` keeps resolving (#1680).
@@ -409,6 +371,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- The release binary ships mimalloc + thin-LTO/one-CGU/strip: steady
+  resident daemon RSS settles at ~8 MB after a cold full run (220 MB-class
+  before), the in-process peak is 211 MB, and the binary is 25.4% smaller
+  (27.6 MB). Warm analyze turns run 30–50 ms end-to-end on the host face;
+  cold resident starts are 33% faster on a mid-size project; the write
+  path allocates 146× fewer bytes (24,014× fewer allocs) per recorded
+  answer; ten cold runs produce one md5, warm==cold per set (#4220, #4246,
+  #4252–#4261).
 - Discovery collapses the per-package-root serial walk+read phases into
   one parallel fan-out plus one global 4096-file chunked load with the
   sorted enqueue order and first-error position preserved; the library

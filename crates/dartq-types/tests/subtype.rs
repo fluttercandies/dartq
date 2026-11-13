@@ -73,9 +73,18 @@ fn rule3_left_bottom() {
         fx.table.intern(UninternedType::Never, true),
         fx.int_question()
     ));
-    assert!(!sys.is_subtype(fx.table.intern(UninternedType::Never, true), fx.int()));
-    assert!(sys.is_subtype(fx.null(), fx.table.intern(UninternedType::Never, true)));
-    assert!(!sys.is_subtype(fx.table.intern(UninternedType::Never, true), fx.never()));
+    assert!(!sys.is_subtype(
+        fx.table.intern(UninternedType::Never, true),
+        fx.int()
+    ));
+    assert!(sys.is_subtype(
+        fx.null(),
+        fx.table.intern(UninternedType::Never, true)
+    ));
+    assert!(!sys.is_subtype(
+        fx.table.intern(UninternedType::Never, true),
+        fx.never()
+    ));
 }
 
 #[test]

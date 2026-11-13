@@ -296,53 +296,44 @@ fn extends_void_reports_extends_non_class() {
 /// `extends Enum` reports `extends_non_class` — an `EnumElement` is not a
 /// `ClassElement`/`MixinElement`, so the clause arm fires
 /// (`resolution_visitor.dart:1194-1202`); the resolver's `not_a_type` row
-/// (or `undefined_class` on the recovered shape) stays suppressed.
+/// (or `undefined_class` on the recovered shape) stays suppressed, and the
+/// enum constant itself emits nothing (the live 3.13.7 oracle on this
+/// exact fixture reports the clause row alone).
 #[test]
 fn extends_enum_reports_extends_non_class() {
     let fixture = "enum E { v }\nclass A extends E {}\n";
     let report = report_ops(fixture);
     assert_eq!(
         code_spans(&report),
-        vec![
-            // The enum constant's own induced instance getter collides
-            // with the constant's static field — a deterministic
-            // `conflicting_static_and_instance` row (#3124's in-flight
-            // face), verbatim, beside the clause arm's own verdict.
-            ("conflicting_static_and_instance", at(fixture, "v }"), 1),
-            ("extends_non_class", at(fixture, "E {}"), 1),
-        ],
+        vec![("extends_non_class", at(fixture, "E {}"), 1)],
         "rows: {:?}",
         rows(&report)
     );
 }
 
-/// `implements Enum` reports `implements_non_class`.
+/// `implements Enum` reports `implements_non_class` (clause row alone —
+/// the live 3.13.7 oracle on this exact fixture).
 #[test]
 fn implements_enum_reports_implements_non_class() {
     let fixture = "enum E { v }\nclass A implements E {}\n";
     let report = report_ops(fixture);
     assert_eq!(
         code_spans(&report),
-        vec![
-            ("conflicting_static_and_instance", at(fixture, "v }"), 1),
-            ("implements_non_class", at(fixture, "E {}"), 1),
-        ],
+        vec![("implements_non_class", at(fixture, "E {}"), 1)],
         "rows: {:?}",
         rows(&report)
     );
 }
 
-/// `with Enum` reports `mixin_of_non_class`.
+/// `with Enum` reports `mixin_of_non_class` (clause row alone — the live
+/// 3.13.7 oracle on this exact fixture).
 #[test]
 fn with_enum_reports_mixin_of_non_class() {
     let fixture = "enum E { v }\nclass B {}\nclass A extends B with E {}\n";
     let report = report_ops(fixture);
     assert_eq!(
         code_spans(&report),
-        vec![
-            ("conflicting_static_and_instance", at(fixture, "v }"), 1),
-            ("mixin_of_non_class", at(fixture, "E {}"), 1),
-        ],
+        vec![("mixin_of_non_class", at(fixture, "E {}"), 1)],
         "rows: {:?}",
         rows(&report)
     );
@@ -639,21 +630,19 @@ fn mixin_on_nonclass_reports_constraint_and_not_a_type() {
 
 /// `mixin M on E` where `E` is an enum reports
 /// `mixin_super_class_constraint_non_interface` — the resolved element
-/// is not a `ClassElement`/`MixinElement`, so the clause arm fires.
+/// is not a `ClassElement`/`MixinElement`, so the clause arm fires
+/// (clause row alone — the live 3.13.7 oracle on this exact fixture).
 #[test]
 fn mixin_on_enum_reports_constraint_non_interface() {
     let fixture = "enum E { v }\nmixin M on E {}\n";
     let report = report_ops(fixture);
     assert_eq!(
         code_spans(&report),
-        vec![
-            ("conflicting_static_and_instance", at(fixture, "v }"), 1),
-            (
-                "mixin_super_class_constraint_non_interface",
-                at(fixture, "E {}"),
-                1
-            ),
-        ],
+        vec![(
+            "mixin_super_class_constraint_non_interface",
+            at(fixture, "E {}"),
+            1
+        )],
         "rows: {:?}",
         rows(&report)
     );

@@ -35,15 +35,16 @@
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 
-/// The rows of one code, ascending by offset, as `(offset, message)` — the
-/// message trimmed of the template's terminal space (the empty appendix
-/// keeps it, the filled one does not).
+/// The rows of one code, ascending by offset, as `(offset, message)` —
+/// the message raw: the `argument_type_not_assignable` template ends at
+/// `'. ` even with the `#additionalInfo` appendix empty (the oracle's
+/// own machine-format face, messages.yaml:1363).
 fn rows(report: &FileReport, code: &str) -> Vec<(u32, String)> {
     let mut rows = report
         .diagnostics
         .iter()
         .filter(|d| d.code.name == code)
-        .map(|d| (d.range.offset, d.message.trim_end().to_string()))
+        .map(|d| (d.range.offset, d.message.to_string()))
         .collect::<Vec<_>>();
     rows.sort_by_key(|(offset, _)| *offset);
     rows
@@ -226,7 +227,7 @@ void main() {
         rows(&report, "argument_type_not_assignable"),
         vec![(
             at(fixture, "0", 0),
-            "The argument type 'int' can't be assigned to the parameter type 'String'.".to_string(),
+            "The argument type 'int' can't be assigned to the parameter type 'String'. ".to_string(),
         )],
         "no appendix for a non-record pair: {:?}",
         report.diagnostics
@@ -250,7 +251,7 @@ void main(Map<int, int> m) {
         rows(&report, "argument_type_not_assignable"),
         vec![(
             at(fixture, "'x'", 0),
-            "The argument type 'String' can't be assigned to the parameter type 'int'.".to_string(),
+            "The argument type 'String' can't be assigned to the parameter type 'int'. ".to_string(),
         )],
         "the write element's key formal decides the index argument: {:?}",
         report.diagnostics
@@ -272,7 +273,7 @@ void main(Map<int, int> m) {
         atna.first(),
         Some(&(
             at(fixture, "'x'", 0),
-            "The argument type 'String' can't be assigned to the parameter type 'int'.".to_string(),
+            "The argument type 'String' can't be assigned to the parameter type 'int'. ".to_string(),
         )),
         "the compound write form checks the key formal too: {:?}",
         report.diagnostics
@@ -337,7 +338,7 @@ void main() {
         vec![(
             at(fixture, "take(g)", 0) + 5,
             "The argument type 'void Function()' can't be assigned to the parameter type \
-             'int Function()'."
+             'int Function()'. "
                 .to_string(),
         )],
         "a tear-off keeps its written return: {:?}",

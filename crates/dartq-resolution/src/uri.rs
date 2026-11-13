@@ -2398,7 +2398,10 @@ mod tests {
                 "lib/core/raw.dart",
                 "// License.\nimport 'dart:core';\n\npart of r'dart:core';\n",
             );
-            write("lib/core/adjacent.dart", "part of 'dart:' 'core';\n");
+            write(
+                "lib/core/adjacent.dart",
+                "part of 'dart:' 'core';\n",
+            );
             write(
                 "lib/io/patch.dart",
                 "// Patch file for dart:io.\n\nimport 'dart:async';\n\nvoid f() {}\n",
@@ -2826,7 +2829,11 @@ mod tests {
         // `temp_dir()` spells it through the /var symlink while the
         // canonical form carries the /private prefix (identity on Linux),
         // so the expected joins must come from the canonicalized root.
-        let sdk_root = fixture.sdk.root.canonicalize().expect("canonical SDK root");
+        let sdk_root = fixture
+            .sdk
+            .root
+            .canonicalize()
+            .expect("canonical SDK root");
 
         let core = resolver.resolve(container, Some("dart:core"), DirectiveKind::ImportExport);
         assert_eq!(

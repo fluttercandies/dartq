@@ -115,6 +115,34 @@
 //! dependents are deliberately not marked: the changed set is the files
 //! the client wrote.
 //!
+//! # Warm-turn answers (#4240)
+//!
+//! A quiet warm turn's rendered `dartq/analyze` answer is a pure function
+//! of the engine content and the answer's fixed inputs (targets, format,
+//! workspace advisory, package stamp) — but the engine turn it rides
+//! revalidates the whole-library replay (~1.0-1.5 s `analyze_ms` on a
+//! monorepo) to prove the tree quiet, every turn. The answer cache turns
+//! that proof around: the freshness walk has already stat'ed the tree at
+//! the drain seam ([`Session::refresh_workspace_state`]), so a base group
+//! whose every request is a rendered analyze the cache holds under the
+//! current epoch answers from the cache and skips the engine turn whole —
+//! lookup strictly before the revalidation, never a partial one. The
+//! cache holds the answers' serialized bytes (#4258): a hit re-serves
+//! them verbatim (`AnswerPayload::Wire`, an `Arc` bump per request — no
+//! value materialized, nothing re-serialized; byte identity holds by
+//! construction, the served bytes being the bytes the answering turn
+//! serialized). The
+//! epoch bumps (and the cache drops) at every state change the frozen
+//! answer would observe: an applied write, a refresh pass that reloaded
+//! or removed anything (or could not look), a changed workspace advisory,
+//! and a universe rebuild. An agent view, a plugin-hosting session, or a
+//! due publish diff never serves cached (the agent's wear and the plugin
+//! cycle are observables the base epoch does not cover); any miss takes
+//! today's full path unconditionally and re-arms the cache on the way
+//! out. The routed answer's package stamp is the caller's belt: a cache
+//! that somehow served stale universe bytes is refused client-side, never
+//! printed.
+//!
 //! # Store hygiene (daemon-audit findings 2, 5)
 //!
 //! The runtime's shared overlay store is garbage-collected at the turn
@@ -584,6 +612,47 @@ fn rejection_collector(out: &mut Vec<(PathBuf, u64)>) -> impl FnMut(EngineEvent)
     }
 }
 
+/// One answered request's payload: a rendered value, or the verbatim wire
+/// bytes a cache hit re-serves (#4258). The wire form is the answer's own
+/// serialization — exactly the bytes `serde_json::to_vec` produced over the
+/// value at store time — so a hit re-serves them without materializing a
+/// value and without re-serializing; the value form is a fresh render the
+/// write path serializes as before.
+#[derive(Debug, Clone)]
+pub enum AnswerPayload {
+    /// A freshly rendered answer, not yet serialized.
+    Value(serde_json::Value),
+    /// A cached answer's serialized bytes, served verbatim.
+    Wire(std::sync::Arc<[u8]>),
+}
+
+impl AnswerPayload {
+    /// The payload as a value: borrowed for a fresh render, deserialized on
+    /// demand for the wire form (a test convenience — the write path
+    /// splices the wire form and never calls this).
+    #[cfg(test)]
+    fn as_value(&self) -> std::borrow::Cow<'_, serde_json::Value> {
+        match self {
+            Self::Value(value) => std::borrow::Cow::Borrowed(value),
+            Self::Wire(bytes) => {
+                std::borrow::Cow::Owned(serde_json::from_slice(bytes).expect("cached bytes parse"))
+            }
+        }
+    }
+
+    /// The payload's serialized bytes — the write path's unit (a test
+    /// convenience; production splices or serializes directly).
+    #[cfg(test)]
+    fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Self::Value(value) => {
+                std::borrow::Cow::Owned(serde_json::to_vec(value).expect("answers serialize"))
+            }
+            Self::Wire(bytes) => std::borrow::Cow::Borrowed(bytes),
+        }
+    }
+}
+
 /// What one [`Session::service`] turn produced, in drain-execution order.
 #[derive(Default)]
 pub struct Turn {
@@ -597,12 +666,118 @@ pub struct Turn {
     /// One entry per attached request; `Err` marks a request whose task was
     /// stale at the drain (cancelled) or whose parameters named no valid
     /// target, and produced nothing.
-    pub answers: Vec<(RequestId, Result<serde_json::Value, SessionError>)>,
+    pub answers: Vec<(RequestId, Result<AnswerPayload, SessionError>)>,
 }
 
 /// One read task's per-view request group: the agent name (`None` is the
 /// base view) with the view's queued requests.
 type ViewGroup = (Option<String>, Vec<(RequestId, Request)>);
+
+/// The warm-turn answer cache's key (#4240): the context whose engine view
+/// answered, the canonical target set (variant-tagged, path-sorted,
+/// deduped, NUL-separated — asks that name the same coverage in a
+/// different order share one entry), and the rendered format. Verbosity
+/// needs no leg: the parse pins the rendered arm to compact, and the
+/// rendered bytes never read it.
+type AnswerKey = (ContextId, Vec<u8>, commands::RenderFormat);
+
+/// The key for one request, `None` when the request is not a cacheable
+/// rendered base-view analyze (another face, a `None` format, or an agent
+/// view — the agent's wear makes its answers a per-overlay function the
+/// base epoch does not observe).
+fn answer_key(context: ContextId, request: &Request) -> Option<AnswerKey> {
+    let Request::Analyze {
+        targets,
+        format: Some(format),
+        agent: None,
+        ..
+    } = request
+    else {
+        return None;
+    };
+    let mut legs: Vec<(u8, &std::ffi::OsStr)> = targets
+        .iter()
+        .map(|target| match target {
+            dartq_commands::analyze::Target::Dir(path) => (0, path.as_os_str()),
+            dartq_commands::analyze::Target::File(path) => (1, path.as_os_str()),
+        })
+        .collect();
+    legs.sort();
+    legs.dedup();
+    let mut spelled = Vec::new();
+    for (tag, path) in legs {
+        spelled.push(tag);
+        spelled.extend_from_slice(path.as_encoded_bytes());
+        spelled.push(0);
+    }
+    Some((context, spelled, *format))
+}
+
+/// One cached rendered answer (#4240, bytes-served since #4258): the
+/// answer's serialized wire bytes beside the epoch it was computed under.
+/// The serialized length — `wire.len()`, measured once at insert — is the
+/// byte-budget unit; the payload is exactly the bytes the answering turn
+/// serialized, so a hit re-serves them verbatim (no value materialized, no
+/// re-serialization) and byte identity holds by construction.
+struct CachedAnswer {
+    epoch: u64,
+    wire: std::sync::Arc<[u8]>,
+}
+
+/// The rendered-answer LRU (#4240): whole serialized answers per
+/// [`AnswerKey`] shape, most recently used last, bounded on entries and on
+/// total bytes so a client that cycles target sets cannot grow the
+/// resident set without bound. The session's epoch is the validator: a
+/// bump drops the cache wholesale (see [`Session::invalidate_answers`]),
+/// and an entry whose epoch somehow lags never serves.
+#[derive(Default)]
+struct AnswerCache {
+    entries: std::collections::VecDeque<(AnswerKey, CachedAnswer)>,
+    bytes_total: usize,
+}
+
+impl AnswerCache {
+    /// The most target shapes cached at once.
+    const CAP: usize = 8;
+    /// The most answer bytes cached across all entries (64 MiB — the
+    /// oracle JSON envelope over a monorepo sits around 16 MiB).
+    const BYTES_CAP: usize = 64 << 20;
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes_total = 0;
+    }
+
+    fn get(&mut self, key: &AnswerKey) -> Option<&CachedAnswer> {
+        let index = self.entries.iter().position(|(shape, _)| shape == key)?;
+        let entry = self.entries.remove(index).expect("positioned");
+        self.entries.push_back(entry);
+        Some(&self.entries.back().expect("just pushed").1)
+    }
+
+    fn insert(&mut self, key: AnswerKey, answer: CachedAnswer) {
+        if let Some(index) = self.entries.iter().position(|(shape, _)| *shape == key) {
+            self.bytes_total -= self.entries[index].1.wire.len();
+            self.entries.remove(index);
+        }
+        // An answer that alone exceeds the byte cap is not cacheable: it
+        // ships this turn, never stores.
+        if answer.wire.len() > Self::BYTES_CAP {
+            return;
+        }
+        while self.entries.len() >= Self::CAP
+            || self.bytes_total + answer.wire.len() > Self::BYTES_CAP
+        {
+            if let Some((_, evicted)) = self.entries.pop_front() {
+                self.bytes_total -= evicted.wire.len();
+            } else {
+                break;
+            }
+        }
+        self.bytes_total += answer.wire.len();
+        self.entries.push_back((key, answer));
+    }
+}
 
 /// A queued read task and the requests waiting on its answer. Reads coalesce
 /// per context: one analysis of that context's engine serves every attached
@@ -945,6 +1120,19 @@ pub struct Session {
     /// and the delta contract sends pre-eviction clients to a re-sync
     /// (#947 F8).
     changed: FxHashMap<PathBuf, u64>,
+    /// The warm-turn answer cache's epoch (#4240): bumped — with the cache
+    /// dropped — at every state change the analysis a cached answer froze
+    /// would observe: an applied write, a workspace refresh that reloaded
+    /// or removed anything (or failed to look), a changed workspace
+    /// advisory, and a universe rebuild. A turn whose epoch matches served
+    /// the same rendered bytes the full path would recompute.
+    answer_epoch: u64,
+    /// The rendered `dartq/analyze` answers of quiet turns (#4240): the
+    /// whole answer value per (context, targets, format) shape, LRU-bounded
+    /// on entries and bytes — a warm turn re-renders nothing when nothing
+    /// changed, skipping the engine turn (the whole-library replay
+    /// revalidation) entirely.
+    answers: AnswerCache,
     /// A base write applied this session whose publish diff has not drained
     /// yet: forces the default context's base analysis even when only
     /// context-tagged or agent requests ride the read, so the diff still
@@ -1442,6 +1630,8 @@ impl Session {
             worn: None,
             cursor: 0,
             changed: FxHashMap::default(),
+            answer_epoch: 0,
+            answers: AnswerCache::default(),
             publishes_due: false,
             discovered: false,
             config_stamps,
@@ -1579,25 +1769,39 @@ impl Session {
             }
         } else {
             let cap = self.live_path_cap;
+            // The answer cache's freshness leg (#4240): a pass that
+            // reloaded or removed anything changed the engine content a
+            // cached answer froze, and a pass that could not look leaves
+            // the tree's state unknown — either way the next analyze
+            // revalidates from scratch. A clean pass over every context
+            // changes nothing (paths the live-path ceiling skipped were
+            // never resident, so the analyzed view stands).
+            let mut moved = false;
             for index in 0..self.context_ids.len() {
                 match self
                     .engine_mut(self.context_ids[index])
                     .refresh_workspace(cap)
                 {
-                    Ok(stats) if stats.skipped > 0 && !self.refresh_skip_reported => {
-                        self.refresh_skip_reported = true;
-                        eprintln!(
-                            "dartq-daemon: workspace refresh skipped {} new path(s) past the \
-                             {}-path session live-path ceiling; they load when the session \
-                             shrinks or a new session starts",
-                            stats.skipped, cap,
-                        );
+                    Ok(stats) => {
+                        moved |= stats.reloaded > 0 || stats.removed > 0;
+                        if stats.skipped > 0 && !self.refresh_skip_reported {
+                            self.refresh_skip_reported = true;
+                            eprintln!(
+                                "dartq-daemon: workspace refresh skipped {} new path(s) past the \
+                                 {}-path session live-path ceiling; they load when the session \
+                                 shrinks or a new session starts",
+                                stats.skipped, cap,
+                            );
+                        }
                     }
-                    Ok(_) => {}
                     Err(error) => {
+                        moved = true;
                         eprintln!("dartq-daemon: workspace refresh failed: {error}")
                     }
                 }
+            }
+            if moved {
+                self.invalidate_answers();
             }
         }
         // The serve face's `dartq.yaml` advisory (#4106): ticked on this
@@ -1613,6 +1817,83 @@ impl Session {
         if self.config_stamps_moved() {
             self.note_config_stamps();
             self.refresh_config_inputs();
+        }
+    }
+
+    /// The warm-turn answer cache's invalidation (#4240): every state
+    /// change the analysis a cached answer froze would observe bumps the
+    /// epoch and drops the entries — the miss cost is one full turn, the
+    /// stale-hit cost is wrong bytes, so the drop is wholesale and the
+    /// sites are the ones that move engine content or the answer's fixed
+    /// inputs (applied writes, workspace refresh reloads/removals or a
+    /// failed walk, a changed workspace advisory — a leg of the rendered
+    /// answer — and a universe rebuild, whose fresh context re-keys every
+    /// file id). Nothing else moves them: the warm lane pre-computes what
+    /// a later turn would compute, it never changes an input.
+    fn invalidate_answers(&mut self) {
+        self.answer_epoch += 1;
+        self.answers.clear();
+    }
+
+    /// Serves a base group's every request from the warm-turn answer cache
+    /// (#4240) when the whole group hits under `epoch`: the serialized
+    /// answers clone straight into the turn (an `Arc` bump per request —
+    /// no value is materialized, nothing re-serializes) and the group's
+    /// engine turn (the whole-library replay revalidation a quiet tree
+    /// pays for nothing) never runs. `None` on any non-cacheable request
+    /// or any miss — the caller takes today's full path for the whole
+    /// group, which answers the hitting shapes with the very bytes the
+    /// cache holds.
+    fn cached_answers(
+        &mut self,
+        context: ContextId,
+        epoch: u64,
+        requests: &[(RequestId, Request)],
+    ) -> Option<Vec<(RequestId, Result<AnswerPayload, SessionError>)>> {
+        // A request-less group is not a cache event: it exists to run the
+        // base analysis (a due publish diff), never to serve answers.
+        if requests.is_empty() {
+            return None;
+        }
+        let mut served = Vec::with_capacity(requests.len());
+        for (id, request) in requests {
+            let key = answer_key(context, request)?;
+            let hit = self.answers.get(&key)?;
+            if hit.epoch != epoch {
+                return None;
+            }
+            served.push((id.clone(), Ok(AnswerPayload::Wire(hit.wire.clone()))));
+        }
+        Some(served)
+    }
+
+    /// Stores a full path's rendered analyze answers (#4240): one entry
+    /// per answered cacheable request (`keys`, precomputed beside the
+    /// requests the answering fan-out consumed), keyed and sized at
+    /// insert. The answer serializes exactly once here — the stored bytes
+    /// are what a later hit re-serves — and the serialized length is the
+    /// byte budget's unit, paid once per state change (a miss turn); a hit
+    /// never serializes. An answer that cannot serialize is not cacheable:
+    /// it ships this turn, never stores.
+    fn store_answers(
+        &mut self,
+        epoch: u64,
+        keys: &[Option<AnswerKey>],
+        answers: &[(RequestId, Result<AnswerPayload, SessionError>)],
+    ) {
+        for (key, (_, answer)) in keys.iter().zip(answers) {
+            let (Some(key), Ok(payload)) = (key, answer) else {
+                continue;
+            };
+            let wire = match payload {
+                AnswerPayload::Wire(bytes) => bytes.clone(),
+                AnswerPayload::Value(value) => match serde_json::to_vec(value) {
+                    Ok(encoded) => encoded.into(),
+                    Err(_) => continue,
+                },
+            };
+            self.answers
+                .insert(key.clone(), CachedAnswer { epoch, wire });
         }
     }
 
@@ -1775,6 +2056,9 @@ impl Session {
             }
             self.published.clear();
             self.publishes_due = true;
+            // A fresh universe re-keys every file id and moves the answer's
+            // package stamp (#4240): no frozen answer survives it.
+            self.invalidate_answers();
             self.pub_config = pub_config;
             self.config_dir = config_dir;
             let fresh_plugins =
@@ -1825,6 +2109,9 @@ impl Session {
             return;
         }
         let previous = std::mem::replace(&mut self.workspace_advisory, fresh);
+        // A moved verdict is a leg of the rendered analyze answer (#4240):
+        // the next one re-renders, never serves the frozen bytes.
+        self.invalidate_answers();
         if !self.advisory_pushed {
             return;
         }
@@ -2694,6 +2981,9 @@ impl Session {
                 if let Ok(()) = applied {
                     self.snapshot.note_apply();
                     self.cursor += 1;
+                    // Content moved (#4240): no frozen answer survives a
+                    // landed write.
+                    self.invalidate_answers();
                     for change in &changes {
                         match change {
                             OverlayChange::Set { path, bytes } => {
@@ -2739,6 +3029,11 @@ impl Session {
                         "dartq-daemon: overlay apply panicked; the write did not land; \
                          the edits are restaged for the next write task"
                     );
+                    // The containment says the write did not land, but a
+                    // mid-fan-out panic may have applied some contexts
+                    // (#4240): treat the content as moved — one full turn
+                    // is the cheap side of that uncertainty.
+                    self.invalidate_answers();
                     // Re-stage the taken changes (last-wins merge with
                     // anything a new edit stages) WITHOUT re-enqueueing
                     // the write task: the next real intake re-queues via
@@ -3025,7 +3320,8 @@ impl Session {
             && !run.expired
             && !run.cancelled
         {
-            turn.answers.push((run.id, mail.outcome));
+            turn.answers
+                .push((run.id, mail.outcome.map(AnswerPayload::Value)));
         }
     }
 
@@ -3382,6 +3678,32 @@ impl Session {
             self.restore_base_view();
         }
 
+        // The warm-turn answer cache (#4240): a base group whose every
+        // request is a rendered analyze the cache holds under the current
+        // epoch answers without the engine turn — the whole-library
+        // replay revalidation a quiet tree pays for nothing. Serving is
+        // gated (a hosted plugin set makes the base analysis's cycle an
+        // observable of its own, a due publish diff needs the analysis);
+        // storing is not — an edit turn's fresh answer arms the very
+        // state it answered, so the first quiet turn after it serves.
+        // Any miss takes today's full path for the whole group.
+        let answer_cacheable = agent.is_none() && self.plugins.is_empty();
+        let answer_keys: Vec<Option<AnswerKey>> = if answer_cacheable {
+            requests
+                .iter()
+                .map(|(_, request)| answer_key(context, request))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if answer_cacheable && !self.publishes_due {
+            let epoch = self.answer_epoch;
+            if let Some(served) = self.cached_answers(context, epoch, &requests) {
+                turn.answers.extend(served);
+                return;
+            }
+        }
+
         let Ok(diagnostics) = self.analyze_with_lints(context) else {
             for (id, _) in requests {
                 turn.answers.push((id, Err(SessionError::Cancelled)));
@@ -3452,7 +3774,20 @@ impl Session {
             overlay_paths: &overlay_paths,
             symbols: &self.symbols,
         };
+        let answers_before = turn.answers.len();
         Self::answer_requests(&drain, requests, &mut turn.answers);
+        // The full path's answers re-arm the cache (#4240): every
+        // cacheable shape this group answered stores under the epoch as it
+        // stands now — writes apply and universes rebuild ahead of the
+        // read arm on this same thread, so an edit turn stores the very
+        // state it just answered and the next quiet turn serves it.
+        if answer_cacheable {
+            self.store_answers(
+                self.answer_epoch,
+                &answer_keys,
+                &turn.answers[answers_before..],
+            );
+        }
         // The plugin merge step, strictly last: the plugin set is consulted
         // only after the core publish is staged and the group's answers are
         // built, so the bounded per-plugin drain (the timeout isolation) can
@@ -3822,18 +4157,21 @@ impl Session {
     fn answer_requests(
         drain: &commands::Drain<'_>,
         requests: Vec<(RequestId, Request)>,
-        answers: &mut Vec<(RequestId, Result<serde_json::Value, SessionError>)>,
+        answers: &mut Vec<(RequestId, Result<AnswerPayload, SessionError>)>,
     ) {
         // Each slot owns its request id up front: a slot fills with its
         // answer below, and a slot a panicked worker emptied answers the
         // per-request internal error at the end (the id survives in the
         // slot either way).
-        let mut slots: Vec<(RequestId, Option<Result<serde_json::Value, SessionError>>)> =
+        let mut slots: Vec<(RequestId, Option<Result<AnswerPayload, SessionError>>)> =
             Vec::with_capacity(requests.len());
         let mut parallel: Vec<(usize, Request)> = Vec::with_capacity(requests.len());
         for (id, request) in requests {
             if request.verbosity() == Verbosity::Full {
-                slots.push((id, Some(commands::answer(drain, &request))));
+                slots.push((
+                    id,
+                    Some(commands::answer(drain, &request).map(AnswerPayload::Value)),
+                ));
             } else {
                 parallel.push((slots.len(), request));
                 slots.push((id, None));
@@ -3882,11 +4220,11 @@ impl Session {
                 );
             }
             for (index, answer) in results {
-                slots[index].1 = Some(answer);
+                slots[index].1 = Some(answer.map(AnswerPayload::Value));
             }
         } else {
             for (index, request) in parallel {
-                slots[index].1 = Some(commands::answer(drain, &request));
+                slots[index].1 = Some(commands::answer(drain, &request).map(AnswerPayload::Value));
             }
         }
         // Unfilled slots are exactly the jobs a panicked worker had claimed
@@ -4792,7 +5130,8 @@ mod tests {
                 .1
                 .as_ref()
                 .expect("the routed pull answers")
-                .clone()
+                .as_value()
+                .into_owned()
         };
 
         // Before: the resolution does not know `dep` — the import dangles.
@@ -4981,7 +5320,11 @@ mod tests {
             },
         );
         let turn = session.service();
-        let answer = turn.answers[0].1.as_ref().expect("the pull answers");
+        let answer = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("the pull answers")
+            .as_value();
         assert_eq!(
             answer["root"],
             workspace.root.display().to_string(),
@@ -5021,7 +5364,8 @@ mod tests {
         let answer = turn.answers[0]
             .1
             .as_ref()
-            .expect("the post-edit pull answers");
+            .expect("the post-edit pull answers")
+            .as_value();
         let rows = answer["diags"].as_array().expect("diagnostics rows");
         assert!(
             rows.iter().all(|row| row["file"] != config_uri.as_str()),
@@ -5055,9 +5399,12 @@ mod tests {
         );
         let turn = session.service();
         let fresh_uri = uri::from_path(&fresh.path(".dart_tool/package_config.json"));
-        let rows = turn.answers[0].1.as_ref().expect("the fresh pull answers")["diags"]
-            .as_array()
-            .expect("diagnostics rows");
+        let fresh_answer = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("the fresh pull answers")
+            .as_value();
+        let rows = fresh_answer["diags"].as_array().expect("diagnostics rows");
         assert!(
             rows.iter().all(|row| row["file"] != fresh_uri.as_str()),
             "a fresh assembly's pull never carries the advisory"
@@ -5131,9 +5478,12 @@ mod tests {
             "the pushed row names the fresh verdict: {:?}",
             pushes[0].diagnostics[0].message
         );
-        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diags"]
-            .as_array()
-            .expect("diagnostics rows");
+        let pull_answer = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("the pull answers")
+            .as_value();
+        let rows = pull_answer["diags"].as_array().expect("diagnostics rows");
         assert!(
             rows.iter().all(|row| row["file"] != config_uri.as_str()),
             "the healed verdict rides the push, never the machine pull: {rows:?}"
@@ -5169,9 +5519,12 @@ mod tests {
             pushes[0].diagnostics.is_empty(),
             "the retraction is an empty set"
         );
-        let rows = turn.answers[0].1.as_ref().expect("the healed pull answers")["diags"]
-            .as_array()
-            .expect("diagnostics rows");
+        let healed_answer = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("the healed pull answers")
+            .as_value();
+        let rows = healed_answer["diags"].as_array().expect("diagnostics rows");
         assert!(
             rows.iter().all(|row| row["file"] != config_uri.as_str()),
             "the cleared verdict no longer leads the pull"
@@ -5253,9 +5606,12 @@ mod tests {
             turn.publishes.iter().all(|push| push.uri != config_uri),
             "an unchanged verdict never republishes, however often the event re-fires"
         );
-        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diags"]
-            .as_array()
-            .expect("diagnostics rows");
+        let pull_answer = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("the pull answers")
+            .as_value();
+        let rows = pull_answer["diags"].as_array().expect("diagnostics rows");
         assert!(
             rows.iter().all(|row| row["file"] != config_uri.as_str()),
             "the pull stays the CLI document, advisory-free: {rows:?}"
@@ -5341,9 +5697,8 @@ mod tests {
             [&RequestId::Num(2), &RequestId::Num(3)]
         );
         for (_, answer) in &turn.answers {
-            let entries = answer.as_ref().expect("both requests answer")["diags"]
-                .as_array()
-                .expect("diagnostics array");
+            let view = answer.as_ref().expect("both requests answer").as_value();
+            let entries = view["diags"].as_array().expect("diagnostics array");
             assert!(entries.is_empty(), "post-write view: {entries:?}");
         }
     }
@@ -5406,7 +5761,8 @@ mod tests {
         for (id, answer) in &turn.answers {
             let value = answer
                 .as_ref()
-                .unwrap_or_else(|error| panic!("request {id:?} answers: {error:?}"));
+                .unwrap_or_else(|error| panic!("request {id:?} answers: {error:?}"))
+                .as_value();
             let rows = value["diags"].as_array().expect("rows");
             assert_eq!(rows.len(), 2, "request {id:?} sees the same view");
         }
@@ -5418,13 +5774,14 @@ mod tests {
             .expect("the full answer")
             .1
             .as_ref()
-            .expect("ok");
+            .expect("ok")
+            .as_value();
         assert_eq!(full["diags"][0]["file"], "s1", "shortened");
         assert!(
             full["symbols"]["s1"].is_string(),
             "the preamble names the path: {full}"
         );
-        let compact = turn.answers[0].1.as_ref().expect("ok");
+        let compact = turn.answers[0].1.as_ref().expect("ok").as_value();
         assert!(
             compact["symbols"].is_null(),
             "compact answers stay unshortened: {compact}"
@@ -5502,9 +5859,12 @@ mod tests {
             "the unchanged set stays diff-suppressed: {:?}",
             turn.publishes
         );
-        let entries = turn.answers[0].1.as_ref().expect("post-write answer")["diags"]
-            .as_array()
-            .expect("diagnostics array");
+        let view = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("post-write answer")
+            .as_value();
+        let entries = view["diags"].as_array().expect("diagnostics array");
         assert!(entries.is_empty(), "post-write view: {entries:?}");
     }
 
@@ -5728,7 +6088,7 @@ mod tests {
             panic!("one answer: {:?}", turn.answers);
         };
         assert_eq!(*id, RequestId::Num(2));
-        let answer = answer.as_ref().expect("the fix answers");
+        let answer = answer.as_ref().expect("the fix answers").as_value();
         assert_eq!(answer["v"], serde_json::json!(commands::SCHEMA_VERSION));
         assert!(answer["files"].is_array(), "the patch document: {answer}");
         assert!(session.fix_running.is_none(), "the mail freed the slot");
@@ -5909,7 +6269,9 @@ mod tests {
         };
         assert_eq!(*id, RequestId::Num(2));
         assert!(
-            answer.as_ref().is_ok_and(|value| value["files"].is_array()),
+            answer
+                .as_ref()
+                .is_ok_and(|payload| payload.as_value()["files"].is_array()),
             "the re-stamped fix answers: {answer:?}"
         );
         assert!(session.fixes.is_empty(), "the job left with the dispatch");
@@ -6319,9 +6681,12 @@ mod tests {
             "the cancelled id: {:?}",
             turn.answers[0]
         );
-        let entries = turn.answers[1].1.as_ref().expect("survivor answers Ok")["diags"]
-            .as_array()
-            .expect("diagnostics array");
+        let view = turn.answers[1]
+            .1
+            .as_ref()
+            .expect("survivor answers Ok")
+            .as_value();
+        let entries = view["diags"].as_array().expect("diagnostics array");
         assert!(
             entries
                 .iter()
@@ -6444,9 +6809,12 @@ mod tests {
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("post-batch answer")["diags"]
-            .as_array()
-            .expect("diagnostics array");
+        let view = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("post-batch answer")
+            .as_value();
+        let entries = view["diags"].as_array().expect("diagnostics array");
         assert!(
             entries.is_empty(),
             "the last edit is the applied one: {entries:?}"
@@ -6504,9 +6872,12 @@ mod tests {
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("post-removal answer")["diags"]
-            .as_array()
-            .expect("diagnostics array");
+        let view = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("post-removal answer")
+            .as_value();
+        let entries = view["diags"].as_array().expect("diagnostics array");
         assert!(
             entries.iter().all(|entry| !entry["file"]
                 .as_str()
@@ -6651,9 +7022,12 @@ mod tests {
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diags"]
-            .as_array()
-            .expect("diagnostics array");
+        let view = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("analyze answers")
+            .as_value();
+        let entries = view["diags"].as_array().expect("diagnostics array");
         assert!(
             entries.iter().any(|entry| entry["file"]
                 .as_str()
@@ -6868,9 +7242,12 @@ mod tests {
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diags"]
-            .as_array()
-            .expect("diagnostics array");
+        let view = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("analyze answers")
+            .as_value();
+        let entries = view["diags"].as_array().expect("diagnostics array");
         assert!(
             !entries.is_empty(),
             "the fixture must carry diagnostics for the probe"
@@ -7005,9 +7382,9 @@ mod tests {
     const SYNTAX_BROKEN: &str = "void f() { x }\n";
 
     /// The codes of a check/analyze answer's rows.
-    fn answer_codes(answer: &Result<serde_json::Value, SessionError>) -> Vec<String> {
+    fn answer_codes(answer: &Result<AnswerPayload, SessionError>) -> Vec<String> {
         match answer {
-            Ok(value) => value["diags"]
+            Ok(payload) => payload.as_value()["diags"]
                 .as_array()
                 .expect("diagnostics array")
                 .iter()
@@ -7399,7 +7776,7 @@ mod tests {
         // scan+parse row set); the cursor (1) echoes.
         assert_eq!(answer_codes(by_id(2)), ["expected_token"], "{:?}", by_id(2));
         assert_eq!(
-            by_id(2).as_ref().expect("ok")["since"],
+            by_id(2).as_ref().expect("ok").as_value()["since"],
             1,
             "the answer echoes the session's current cursor"
         );
@@ -7409,11 +7786,16 @@ mod tests {
             "a delta at the current cursor is empty: {:?}",
             by_id(3)
         );
-        assert_eq!(by_id(3).as_ref().expect("ok")["since"], 1);
+        assert_eq!(by_id(3).as_ref().expect("ok").as_value()["since"], 1);
         // No `since`: the full answer, no cursor field.
         assert_eq!(answer_codes(by_id(4)), ["expected_token"]);
         assert!(
-            by_id(4).as_ref().expect("ok").get("since").is_none(),
+            by_id(4)
+                .as_ref()
+                .expect("ok")
+                .as_value()
+                .get("since")
+                .is_none(),
             "a full answer carries no cursor"
         );
     }
@@ -7452,8 +7834,8 @@ mod tests {
                 .expect("answer present")
                 .1
         };
-        let syms = |answer: &Result<serde_json::Value, SessionError>| {
-            answer.as_ref().expect("the impact answer is ok")["sym"]
+        let syms = |answer: &Result<AnswerPayload, SessionError>| {
+            answer.as_ref().expect("the impact answer is ok").as_value()["sym"]
                 .as_array()
                 .expect("the changed-symbol rows")
                 .to_vec()
@@ -7469,7 +7851,7 @@ mod tests {
             "the edited in-root row survives the delta filter: {all_syms:?}"
         );
         assert_eq!(
-            by_id(2).as_ref().expect("ok")["since"],
+            by_id(2).as_ref().expect("ok").as_value()["since"],
             1,
             "the delta answer echoes the session's current cursor"
         );
@@ -10069,9 +10451,12 @@ mod tests {
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diags"]
-            .as_array()
-            .expect("diagnostics array");
+        let view = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("analyze answers")
+            .as_value();
+        let entries = view["diags"].as_array().expect("diagnostics array");
         assert_eq!(entries.len(), 2, "the warning plus the error: {entries:?}");
         assert_eq!(
             entries[0]["file"], "lib/b.dart",
@@ -10111,7 +10496,8 @@ mod tests {
         let report = turn.answers[0]
             .1
             .as_ref()
-            .expect("the session SDK backs the report");
+            .expect("the session SDK backs the report")
+            .as_value();
         assert_eq!(report["declaration"]["name"], "main");
 
         // Explicit `sdk` is authoritative: a bogus root fails loudly.
@@ -10285,6 +10671,7 @@ mod tests {
             .1
             .as_ref()
             .expect("the unflipped turn answers the analysis")
+            .as_value()
             .clone();
         assert!(
             baseline_gets > PARTS,
@@ -10376,7 +10763,8 @@ mod tests {
             .1
             .as_ref()
             .expect("the posture face answers")
-            .clone();
+            .as_value()
+            .into_owned();
         assert_eq!(
             answer["limit_mib"].as_u64(),
             Some(DEFAULT_MEMORY_LIMIT_MIB),
@@ -10405,5 +10793,221 @@ mod tests {
             Some(u64::from(dartq_commands::SCHEMA_VERSION)),
             "the short-vocabulary stamp: {answer}"
         );
+    }
+
+    /// The answer cache's own rules (#4240), pure: canonical target sets
+    /// share one entry, the LRU cap evicts least-recently-used, the byte
+    /// cap refuses an answer that alone exceeds it, and accounting tracks
+    /// every insert and eviction.
+    #[test]
+    fn the_answer_cache_holds_shapes_under_lru_and_byte_caps() {
+        let (workspace, session) = fixture("answer-cache-rules");
+        let context = session.default_context;
+        let shape = |name: &str| {
+            let mut spelled = vec![0];
+            spelled.extend_from_slice(name.as_bytes());
+            spelled.push(0);
+            (context, spelled, crate::commands::RenderFormat::Json)
+        };
+        let entry = |bytes: usize| CachedAnswer {
+            epoch: 7,
+            wire: vec![b'x'; bytes].into(),
+        };
+        let mut cache = AnswerCache::default();
+        cache.insert(shape("a"), entry(16));
+        cache.insert(shape("b"), entry(16));
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.bytes_total, 32);
+        // The LRU touch: `a` was just served, so filling to the cap evicts
+        // `b` — the untouched least-recently-used leg — and leaves `a`.
+        assert!(cache.get(&shape("a")).is_some());
+        for index in 0..7 {
+            cache.insert(shape(&format!("n{index}")), entry(16));
+        }
+        assert_eq!(cache.entries.len(), AnswerCache::CAP, "the entry cap holds");
+        assert!(cache.get(&shape("b")).is_none(), "the LRU leg went");
+        assert!(cache.get(&shape("a")).is_some(), "the touched leg stayed");
+        // An answer over the byte cap alone never stores.
+        cache.insert(shape("huge"), entry(AnswerCache::BYTES_CAP + 1));
+        assert!(cache.get(&shape("huge")).is_none());
+        // A clear drops everything, accounting included.
+        cache.clear();
+        assert!(cache.entries.is_empty() && cache.bytes_total == 0);
+        fs::remove_dir_all(&workspace.root).ok();
+    }
+
+    /// The warm-turn answer cache (#4240): a quiet tree's repeated rendered
+    /// analyze answers from the cache with byte-identical values and no
+    /// engine turn (the conversion counter a full turn pays stays flat); an
+    /// out-of-band disk edit the freshness walk picks up invalidates, and
+    /// the full turn that follows re-renders the same bytes a from-scratch
+    /// run produces (a comment append moves no diagnostic) and re-arms the
+    /// cache. A staged write invalidates the same way.
+    #[test]
+    fn warm_analyze_turns_serve_cached_bytes_and_invalidate_on_edits() {
+        let (workspace, mut session) = fixture("answer-cache");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        let pull = |session: &mut Session, id: i64| {
+            session.queue_command(
+                RequestId::Num(id),
+                Request::Analyze {
+                    targets: Vec::new(),
+                    format: Some(crate::commands::RenderFormat::Json),
+                    verbosity: Verbosity::Compact,
+                    agent: None,
+                    context: None,
+                },
+            );
+            crate::probe::reset_counters();
+            let turn = session.service();
+            let conversions = crate::probe::counters().0;
+            (
+                turn.answers[0]
+                    .1
+                    .as_ref()
+                    .expect("the routed pull answers")
+                    .as_value()
+                    .into_owned(),
+                conversions,
+            )
+        };
+
+        // The first pull is cold for the cache: the full path runs (it
+        // converts the broken import's rows) and stores the answer.
+        let (first, conversions) = pull(&mut session, 1);
+        assert!(conversions > 0, "the arming turn analyzed: {first}");
+        assert_eq!(session.answers.entries.len(), 1, "the answer stored");
+        let stored_epoch = session.answer_epoch;
+
+        // The second pull over the same quiet tree serves from the cache:
+        // identical value, zero conversions — no engine turn ran.
+        let (second, conversions) = pull(&mut session, 2);
+        assert_eq!(second, first, "the cached value is byte-equal");
+        assert_eq!(conversions, 0, "a served turn analyzes nothing");
+        assert_eq!(
+            session.answer_epoch, stored_epoch,
+            "a quiet turn bumps nothing"
+        );
+
+        // An out-of-band edit (a comment append — diagnostics stand, the
+        // stamp moves): the freshness walk reloads it, the cache drops, and
+        // the next pull runs the full path — converting again, re-rendering
+        // the very same bytes (the comment moved no row), and re-arming.
+        let main = workspace.path("lib/main.dart");
+        let edited = format!(
+            "{}// an out-of-band comment\n",
+            fs::read_to_string(&main).expect("read main")
+        );
+        fs::write(&main, edited).expect("append the comment");
+        let (third, conversions) = pull(&mut session, 3);
+        assert!(conversions > 0, "an invalidated turn re-analyzes");
+        assert_eq!(third, first, "the fresh bytes equal the frozen bytes");
+        assert_eq!(session.answers.entries.len(), 1, "the full path re-armed");
+
+        // The settled tree serves from the cache again.
+        let (fourth, conversions) = pull(&mut session, 4);
+        assert_eq!(fourth, first);
+        assert_eq!(conversions, 0, "the re-armed cache serves");
+
+        // A staged write invalidates the same way: the write applies ahead
+        // of the read, the cache drops, and the answering turn analyzes.
+        sync_text(
+            &mut session,
+            &main,
+            "import 'also_missing.dart';\nvoid main() {}\n",
+        );
+        let (fifth, conversions) = pull(&mut session, 5);
+        assert!(conversions > 0, "a landed write invalidates");
+        assert_ne!(fifth, first, "the edited tree answers differently");
+        let (sixth, conversions) = pull(&mut session, 6);
+        assert_eq!(sixth, fifth, "the post-write answer re-caches");
+        assert_eq!(conversions, 0);
+
+        fs::remove_dir_all(&workspace.root).ok();
+    }
+
+    /// The warm-turn serve cost receipt (#4258): repeated rendered analyze
+    /// turns over a quiet tree with a realistically heavy answer — per-turn
+    /// wall time and the served payload's serialized bytes. The asserts pin
+    /// structure (every turn serves byte-identical answers, turns after the
+    /// first never analyze) and the medians print under `--nocapture` as the
+    /// turn-time receipt; wall times are never asserted (machine noise).
+    #[test]
+    fn warm_turn_serve_cost_receipt() {
+        // One undefined reference per statement: each names one diagnostic
+        // row, so the rendered JSON answer carries real payload weight.
+        let mut main = String::from("void main() {\n");
+        for index in 0..4_000 {
+            main.push_str(&format!(
+                "  int v{index} = undefinedSymbolNumber{index} + {index};\n"
+            ));
+        }
+        main.push_str("}\n");
+        let (workspace, mut session) = fixture_with("answer-serve-receipt", &main);
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        let mut served: Vec<Vec<u8>> = Vec::new();
+        let mut walls = Vec::new();
+        for id in 1..=12i64 {
+            session.queue_command(
+                RequestId::Num(id),
+                Request::Analyze {
+                    targets: Vec::new(),
+                    format: Some(crate::commands::RenderFormat::Json),
+                    verbosity: Verbosity::Compact,
+                    agent: None,
+                    context: None,
+                },
+            );
+            crate::probe::reset_counters();
+            let start = std::time::Instant::now();
+            let turn = session.service();
+            walls.push(start.elapsed().as_secs_f64() * 1e3);
+            let conversions = crate::probe::counters().0;
+            let payload = turn.answers[0].1.as_ref().expect("the pull answers");
+            served.push(payload.as_bytes().into_owned());
+            if id > 1 {
+                assert_eq!(conversions, 0, "turn {id} serves the cache: no analysis");
+                assert!(
+                    matches!(payload, AnswerPayload::Wire(_)),
+                    "turn {id} serves the cached wire bytes"
+                );
+            }
+        }
+        for (index, bytes) in served.iter().enumerate() {
+            assert_eq!(
+                bytes,
+                &served[0],
+                "turn {} serves byte-identical answer bytes",
+                index + 1
+            );
+        }
+        let mut digest = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hasher::write(&mut digest, &served[0]);
+        let digest = std::hash::Hasher::finish(&digest);
+        let mut hits = walls[1..].to_vec();
+        hits.sort_by(|a, b| a.total_cmp(b));
+        println!(
+            "serve receipt: {} bytes/turn, 12 turns (1 miss + 11 hits): miss {:.3} ms, hit median {:.3} ms, hit max {:.3} ms",
+            served[0].len(),
+            walls[0],
+            hits[hits.len() / 2],
+            hits[hits.len() - 1],
+        );
+        println!(
+            "serve receipt: answer digest {digest:016x}, per-turn walls (ms): {}",
+            walls
+                .iter()
+                .map(|ms| format!("{ms:.3}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(
+            served[0].len() > 100_000,
+            "the fixture answer is heavy enough to measure: {} bytes",
+            served[0].len()
+        );
+        fs::remove_dir_all(&workspace.root).ok();
     }
 }

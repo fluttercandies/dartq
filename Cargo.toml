@@ -39,7 +39,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.22"
+version = "0.1.21"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.99"
@@ -140,3 +140,13 @@ pedantic = { level = "warn", priority = -1 }
 # Hot-path hashing policy (see clippy.toml for the ban list): std hash
 # collections are banned workspace-wide; use rustc-hash's FxHashMap/FxHashSet.
 disallowed-types = "deny"
+
+# The release posture (#4220): the resident daemon's RSS floor includes
+# the binary's resident code pages — thin LTO + one codegen unit let
+# rustc drop dead/cold code across crate boundaries, and symbol
+# stripping keeps the on-disk and paged-in image lean. Unwind semantics
+# stay (no `panic = "abort"`): the engine's catch paths are load-bearing.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

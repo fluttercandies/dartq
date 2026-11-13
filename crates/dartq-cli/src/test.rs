@@ -773,7 +773,15 @@ fn run_guard(dir: &Path, inv: &Invocation) -> Result<Option<crate::JobSlot>, u8>
         crate::gate_bypass();
     }
     let key = format!("test:{}", dir.display());
-    match crate::job_slot(crate::Job::Test, &key, dir, crate::memory_max_percent(dir)) {
+    // One discovery feeds both the gate's cap and its memory share.
+    let yaml = dartq_commands::config::discover(dir).ok().flatten();
+    match crate::job_slot(
+        crate::Job::Test,
+        &key,
+        dir,
+        crate::memory_max_percent(yaml.as_ref()),
+        crate::job_cap(yaml.as_ref()),
+    ) {
         Ok(slot) => {
             #[cfg(unix)]
             if let Some(created) = dartq_toolchain::ledger::take_dead() {
@@ -2200,7 +2208,9 @@ fn run_grouped(
         profile,
         target,
         wanted,
-        crate::memory_max_percent(root),
+        crate::memory_max_percent(
+            dartq_commands::config::discover(root).ok().flatten().as_ref(),
+        ),
         deadline,
     )?;
     let (shards, workers) = match &lease {
@@ -2335,7 +2345,9 @@ fn run_stock(
     let deadline = Instant::now() + idle_timeout();
     let (lease, workers) = dartq_test::lease_run(
         plan.workers.min(indices.len()).max(1),
-        crate::memory_max_percent(root),
+        crate::memory_max_percent(
+            dartq_commands::config::discover(root).ok().flatten().as_ref(),
+        ),
         deadline,
     )?;
     let (sender, receiver) = std::sync::mpsc::channel::<dartq_test::Streamed>();

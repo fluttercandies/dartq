@@ -443,8 +443,12 @@ fn extension_invalid_receiver_argument_credits_nothing() {
                       extension _E on List<C> { int get used => 0; }\n\
                       void f(List<Missing> x) { x.used; }\n";
     let names = code_names(&report(source));
-    assert!(names.contains(&"undefined_class"), "{names:?}");
-    assert!(names.contains(&"non_type_as_type_argument"), "{names:?}");
+    // The live 3.13 oracle answers exactly the `Missing` type-argument
+    // row: the receiver's `List<InvalidType>` still applies the face
+    // (InvalidType satisfies `C`), the access resolves, and `used`
+    // credits — `int` resolves as dart:core's final primitive, so no
+    // `undefined_class` row joins either.
+    assert_eq!(names, vec!["non_type_as_type_argument"], "{names:?}");
     assert!(!names.contains(&"undefined_method"), "{names:?}");
     assert!(!names.contains(&"undefined_getter"), "{names:?}");
 }

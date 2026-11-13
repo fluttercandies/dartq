@@ -133,14 +133,14 @@ fn superinterface_downward_solve_reports_substituted_formals() {
         texts
             .iter()
             .any(|m| *m
-                == "The argument type 'int' can't be assigned to the parameter type 'String'."),
+                == "The argument type 'int' can't be assigned to the parameter type 'String'. "),
         "int into String formal: {rows:?}"
     );
     assert!(
         texts
             .iter()
             .any(|m| *m
-                == "The argument type 'String' can't be assigned to the parameter type 'int'."),
+                == "The argument type 'String' can't be assigned to the parameter type 'int'. "),
         "String into int formal: {rows:?}"
     );
 }
@@ -192,7 +192,7 @@ fn superinterface_downward_solve_climbs_two_hops() {
     let rows = atna_rows(&report);
     assert!(
         rows.iter().any(|(_, _, m)| m
-            == "The argument type 'int' can't be assigned to the parameter type 'String'."),
+            == "The argument type 'int' can't be assigned to the parameter type 'String'. "),
         "the two-hop solve reports int into String: {rows:?}"
     );
 }
@@ -256,10 +256,12 @@ fn closure_argument_pairs_against_written_formal() {
     );
     let rows = atna_rows(&report);
     assert_eq!(rows.len(), 1, "the arity face reports: {rows:?}");
+    // The oracle's machine-format row ends at `'. ` — the empty appendix
+    // keeps its separating space (live 3.13.7, byte-confirmed by od).
     assert_eq!(
         rows[0].2,
         "The argument type 'void Function()' can't be assigned to the \
-         parameter type 'void Function(int)'.",
+         parameter type 'void Function(int)'. ",
         "the arity message: {rows:?}"
     );
 }
@@ -283,7 +285,7 @@ fn extension_type_primary_ctor_checks_dynamic_arg() {
     let rows = atna_rows(&report);
     assert!(
         rows.iter().any(|(_, _, m)| m
-            == "The argument type 'dynamic' can't be assigned to the parameter type 'int'."),
+            == "The argument type 'dynamic' can't be assigned to the parameter type 'int'. "),
         "dynamic into int under strict-casts: {rows:?}"
     );
 }

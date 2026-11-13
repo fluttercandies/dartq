@@ -12,7 +12,8 @@ use serde::Serialize;
 
 use crate::code::CodeInfo;
 use crate::model::{
-    AnalysisOutput, ContextMessage, Diagnostic, DiagnosticType, FileId, FindingOrigin, SourceRange,
+    AnalysisOutput, ContextMessage, Diagnostic, DiagnosticType, FileId, FindingOrigin,
+    SourceRange,
 };
 
 /// Writes diagnostics in the oracle machine format, one line per diagnostic:
@@ -455,13 +456,10 @@ mod tests {
         };
         let mut out = Vec::new();
         write_json(&mut out, &output).expect("write");
-        let envelope: serde_json::Value = serde_json::from_slice(&out).expect("one JSON object");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&out).expect("one JSON object");
         let rows = envelope["diagnostics"].as_array().expect("rows");
-        assert_eq!(
-            rows.len(),
-            2,
-            "both rows survive: multiplicity is the row set"
-        );
+        assert_eq!(rows.len(), 2, "both rows survive: multiplicity is the row set");
         assert_eq!(
             rows[0]["documentation"], "https://dart.dev/diagnostics/unused_import",
             "the engine row keeps the published page"

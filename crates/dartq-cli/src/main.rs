@@ -82,7 +82,8 @@ use clap::{Args, Parser as _, Subcommand, ValueEnum};
 use dartq_commands::analyze::Target;
 use dartq_commands::analyze::official::{self, OfficialRun};
 use dartq_commands::config::{
-    ConfigError, ContextConfig, ContextTarget, load as load_dartq_config, resolve_locator,
+    ConfigError, ContextConfig, ContextTarget, DartqConfig,
+    load as load_dartq_config, resolve_locator,
 };
 use dartq_commands::discover::{DiscoverError, discover};
 use dartq_commands::explain::ExplainError;
@@ -93,7 +94,9 @@ use dartq_commands::workspace::{
 };
 use dartq_diagnostics::{AnalysisOutput, Diagnostic, Severity, write_json};
 use dartq_engine::EngineConfig;
+use dartq_engine::{AnswerAim, AnswerFace, AnswerProbe, AnswerShape, AnswerStamp, AnswerSummary};
 use dartq_sdk::SdkSnapshot;
+use rustc_hash::FxHashMap;
 #[cfg(unix)]
 mod compat;
 mod debug;
@@ -155,7 +158,27 @@ mod exit {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// `mi_option_purge_delay` — mimalloc v3's enum index 15. The safe
+/// wrapper ships no option constants; the index is pinned against the
+/// vendored `mimalloc.h` of libmimalloc-sys 0.1.49 (`c_src/mimalloc/v3`,
+/// between the bindings' `eager_commit_delay` = 14 and
+/// `use_numa_nodes` = 16).
+const MI_OPTION_PURGE_DELAY: std::ffi::c_int = 15;
+
+/// The allocator posture for every face of this binary (#4220): freed
+/// pages return to the OS at the next abandonment check instead of
+/// after the 10 ms batch window — the resident daemon's between-turn
+/// RSS floor. Runs before any argument parsing so the serve daemon and
+/// the one-shot CLI faces share it.
+fn init_allocator() {
+    // SAFETY: an mimalloc runtime-option write; the value is a plain
+    // long, and setting it ahead of the first purge decision installs
+    // it in place of the built-in default.
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+}
+
 fn main() -> ExitCode {
+    init_allocator();
     let mut raw_args = std::env::args_os();
     let argv0 = raw_args.next();
     // The `dart` PATH shim: when argv0 names this binary `dart` (the
@@ -576,10 +599,19 @@ struct AnalyzeArgs {
     /// workspace member analyzes that package instead of the whole
     /// workspace, the scope `dart analyze <file>` itself uses. `workspace`
     /// roots it at the aim's pub workspace root (the whole-workspace
-    /// posture). An aim that is a workspace root resolves to that root
-    /// either way.
-    #[arg(long, value_enum, default_value_t = AnalyzeScope::Package)]
-    scope: AnalyzeScope,
+    /// posture). `file` (alias `dir`) roots it at the aims themselves —
+    /// the server's included set is the aim paths (files or directories),
+    /// the universe `dart analyze <paths>`'s own root spelling opens. An
+    /// aim that is a workspace root resolves to that root either way.
+    ///
+    /// Unset — the default — resolves per shape at run time (see
+    /// [`resolve_scope`]): aims — files or directories — whose package
+    /// context is their workspace root — the single-pubspec shape, where
+    /// the package tier would root at the whole repo and gain nothing —
+    /// take the file tier; every other default keeps the package tier. An
+    /// explicit `--scope` never re-resolves.
+    #[arg(long, value_enum)]
+    scope: Option<AnalyzeScope>,
     /// Print one stderr line naming the engine that answered (and, for
     /// `official`, the SDK version and whether the resident server or a
     /// per-run `dart analyze` did; for `dartq`, whether the resident
@@ -781,6 +813,19 @@ enum AnalyzeScope {
     /// The aim's pub workspace root — one analysis universe per worktree
     /// (the pre-`--scope` posture).
     Workspace,
+    /// The aims themselves — the aim paths (files or directories) are the
+    /// resident server's `analysis.setAnalysisRoots` included set verbatim,
+    /// the universe `dart analyze <paths>` itself opens (dartdev passes the
+    /// canonicalized rest targets — directories included — as `included`,
+    /// upstream Dart SDK source,
+    /// pkg/dartdev/lib/src/analysis_server.dart:174-198). A single-file aim
+    /// in a single-pubspec repo analyzes that one file's context — an
+    /// oracle-class cold start — and a directory aim analyzes the
+    /// directory's tree instead of the whole package. The aim set keys its
+    /// own resident (the roots key the daemon, so an aim never drags the
+    /// whole package's server in or shares its context).
+    #[value(alias = "dir")]
+    File,
 }
 
 /// The analyze flags against the official backend, every flag in one class
@@ -1456,17 +1501,12 @@ impl Backend {
         }
     }
 
-    /// [`Backend::of`] over the cwd's `dartq.yaml`. An unreadable config
-    /// leaves the choice to the flag and the default: the analyze face never
-    /// failed on `dartq.yaml` and must not start now.
-    fn resolve(flag: Option<EngineArg>) -> Self {
-        let config = flag
-            .is_none()
-            .then(|| std::env::current_dir().ok())
-            .flatten()
-            .and_then(|cwd| dartq_commands::config::discover(&cwd).ok().flatten())
-            .and_then(|config| config.engine());
-        Self::of(flag, config)
+    /// [`Backend::of`] over the invocation's discovered `dartq.yaml`
+    /// (found once per invocation — see [`analyze`]). An unreadable
+    /// config leaves the choice to the flag and the default: the analyze
+    /// face never failed on `dartq.yaml` and must not start now.
+    fn resolve(flag: Option<EngineArg>, config: Option<&DartqConfig>) -> Self {
+        Self::of(flag, config.and_then(DartqConfig::engine))
     }
 }
 
@@ -1520,8 +1560,16 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
             dartq_commands::render::render_official_face,
         );
     }
+    // One config discovery per invocation: `dartq.yaml` is found once
+    // here and threaded through every face below — the backend choice,
+    // the official settings, the resident request's knobs — where each
+    // knob used to re-walk the same ancestors. A file that appears or
+    // changes mid-run is not re-read: single discovery per process is
+    // the contract.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config = dartq_commands::config::discover(&cwd);
     dispatch(
-        Backend::resolve(args.engine),
+        Backend::resolve(args.engine, config.as_ref().ok().and_then(Option::as_ref)),
         args.engine_only_flag(),
         args.no_resident.then_some("--no-resident"),
         || {
@@ -1535,6 +1583,7 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
                 },
                 &args.targets,
                 args.no_queue,
+                &config,
             )
         },
         || analyze_engine(args),
@@ -1544,8 +1593,11 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
 /// `dartq check`: `analyze`'s entry under the hidden spelling, with
 /// [`check`] the engine face.
 fn check_entry(args: &CheckArgs) -> u8 {
+    // One discovery per invocation, as in [`analyze`].
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config = dartq_commands::config::discover(&cwd);
     dispatch(
-        Backend::resolve(args.engine),
+        Backend::resolve(args.engine, config.as_ref().ok().and_then(Option::as_ref)),
         args.engine_only_flag(),
         None,
         || {
@@ -1559,6 +1611,7 @@ fn check_entry(args: &CheckArgs) -> u8 {
                 },
                 &args.paths,
                 args.no_queue,
+                &config,
             )
         },
         || check(args),
@@ -1577,12 +1630,14 @@ struct OfficialFace {
 }
 
 /// What the resident server needs beyond the targets: the forwarded
-/// flags it honors, and the analysis scope its roots resolve under.
+/// flags it honors, and the analysis scope its roots resolve under — the
+/// explicit `--scope` verbatim, `None` the shape-resolved default
+/// ([`resolve_scope`]).
 struct ResidentAsk {
     packages: Option<PathBuf>,
     fatal_warnings: bool,
     fatal_infos: bool,
-    scope: AnalyzeScope,
+    scope: Option<AnalyzeScope>,
 }
 
 /// A `dartq test` line that only asks for help or the version skips the
@@ -1601,11 +1656,17 @@ fn queue_bypass(args: test::TestArgs) -> test::TestArgs {
 /// with the same wording), `dart` resolves through the shared toolchain
 /// resolver, and a resolver miss or a binary that does not start is the
 /// usage tier — the environment failed, like the engine path's missing SDK.
-fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8 {
+fn official_face(
+    face: &OfficialFace,
+    targets: &[PathBuf],
+    no_queue: bool,
+    config: &Result<Option<DartqConfig>, ConfigError>,
+) -> u8 {
     let outcome = crash_tier(|| {
         let cwd = std::env::current_dir().unwrap_or_default();
-        let settings = official_settings(&cwd);
-        let max_percent = memory_max_percent(&cwd);
+        let settings = official_settings(config);
+        let yaml = config.as_ref().ok().and_then(Option::as_ref);
+        let max_percent = memory_max_percent(yaml);
         let resolved = match resolve_targets(targets) {
             Ok(targets) => targets,
             Err(path) => {
@@ -1613,7 +1674,11 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
                 return exit::USAGE;
             }
         };
-        let root = analysis_root(&resolved);
+        // One root-resolution walk per distinct directory this invocation
+        // (#4260): the analysis root, the scope pass, and the request
+        // roots share it.
+        let mut roots = RootMemo::default();
+        let root = analysis_root(&resolved, &mut roots);
         let dart = dartq_toolchain::find_dart(None);
         let out = &mut BufWriter::new(io::stdout().lock());
         let err = &mut io::stderr().lock();
@@ -1638,6 +1703,7 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
             // workspace, while the aims scope its report. Every
             // `dartq analyze` over the same roots shares the daemon and
             // its cache.
+            let warm = warm_posture(yaml);
             let request = dartq_analyzer_host::Request {
                 dart: dart.clone(),
                 targets: resolved
@@ -1646,13 +1712,19 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
                         TargetKind::Dir(dir) | TargetKind::File(dir) => dir.clone(),
                     })
                     .collect(),
-                roots: scope_roots(&resolved, ask.scope),
+                roots: scope_roots(
+                    &resolved,
+                    resolve_scope(ask.scope, &resolved, &mut roots),
+                    &mut roots,
+                ),
                 packages: ask.packages.clone(),
                 budget: settings.memory_budget_bytes,
                 idle: Duration::from_secs(settings.idle_minutes.max(1) * 60),
                 max_percent,
-                max_concurrent: job_cap(&cwd),
-                pool: pool_posture(&cwd),
+                max_concurrent: job_cap(yaml),
+                pool: pool_posture(yaml),
+                warm: warm.0,
+                warm_ttl_secs: warm.1,
                 face: Some(dartq_analyzer_host::Face {
                     format: match face.format {
                         AnalyzeFormat::Lon => dartq_analyzer_host::FaceFormat::Lon,
@@ -1707,7 +1779,7 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
         // peak (`analyze:<cwd>`) for the run's life, the `dart analyze`
         // child included.
         let peak_key = format!("analyze:{}", cwd.display());
-        let _slot = match job_slot(Job::Analyze, &peak_key, &cwd, max_percent) {
+        let _slot = match job_slot(Job::Analyze, &peak_key, &cwd, max_percent, job_cap(yaml)) {
             Ok(slot) => slot,
             Err(message) => {
                 eprintln!("error: {message}");
@@ -1884,10 +1956,10 @@ fn face_format(format: AnalyzeFormat) -> dartq_analyzer_host::FaceFormat {
 /// analyze face never failed on `dartq.yaml` before and must not start now.
 /// The governing `memory.max_percent` (the default when dartq.yaml is
 /// unreadable: [`official_settings`] already said so).
-pub(crate) fn memory_max_percent(dir: &Path) -> u8 {
-    dartq_commands::config::discover(dir).ok().flatten().map_or(
+pub(crate) fn memory_max_percent(config: Option<&DartqConfig>) -> u8 {
+    config.map_or(
         dartq_commands::config::DEFAULT_MEMORY_MAX_PERCENT,
-        |config| config.memory_max_percent(),
+        DartqConfig::memory_max_percent,
     )
 }
 
@@ -1895,11 +1967,8 @@ pub(crate) fn memory_max_percent(dir: &Path) -> u8 {
 /// (with `DARTQ_POOL_MAX_ROOTS`, 1–64, overriding the cap), else
 /// `analyzer.pool` in `dartq.yaml` decides. `None` is the one-daemon-per-
 /// worktree posture.
-fn pool_posture(dir: &Path) -> Option<u32> {
-    let (enabled, max_roots) = dartq_commands::config::discover(dir)
-        .ok()
-        .flatten()
-        .map_or((false, 3), |config| config.pool());
+fn pool_posture(config: Option<&DartqConfig>) -> Option<u32> {
+    let (enabled, max_roots) = config.map_or((false, 3), DartqConfig::pool);
     let env_on = std::env::var("DARTQ_POOL").is_ok_and(|value| value == "1");
     if !env_on && !enabled {
         return None;
@@ -1912,13 +1981,21 @@ fn pool_posture(dir: &Path) -> Option<u32> {
     Some(cap)
 }
 
+/// The warm-standby posture beside [`pool_posture`]: the resolved
+/// `analyzer.pool.warm_servers` / `warm_ttl_secs` of `dartq.yaml`, carried
+/// into the daemon's spec. `warm == 0` is the spec's not-declared — the
+/// daemon's own default resolves — so `warm_servers: false` has no spec
+/// spelling: `DARTQ_WARM_SERVERS=0` stays the off arm (the env wins
+/// daemon-side over whatever the spec carries).
+fn warm_posture(config: Option<&DartqConfig>) -> (u32, u32) {
+    let (warm, ttl) = config.map_or((false, 900), DartqConfig::warm);
+    (u32::from(warm), u32::try_from(ttl).unwrap_or(u32::MAX))
+}
+
 /// The governing `memory.max_concurrent` (unlimited when dartq.yaml is
 /// unreadable), under the `DARTQ_MAX_CONCURRENT` override.
-pub(crate) fn job_cap(dir: &Path) -> u32 {
-    let configured = dartq_commands::config::discover(dir)
-        .ok()
-        .flatten()
-        .map_or(0, |config| config.memory_max_concurrent());
+pub(crate) fn job_cap(config: Option<&DartqConfig>) -> u32 {
+    let configured = config.map_or(0, DartqConfig::memory_max_concurrent);
     #[cfg(unix)]
     {
         dartq_toolchain::ledger::cap(configured)
@@ -1957,7 +2034,8 @@ impl Job {
 }
 
 /// One job slot of the machine-wide gate for this process's tree: the
-/// governing `memory.max_concurrent`, and the recorded peak of `peak_key`
+/// governing `memory.max_concurrent` (`cap`, resolved by the calling face
+/// from its one discovered config), and the recorded peak of `peak_key`
 /// (else a live peer's of `face`, else the default, unsized) as its
 /// memory. Waits with notes on stderr; a run nested inside another dartq
 /// job's slot joins it. `Ok(None)` runs ungated (`--no-queue`, no
@@ -1968,6 +2046,7 @@ pub(crate) fn job_slot(
     peak_key: &str,
     dir: &Path,
     max_percent: u8,
+    cap: u32,
 ) -> Result<Option<JobSlot>, String> {
     use dartq_toolchain::ledger::{self, Request};
     #[cfg(test)]
@@ -1983,7 +2062,7 @@ pub(crate) fn job_slot(
         pid: Some(std::process::id()),
         release: None,
         slot: true,
-        cap: job_cap(dir),
+        cap,
         sized,
         peak_key: Some(peak_key.to_owned()),
         source_bytes: None,
@@ -2003,7 +2082,13 @@ pub(crate) fn job_slot(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn job_slot(_: Job, _: &str, _: &Path, _: u8) -> Result<Option<JobSlot>, String> {
+pub(crate) fn job_slot(
+    _: Job,
+    _: &str,
+    _: &Path,
+    _: u8,
+    _: u32,
+) -> Result<Option<JobSlot>, String> {
     Ok(None)
 }
 
@@ -2053,11 +2138,13 @@ pub(crate) fn engine_root(target: &Path) -> PathBuf {
 /// on [`engine_root`]. The error is a wait that timed out.
 pub(crate) fn engine_slot(target: &Path) -> Result<Option<JobSlot>, String> {
     let root = engine_root(target);
+    let yaml = dartq_commands::config::discover(&root).ok().flatten();
     job_slot(
         Job::Engine,
         &format!("engine:{}", root.display()),
         &root,
-        memory_max_percent(&root),
+        memory_max_percent(yaml.as_ref()),
+        job_cap(yaml.as_ref()),
     )
 }
 
@@ -2088,14 +2175,17 @@ pub(crate) fn gate_nested() -> bool {
     }
 }
 
-fn official_settings(dir: &Path) -> dartq_commands::config::OfficialSettings {
-    match dartq_commands::config::discover(dir) {
-        Ok(config) => config.unwrap_or_default().official(),
+fn official_settings(
+    config: &Result<Option<DartqConfig>, ConfigError>,
+) -> dartq_commands::config::OfficialSettings {
+    match config {
+        Ok(Some(config)) => config.official(),
+        Ok(None) => DartqConfig::default().official(),
         Err(error) => {
             eprintln!(
                 "dartq analyze: dartq.yaml unreadable ({error}) — using the analyzer defaults"
             );
-            dartq_commands::config::DartqConfig::default().official()
+            DartqConfig::default().official()
         }
     }
 }
@@ -2142,9 +2232,13 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
+    // One root-resolution walk per distinct directory this invocation
+    // (#4260): the resident route and the engine grouping share it.
+    let mut roots = RootMemo::default();
     #[cfg(unix)]
     if !args.cold
-        && let Some(code) = resident::route_analyze(args, &targets, out, &session::spawn_server)
+        && let Some(code) =
+            resident::route_analyze(args, &targets, out, &session::spawn_server, &mut roots)
     {
         if args.stats {
             eprintln!("dartq analyze: engine dartq (resident)");
@@ -2154,7 +2248,7 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     if args.stats {
         eprintln!("dartq analyze: engine dartq (in-process)");
     }
-    analyze_targets(args, &targets, out)
+    analyze_targets(args, &targets, out, &mut roots)
 }
 
 /// One rest argument's on-disk kind — a directory target walks its tree,
@@ -2243,22 +2337,90 @@ fn package_root_of(dir: &Path) -> PathBuf {
     dartq_commands::workspace::nearest_pubspec_dir(dir).unwrap_or_else(|| dir.to_path_buf())
 }
 
+/// One invocation's root-resolution memo (#4260): the resident route, the
+/// engine grouping, the scope pass, and the analysis root ask for the same
+/// targets' workspace/package roots — each miss is a full ancestor walk
+/// (a pubspec probe per level), each hit one hash lookup. Per-invocation
+/// by construction: the tree can change between runs, so the memo never
+/// outlives one.
+#[derive(Default)]
+pub(crate) struct RootMemo {
+    workspace: FxHashMap<PathBuf, PathBuf>,
+    package: FxHashMap<PathBuf, PathBuf>,
+}
+
+impl RootMemo {
+    /// [`workspace_root_of`], walked once per distinct directory.
+    pub(crate) fn workspace_root(&mut self, dir: &Path) -> PathBuf {
+        if let Some(root) = self.workspace.get(dir) {
+            return root.clone();
+        }
+        let root = workspace_root_of(dir);
+        self.workspace.insert(dir.to_path_buf(), root.clone());
+        root
+    }
+
+    /// [`package_root_of`], walked once per distinct directory.
+    pub(crate) fn package_root(&mut self, dir: &Path) -> PathBuf {
+        if let Some(root) = self.package.get(dir) {
+            return root.clone();
+        }
+        let root = package_root_of(dir);
+        self.package.insert(dir.to_path_buf(), root.clone());
+        root
+    }
+}
+
+/// The scope one run resolves: an explicit `--scope` verbatim — it never
+/// re-resolves — and the default per shape: every aim — file or directory —
+/// whose package context is its workspace root (the single-pubspec shape,
+/// where the package tier roots at the whole repo and gains nothing:
+/// package == workspace == repo) takes the file tier `dart analyze <paths>`
+/// itself opens; anything else — a pub workspace member's aim (its package
+/// tier is genuinely narrower) — keeps the package tier. A no-pubspec aim
+/// fires too: its package tier floors at the aim's own directory while the
+/// file tier is the oracle's own posture.
+fn resolve_scope(
+    explicit: Option<AnalyzeScope>,
+    targets: &[TargetKind],
+    roots: &mut RootMemo,
+) -> AnalyzeScope {
+    explicit.unwrap_or_else(|| {
+        let aims_over_their_workspace_root = targets.iter().all(|target| {
+            let dir = target.package_dir();
+            roots.package_root(dir) == roots.workspace_root(dir)
+        });
+        if aims_over_their_workspace_root {
+            AnalyzeScope::File
+        } else {
+            AnalyzeScope::Package
+        }
+    })
+}
+
 /// The distinct analysis roots one resident request opens for `targets`: the
-/// package context of every aim (`--scope package`, the default) or the aim's
-/// pub workspace root (`--scope workspace`).
+/// package context of every aim (`--scope package`, the default), the aim's
+/// pub workspace root (`--scope workspace`), or the aims themselves
+/// (`--scope file` — the resident server's `included` set is the aim paths,
+/// the universe `dart analyze <paths>` itself opens).
 ///
 /// Aims sharing a root share the request — and the daemon, which keys on its
 /// roots — so one invocation stays one resident however many aims cover the
 /// same package, and aims in different packages land on their own roots
 /// together in one multi-root context, never on a shared workspace root.
-/// `Request.roots` is order-free (the client sorts and dedups before keying),
-/// so the aim order never splits a daemon.
-fn scope_roots(targets: &[TargetKind], scope: AnalyzeScope) -> Vec<PathBuf> {
+/// Under `--scope file` a distinct aim set is a distinct resident (an aim
+/// keys its own answer context), the same-aim dedupe the client's
+/// sorted-roots keying always ran. `Request.roots` is order-free (the client
+/// sorts and dedups before keying), so the aim order never splits a daemon.
+fn scope_roots(targets: &[TargetKind], scope: AnalyzeScope, memo: &mut RootMemo) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = targets
         .iter()
         .map(|target| match scope {
-            AnalyzeScope::Package => package_root_of(target.package_dir()),
-            AnalyzeScope::Workspace => workspace_root_of(target.package_dir()),
+            AnalyzeScope::Package => memo.package_root(target.package_dir()),
+            AnalyzeScope::Workspace => memo.workspace_root(target.package_dir()),
+            AnalyzeScope::File => match target {
+                TargetKind::Dir(path) | TargetKind::File(path) => path.clone(),
+            },
         })
         .collect();
     roots.sort();
@@ -2275,10 +2437,10 @@ fn scope_roots(targets: &[TargetKind], scope: AnalyzeScope) -> Vec<PathBuf> {
 /// what the resident server analyzes (see [`scope_roots`]) while its rows
 /// keep spelling against the workspace, so the output bytes do not move with
 /// the scope.
-fn analysis_root(targets: &[TargetKind]) -> Option<PathBuf> {
+fn analysis_root(targets: &[TargetKind], memo: &mut RootMemo) -> Option<PathBuf> {
     let mut roots = targets
         .iter()
-        .map(|target| workspace_root_of(target.package_dir()));
+        .map(|target| memo.workspace_root(target.package_dir()));
     let first = roots.next()?;
     roots.all(|root| root == first).then_some(first)
 }
@@ -2287,7 +2449,12 @@ fn analysis_root(targets: &[TargetKind]) -> Option<PathBuf> {
 /// serving the targets it covers; every run filters its emitted set to the
 /// covered files (the oracle pushes diagnostics only inside the targets'
 /// context roots) and the merged union renders through the shared writers.
-fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Write) -> u8 {
+fn analyze_targets(
+    args: &AnalyzeArgs,
+    targets: &[TargetKind],
+    out: &mut impl Write,
+    roots: &mut RootMemo,
+) -> u8 {
     let started = Instant::now();
 
     // Group targets by resolved workspace root.
@@ -2297,7 +2464,7 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
             TargetKind::Dir(dir) => Target::Dir(dir.clone()),
             TargetKind::File(file) => Target::File(file.clone()),
         };
-        let root = workspace_root_of(target.package_dir());
+        let root = roots.workspace_root(target.package_dir());
         match groups.iter_mut().find(|(key, _)| *key == root) {
             Some((_, members)) => members.push(mapped),
             None => groups.push((root, vec![mapped])),
@@ -2327,11 +2494,13 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
     let gate_root = groups
         .first()
         .map_or_else(PathBuf::new, |(root, _)| root.clone());
+    let yaml = dartq_commands::config::discover(&gate_root).ok().flatten();
     let _slot = match job_slot(
         Job::Engine,
         &format!("engine:{}", gate_root.display()),
         &gate_root,
-        memory_max_percent(&gate_root),
+        memory_max_percent(yaml.as_ref()),
+        job_cap(yaml.as_ref()),
     ) {
         Ok(slot) => slot,
         Err(reason) => {
@@ -2340,17 +2509,16 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
         }
     };
     // The cross-process facts cache (#2630): the one-shot face opens the
-    // same XDG-rooted store the daemon flushes. An unreadable store warns
-    // once and leaves every engine cold — the accelerator posture, never a
-    // dependency.
-    let facts_store =
-        match dartq_snapshot::SnapshotStore::open(dartq_snapshot::SnapshotConfig::default()) {
-            Ok(store) => Some(store),
-            Err(error) => {
-                eprintln!("warning: facts snapshot store unavailable: {error}");
-                None
-            }
-        };
+    // same XDG-rooted store the daemon flushes — after the answered-turn
+    // probe seam below (#4260), so a probe hit never pays the open. An
+    // unreadable store warns once and leaves every engine cold — the
+    // accelerator posture, never a dependency.
+    // The answered-turn probe's cache root (#4260): the same root the L3
+    // arm below opens under — the probe reads the record by path, never
+    // opening the store, so `None` (nowhere to put a cache) simply skips
+    // the probe.
+    let cache_root = dartq_engine::store::default_root();
+    let single = groups.len() == 1;
     let mut engines = Vec::with_capacity(groups.len());
     let mut members: Vec<Vec<Target>> = Vec::new();
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -2359,6 +2527,11 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
     // The SDK snapshot loads, summed across workspace groups — the one
     // sub-interval of the setup window attributed to `sdk_ms`.
     let mut sdk = Duration::ZERO;
+    // The answered-turn envelope (#4243): the shape this run probes and
+    // persists under, with its read-time stamps — or the first v1 gate
+    // that declined (deferred to the arming side for the trace row).
+    let mut envelope: Option<(AnswerShape, Vec<(PathBuf, AnswerStamp)>)> = None;
+    let mut gated: Option<&'static str> = None;
     for (root, group) in groups {
         // The assembled config — not the opened engine — because the plugin
         // set launches off `pub_config`/`config_dir` before `Engine::new`
@@ -2376,6 +2549,9 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
             }
         };
         sdk += phases.sdk;
+        if let Some(advisory) = stale_advisory {
+            advisories.push(advisory);
+        }
         // The launch is lazy (no sidecar starts): a plugin-free workspace
         // pays the two absence probes and nothing more.
         let plugin_set = if plugins_enabled {
@@ -2387,28 +2563,53 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
         } else {
             dartq_commands::plugins::PluginSet::default()
         };
-        let mut engine = match dartq_engine::Engine::new(config) {
+        // The answered-turn probe seam (#4260): a single-workspace run
+        // probes the record BEFORE `Engine::new` — every key input (the
+        // generation header, the grants fingerprint, the stamps) derives
+        // from the assembled config through the engine's own spellings —
+        // so a re-ask over an unchanged tree serves the previous run's
+        // rendered stdout without the engine, the store arms, or any
+        // later phase ever running. Any gate, any miss, any decode or
+        // stamp mismatch falls through to the unchanged full path below;
+        // the stamps a miss hands back are the run's read-time record,
+        // reused verbatim by the persist side, never a post-render
+        // re-walk.
+        if single {
+            match answer_envelope_shape(args, targets, 1, &plugin_set) {
+                Ok(shape) => match &cache_root {
+                    Some(root) => {
+                        match dartq_engine::probe_answer_unassembled(&config, root, &shape) {
+                            (AnswerProbe::Hit { bytes, summary }, _) => {
+                                plugin_set.shutdown();
+                                return answer_envelope_serve(
+                                    args,
+                                    shape.face,
+                                    &bytes,
+                                    &summary,
+                                    &advisories,
+                                    out,
+                                );
+                            }
+                            (AnswerProbe::Miss(_), stamps) => {
+                                envelope = Some((shape, stamps));
+                            }
+                        }
+                    }
+                    // Nowhere to put a cache: the unarmed-store posture —
+                    // the persist side stays selected (the buffer render)
+                    // but the engine's own persist is the documented no-op.
+                    None => envelope = Some((shape, Vec::new())),
+                },
+                Err(reason) => gated = Some(reason),
+            }
+        }
+        let engine = match dartq_engine::Engine::new(config) {
             Ok(engine) => engine,
             Err(error) => {
                 eprintln!("error: engine context unusable: {error}");
                 return exit::USAGE;
             }
         };
-        // Warm start (#2630): the engine's own header pins the SDK identity,
-        // the package graph, and the context salt, so a stale or foreign
-        // generation is a whole-generation miss — never a poisoned load.
-        // Staged facts serve the first apply's content-hash lookups (SDK
-        // units included: the keys are path-free); a miss is the plain cold
-        // build.
-        if let Some(store) = &facts_store {
-            let header = engine.snapshot_header();
-            if let Some(snapshot) = store.load::<dartq_engine::PersistedFacts>(&header) {
-                engine.ingest_facts_snapshot(snapshot);
-            }
-        }
-        if let Some(advisory) = stale_advisory {
-            advisories.push(advisory);
-        }
         engines.push(engine);
         members.push(group);
         plugin_sets.push(plugin_set);
@@ -2439,6 +2640,44 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
             _ => None,
         });
         arm_content_store(engine, args.cache_size_limit);
+    }
+
+    // The v1 gates' trace rows: the single-workspace gate verdict the
+    // pre-assembly seam recorded, and the multi-engine
+    // decline (one record per ask; the merged multi-engine face has no
+    // single engine to pin it to) — written on the first engine once its
+    // trace sink is armed, the same rows and position the post-arming
+    // probe block wrote before the seam moved the probe earlier.
+    if let Some(reason) = gated {
+        engines[0].answer_gated(reason);
+    } else if engines.len() > 1 {
+        if let Err(reason) = answer_envelope_shape(args, targets, engines.len(), &plugin_sets[0]) {
+            engines[0].answer_gated(reason);
+        }
+    }
+
+    // Warm start (#2630): the engine's own header pins the SDK identity,
+    // the package graph, and the context salt, so a stale or foreign
+    // generation is a whole-generation miss — never a poisoned load.
+    // Staged facts serve the first apply's content-hash lookups (SDK
+    // units included: the keys are path-free); a miss is the plain cold
+    // build. The store opens here — past the probe seam (#4260), so a
+    // served hit never pays it.
+    let facts_store = match dartq_snapshot::SnapshotStore::open(dartq_snapshot::SnapshotConfig::default())
+    {
+        Ok(store) => Some(store),
+        Err(error) => {
+            eprintln!("warning: facts snapshot store unavailable: {error}");
+            None
+        }
+    };
+    for engine in &mut engines {
+        if let Some(store) = &facts_store {
+            let header = engine.snapshot_header();
+            if let Some(snapshot) = store.load::<dartq_engine::PersistedFacts>(&header) {
+                engine.ingest_facts_snapshot(snapshot);
+            }
+        }
     }
 
     // Relative overlay specs resolve against the single workspace root —
@@ -2493,16 +2732,91 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
         runs.push(run);
     }
     let merged = dartq_commands::analyze::merge_runs(runs);
-    let code = analyze_finish(
-        args,
-        &merged,
-        started,
-        out,
-        &advisories,
-        sdk_ms,
-        assembly_ms,
-        &merged.memory,
-    );
+    // The answered-turn persist posture (#4243): a probe-missed gated run
+    // renders the stdout face into a buffer first, so the record pins the
+    // exact bytes the face wrote (byte-identical to the direct render by
+    // construction — the same writers, the same input), then writes the
+    // buffer through. Ungated runs keep the direct render unchanged.
+    let persisting = envelope.is_some();
+    let mut face_bytes = Vec::new();
+    let code = if persisting {
+        analyze_finish(
+            args,
+            &merged,
+            started,
+            &mut face_bytes,
+            &advisories,
+            sdk_ms,
+            assembly_ms,
+            &merged.memory,
+        )
+    } else {
+        analyze_finish(
+            args,
+            &merged,
+            started,
+            out,
+            &advisories,
+            sdk_ms,
+            assembly_ms,
+            &merged.memory,
+        )
+    };
+    if persisting {
+        if let Err(error) = out.write_all(&face_bytes).and_then(|()| out.flush()) {
+            eprintln!("dartq: internal error: writing diagnostics failed: {error}");
+            for set in plugin_sets {
+                set.shutdown();
+            }
+            return exit::INTERNAL_ERROR;
+        }
+    }
+    // The record's payload, assembled while `merged` still lives: the
+    // summary counts, and the blob bytes — the captured stdout face, except
+    // the json+memory face whose `memory` key is per-process: it records
+    // the pre-splice envelope (the deterministic writer over the same
+    // output) and re-splices on serve.
+    let record = envelope.map(|(shape, stamps)| {
+        let mut has_error = false;
+        let mut has_warning = false;
+        let mut has_info = false;
+        for diagnostic in &merged.diagnostics {
+            match diagnostic.severity {
+                Severity::Error => has_error = true,
+                Severity::Warning => has_warning = true,
+                Severity::Info => has_info = true,
+            }
+        }
+        let summary = AnswerSummary {
+            files: merged.file_count as u64,
+            loc: merged.loc,
+            diagnostics: merged.diagnostics.len() as u64,
+            libraries_analyzed: merged.libraries_analyzed as u64,
+            libraries_from_cache: merged.libraries_from_cache as u64,
+            has_error,
+            has_warning,
+            has_info,
+        };
+        let blob = if shape.face == AnswerFace::AnalyzeJsonMemory {
+            let mut envelope_bytes = Vec::new();
+            let output = AnalysisOutput {
+                diagnostics: &merged.diagnostics,
+                files: &merged,
+            };
+            match write_json(&mut envelope_bytes, &output) {
+                Ok(()) => envelope_bytes,
+                // A render failure never blocks the run — the record is a
+                // pure accelerator; skip the persist, warn once.
+                Err(error) => {
+                    eprintln!("warning: answered-turn record skipped: {error}");
+                    Vec::new()
+                }
+            }
+        } else {
+            face_bytes
+        };
+        (shape, stamps, blob, summary)
+    });
     // Release the runs' engine borrows before the flush below — `merged`
     // holds each `AnalyzeRun`'s `&mut Engine` until dropped, and the save
     // walks `&engines` immutably.
@@ -2516,6 +2830,15 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
             if let Err(error) = engine.save_facts_snapshot(store) {
                 eprintln!("warning: facts snapshot save skipped: {error}");
             }
+        }
+    }
+    // The answered-turn record beside the facts flush (#4243): the blob in
+    // the content store (dedup — an unchanged answer writes zero bytes),
+    // the sidecar under the read-time stamps captured before the run. A
+    // failed persist is a future miss, never an error.
+    if let Some((shape, stamps, blob, summary)) = record {
+        if !blob.is_empty() {
+            engines[0].persist_answer(&shape, stamps, &blob, summary);
         }
     }
     // The graceful teardown: each live plugin handshake-completes before the
@@ -2646,6 +2969,114 @@ fn arm_content_store(engine: &mut dartq_engine::Engine, size_limit: Option<u64>)
     if let Err(error) = engine.open_content_store(&config) {
         eprintln!("warning: content store disabled: {error}");
     }
+}
+
+/// The answered-turn ask this run probes and persists under (#4243): the
+/// face tag plus the canonicalized aim set — or the first v1 conservative
+/// gate that declines. The gates exist because each
+/// flag changes the answer without moving any key or stamp input: overlays
+/// edit sources off-disk, `--packages` and `--enable-experiment` re-shape
+/// resolution, the memory budget and trace sink are run postures the
+/// rendered face doesn't fold, and the metrics/memory-report flags ask for
+/// per-run side channels a served hit cannot honestly produce. The
+/// workspace-plugin gate is the set itself, not the `--no-plugins` flag:
+/// a plugin-free workspace renders identically under either flag, while a
+/// plugin-ful one would serve a plugin-free answer to a plugins-enabled
+/// re-ask under the same key. Multi-root runs decline on shape — one
+/// record per ask, and the merged multi-engine face has no single engine
+/// to pin it to.
+fn answer_envelope_shape(
+    args: &AnalyzeArgs,
+    targets: &[TargetKind],
+    engines: usize,
+    plugin_set: &dartq_commands::plugins::PluginSet,
+) -> Result<AnswerShape, &'static str> {
+    if engines != 1 {
+        return Err("gated-multi-engine");
+    }
+    if !plugin_set.is_empty() {
+        return Err("gated-plugins");
+    }
+    if !args.overlays.is_empty() {
+        return Err("gated-overlays");
+    }
+    if args.packages.is_some() {
+        return Err("gated-packages");
+    }
+    if !args.enable_experiments.is_empty() {
+        return Err("gated-experiments");
+    }
+    if args.memory_limit.is_some() {
+        return Err("gated-memory-limit");
+    }
+    if args.trace_events.is_some() {
+        return Err("gated-trace-events");
+    }
+    if args.metrics_json.is_some() {
+        return Err("gated-metrics-json");
+    }
+    if args.memory_report {
+        return Err("gated-memory-report");
+    }
+    let face = match (args.format, args.memory) {
+        (AnalyzeFormat::Lon, _) => AnswerFace::AnalyzeLon,
+        (AnalyzeFormat::Text, _) => AnswerFace::AnalyzeText,
+        (AnalyzeFormat::Json, true) => AnswerFace::AnalyzeJsonMemory,
+        (AnalyzeFormat::Json, false) => AnswerFace::AnalyzeJson,
+    };
+    let aims = targets
+        .iter()
+        .map(|target| match target {
+            TargetKind::Dir(dir) => AnswerAim::Dir(dir.clone()),
+            TargetKind::File(file) => AnswerAim::File(file.clone()),
+        })
+        .collect();
+    Ok(AnswerShape::new(face, aims))
+}
+
+/// Serves one answered-turn hit (#4243): the recorded stdout face verbatim
+/// — the json+memory face re-applies [`splice_memory_key`] over the
+/// recorded pre-splice envelope, so the `memory` key reports this
+/// process's own peak RSS (the resident-routed face's splice posture) —
+/// then the data faces' stderr advisories and the severity exit tier from
+/// the recorded flags. Stdout is byte-identical to a full-path render over
+/// the same tree by construction: the bytes are the previous render's own,
+/// and every input the render folds (sources, options, pubspecs, package
+/// config, SDK, shape) moved a stamp or the key since.
+fn answer_envelope_serve(
+    args: &AnalyzeArgs,
+    face: AnswerFace,
+    bytes: &[u8],
+    summary: &AnswerSummary,
+    advisories: &[WorkspaceAdvisory],
+    out: &mut impl Write,
+) -> u8 {
+    // The text face's advisory lines ride stdout (already inside the
+    // served bytes); the data faces keep them on stderr — the same stream
+    // split `analyze_finish` applies.
+    if face != AnswerFace::AnalyzeText {
+        for advisory in advisories {
+            eprintln!("Info • {} • {}", advisory.code().name, advisory.message());
+        }
+    }
+    let written = if face == AnswerFace::AnalyzeJsonMemory {
+        let mut line = String::from_utf8(bytes.to_vec()).expect("the writer emits UTF-8");
+        splice_memory_key(&mut line);
+        out.write_all(line.as_bytes())
+    } else {
+        out.write_all(bytes)
+    };
+    if let Err(error) = written.and_then(|()| out.flush()) {
+        eprintln!("dartq: internal error: writing diagnostics failed: {error}");
+        return exit::INTERNAL_ERROR;
+    }
+    severity_tier(
+        summary.has_error,
+        summary.has_warning,
+        summary.has_info,
+        !args.no_fatal_warnings,
+        args.fatal_infos,
+    )
 }
 
 /// The shared analyze postlude: the assemblies' workspace advisories (the
@@ -2925,11 +3356,13 @@ fn daemon(args: &DaemonArgs) -> u8 {
     // path fails before the session serves.
     // The stdio daemon is a heavy job for its whole life: one slot of the
     // machine-wide gate, sized by its worktree's recorded peak.
+    let yaml = dartq_commands::config::discover(&args.dir).ok().flatten();
     let _slot = match job_slot(
         Job::Engine,
         &format!("engine:{}", args.dir.display()),
         &args.dir,
-        memory_max_percent(&args.dir),
+        memory_max_percent(yaml.as_ref()),
+        job_cap(yaml.as_ref()),
     ) {
         Ok(slot) => slot,
         Err(reason) => {
@@ -4248,11 +4681,10 @@ mod tests {
             &["analyze", "--format=yaml", "/p"][..],
             &["analyze", "--format", "human", "/p"][..],
             &["analyze", "--format=human", "/p"][..],
-            // The scope axis is package|workspace; `file` is the
-            // invalid-value role (a file aim's package context is the
-            // narrowest supported scope).
-            &["analyze", "--scope", "file", "/p"][..],
-            &["analyze", "--scope=file", "/p"][..],
+            // The scope axis is package|workspace|file; `aim` is the
+            // invalid-value role.
+            &["analyze", "--scope", "aim", "/p"][..],
+            &["analyze", "--scope=aim", "/p"][..],
             &["analyze", "--metrics-json"][..],
             &["check", "--metrics-json"][..],
             &["query"][..],
@@ -5362,7 +5794,9 @@ mod tests {
         fs::write(package.join("pubspec.yaml"), "name: pkg\n").expect("write");
         fs::write(package.join("lib/a.dart"), "").expect("write");
 
-        let resolved = |paths: &[PathBuf]| analysis_root(&resolve_targets(paths).expect("targets"));
+        let resolved = |paths: &[PathBuf]| {
+            analysis_root(&resolve_targets(paths).expect("targets"), &mut RootMemo::default())
+        };
         assert_eq!(
             resolved(&[package.join("lib/a.dart"), package.join("test")]),
             Some(package.clone())
@@ -5399,14 +5833,20 @@ mod tests {
         for (package, name) in [(&a, "a"), (&b, "b")] {
             fs::write(
                 package.join("pubspec.yaml"),
-                format!("name: {name}\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n"),
+                format!(
+                    "name: {name}\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n"
+                ),
             )
             .expect("member pubspec");
         }
         fs::write(standalone.join("pubspec.yaml"), "name: standalone\n").expect("pubspec");
 
         let resolved = |paths: &[PathBuf], scope| {
-            scope_roots(&resolve_targets(paths).expect("targets"), scope)
+            scope_roots(
+                &resolve_targets(paths).expect("targets"),
+                scope,
+                &mut RootMemo::default(),
+            )
         };
         // A member's file and a member directory both resolve to the member.
         for aim in [a.join("lib/x.dart"), a.clone()] {
@@ -5437,6 +5877,32 @@ mod tests {
         );
         // No pubspec on the walk: the aim directory itself, never the cwd.
         assert_eq!(resolved(&[bare.clone()], AnalyzeScope::Package), vec![bare]);
+        // The file tier: the aims themselves are the roots — a file aim is
+        // its own root (never its package), a directory aim is the
+        // directory, and duplicate spellings of one aim dedupe while two
+        // files keep two roots (a file set keys its own resident).
+        let x = a.join("lib/x.dart");
+        assert_eq!(resolved(&[x.clone()], AnalyzeScope::File), vec![x.clone()]);
+        assert_eq!(
+            resolved(&[x.clone(), a.clone()], AnalyzeScope::File),
+            vec![a.clone(), x.clone()],
+            "a file aim beside its own directory keeps both roots"
+        );
+        assert_eq!(
+            resolved(&[b.clone()], AnalyzeScope::File),
+            vec![b.clone()],
+            "a directory aim is its own file-tier root"
+        );
+        let y = b.join("lib/x.dart");
+        assert_eq!(
+            resolved(&[y.clone(), x.clone()], AnalyzeScope::File),
+            vec![x, y],
+            "two files aim at two roots, sorted"
+        );
+        assert_eq!(
+            resolved(&[root.clone()], AnalyzeScope::File),
+            vec![root.clone()]
+        );
         // Two packages aimed at once: one request over both package roots,
         // deduped; the workspace posture folds them onto the shared root.
         assert_eq!(
@@ -5455,6 +5921,180 @@ mod tests {
             resolved(&[b, root.clone()], AnalyzeScope::Workspace),
             vec![root]
         );
+    }
+
+    /// The default scope resolves per shape (see [`resolve_scope`]): aims
+    /// — files or directories — whose package context is their workspace
+    /// root — the single-pubspec repo, a workspace root's own package, a
+    /// no-pubspec bare aim — take the file tier, where the package tier
+    /// would root at the whole repo and gain nothing (a directory aim
+    /// then analyzes its own tree, the universe `dart analyze <dir>`
+    /// opens). A pub workspace member's aim (its package tier is
+    /// genuinely narrower) keeps the package tier, alone or mixed with
+    /// whole-repo aims. An explicit `--scope` passes verbatim and never
+    /// re-resolves.
+    #[test]
+    fn resolve_scope_takes_the_file_tier_for_whole_repo_aims() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let outer = tempfile::tempdir().expect("tempdir");
+        let bare = outer.path().canonicalize().expect("canonical").join("bare");
+        let a = root.join("packages/a");
+        let standalone = root.join("standalone");
+        for package in [&a, &standalone] {
+            fs::create_dir_all(package.join("lib")).expect("mkdir");
+            fs::write(package.join("lib/x.dart"), "").expect("write");
+        }
+        fs::create_dir_all(root.join("tool")).expect("mkdir");
+        fs::write(root.join("tool/main.dart"), "").expect("write");
+        fs::create_dir_all(bare.join("lib")).expect("mkdir");
+        fs::write(bare.join("lib/x.dart"), "").expect("write");
+        fs::write(
+            root.join("pubspec.yaml"),
+            "name: root\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - packages/a\n",
+        )
+        .expect("workspace root");
+        fs::write(
+            a.join("pubspec.yaml"),
+            "name: a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        )
+        .expect("member pubspec");
+        fs::write(standalone.join("pubspec.yaml"), "name: standalone\n").expect("pubspec");
+
+        let resolved = |paths: &[PathBuf]| resolve_targets(paths).expect("targets");
+        // The single-pubspec shape: the file tier.
+        assert_eq!(
+            resolve_scope(None, &resolved(&[standalone.join("lib/x.dart")]), &mut RootMemo::default()),
+            AnalyzeScope::File,
+            "a single-pubspec file aim: package == workspace == the repo"
+        );
+        // The workspace root's own package is that shape too: its package
+        // tier roots at the whole workspace.
+        assert_eq!(
+            resolve_scope(None, &resolved(&[root.join("tool/main.dart")]), &mut RootMemo::default()),
+            AnalyzeScope::File,
+            "a workspace root's own file aim: the package tier is the whole repo"
+        );
+        // A no-pubspec bare file: the package tier floors at the parent
+        // directory while the file tier is the oracle's own posture.
+        assert_eq!(
+            resolve_scope(None, &resolved(&[bare.join("lib/x.dart")]), &mut RootMemo::default()),
+            AnalyzeScope::File
+        );
+        // A member's file keeps the package tier — it is genuinely
+        // narrower than the workspace.
+        assert_eq!(
+            resolve_scope(None, &resolved(&[a.join("lib/x.dart")]), &mut RootMemo::default()),
+            AnalyzeScope::Package,
+            "a member file aim keeps its narrower package tier"
+        );
+        // A single-pubspec directory aim takes the aims tier too — the
+        // package tier would pay the whole repo for one module tree (the
+        // aim directory is what `dart analyze <dir>` passes verbatim).
+        assert_eq!(
+            resolve_scope(None, &resolved(&[standalone.clone()]), &mut RootMemo::default()),
+            AnalyzeScope::File,
+            "a single-pubspec directory aim analyzes its own tree"
+        );
+        // A nested module dir inside it: the same shape one level down.
+        assert_eq!(
+            resolve_scope(None, &resolved(&[standalone.join("lib")]), &mut RootMemo::default()),
+            AnalyzeScope::File,
+            "a nested module dir takes the aims tier"
+        );
+        // A mixed file + dir aim set over the same whole-repo shape: the
+        // oracle passes both verbatim, so the closure covers both.
+        assert_eq!(
+            resolve_scope(
+                None,
+                &resolved(&[standalone.join("lib/x.dart"), standalone.clone()]),
+                &mut RootMemo::default(),
+            ),
+            AnalyzeScope::File,
+            "a mixed file + dir aim set over one whole-repo shape fires together"
+        );
+        // A member directory keeps the package tier just the same — the
+        // member package is genuinely narrower than the workspace.
+        assert_eq!(
+            resolve_scope(None, &resolved(&[a.clone()]), &mut RootMemo::default()),
+            AnalyzeScope::Package,
+            "a member directory aim keeps its narrower package tier"
+        );
+        // A no-pubspec bare directory aim: both tiers floor at the aim
+        // itself — firing is the oracle's own posture and changes nothing.
+        assert_eq!(
+            resolve_scope(None, &resolved(&[bare.join("lib")]), &mut RootMemo::default()),
+            AnalyzeScope::File
+        );
+        // The workspace root aimed as a directory: firing is harmless —
+        // both tiers root at the identical tree (held end-to-end by the
+        // root-aim byte gates).
+        assert_eq!(
+            resolve_scope(None, &resolved(&[root.clone()]), &mut RootMemo::default()),
+            AnalyzeScope::File,
+            "the workspace root aim fires on the identical-tree shape"
+        );
+        assert_eq!(
+            resolve_scope(
+                None,
+                &resolved(&[standalone.join("lib/x.dart"), a.join("lib/x.dart")]),
+                &mut RootMemo::default(),
+            ),
+            AnalyzeScope::Package,
+            "one member aim beside a whole-repo file aim keeps the package tier"
+        );
+        // An explicit scope passes verbatim on the firing shape.
+        for scope in [AnalyzeScope::Package, AnalyzeScope::Workspace, AnalyzeScope::File] {
+            assert_eq!(
+                resolve_scope(
+                Some(scope),
+                &resolved(&[standalone.join("lib/x.dart")]),
+                &mut RootMemo::default(),
+            ),
+                scope,
+                "an explicit --scope never re-resolves"
+            );
+        }
+    }
+
+    /// The warm-standby passthrough (see [`warm_posture`]): the resolved
+    /// `analyzer.pool` knobs of the governing `dartq.yaml` become the
+    /// spec's `warm` / `warm_ttl_secs` — `warm_servers: true` declares
+    /// warm on, `false` carries the spec's not-declared `0` (the off arm
+    /// is the `DARTQ_WARM_SERVERS` env), and a config-less or malformed
+    /// file carries the same not-declared default (the daemon's own
+    /// default, off since 0.1.23).
+    #[test]
+    fn warm_posture_carries_the_yaml_knobs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let at = |yaml: &str| {
+            fs::write(dir.path().join("dartq.yaml"), yaml).expect("write");
+            let config = dartq_commands::config::discover(dir.path())
+                .ok()
+                .flatten();
+            warm_posture(config.as_ref())
+        };
+        assert_eq!(
+            at("version: 1\nanalyzer:\n  pool:\n    enabled: true\n    warm_servers: true\n    warm_ttl_secs: 120\n"),
+            (1, 120),
+            "warm on with the declared TTL"
+        );
+        assert_eq!(
+            at("version: 1\nanalyzer:\n  pool:\n    enabled: true\n    warm_servers: false\n    warm_ttl_secs: 900\n"),
+            (0, 900),
+            "the off arm carries not-declared — the env is the off switch"
+        );
+        assert_eq!(
+            at("version: 1\nanalyzer:\n  pool:\n    enabled: true\n"),
+            (0, 900),
+            "the pool section's own defaults: not-declared warm, 900 s"
+        );
+        assert_eq!(
+            at("not: [a, config\n"),
+            (0, 900),
+            "a malformed dartq.yaml fails open to the default posture"
+        );
+        fs::remove_file(dir.path().join("dartq.yaml")).expect("remove");
     }
 
     // -----------------------------------------------------------------------
@@ -5480,9 +6120,8 @@ mod tests {
         assert_eq!(args.engine, None, "the official backend is the default");
         assert!(args.metrics_json.is_none() && args.sdk_path.is_none());
         assert_eq!(
-            args.scope,
-            AnalyzeScope::Package,
-            "a file/dir aim analyzes its package context by default"
+            args.scope, None,
+            "the scope is unset by default — the shape resolves it at run time"
         );
         assert!(args.overlays.is_empty(), "no overlay by default");
         assert!(!args.no_fatal_warnings && !args.fatal_infos);
@@ -5574,15 +6213,38 @@ mod tests {
             &["analyze", "--scope", "workspace", "/pkg"][..],
             &["analyze", "--scope=workspace", "/pkg"][..],
         ] {
-            let parsed = parse_args_of(spelling).expect("parse").expect("subcommand");
+            let parsed = parse_args_of(spelling)
+                .expect("parse")
+                .expect("subcommand");
             let Command::Analyze(args) = parsed else {
                 panic!("expected analyze command")
             };
-            assert_eq!(args.scope, AnalyzeScope::Workspace, "{spelling:?}");
+            assert_eq!(args.scope, Some(AnalyzeScope::Workspace), "{spelling:?}");
+            assert!(
+                args.resident_request().is_some_and(|ask| ask.scope
+                    == Some(AnalyzeScope::Workspace)),
+                "--scope plumbs into the resident request"
+            );
+        }
+
+        // The file tier: both spellings parse and plumb the same way, and
+        // the `dir` alias lands on the same aims-verbatim variant.
+        for spelling in [
+            &["analyze", "--scope", "file", "/pkg/lib/a.dart"][..],
+            &["analyze", "--scope=file", "/pkg/lib/a.dart"][..],
+            &["analyze", "--scope", "dir", "/pkg/lib"][..],
+        ] {
+            let parsed = parse_args_of(spelling)
+                .expect("parse")
+                .expect("subcommand");
+            let Command::Analyze(args) = parsed else {
+                panic!("expected analyze command")
+            };
+            assert_eq!(args.scope, Some(AnalyzeScope::File), "{spelling:?}");
             assert!(
                 args.resident_request()
-                    .is_some_and(|ask| ask.scope == AnalyzeScope::Workspace),
-                "--scope plumbs into the resident request"
+                    .is_some_and(|ask| ask.scope == Some(AnalyzeScope::File)),
+                "--scope file plumbs into the resident request"
             );
         }
 
@@ -5781,7 +6443,7 @@ mod tests {
                 .filter(|(face, held, _)| *face == Face::Analyze && *held == label)
                 .count()
         };
-        let slot = job_slot(Job::Analyze, &key, dir.path(), 90).expect("admitted");
+        let slot = job_slot(Job::Analyze, &key, dir.path(), 90, 0).expect("admitted");
         assert_eq!(held(), usize::from(slot.is_some()));
         drop(slot);
         assert_eq!(held(), 0);
@@ -6091,21 +6753,25 @@ mod tests {
     #[test]
     fn memory_max_percent_reads_the_config() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let percent = |dir: &Path| {
+            let config = dartq_commands::config::discover(dir).ok().flatten();
+            memory_max_percent(config.as_ref())
+        };
         fs::write(dir.path().join("dartq.yaml"), "version: 1\n").expect("dartq.yaml");
-        assert_eq!(memory_max_percent(dir.path()), 90);
+        assert_eq!(percent(dir.path()), 90);
         fs::write(
             dir.path().join("dartq.yaml"),
             "version: 1\nmemory:\n  max_percent: 60\n",
         )
         .expect("dartq.yaml");
-        assert_eq!(memory_max_percent(dir.path()), 60);
+        assert_eq!(percent(dir.path()), 60);
         fs::write(
             dir.path().join("dartq.yaml"),
             "version: 1\nmemory:\n  max_percent: 0\n",
         )
         .expect("dartq.yaml");
         assert_eq!(
-            memory_max_percent(dir.path()),
+            percent(dir.path()),
             90,
             "a config error falls back"
         );
@@ -6117,7 +6783,11 @@ mod tests {
     #[test]
     fn official_settings_read_the_config() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let settings = official_settings(dir.path());
+        let at = |dir: &Path| {
+            let config = dartq_commands::config::discover(dir);
+            official_settings(&config)
+        };
+        let settings = at(dir.path());
         assert_eq!(
             (
                 settings.memory_budget_bytes,
@@ -6131,7 +6801,7 @@ mod tests {
             "version: 1\nanalyzer:\n  official:\n    memory_budget_gb: 20\n    resident: false\n",
         )
         .expect("dartq.yaml");
-        let settings = official_settings(dir.path());
+        let settings = at(dir.path());
         assert_eq!(
             (settings.memory_budget_bytes, settings.resident),
             (20 << 30, false)
@@ -6230,7 +6900,7 @@ mod tests {
         AnalyzeArgs {
             engine: Some(EngineArg::Dartq),
             no_resident: false,
-            scope: AnalyzeScope::Package,
+            scope: None,
             stats: false,
             resident_serve: None,
             targets: vec![root.to_path_buf()],
@@ -6322,6 +6992,246 @@ mod tests {
         assert_eq!(metrics["libraries_from_cache"], 0);
         assert!(metrics["max_rss_bytes"].is_u64(), "getrusage hook wired");
         assert!(metrics["total_ms"].is_u64());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The v1 gate ladder: each posture flag
+    /// declines with its own trace reason, the clean default ask maps the
+    /// face tag, and the aim set canonicalizes (order and duplicates fold
+    /// — two spellings of one coverage are one key).
+    #[test]
+    fn answer_envelope_shape_gates_and_maps_faces() {
+        let root = PathBuf::from("/w");
+        let targets = |paths: &[(&str, bool)]| {
+            paths
+                .iter()
+                .map(|&(path, file)| {
+                    if file {
+                        TargetKind::File(PathBuf::from(path))
+                    } else {
+                        TargetKind::Dir(PathBuf::from(path))
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let no_aims: Vec<TargetKind> = Vec::new();
+
+        // The clean ask: lon face, aims sorted (Dir before File by leg) and
+        // deduped.
+        let shape = answer_envelope_shape(
+            &analyze_args(&root, AnalyzeFormat::Lon, None),
+            &targets(&[("/w/lib", false), ("/w/a.dart", true), ("/w/lib", false)]),
+            1,
+            &Default::default(),
+        )
+        .expect("the default posture asks");
+        assert_eq!(shape.face, AnswerFace::AnalyzeLon);
+        assert_eq!(
+            shape.aims,
+            vec![
+                AnswerAim::Dir(PathBuf::from("/w/lib")),
+                AnswerAim::File(PathBuf::from("/w/a.dart")),
+            ],
+            "sorted, deduped"
+        );
+
+        // Each posture flag declines with its own reason.
+        let declines = |args: &AnalyzeArgs, reason: &str| {
+            assert_eq!(
+                answer_envelope_shape(args, &no_aims, 1, &Default::default())
+                    .expect_err("gated"),
+                reason
+            );
+        };
+        let mut args = analyze_args(&root, AnalyzeFormat::Lon, None);
+        args.packages = Some(PathBuf::from("/w/.dart_tool/package_config.json"));
+        declines(&args, "gated-packages");
+        let mut args = analyze_args(&root, AnalyzeFormat::Lon, None);
+        args.enable_experiments = vec!["records".to_owned()];
+        declines(&args, "gated-experiments");
+        let mut args = analyze_args(&root, AnalyzeFormat::Lon, None);
+        args.overlays = vec!["lib/a.dart=-".to_owned()];
+        declines(&args, "gated-overlays");
+        let mut args = analyze_args(&root, AnalyzeFormat::Lon, None);
+        args.memory_limit = Some(512);
+        declines(&args, "gated-memory-limit");
+        let mut args = analyze_args(&root, AnalyzeFormat::Lon, None);
+        args.trace_events = Some(PathBuf::from("/w/trace.jsonl"));
+        declines(&args, "gated-trace-events");
+        let mut args = analyze_args(&root, AnalyzeFormat::Lon, None);
+        args.metrics_json = Some(PathBuf::from("/w/metrics.json"));
+        declines(&args, "gated-metrics-json");
+        let mut args = analyze_args(&root, AnalyzeFormat::Lon, None);
+        args.memory_report = true;
+        declines(&args, "gated-memory-report");
+        assert_eq!(
+            answer_envelope_shape(
+                &analyze_args(&root, AnalyzeFormat::Lon, None),
+                &no_aims,
+                2,
+                &Default::default()
+            )
+            .expect_err("multi-root"),
+            "gated-multi-engine"
+        );
+
+        // The face mapping.
+        let face_of = |format, memory| {
+            let mut args = analyze_args(&root, AnalyzeFormat::Lon, None);
+            args.format = format;
+            args.memory = memory;
+            answer_envelope_shape(&args, &no_aims, 1, &Default::default())
+                .expect("asks")
+                .face
+        };
+        assert_eq!(face_of(AnalyzeFormat::Text, false), AnswerFace::AnalyzeText);
+        assert_eq!(face_of(AnalyzeFormat::Json, false), AnswerFace::AnalyzeJson);
+        assert_eq!(
+            face_of(AnalyzeFormat::Json, true),
+            AnswerFace::AnalyzeJsonMemory
+        );
+    }
+
+    /// The serve face (#4243): the recorded stdout bytes write verbatim
+    /// with the recorded severity flags' exit tier, and the json+memory
+    /// face re-splices the `memory` member over the recorded pre-splice
+    /// envelope — this process's own peak RSS, the resident-routed face's
+    /// splice posture.
+    #[test]
+    fn answer_envelope_serve_writes_bytes_and_tier() {
+        let root = PathBuf::from("/w");
+        let tier_of = |has_error: bool,
+                       has_warning: bool,
+                       has_info: bool,
+                       fatal_warnings: bool,
+                       fatal_infos: bool| {
+            let mut args = analyze_args(&root, AnalyzeFormat::Lon, None);
+            args.no_fatal_warnings = !fatal_warnings;
+            args.fatal_infos = fatal_infos;
+            let summary = AnswerSummary {
+                has_error,
+                has_warning,
+                has_info,
+                ..AnswerSummary::default()
+            };
+            let mut out: Vec<u8> = Vec::new();
+            let code = answer_envelope_serve(
+                &args,
+                AnswerFace::AnalyzeLon,
+                b"lon-bytes",
+                &summary,
+                &[],
+                &mut out,
+            );
+            assert_eq!(out, b"lon-bytes", "verbatim serve");
+            code
+        };
+        assert_eq!(tier_of(true, true, true, true, true), exit::ERRORS);
+        assert_eq!(
+            tier_of(false, true, false, true, false),
+            exit::FATAL_WARNINGS
+        );
+        assert_eq!(tier_of(false, false, true, true, true), exit::FATAL_INFOS);
+        assert_eq!(tier_of(false, false, false, true, true), exit::CLEAN);
+
+        // The json+memory splice: the envelope ends `}\n`; a host with an
+        // RSS reading gains the member before the closing brace, a host
+        // without keeps the envelope (the oracle's null-usage gate).
+        let mut args = analyze_args(&root, AnalyzeFormat::Json, None);
+        args.memory = true;
+        let envelope = "{\"v\":1,\"diagnostics\":[]}\n";
+        let mut out: Vec<u8> = Vec::new();
+        answer_envelope_serve(
+            &args,
+            AnswerFace::AnalyzeJsonMemory,
+            envelope.as_bytes(),
+            &AnswerSummary::default(),
+            &[],
+            &mut out,
+        );
+        let served = String::from_utf8(out).expect("utf-8");
+        if max_rss_bytes().is_some() {
+            assert!(
+                served.starts_with("{\"v\":1,\"diagnostics\":[]")
+                    && served.contains("\"memory\":")
+                    && served.ends_with("}\n"),
+                "the member splices inside the envelope: {served}"
+            );
+        } else {
+            assert_eq!(served, envelope);
+        }
+    }
+
+    /// End to end over a real temp workspace (#4243): the cold run renders
+    /// and persists the answered-turn record (the sidecar appears under
+    /// the default cache root's answers dir), the warm re-ask over an
+    /// unchanged tree serves byte-identical stdout at the same exit tier —
+    /// proven a serve, not a deterministic re-render, by a permission flip
+    /// that moves no stamp field yet makes the file's rows unrenderable —
+    /// and source edits move stamps: the next ask re-renders, and with the
+    /// errors gone the tier clears.
+    #[test]
+    fn analyze_warm_reask_serves_the_persisted_answer() {
+        let root = analyze_fixture(
+            "envelope",
+            &[
+                ("lib/broken.dart", "void f() { x }\n"),
+                // Both files contribute rows: the permission-flip leg needs
+                // the flipped file's diagnostics inside the served bytes.
+                ("lib/clean.dart", "int dup = 1;\nint dup = 2;\n"),
+            ],
+        );
+        let args = analyze_args(&root, AnalyzeFormat::Lon, None);
+        let targets = resolve_targets(&args.targets).expect("targets");
+
+        let answers_dir = dartq_engine::store::default_root()
+            .expect("cache root")
+            .join("answers");
+        let before = fs::read_dir(&answers_dir).map(|entries| entries.count()).unwrap_or(0);
+
+        let mut out1: Vec<u8> = Vec::new();
+        let code1 = analyze_targets(&args, &targets, &mut out1, &mut RootMemo::default());
+        assert_eq!(code1, exit::ERRORS, "the fixture's error tier");
+        let after =
+            fs::read_dir(&answers_dir).map(|entries| entries.count()).unwrap_or(0);
+        assert!(
+            after > before,
+            "the cold run persisted an answer record under {answers_dir:?}"
+        );
+
+        // The hit proof: a permission flip moves no stamp field (dev, ino,
+        // mtime, size all stand), so the warm re-ask must HIT — but a
+        // re-render could never reproduce run 1's bytes, whose rows quote
+        // the now-unreadable file. Byte equality here proves the serve
+        // bypassed the analysis phases, not just that renders are
+        // deterministic.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable = root.join("lib/clean.dart");
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+        }
+        let mut out2: Vec<u8> = Vec::new();
+        let code2 = analyze_targets(&args, &targets, &mut out2, &mut RootMemo::default());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.join("lib/clean.dart"), fs::Permissions::from_mode(0o644))
+                .expect("restore chmod");
+        }
+        assert_eq!(out2, out1, "the warm re-ask serves byte-identical stdout");
+        assert_eq!(code2, code1, "the same exit tier");
+
+        // A source edit moves a stamp: the next ask re-renders. Fixing
+        // both files clears the error tier.
+        fs::write(root.join("lib/broken.dart"), "void f() { }\n").expect("fix");
+        fs::write(root.join("lib/clean.dart"), "var ok = 1;\n").expect("fix");
+        let mut out3: Vec<u8> = Vec::new();
+        let code3 = analyze_targets(&args, &targets, &mut out3, &mut RootMemo::default());
+        assert_eq!(code3, exit::CLEAN, "the fixed tree's tier");
+        assert_ne!(out3, out1, "the re-render reflects the edit");
 
         fs::remove_dir_all(&root).ok();
     }

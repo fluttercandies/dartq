@@ -20,6 +20,11 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 mimalloc = { workspace = true }
+# The global allocator's runtime knobs (#4220): `mi_option_set` for the
+# immediate-purge posture. Same source the `mimalloc` crate links; the
+# `extended` feature only un-gates the raw bindings (no C build change)
+# — the safe wrapper keeps its `use ffi::*` private.
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 dartq-commands = { workspace = true }
 # The official engine's resident analysis server (client and daemon).
 dartq-analyzer-host = { workspace = true }
@@ -52,6 +57,9 @@ dartq-bcache = { workspace = true }
 # The `dartq test` face replays cached results in parallel (one entry file
 # per suite).
 rayon = { workspace = true }
+# The resident frame reader's header scan (#4260): the `\r\n\r\n`
+# terminator search over the stack buffer.
+memchr = { workspace = true }
 rustc-hash = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

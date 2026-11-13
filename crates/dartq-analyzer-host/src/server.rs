@@ -16,7 +16,14 @@
 //! asynchronously after its response, and the server's own file watcher
 //! interleaves flushes and analysis cycles of its own, so no event marks
 //! the rebuilt analysis reliably. A fresh server is `dart analyze` by
-//! construction, and its `--cache` keeps the restart near a warm start.
+//! construction.
+//!
+//! A server also exists in a standby state between borrows:
+//! [`Server::spawn_and_connect`] leaves it spawned and connected with no
+//! roots (optionally armed by one tiny roots pass that warms the
+//! server-lifetime byte store), and [`Server::adopt`] turns it into the
+//! next borrower's serving server with the same first roots assignment a
+//! fresh spawn runs.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -272,6 +279,9 @@ pub struct Server {
     next_id: u64,
     budget: Option<u64>,
     peak: u64,
+    /// The facts the child was spawned under — an adoption's validation
+    /// input (a standby serves the launch it was spawned for, no other).
+    launch: Launch,
 }
 
 impl Server {
@@ -290,6 +300,28 @@ impl Server {
         budget: Option<u64>,
         mut brake: impl FnMut() -> bool,
     ) -> Result<Self, Fault> {
+        let mut server = Self::spawn_and_connect(launch, budget)?;
+        let settled = server.set_roots_initial(roots, &mut brake);
+        if let Err(fault) = settled {
+            server.kill();
+            return Err(fault);
+        }
+        // The full analysis just ended: the heap is near its peak even when
+        // the analysis was shorter than one sample period.
+        server.peak = server.peak.max(tree_rss(server.pid()));
+        Ok(server)
+    }
+
+    /// Spawns the server child and waits for its `server.connected`: the
+    /// standby state — a live server with no subscriptions and no roots,
+    /// one `analysis.setAnalysisRoots` away from serving any borrower
+    /// ([`Server::adopt`]). The protocol check is the gate the handshake
+    /// always was: a protocol the daemon does not know never serves.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault`] when the server does not spawn or never connects.
+    pub fn spawn_and_connect(launch: &Launch, budget: Option<u64>) -> Result<Self, Fault> {
         let mut command = launch.command();
         // The server stays in its parent's process group: the daemon runs in
         // a group of its own and takes the whole group down with it.
@@ -310,56 +342,92 @@ impl Server {
         std::thread::spawn(move || {
             let _ = std::io::copy(&mut stderr, &mut std::io::sink());
         });
-        let mut server = Self {
+        let server = Self {
             child,
             stdin,
             shared,
             next_id: 0,
             budget,
             peak: 0,
+            launch: launch.clone(),
         };
-        let result = server.handshake(launch.sdk.version, roots, &mut brake);
-        if let Err(fault) = result {
-            server.kill();
-            return Err(fault);
-        }
-        // The full analysis just ended: the heap is near its peak even when
-        // the analysis was shorter than one sample period.
-        server.peak = server.peak.max(tree_rss(server.pid()));
+        server.await_connected(launch.sdk.version)?;
         Ok(server)
     }
 
-    fn handshake(
+    /// Adopts a standby as this borrower's serving server: the launch
+    /// facts and protocol the standby was spawned under are re-validated,
+    /// and the first roots assignment runs exactly as a fresh spawn's
+    /// ([`Server::start`]) — the standby is rootless by construction
+    /// (spawn + connected, never subscribed, never served), so its
+    /// answers are the fresh spawn's by construction: the borrower's
+    /// roots build is the server's first and only context. The standby
+    /// carries its own budget from [`Server::spawn_and_connect`] — the
+    /// one shared daemon config.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault`] as in [`Server::start`] (a failed adoption leaves the
+    /// child killed; the caller spawns fresh).
+    pub fn adopt(
+        mut standby: Self,
+        launch: &Launch,
+        roots: &[PathBuf],
+        mut brake: impl FnMut() -> bool,
+    ) -> Result<Self, Fault> {
+        if standby.launch.sdk != launch.sdk || standby.launch.packages != launch.packages {
+            standby.kill();
+            return Err(Fault::Server(
+                "the standby server was spawned for another SDK".into(),
+            ));
+        }
+        let sdk = launch.sdk.version;
+        standby.await_connected(sdk)?;
+        let settled = standby.set_roots_initial(roots, &mut brake);
+        if let Err(fault) = settled {
+            standby.kill();
+            return Err(fault);
+        }
+        standby.peak = standby.peak.max(tree_rss(standby.pid()));
+        Ok(standby)
+    }
+
+    /// Waits for `server.connected` and gates its protocol version.
+    fn await_connected(&self, sdk: Version) -> Result<(), Fault> {
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let mut state = self.shared.state.lock();
+        while state.connected.is_none() && state.fault.is_none() {
+            if self
+                .shared
+                .changed
+                .wait_until(&mut state, deadline)
+                .timed_out()
+            {
+                return Err(Fault::Server("the analysis server never connected".into()));
+            }
+        }
+        if let Some(fault) = &state.fault {
+            return Err(Fault::Server(fault.clone()));
+        }
+        // `server.connected` carries the protocol version, not the SDK
+        // version: a protocol the gate does not know is a per-run run.
+        let protocol = state.connected.as_deref().unwrap_or_default();
+        if Version::parse(protocol).is_none_or(|v| v.0 != 1) {
+            return Err(Fault::Server(format!(
+                "Dart {sdk}: unexpected analysis server protocol {protocol:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The first roots assignment: subscriptions on, `analysis.
+    /// setAnalysisRoots` over `roots`, the settle past it. A fresh spawn's
+    /// handshake tail, and an adoption's whole arm.
+    pub(crate) fn set_roots_initial(
         &mut self,
-        sdk: Version,
         roots: &[PathBuf],
         brake: &mut dyn FnMut() -> bool,
     ) -> Result<(), Fault> {
-        let deadline = Instant::now() + CONNECT_TIMEOUT;
-        {
-            let mut state = self.shared.state.lock();
-            while state.connected.is_none() && state.fault.is_none() {
-                if self
-                    .shared
-                    .changed
-                    .wait_until(&mut state, deadline)
-                    .timed_out()
-                {
-                    return Err(Fault::Server("the analysis server never connected".into()));
-                }
-            }
-            if let Some(fault) = &state.fault {
-                return Err(Fault::Server(fault.clone()));
-            }
-            // `server.connected` carries the protocol version, not the SDK
-            // version: a protocol the gate does not know is a per-run run.
-            let protocol = state.connected.as_deref().unwrap_or_default();
-            if Version::parse(protocol).is_none_or(|v| v.0 != 1) {
-                return Err(Fault::Server(format!(
-                    "Dart {sdk}: unexpected analysis server protocol {protocol:?}"
-                )));
-            }
-        }
         self.send(
             "server.setSubscriptions",
             json!({"subscriptions": ["STATUS"]}),
@@ -696,11 +764,9 @@ fn scoped_report(files: &FxHashMap<Arc<str>, FileErrors>, aims: &[crate::Aim]) -
             return None;
         }
     }
-    Some(Report::from_files(files.iter().filter_map(
-        |(file, errors)| {
-            crate::covered(Path::new(&**file), aims).then_some((&**file, errors.rows.as_slice()))
-        },
-    )))
+    Some(Report::from_files(files.iter().filter_map(|(file, errors)| {
+        crate::covered(Path::new(&**file), aims).then_some((&**file, errors.rows.as_slice()))
+    })))
 }
 
 impl State {
@@ -735,7 +801,9 @@ impl State {
                 continue;
             }
             let rows = &errors.rows;
-            let seg = errors.segs.get_or_insert_with(|| file_seg(file, rows));
+            let seg = errors
+                .segs
+                .get_or_insert_with(|| file_seg(file, rows));
             priority += seg.priority;
             srows.extend(seg.kept.iter().map(|frag| Srow {
                 rank: frag.rank,
@@ -809,7 +877,9 @@ impl State {
                 continue;
             }
             let rows = &errors.rows;
-            let seg = errors.segs.get_or_insert_with(|| file_seg(file, rows));
+            let seg = errors
+                .segs
+                .get_or_insert_with(|| file_seg(file, rows));
             // Each fragment indexes its own `Row` — the one
             // representation the daemon keeps.
             srows.extend(seg.kept.iter().map(|frag| Srow {
@@ -993,10 +1063,7 @@ fn apply(state: &mut State, message: Message, line: &str) {
             // tree, so a file's notification costs only its `Row`s.
             match serde_json::from_str::<ErrorsNote>(line) {
                 Ok(note) => {
-                    let ErrorsParams {
-                        file,
-                        errors: mut rows,
-                    } = note.params;
+                    let ErrorsParams { file, errors: mut rows } = note.params;
                     // The pushed list lives for the analysis's life:
                     // serde's growth slack is dead bytes per file, and
                     // every row's `location.file` names the one path the
@@ -1163,42 +1230,27 @@ mod tests {
 
         let lib = crate::Aim::Dir(PathBuf::from("/p/lib"));
         let scoped = scoped_report(&files, &[lib]).expect("served");
-        let mut names: Vec<&str> = scoped.rows.iter().map(|row| &*row.location.file).collect();
+        let mut names: Vec<&str> = scoped
+            .rows
+            .iter()
+            .map(|row| &*row.location.file)
+            .collect();
         names.sort_unstable();
         assert_eq!(names, ["/p/lib/a.dart", "/p/lib/deep/b.dart"]);
 
         let file_aim = crate::Aim::File(PathBuf::from("/p/test/t.dart"));
-        assert_eq!(
-            scoped_report(&files, &[file_aim])
-                .expect("served")
-                .rows
-                .len(),
-            1
-        );
+        assert_eq!(scoped_report(&files, &[file_aim]).expect("served").rows.len(), 1);
 
         let yaml_aim = crate::Aim::File(PathBuf::from("/p/pubspec.yaml"));
-        assert!(
-            scoped_report(&files, &[yaml_aim])
-                .expect("served")
-                .rows
-                .is_empty()
-        );
+        assert!(scoped_report(&files, &[yaml_aim]).expect("served").rows.is_empty());
 
         let missing = crate::Aim::File(PathBuf::from("/p/lib/gone.dart"));
-        assert!(
-            scoped_report(&files, &[missing]).is_none(),
-            "unanalyzed file aim falls back"
-        );
+        assert!(scoped_report(&files, &[missing]).is_none(), "unanalyzed file aim falls back");
 
         // An excluded file present in no error list is served — its dir
         // aim simply reports the covered files.
         let excluded = crate::Aim::File(PathBuf::from("/p/lib/skip.dart"));
-        assert!(
-            scoped_report(&files, &[excluded])
-                .expect("served")
-                .rows
-                .is_empty()
-        );
+        assert!(scoped_report(&files, &[excluded]).expect("served").rows.is_empty());
     }
 
     /// The rendered answer line is byte-identical to
@@ -1270,13 +1322,7 @@ mod tests {
                 ),
                 (
                     "/p/lib/deep/b.dart",
-                    vec![row(
-                        "ERROR",
-                        "COMPILE_TIME_ERROR",
-                        "/p/lib/deep/b.dart",
-                        5,
-                        "bad",
-                    )],
+                    vec![row("ERROR", "COMPILE_TIME_ERROR", "/p/lib/deep/b.dart", 5, "bad")],
                 ),
                 (
                     "/p/lib/é.dart",
@@ -1285,13 +1331,7 @@ mod tests {
                 (
                     "/p/pubspec.yaml",
                     vec![
-                        row(
-                            "ERROR",
-                            "COMPILE_TIME_ERROR",
-                            "/p/pubspec.yaml",
-                            0,
-                            "priority",
-                        ),
+                        row("ERROR", "COMPILE_TIME_ERROR", "/p/pubspec.yaml", 0, "priority"),
                         row("WARNING", "STATIC_WARNING", "/p/pubspec.yaml", 0, "kept"),
                     ],
                 ),
@@ -1299,11 +1339,7 @@ mod tests {
             ];
             for (file, rows) in files {
                 let line = errors(file, &rows);
-                apply(
-                    &mut state,
-                    serde_json::from_str(&line).expect("message"),
-                    &line,
-                );
+                apply(&mut state, serde_json::from_str(&line).expect("message"), &line);
             }
             state
         }
@@ -1383,16 +1419,7 @@ mod tests {
             // A content change lands in the re-rendered line.
             feed_lines(
                 &mut state,
-                &errors(
-                    "/p/lib/a.dart",
-                    &[row(
-                        "ERROR",
-                        "COMPILE_TIME_ERROR",
-                        "/p/lib/a.dart",
-                        99,
-                        "new",
-                    )],
-                ),
+                &errors("/p/lib/a.dart", &[row("ERROR", "COMPILE_TIME_ERROR", "/p/lib/a.dart", 99, "new")]),
             );
             let third = rendered(&mut state, &aims).expect("rendered");
             assert_ne!(first, third, "changed map, changed line");
@@ -1533,10 +1560,7 @@ mod tests {
 
         /// Parses `Answer::Face`'s header + payload back out of the wire.
         fn face_parts(wire: &[u8]) -> (crate::daemon::Answer, Vec<u8>) {
-            let newline = wire
-                .iter()
-                .position(|b| *b == b'\n')
-                .expect("header newline");
+            let newline = wire.iter().position(|b| *b == b'\n').expect("header newline");
             let header = std::str::from_utf8(&wire[..newline]).expect("header utf8");
             let answer: crate::daemon::Answer =
                 serde_json::from_str(header).expect("header parses");
@@ -1588,16 +1612,10 @@ mod tests {
                 format: crate::face::FaceFormat::Json,
                 root: None,
             };
-            let first = state
-                .render_face(&aims, &lon, stub_render)
-                .expect("rendered");
-            let again = state
-                .render_face(&aims, &lon, stub_render)
-                .expect("rendered");
+            let first = state.render_face(&aims, &lon, stub_render).expect("rendered");
+            let again = state.render_face(&aims, &lon, stub_render).expect("rendered");
             assert_eq!(first, again, "same (aims, face) hits");
-            let other = state
-                .render_face(&aims, &json, stub_render)
-                .expect("rendered");
+            let other = state.render_face(&aims, &json, stub_render).expect("rendered");
             assert_ne!(first, other, "a different face misses");
             // The report line and the faces share the one cache.
             state.render(&aims).expect("rendered");
@@ -1605,9 +1623,7 @@ mod tests {
             // An epoch bump misses every lane.
             let rows = state.files["/p/lib/a.dart"].rows.clone();
             feed_lines(&mut state, &errors("/p/lib/a.dart", &rows));
-            let re = state
-                .render_face(&aims, &lon, stub_render)
-                .expect("rendered");
+            let re = state.render_face(&aims, &lon, stub_render).expect("rendered");
             assert_eq!(re, first, "identical map re-renders identical bytes");
         }
     }

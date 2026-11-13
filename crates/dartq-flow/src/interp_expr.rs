@@ -7,7 +7,9 @@ use dartq_source::SourceRange;
 use crate::ev::{BinOp, Ev};
 use crate::facts::{FlowFact, PropReceiver};
 pub(crate) use crate::interp::Expr;
-use crate::interp::{CollIfFrame, Frame, Interp, Resolved, SUPER_RECEIVER, THIS_RECEIVER};
+use crate::interp::{
+    CollIfFrame, Frame, Interp, PatternKind, Resolved, SUPER_RECEIVER, THIS_RECEIVER,
+};
 use crate::model::State;
 use crate::ty::{Base, Classification, Ty};
 
@@ -1099,6 +1101,26 @@ impl Interp<'_> {
                         // `dead_arm_row` reads the OUTER arms only.
                         self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
                         self.dead_arm_row(op_span.range.offset, *end, true);
+                        // Upstream's `_firstDeadNode` is NOT retired by the
+                        // emit above: only a covering `flowEnd` resets it
+                        // (dead_code_verifier.dart:223-232's
+                        // `_containsFirstDeadNode` gate), and no handler
+                        // calls `flowEnd` on an if-null expression — the
+                        // open interval keeps folding every later
+                        // unreachable node into the SAME row until a
+                        // containing construct closes. `x ?? y; y ??= x;`
+                        // therefore reports the assignment's operand
+                        // `dead_null_aware_expression` alone — the generic
+                        // `dead_code` was already emitted. Park a
+                        // `suppressed` interval so the `Ev::Assign`-time
+                        // `??=` dead-poll sees `self.dead.is_some()` and
+                        // folds instead of opening a fresh row; the
+                        // covering close retires it silently
+                        // (`close_covered`'s suppressed early-return).
+                        self.dead = Some(crate::interp::DeadWindow::suppressed_at(
+                            self.stack.len(),
+                            op_span,
+                        ));
                     }
                     let right = self.pop_value();
                     let (right_if_true, right_if_false) = self.cond_split(&right);
@@ -1929,7 +1951,20 @@ impl Interp<'_> {
                                 },
                             };
                             match &mut self.dead {
-                                Some(window) if window.anchor_from(anchor.range.offset) => {
+                                // An open interval whose anchor already
+                                // sits inside this operand re-anchors to
+                                // the operand's head (the statement
+                                // wrapper's top-down poll). A `suppressed`
+                                // `??`-anchored interval is the earlier
+                                // arm's `_firstDeadNode` — its anchor
+                                // never moves (the oracle's
+                                // `x ?? y; y ??= x;` row stays on `?? y;`,
+                                // dead_code_verifier.dart:223-232), and
+                                // this operand simply folds into it.
+                                Some(window)
+                                    if !window.is_suppressed()
+                                        && window.anchor_from(anchor.range.offset) =>
+                                {
                                     window.reanchor_to(anchor);
                                 }
                                 Some(_) => {}
@@ -3996,6 +4031,81 @@ impl Interp<'_> {
                 self.pending_if_kw = Some(*if_kw);
             }
             Ev::ThenControlFlow { arm_start } => {
+                // The if-case element form (`[if (x case int a) …]`): the
+                // pattern context the condition's case clause opened
+                // decides the split — the same arm the statement form's
+                // `ThenBegin` runs (`visitIfElement` routes the identical
+                // `_resolveGuardedPattern`, resolution_visitor.dart:569-583).
+                // The binder must not leak into the condition-false state:
+                // the then-element runs under the matched state, the
+                // unmatched chain (pattern failures plus the guard's false
+                // arm) is the element's false branch, and the shadowed
+                // outer bindings restore at the element's end. The element
+                // form never receives `IfCaseCondition` (that marker rides
+                // `handle_parenthesized_condition`'s statement path), so a
+                // `Decl` context carrying a scrutinee is this element's own
+                // clause — the same adoption `ThenBegin`'s fallback runs.
+                let if_case_element = match self.pattern.as_ref() {
+                    Some(p) if p.kind == PatternKind::IfCase => true,
+                    Some(p) if p.kind == PatternKind::Decl && p.scrutinee.is_some() => true,
+                    _ => false,
+                };
+                if if_case_element {
+                    // Spend the peeked scrutinee value the way ThenBegin's
+                    // adoption arm does — the clause machinery owns
+                    // everything past the condition.
+                    if let Some(pattern) = self.pattern.as_mut() {
+                        let pending = pattern.scrutinee_pending;
+                        pattern.scrutinee_pending = false;
+                        if pending {
+                            drop(self.exprs.pop());
+                        }
+                    }
+                    let cond_began_dead =
+                        self.stmt_began_dead || self.arm_dead_depth > 0 || self.dead.is_some();
+                    let parent_live = !cond_began_dead;
+                    if parent_live && !self.reachable() {
+                        if let Some(if_kw) = self.pending_if_kw.take() {
+                            self.dead_code(if_kw);
+                        }
+                    } else {
+                        self.pending_if_kw = None;
+                    }
+                    let Some(mut pattern) = self.pattern.take() else {
+                        return true;
+                    };
+                    let mut matched = self.current.clone();
+                    if let Some(guard) = pattern.guard {
+                        let (if_true, if_false) = self.cond_split(&guard);
+                        // The guard's false arm is an UNMATCHED path —
+                        // `_handleGuard` joins it into the chain the
+                        // pattern's failures feed (the statement arm's
+                        // contract, interp_stmt.rs).
+                        pattern.unmatched =
+                            self.join(Some(pattern.unmatched.clone()), Some(if_false));
+                        matched = if_true;
+                    }
+                    let then_dead_entry =
+                        parent_live && !self.reach.overall_reachable(matched.reach);
+                    if then_dead_entry {
+                        self.arm_dead_depth += 1;
+                    }
+                    self.stack.push(Frame::If {
+                        branch: pattern.unmatched,
+                        after_then: None,
+                        shadowed: pattern.shadowed,
+                    });
+                    self.current = matched;
+                    self.coll_if.push(CollIfFrame {
+                        then_start: *arm_start,
+                        else_start: None,
+                        after_then: None,
+                        parent_live,
+                        then_dead_entry,
+                        else_dead_entry: false,
+                    });
+                    return true;
+                }
                 // The collection-if condition ended: rejoin its open
                 // null-shorting before the split.
                 self.flush_null_shorts_above(self.consumer_base(1));
@@ -4095,7 +4205,9 @@ impl Interp<'_> {
                 {
                     self.dead_arm_row(then_start, *then_end, then_dead_entry);
                 }
-                if let Some(Frame::Branch { branch, .. }) = self.stack.last() {
+                if let Some(Frame::Branch { branch, .. }) | Some(Frame::If { branch, .. }) =
+                    self.stack.last()
+                {
                     // The else-element begins under the condition-false
                     // branch — its own entry deadness latches the same
                     // way the then-element's did (only a live parent makes
@@ -4140,12 +4252,32 @@ impl Interp<'_> {
                         self.dead_arm_row(anchor, *arm_end, arm_dead_entry);
                     }
                 }
-                let Some(Frame::Branch { branch, .. }) = self.stack.pop() else {
+                let Some(frame) = self.stack.pop() else {
                     // A frame-less close (unbalanced recovery buffer): the
                     // element still nets one value for its consumer.
                     self.exprs.push(Expr::trivial(Ty::UNKNOWN));
                     return true;
                 };
+                // An if-case element leaves a `Frame::If` — its shadowed
+                // outer bindings restore here, the statement close's
+                // `restore_bindings` contract (a plain value-condition
+                // element leaves a `Branch` with nothing to restore).
+                let (branch, shadowed) = match frame {
+                    Frame::Branch { branch, .. } => (branch, Vec::new()),
+                    Frame::If {
+                        branch,
+                        shadowed,
+                        ..
+                    } => (branch, shadowed),
+                    // The element close only ever pairs with its own open:
+                    // a mismatched frame is recovery bleed — treat it as a
+                    // branchless close so the value accounting still nets.
+                    _ => {
+                        self.exprs.push(Expr::trivial(Ty::UNKNOWN));
+                        return true;
+                    }
+                };
+                self.restore_bindings(&shadowed);
                 // The close joins the two arms' exit states (official
                 // `ifStatement_end`: `afterThen` saved at elseBegin,
                 // `afterElse` = current; the elseless arm joins the then

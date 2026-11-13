@@ -162,9 +162,17 @@ class Ev {{
 }
 
 /// The census's declaration.dart operator== shape: the creation sits in
-/// the `&&` composite's bool-latched context, and `same` must resolve on
-/// `Equality<Apple>` — the composite's face must not lend itself to the
-/// creation's receiver (the oracle is silent; the census row named `bool`).
+/// the `&&` composite, and `same` must resolve on `Equality<Apple>` — the
+/// member's own return type (`Flag`, a known non-`bool`) decides the
+/// junction's operand face, never the composite's latched `bool` context.
+/// The rig's `same` returns `Flag` (the xml census site's returned `bool`
+/// — its own silence probe); THIS rig's exact fixture reports one
+/// `non_bool_operand` at the whole send span (oracle-pinned, dart analyze
+/// 3.13.7: NON_BOOL_OPERAND "The operands of the operator '&&' must be
+/// assignable to 'bool'." at the 58-col `const Equality<Apple>()
+/// .same(other.attributes, attributes)` operand — the earlier silence
+/// expectation held the census site's shape over a rig whose own member
+/// face disproves it; the re-pin records the disproof).
 #[test]
 fn const_creation_same_in_operator_resolves_on_ctor_type() {
     let source = format!(
@@ -181,7 +189,13 @@ class Ev {{
 "
     );
     let report = report(&source);
-    assert!(report.diagnostics.is_empty(), "{:?}", messages(&report));
+    let rows = messages(&report);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0],
+        "non_bool_operand: The operands of the operator '&&' must be assignable to 'bool'.",
+        "{rows:?}"
+    );
 }
 
 /// The start_element.dart/binary.dart shapes: the same creation spellings
@@ -291,13 +305,32 @@ class ALP extends LoadParams {
 /// The census's android_webview_controller.dart shape: the factory forwards
 /// `headers:` — a generic-typed factory formal — to the creation's
 /// initializing formal whose default spells typed arguments. The slot's
-/// type is the field's declared `Pair<Apple, Pear>`, so the oracle is
-/// silent. The pre-fix capture took the default's last type argument
-/// (`Pear`) as the formal's type and reported ATNA against it.
+/// type is the field's declared `Pair<Apple, Pear>`, so the default's
+/// `Map` literal reports the genuine `invalid_assignment` — the live
+/// 3.13 oracle's rows for this exact shape (the initializing formal's
+/// default and the factory formal's default both reject `Map<Apple,
+/// Pear>` against `Pair<Apple, Pear>`; the pre-fix capture instead took
+/// the default's last type argument `Pear` as the formal's type and
+/// reported ATNA against it). The engine currently emits the
+/// initializing-formal row; the factory-formal default's twin row
+/// remains an under-report gap.
 #[test]
 fn initializing_formal_named_slot_takes_field_type() {
     let report = report(PARAMS);
-    assert!(report.diagnostics.is_empty(), "{:?}", messages(&report));
+    assert_eq!(
+        count_code(&report, "invalid_assignment"),
+        1,
+        "{:?}",
+        messages(&report)
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("'Pair<Apple, Pear>'")),
+        "the slot reads the field's declared type: {:?}",
+        messages(&report)
+    );
 }
 
 /// The slot's field type enforces for real: a wrong-typed `headers:`

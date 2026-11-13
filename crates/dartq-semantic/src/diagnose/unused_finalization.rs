@@ -120,6 +120,15 @@ impl<'a> Engine<'a> {
                     },
                 };
                 let Some((container, owner)) = resolved else {
+                    // The core `Object` head: no project declaration ever
+                    // resolves it, but the element is dart:core's plain
+                    // class — `with Object` reports at the whole entry
+                    // span (oracle #3159: `class B = Object with Object;`
+                    // → `class_used_as_mixin`). Every other unresolved
+                    // head keeps the miss (under-report).
+                    if self.strings.resolve(head) == "Object" {
+                        self.emit(SemanticCode::ClassUsedAsMixin, span, "Object", "");
+                    }
                     continue;
                 };
                 if container.kind != ContainerKind::Class {
@@ -2028,11 +2037,17 @@ impl<'a> Engine<'a> {
             }
             // The implicit-`call` arm (`visitFunctionExpressionInvocation`,
             // unused_local_elements_verifier.dart:175-180): a bare callee
-            // the tables type record or function resolves `call` through
-            // the shape face — `a()` over `extension on (String,)`.
+            // the tables type record, function, or a named head resolves
+            // `call` through the applicable face — `a()` over `extension
+            // on (String,)`, `x()` over `extension on List<A>` beside
+            // `on List<B>` (#3795: the receiver-admitting count settles
+            // which application credits).
             if self.byte_at(self.skip_whitespace(unit_ref.range.end())) == Some(b'(')
                 && let Some(operand) = self.operand_ty_of_ref(&unit_ref)
-                && matches!(operand, Ty::Record { .. } | Ty::Function { .. })
+                && matches!(
+                    operand,
+                    Ty::Record { .. } | Ty::Function { .. } | Ty::Named { .. }
+                )
             {
                 self.credit_face_member_ty(
                     &faces,
@@ -2494,12 +2509,24 @@ impl<'a> Engine<'a> {
     fn credit_face_member_ty(
         &mut self,
         faces: &[(&ExtensionFace, FileId)],
-        declarers: &FxHashMap<StringId, u32>,
+        _declarers: &FxHashMap<StringId, u32>,
         member: StringId,
         receiver: Ty,
         index_read_used: &mut FxHashSet<(FileId, u32)>,
     ) -> bool {
-        if declarers.get(&member).copied() != Some(1) {
+        // The applicable-face resolution (upstream extension_member_resolver
+        // .dart): among the faces declaring the spelling, the candidates are
+        // the ones whose `on` type admits the receiver — exactly one is the
+        // unambiguous application (#3795's `g(List<A> x) => x()` over
+        // `on List<A>` beside `on List<B>`), two or more stay ambiguous
+        // (the `x()` over `List<C>` arm), none is a miss.
+        let mut admitting = faces.iter().filter(|(face, _)| {
+            face.members.contains_key(&member) && self.extension_on_admits(face, receiver)
+        });
+        let Some(&(face, face_file)) = admitting.next() else {
+            return false;
+        };
+        if admitting.next().is_some() {
             return false;
         }
         if let Ty::Named { name, .. } = receiver
@@ -2507,11 +2534,6 @@ impl<'a> Engine<'a> {
         {
             return false;
         }
-        let Some(&(face, face_file)) = faces.iter().find(|(face, _)| {
-            face.members.contains_key(&member) && self.extension_on_admits(face, receiver)
-        }) else {
-            return false;
-        };
         if let Some(face_index) = self
             .index
             .get(face_file)
@@ -2550,9 +2572,29 @@ impl<'a> Engine<'a> {
     /// here).
     fn extension_on_admits(&self, face: &ExtensionFace, ty: Ty) -> bool {
         match (face.on_ty, ty) {
-            (Ty::Named { name: on_name, .. }, Ty::Named { name, .. }) => {
+            (Ty::Named {
+                name: on_name,
+                args: on_args,
+                ..
+            }, Ty::Named { name, args, .. }) => {
                 if on_name == name {
-                    return true;
+                    // The written arguments gate the admission exactly when
+                    // both sides spell them: `on List<A>` admits `List<C>`
+                    // (C's clause chain reaches A) and refuses `List<B>`
+                    // (#3795's sibling faces). A raw or under-modeled side
+                    // keeps the head-equality admission.
+                    if on_args == crate::model::ArgListId::EMPTY
+                        || args == crate::model::ArgListId::EMPTY
+                    {
+                        return true;
+                    }
+                    let pool = self.boundary.pool();
+                    let (on_list, got_list) = (pool.get(on_args), pool.get(args));
+                    return on_list.len() == got_list.len()
+                        && on_list
+                            .iter()
+                            .zip(got_list.iter())
+                            .all(|(on, got)| self.ty_arg_admits(*on, *got));
                 }
                 // `extension<T> on T` / `on T?`: the parameter's bound is
                 // the admitting type (an unbounded parameter admits every
@@ -2611,6 +2653,47 @@ impl<'a> Engine<'a> {
                 Ty::Function { shape, .. } => self.fn_on_admits(face, on_shape, shape),
                 _ => false,
             },
+            _ => false,
+        }
+    }
+
+    /// Whether a written `on` type argument admits a receiver argument
+    /// (covariance: the receiver's slot must reach the `on` slot): equal
+    /// interned shapes pass, a named pair settles through the name-level
+    /// supertype walk (`on List<A>` admits `List<C>` — C's clause chain
+    /// reaches A), nested argument lists recurse, anything else declines
+    /// (under-report).
+    fn ty_arg_admits(&self, on: Ty, got: Ty) -> bool {
+        if on == got {
+            return true;
+        }
+        match (on, got) {
+            (
+                Ty::Named {
+                    name: on_name,
+                    args: on_args,
+                    ..
+                },
+                Ty::Named { name, args, .. },
+            ) => {
+                if on_args != crate::model::ArgListId::EMPTY
+                    && args != crate::model::ArgListId::EMPTY
+                {
+                    let pool = self.boundary.pool();
+                    let (on_list, got_list) = (pool.get(on_args), pool.get(args));
+                    if on_list.len() != got_list.len() {
+                        return false;
+                    }
+                    if !on_list
+                        .iter()
+                        .zip(got_list.iter())
+                        .all(|(on, got)| self.ty_arg_admits(*on, *got))
+                    {
+                        return false;
+                    }
+                }
+                self.name_world().named_sub(name, on_name)
+            }
             _ => false,
         }
     }
@@ -2802,6 +2885,17 @@ impl<'a> Engine<'a> {
                         None
                     }
                     _ => {
+                        // A record annotation (`(String,) a`) never reaches
+                        // the whitespace-adjacency scan as one leaf — the
+                        // `,)` bytes sit between `String` and the
+                        // declarator — so the backward text walk parses the
+                        // written record shape directly (#3477/#3795's
+                        // record operand).
+                        if let Some(text) = self.backward_type_text(decl_offset)
+                            && let Some(ty) = self.parse_record_annotation(&text)
+                        {
+                            return Some(ty);
+                        }
                         let decl_byte = self.byte_of(decl_offset);
                         let annotation = self
                             .type_uses
@@ -2813,23 +2907,37 @@ impl<'a> Engine<'a> {
                                     .all(u8::is_ascii_whitespace)
                             })
                             .last()
-                            .map(|(_, name)| *name)?;
-                        let folded = self.fold_alias_ty(Ty::named(annotation));
-                        if matches!(folded, Ty::Record { .. } | Ty::Function { .. }) {
-                            return Some(folded);
-                        }
-                        // A type-parameter spelling (`T extends int
-                        // Function(int)`): the bound's shape decides the
-                        // operator/call face.
-                        if let Ty::Named { name, .. } = folded
-                            && let Some(bound) = self.param_bound_of(name)
-                        {
-                            let bound = self.fold_alias_ty(bound);
-                            if matches!(bound, Ty::Record { .. } | Ty::Function { .. }) {
-                                return Some(bound);
+                            .map(|(_, name)| *name);
+                        if let Some(annotation) = annotation {
+                            let folded = self.fold_alias_ty(Ty::named(annotation));
+                            if matches!(folded, Ty::Record { .. } | Ty::Function { .. }) {
+                                return Some(folded);
+                            }
+                            // A type-parameter spelling (`T extends int
+                            // Function(int)`): the bound's shape decides the
+                            // operator/call face.
+                            if let Ty::Named { name, .. } = folded
+                                && let Some(bound) = self.param_bound_of(name)
+                            {
+                                let bound = self.fold_alias_ty(bound);
+                                if matches!(bound, Ty::Record { .. } | Ty::Function { .. }) {
+                                    return Some(bound);
+                                }
                             }
                         }
-                        None
+                        // The written-shape fallback: a generic or
+                        // function-literal annotation (`List<C> x`,
+                        // `void Function(int) f`) answers no
+                        // whitespace-adjacent leaf — the `<...>`/group
+                        // bytes sit between the last type use and the
+                        // declarator — so the backward text walk parses the
+                        // annotation itself.
+                        self.backward_type_text(decl_offset)
+                            .and_then(|text| self.parse_annotation_ty(&text))
+                            .map(|ty| self.fold_alias_ty(ty))
+                            .filter(|ty| {
+                                matches!(ty, Ty::Record { .. } | Ty::Function { .. })
+                            })
                     }
                 }
             }
@@ -9321,7 +9429,14 @@ impl<'a> Engine<'a> {
     /// `container` carries the annotation (`@mustCallSuper` /
     /// `@mustBeOverridden` lookups against the walk's ancestors). Sites
     /// exist for this file's declarations only — cross-file ancestors
-    /// under-report.
+    /// under-report. The meta faces key on the annotation resolving to
+    /// package:meta's top-level getter (`_isPackageMetaGetter`,
+    /// element.dart:2010-2012), never on the raw spelling: a same-named
+    /// local declaration shadows the name into a plain constructor
+    /// annotation (probed 3.13.7: the `class mustCallSuper { const
+    /// mustCallSuper(); }` fixture reports only
+    /// `no_annotation_constructor_arguments`, no walk row), and an unbound
+    /// spelling stops at `undefined_annotation` the same way.
     pub(crate) fn site_annotation(
         &self,
         container: StringId,
@@ -9331,10 +9446,15 @@ impl<'a> Engine<'a> {
         self.decl_sites.iter().any(|site| {
             matches!(site.kind, DeclKind::Member { container: c, .. } if c == container)
                 && site.name == member
-                && site
-                    .annotations
-                    .iter()
-                    .any(|a| self.strings.resolve(*a) == spelling)
+                && site.annotations.iter().any(|a| {
+                    crate::annotation::is_meta_spelling(
+                        self.strings.resolve(*a),
+                        spelling,
+                        &self.strings,
+                        self.graph,
+                        self.lib,
+                    )
+                })
         })
     }
 }

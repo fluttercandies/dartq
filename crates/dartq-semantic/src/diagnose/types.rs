@@ -717,6 +717,16 @@ pub(crate) struct ClosureCapture {
     /// variables close (0 for the plain `(x) => …` shape) — the upstream
     /// match gate pairs it against `ctx`'s type-parameter count.
     pub(crate) type_params: u16,
+    /// The literal's own `<T extends B…>` group with names and mapped
+    /// bounds, seeded from the just-closed type-variables window the same
+    /// way [`Self::type_params`] is (the parser closes the group before
+    /// `begin_function_expression`). The context path's final type interns
+    /// through it (`function_generic`) so the literal's static type spells
+    /// `void Function<Y extends num>()` — the official
+    /// `FunctionExpression.staticType` carries the declared group, and the
+    /// `relateTypeParameters` equality leg decides over the real bounds
+    /// instead of rejecting a count-only face.
+    pub(crate) type_param_group: Vec<(StringId, Option<Ty>)>,
 }
 
 /// One open record-type annotation's captured fields: `fields` holds one
@@ -2257,6 +2267,16 @@ pub(crate) struct Engine<'a> {
     /// when the operand row sits at the recorded close; any other face
     /// overwrites or consumes it first.
     pub(crate) literal_row_open: Option<(u32, u32)>,
+    /// Every closed collection/record literal's `(open_offset,
+    /// close_offset)` extent. A collection literal folds to ONE expression
+    /// node upstream — its interior rows (a for-element's iterable, a map
+    /// entry's key and value, sibling elements) are parts of that node,
+    /// never separate argument expressions. The argument-window run split
+    /// ([`Engine::flush_argument`]'s named-anywhere boundary) consults this
+    /// table so a row starting inside a literal never opens a new run
+    /// (`f(k: {for (var e in xs) e.a: e.b})` stays one argument, the
+    /// iterable's type never leaks as the named argument's face).
+    pub(crate) literal_extents: Vec<(u32, u32)>,
     /// The last closed formal-parameter list's closer end offset, for
     /// generalized-function-type kinds. `end_function_type` carries the
     /// `Function` keyword and the trailing `?`, never the formals' `)`
@@ -2764,6 +2784,14 @@ pub(crate) struct Engine<'a> {
     /// exact-owner lookups scan it from the back (keep-last, matching the
     /// former map inserts).
     pub(crate) exec_windows: Vec<ExecWindow>,
+    /// The inference parameters whose argument round FAILED the ground
+    /// subtype match (`infer_gather` returned false — `_tryMatchSubtypeOf`'s
+    /// `success` gate rewinding the round): the effective-formal face reads
+    /// them as undecidable (`Ty::UNKNOWN`) so the argument walk suppresses
+    /// the failed slot exactly as the oracle's
+    /// `argumentTypeNotAssignable` walk does beside its `couldNotInfer`
+    /// (#3794). Cleared before each send's constraint solve.
+    pub(crate) infer_poisoned_params: FxHashSet<StringId>,
     /// Whether the latched [`Engine::pending_exec_name`] header is a
     /// method (`MethodDeclaration` — the window's `is_method` bit) or a
     /// top-level function.
@@ -3029,6 +3057,15 @@ pub(crate) struct Engine<'a> {
     /// expression — its const requirement reports
     /// `non_constant_case_expression` instead of the pattern face.
     pub(crate) patterns_enabled: bool,
+    /// The `triple-shift` grant (`FeatureSet::is_enabled(Feature::
+    /// TripleShift)`, `enabledIn: 2.14`): under a pre-2.14 library a
+    /// recovery-shaped `operator >>>` declaration contributes NO
+    /// consultable member — the use site reports `undefined_operator`
+    /// even with the declaration present (the oracle's element model
+    /// leaves the split declaration unnamed; probe 3.13.7 `@dart=2.12`
+    /// `operator >>>` + use: `unused_element` names it `<unnamed>` and the
+    /// use reports the miss).
+    pub(crate) triple_shift_enabled: bool,
     /// The open type-variables window's captured parameters `(name,
     /// declared keyword, name range)` — the container-begin event adopts
     /// them ([`Engine::note_container_type_variables`]).
@@ -3286,6 +3323,20 @@ pub(crate) struct Engine<'a> {
     /// (function_expression_invocation_resolver.dart:67-79 — the
     /// promoted static type's `FunctionTypeImpl` answer).
     pub(crate) promotion_function_reads: FxHashSet<u32>,
+    /// The resolved function faces of un-negated `is` tests over a
+    /// local's read (#3593) — the SIGNATURE twin of the flow layer's
+    /// function-form promotion: the flow lattice spells every function
+    /// type `Base::Function` (the signature dropped at the event seam),
+    /// so a promoted read's fact can name only the form, never the face
+    /// it promoted TO. Each entry carries the test operand's read
+    /// offset, the operand's spelling, and the checked side's fully
+    /// resolved `Ty::Function` ([`Engine::check_type_check`]'s record);
+    /// the pass-2 re-decide of the if-null composite join consults it
+    /// ([`Engine::redecide_promoted_if_null_faces`]). Appended in source
+    /// order; the insert gate mirrors the promotion chain's own step
+    /// decision, and a negated test retires the name's entries (its
+    /// factored remainder is undecidable at the seam).
+    pub(crate) fn_is_promotions: Vec<(u32, StringId, Ty)>,
     /// Implicit-call initializers (`var f = promotedLocal(args)`): the
     /// callee's promoted read re-decides the send's result in pass 2 —
     /// the entry keys the declaring local's name-token offset, the
@@ -3345,6 +3396,13 @@ pub(crate) struct Engine<'a> {
     /// the same table the receiver faces read), so the immutable
     /// expression walk and the staging interleave.
     pub(crate) init_derived_types: std::cell::RefCell<FxHashMap<u32, Ty>>,
+    /// The typed closure-literal faces the parse staged, keyed by the
+    /// literal's own offset (its `(`): `resolve_rows` takes `rows` into
+    /// its walk-local slice, so the `&self` re-derivations
+    /// (`closure_init_ty`) cannot read the rows there — this side table
+    /// carries the face instead (`var g = () => 0` binds `int
+    /// Function()`, the oracle's `FunctionExpressionImpl.staticType`).
+    pub(crate) closure_lit_rows: FxHashMap<u32, Ty>,
     /// The flow-blind locals whose initializer types as the oracle's
     /// `InvalidType` — a member chain rooted in a receiver whose head
     /// resolves to no declaration (`var at = node.operator.offset` with
@@ -3518,6 +3576,18 @@ pub(crate) struct Engine<'a> {
     /// extension-applicability nullability gate must read the receiver as
     /// non-nullable — a non-nullable `on C` face still applies.
     pub(crate) null_aware_members: FxHashSet<u32>,
+    /// The DIRECT `?.`/`?..`-merged member rows (row offset → the merge's
+    /// operator offset): a row here stored its member's declared face
+    /// pre-lift (`row.ty`; the record arm's baked face lives in
+    /// `record_short_fields`), so a chained null-aware operator reads the
+    /// pre-lift face for its gate — upstream's null shorting strips the
+    /// SHORT's appended null, never the member's own (`s?.length?.isEven`
+    /// decides the second `?.` on `int`) — and the row's own operator is
+    /// the `previousShortCircuitingOperator` answer (the variant's causing
+    /// operator). A plain continuation (`.b` of `a?.b.c`) never joins, so
+    /// its chain-lifted entry in `null_aware_members` (a different fact)
+    /// stays out of this map.
+    pub(crate) null_aware_member_ops: FxHashMap<u32, u32>,
     /// The cascade targets' read spans, pushed at each `..`/`?..` and
     /// popped at the cascade's close: every section selector of that
     /// cascade re-reads this span (`builder..a = x`'s `..a` reads
@@ -3730,6 +3800,25 @@ pub(crate) struct Engine<'a> {
     /// `LUB(NonNull(lhs), rhs)`). Only name-decidable joins land here; the
     /// parenthesized close reads it to type `(a ?? b)`.
     pub(crate) if_null_results: FxHashMap<u32, (u32, Ty)>,
+    /// `??=` composites whose context S-branch is promotion-pending
+    /// (#3820): every decidable input admits the branch (`S` from the
+    /// argument's formal schema, `T <!: S`, `T2 <: S`) and only
+    /// `NonNull(T1) <: S` waits on the target's promoted read — a fact the
+    /// flow replay publishes at the executable's end, after every mid-walk
+    /// consumer. Keyed like [`Self::if_null_results`]; the
+    /// extension-bounds seam abstains over these composites (the
+    /// parse-time join face is provisional there).
+    pub(crate) if_null_s_pending: FxHashSet<u32>,
+    /// Extension-member sends whose parse-time bounds check deferred past
+    /// the if-null re-decide (#3593): the receiver composite's staged
+    /// join degraded to the bare `Function` interface at parse (the
+    /// signature-vs-interface collapse), so the bounds verdict over it
+    /// waits for `redecide_promoted_if_null_faces` to join the
+    /// flow-proven signature twin — the pass-2 re-run
+    /// (`run_deferred_if_null_bounds`) re-pairs the send's already
+    /// consumed written-argument group with the re-decided face. Holds
+    /// (callee row offset, written type arguments), in deferral order.
+    pub(crate) deferred_if_null_bounds: Vec<(u32, CallTypeArgs)>,
     /// Completed `==`/`!=` comparison extents: an equality's static type is
     /// `bool`, so an equality that ends exactly at the `??` left operand's
     /// rows makes that operand strictly non-nullable (the dead-coalesce

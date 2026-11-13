@@ -4,7 +4,11 @@
 //! arrive during the first analysis connect and wait. An accept thread
 //! hands connections to the one worker, which owns the server: requests
 //! run one after another, and the server's stdin has a single writer.
-//! Each request pays one freshness check — the journaled watcher's
+//! Construction arms the freshness watcher and walks the first snapshot
+//! on a background thread; the cold ask — no live server, baseline still
+//! priming — skips the check entirely (its diff is dead weight beside
+//! the fresh server's own full analysis) while every later request pays
+//! one freshness check: the journaled watcher's
 //! dirty merge when the stream is armed, else the stat walk; an
 //! unchanged tree answers from the error
 //! map with no server round trip, an edited Dart file is one incremental
@@ -12,7 +16,12 @@
 //! the server. A server that faults is restarted once
 //! per request; a second fault answers the client with the fault, and the
 //! client runs `dart analyze` itself. With no request for the idle timeout
-//! the daemon shuts the server down and exits.
+//! the daemon shuts the server down — and, warm posture on, keeps a
+//! standby server (spawned, connected, no roots) alive on a slotless
+//! memory-only lease for a TTL window instead of exiting: the next
+//! borrower of the same key adopts it (a fresh `analysis.setAnalysisRoots`
+//! on a rootless server is fresh-spawn semantics), and only the TTL's
+//! expiry, host memory pressure, or a stale SDK ends the daemon.
 //!
 //! Every worktree has its own daemon and server, so the machine holds one
 //! server heap per recently used worktree. Two rules keep that inside the
@@ -47,6 +56,7 @@ use serde::{Deserialize, Serialize};
 use crate::face::{Face, FaceRenderer};
 use crate::report::Report;
 use crate::server::{Fault, Launch, Server};
+use crate::snapshot::Diff;
 use crate::support::{Sdk, Support, Version, support};
 use crate::watch::{Freshness, WalkReason};
 use crate::{Files, Spec};
@@ -231,16 +241,30 @@ pub fn serve(dir: &Path, renderer: FaceRenderer) -> u8 {
 
     let mut host = Host::new(&spec, dir, socket, renderer);
     let idle = Duration::from_secs(spec.idle_secs.max(1));
+    // The standby spawns before the first ask is read: its spawn overlaps
+    // the client's connect and the ask's freshness walk, and the asking
+    // client is the standby's first borrower (a PerRun SDK never primes).
+    host.prime();
     let mut last = Instant::now();
     // The shared pressure monitor: while this daemon is idle it samples
     // host memory through the ledger's one policy; two consecutive lows
     // evict the least-recently-used idle releasable resident on the
     // machine (a peer analyzer or a session daemon — the heavy holders).
     let mut pressure = dartq_toolchain::ledger::Pressure::default();
+    // The standby's own pressure debounce: the same two-low shape the
+    // ledger's monitor uses, so a blip never sheds it.
+    let mut warm_lows = 0u8;
     loop {
+        // The idle window is the standby TTL while one lives (Tier 2),
+        // the serving idle timeout otherwise.
+        let window = if host.standby.is_some() {
+            host.warm_ttl
+        } else {
+            idle
+        };
         match rx.recv_timeout(
             OWNERSHIP_CHECK
-                .min(idle)
+                .min(window)
                 .min(dartq_toolchain::ledger::PRESSURE_TICK),
         ) {
             Ok(stream) => {
@@ -249,6 +273,19 @@ pub fn serve(dir: &Path, renderer: FaceRenderer) -> u8 {
                 pressure.reset();
             }
             Err(RecvTimeoutError::Timeout) => {
+                // The standby sheds first: at the same low-memory signal
+                // every peer's monitor samples, this daemon drops its own
+                // few-MiB holder (Tier 3 by pressure) before any peer
+                // would release a whole fat resident.
+                if host.standby.is_some() && host_low(spec.max_percent) {
+                    warm_lows = warm_lows.saturating_add(1);
+                    if warm_lows >= 2 {
+                        host.stop_standby("warm-pressure");
+                        break;
+                    }
+                } else {
+                    warm_lows = 0;
+                }
                 if let Some(victim) = pressure.tick(std::process::id(), spec.max_percent, true) {
                     eprintln!("dartq analyze: released the idle {victim} under memory pressure");
                 }
@@ -262,9 +299,18 @@ pub fn serve(dir: &Path, renderer: FaceRenderer) -> u8 {
         // own to remove.
         if Inode::of(&files.socket) != Some(socket) {
             host.stop("successor");
+            host.stop_standby("successor");
             return 0;
         }
-        if last.elapsed() >= idle {
+        if last.elapsed() >= window {
+            // Idle expiry: Tier 2 keeps a warm standby alive for the TTL
+            // window instead of exiting (the next borrower of this SDK
+            // adopts it); Tier 3 — no standby could be stood up, or the
+            // TTL ran out — exits as the idle daemon always did.
+            if host.enter_tier2() {
+                last = Instant::now();
+                continue;
+            }
             break;
         }
     }
@@ -284,7 +330,10 @@ pub fn serve(dir: &Path, renderer: FaceRenderer) -> u8 {
         }
         drop(lock);
     }
+    // The exit takes down whichever resident lives: the serving server
+    // (`idle-evict`) or the standby whose TTL ran out (`warm-evict`).
     host.stop("idle-evict");
+    host.stop_standby("warm-evict");
     0
 }
 
@@ -312,6 +361,22 @@ struct Host {
     pooled: bool,
     budget: Option<u64>,
     server: Option<Server>,
+    /// The warm standby: a spawned, connected server with no borrower yet,
+    /// owned in-process (Tier 2's whole posture). Adopted by the next
+    /// borrower of this daemon's key; while it lives the daemon's idle
+    /// window is the warm TTL.
+    standby: Option<Server>,
+    /// The standby's lease: memory-only (no job slot — it never blocks a
+    /// per-run analysis under `memory.max_concurrent`), booked at a small
+    /// fixed figure, releasable while this daemon is idle — the ledger's
+    /// cheapest victim on the machine.
+    standby_lease: Option<dartq_toolchain::ledger::Lease>,
+    /// Whether this daemon runs the warm posture (resolved daemon-side at
+    /// [`Host::new`]: `DARTQ_WARM_SERVERS` over the spec's `warm` over
+    /// the default — off since 0.1.23).
+    warm: bool,
+    /// How long an idle daemon keeps its standby before exiting (Tier 3).
+    warm_ttl: Duration,
     /// The freshness oracle: the maintained snapshot plus its journaled
     /// watcher (or walk mode when the stream cannot arm).
     freshness: Freshness,
@@ -340,6 +405,13 @@ struct Host {
     /// [`ledger::sizing_with_source`] for ratio-based estimates and
     /// recorded beside the measured peak.
     source_bytes: Option<u64>,
+    /// The (peak, source) figure this daemon last persisted to the
+    /// ledger's peaks store — the bookkeeping elision's memory: a quiet
+    /// answer would re-record the identical figure, so the write is
+    /// skipped until it moves. `None` until the first record and after
+    /// any arm that changed the store by another path (the growth
+    /// brake's floor record), so the next completion always lands.
+    persisted_peak: Option<(u64, Option<u64>)>,
     /// The growth-brake's running state (the ledger's shared policy):
     /// consecutive samples under the critical floor arm the yield.
     brake: dartq_toolchain::ledger::GrowthBrake,
@@ -369,6 +441,7 @@ impl Host {
             _ => None,
         };
         let files = Files::of(dir);
+        let (warm, warm_ttl) = warm_config(spec);
         Self {
             launch,
             renderer,
@@ -392,7 +465,15 @@ impl Host {
             pooled: spec.pool,
             budget: (spec.budget > 0).then_some(spec.budget),
             server: None,
-            freshness: Freshness::new(&spec.roots, spec.packages.as_deref(), &spec.sdk_home()),
+            standby: None,
+            standby_lease: None,
+            warm,
+            warm_ttl,
+            freshness: Freshness::new(
+                &spec.roots,
+                spec.packages.as_deref(),
+                &spec.sdk_home(),
+            ),
             degrade_streak: 0,
             degrade_noted: false,
             files,
@@ -400,8 +481,13 @@ impl Host {
             lease: None,
             max_percent: spec.max_percent,
             max_concurrent: spec.max_concurrent,
-            peak_key: repo_key(&spec.roots).unwrap_or_else(|| cache.display().to_string()),
-            source_bytes: source_bytes(&spec.roots),
+            peak_key: repo_key(&spec.roots)
+                .unwrap_or_else(|| cache.display().to_string()),
+            // The Dart source size derives from the priming walk's
+            // snapshot once it lands (`analyze_result` refreshes it) —
+            // a daemon start never pays a discovery walk of its own.
+            source_bytes: None,
+            persisted_peak: None,
             brake: dartq_toolchain::ledger::GrowthBrake::default(),
             cache,
             disk: crate::disk::Disk::start(dir),
@@ -434,6 +520,105 @@ impl Host {
         }
         self.lease = None;
         let _ = std::fs::remove_file(&self.files.server_pid);
+    }
+
+    /// Stops the standby for `why` (one event line, the lease freed) —
+    /// Tier 3's TTL exit, the pressure shed, the stale-SDK kill, a
+    /// successor's takeover.
+    fn stop_standby(&mut self, why: &'static str) {
+        if let Some(standby) = self.standby.take() {
+            self.files.event(&format!(
+                "dartq analyze: analyzer pid {} stopped ({why})",
+                standby.pid()
+            ));
+            standby.shutdown();
+        }
+        self.standby_lease = None;
+        let _ = std::fs::remove_file(&self.files.server_pid);
+    }
+
+    /// Primes the standby at daemon start: the spawn overlaps the asking
+    /// client's connect and the first freshness walk, and that client is
+    /// the standby's first borrower — the spawn is never wasted. A
+    /// PerRun SDK never primes (there is nothing to serve); a failed
+    /// prime costs one spawn and nothing more — the next ask spawns
+    /// fresh (`warm-miss`).
+    fn prime(&mut self) {
+        if !self.warm || self.launch.is_none() {
+            return;
+        }
+        self.standby = self.spawn_standby();
+    }
+
+    /// Spawns the next standby on its slotless lease — rootless (spawn +
+    /// connected, no subscriptions, no roots): the design's W1.5 arming
+    /// pass was measured on this host and lost on every axis (an armed
+    /// adoption destroys the arming context before building the
+    /// borrower's, paying more than the warm SDK store saves: borrows of
+    /// 0.57 s rootless vs 0.72 s core-armed vs 0.85 s full-armed on a
+    /// trivial package, 2.52 s vs 2.71 s vs 2.96 s on a mid-size one,
+    /// with the same ~257 MB settled standby either way), so the standby
+    /// stays rootless and the first borrower's roots pass is the same
+    /// `setAnalysisRoots` a fresh spawn's would be. `None` when no
+    /// standby could be stood up — no lease to book, a spawn fault:
+    /// Tier 2 is an optimization, never a wait and never a failure.
+    fn spawn_standby(&mut self) -> Option<Server> {
+        let Some(launch) = self.launch.clone() else {
+            return None;
+        };
+        let label = format!("warm standby {}", launch.sdk.version);
+        let request = standby_request(label, self.files.busy.clone());
+        let lease = dartq_toolchain::ledger::acquire(
+            request,
+            STANDBY_LEASE,
+            self.max_percent,
+            Instant::now() + STANDBY_LEASE_WAIT,
+            |_| {},
+        )
+        .ok()?;
+        let standby = Server::spawn_and_connect(&launch, self.budget).ok()?;
+        self.files.event(&format!(
+            "dartq analyze: analyzer pid {} started (prewarm)",
+            standby.pid()
+        ));
+        // The successor daemon reaps this pid if a SIGKILL stops this
+        // daemon before its group kill can run.
+        let _ = std::fs::write(&self.files.server_pid, standby.pid().to_string());
+        self.standby_lease = lease.map(|mut lease| {
+            lease.track(standby.pid());
+            lease
+        });
+        Some(standby)
+    }
+
+    /// Tier 2: the idle daemon keeps a warm standby instead of exiting —
+    /// the serving server stops (`idle-evict`, its lease freed), a
+    /// rootless standby stands up on a slotless lease, and the daemon
+    /// lives on for the warm TTL (refreshed by every ask). `false` when
+    /// Tier 2 cannot be entered — warm off, a standby already live
+    /// (Tier 2's own TTL expiry is Tier 3), a PerRun SDK, or no lease
+    /// and no spawn to be had — and the caller exits as the idle daemon
+    /// always did.
+    fn enter_tier2(&mut self) -> bool {
+        if !enters_tier2(self.warm, self.standby.is_some(), self.launch.is_some()) {
+            return false;
+        }
+        self.stop("idle-evict");
+        self.standby = self.spawn_standby();
+        self.standby.is_some()
+    }
+
+    /// Whether the SDK the standby was spawned under still sits at its
+    /// root: the version file re-read matches the launch facts the
+    /// standby carries. A same-path SDK swap between spawn and ask never
+    /// serves through a stale standby — `warm-stale-sdk`, fresh spawn.
+    fn sdk_facts_current(&self) -> bool {
+        let Some(launch) = &self.launch else {
+            return false;
+        };
+        std::fs::read_to_string(launch.sdk.root.join("version"))
+            .map(|text| Version::parse(&text) == Some(launch.sdk.version))
+            .unwrap_or(false)
     }
 
     /// The pooled daemon's answer to a join: admit the roots — every
@@ -499,8 +684,13 @@ impl Host {
             // The freshness oracle rebases on the new served set — a
             // joined worktree's files are new inputs, an evicted one's
             // gone (the request's own check then diffs empty, as the
-            // old snapshot rebase did).
-            let _ = self.freshness.check(&roots);
+            // old snapshot rebase did). The cold arm's skip applies
+            // here too: with no live server the rebase's diff is dead
+            // weight, and the next ask's check performs it.
+            if !cold_freshness_skip(self.server.is_some(), self.freshness.primed()) {
+                let _ = self.freshness.check(&roots);
+                self.source_bytes = self.freshness.dart_bytes().or(self.source_bytes);
+            }
         }
         for root in &ask.roots {
             if let Some((_, used)) = self.active.iter_mut().find(|(served, _)| served == root) {
@@ -546,7 +736,8 @@ impl Host {
                         // rows.
                         if owned.is_empty() {
                             let render = (self.renderer)(&[], face);
-                            let Some(mut wire) = face_header(&render.meta, render.bytes.len())
+                            let Some(mut wire) =
+                                face_header(&render.meta, render.bytes.len())
                             else {
                                 return Reply::Answer(Answer::NotServed);
                             };
@@ -597,14 +788,17 @@ impl Host {
         self.disk.check();
         let reply = match serde_json::from_str::<Ask>(&line) {
             Ok(ask) if self.pooled => self.join(&stream, ask),
-            Ok(ask) if ask.roots == self.roots => {
-                self.analyze(&stream, &ask.aims, ask.face.as_ref())
-            }
+            Ok(ask) if ask.roots == self.roots => self.analyze(&stream, &ask.aims, ask.face.as_ref()),
             Ok(_) => Reply::Answer(Answer::Fault("the daemon serves other roots".into())),
             Err(error) => Reply::Answer(Answer::Fault(format!("unreadable request: {error}"))),
         };
         send_reply(&stream, reply);
         if let Some(lease) = &self.lease {
+            lease.touch();
+        }
+        // A Tier-2 ask (adopted, or answered while the standby waits out
+        // its TTL) refreshes the standby lease's last use with it.
+        if let Some(lease) = &self.standby_lease {
             lease.touch();
         }
         // The cache's last use: the disk budget drops idle caches least
@@ -614,7 +808,24 @@ impl Host {
         // least recently used resident first. A daemon whose socket path
         // now names a successor's socket leaves the successor's state be.
         if Inode::of(&self.files.socket) == Some(self.socket) {
-            let _ = std::fs::write(&self.files.state, std::process::id().to_string());
+            self.touch_state();
+        }
+    }
+
+    /// Refreshes the state file's last-answer mtime. The content — the
+    /// daemon's pid — never changes after the bind wrote it, so a quiet
+    /// turn touches the mtime instead of rewriting identical bytes; a
+    /// state file that vanished beneath the daemon (its directory wiped)
+    /// is recreated with the pid rather than silently losing the
+    /// heartbeat `daemon_pid` reads.
+    fn touch_state(&self) {
+        match std::fs::File::options().write(true).open(&self.files.state) {
+            Ok(file) => {
+                let _ = file.set_modified(std::time::SystemTime::now());
+            }
+            Err(_) => {
+                let _ = std::fs::write(&self.files.state, std::process::id().to_string());
+            }
         }
     }
 
@@ -645,7 +856,21 @@ impl Host {
             return Err(self.fail("the SDK changed under the daemon".into()));
         };
         let roots = self.roots();
-        let diff = self.freshness.check(&roots);
+        // The cold arm: with no live server and no baseline installed
+        // yet, no answer observes the check's diff — any diff starts a
+        // server over the same roots the same way, and that server's
+        // first analysis reads the tree from disk itself. The first ask
+        // therefore never waits for the background priming walk; the
+        // next ask settles it (and every later check pays the normal
+        // freshness pass).
+        let diff = if cold_freshness_skip(self.server.is_some(), self.freshness.primed()) {
+            Diff::default()
+        } else {
+            let diff = self.freshness.check(&roots);
+            diff
+        };
+        // The sizing figure rides the walk the oracle already paid.
+        self.source_bytes = self.freshness.dart_bytes().or(self.source_bytes);
         self.note_degradation(client);
         if diff.rebuild {
             self.stop("rebuild");
@@ -672,7 +897,7 @@ impl Host {
                 // incremental-edit settle.
                 server.changed(&diff.changed, || {
                     disk.tick();
-                    false
+                    incremental_settle_yields()
                 })
             }
             Some(server) => server.wait_idle(|| sample(disk, brake)),
@@ -682,9 +907,7 @@ impl Host {
             Ok(()) => Ok(()),
             Err(Fault::Budget { budget, measured }) => {
                 self.forget("budget");
-                return Err(Answer::Budget(
-                    Fault::Budget { budget, measured }.to_string(),
-                ));
+                return Err(Answer::Budget(Fault::Budget { budget, measured }.to_string()));
             }
             Err(Fault::Yield { peak }) => {
                 // The growth brake fired: the server is already dead.
@@ -716,18 +939,25 @@ impl Host {
                 let server = self.server.as_ref().expect("a live server");
                 // The measured peak sizes this resident's own lease at
                 // once: it leaves the first-run slot, and a peer analyzer
-                // waiting there borrows the figure.
+                // waiting there borrows the figure. A quiet answer
+                // re-records the identical figure, so the write is elided
+                // until it moves — the peaks file already holds exactly
+                // those bytes, and an unclean death leaves that earlier,
+                // still-correct record behind.
                 let peak = server.peak();
-                match self.lease.as_mut() {
-                    Some(lease) => {
-                        lease.record_peak_with_source(&self.peak_key, peak, self.source_bytes);
+                if peak_persist_moved(self.persisted_peak, peak, self.source_bytes) {
+                    match self.lease.as_mut() {
+                        Some(lease) => {
+                            lease.record_peak_with_source(&self.peak_key, peak, self.source_bytes);
+                        }
+                        None => dartq_toolchain::ledger::record_peak_with_source(
+                            &self.peak_key,
+                            dartq_toolchain::ledger::Face::AnalysisServer,
+                            peak,
+                            self.source_bytes.unwrap_or(0),
+                        ),
                     }
-                    None => dartq_toolchain::ledger::record_peak_with_source(
-                        &self.peak_key,
-                        dartq_toolchain::ledger::Face::AnalysisServer,
-                        peak,
-                        self.source_bytes.unwrap_or(0),
-                    ),
+                    self.persisted_peak = Some((peak, self.source_bytes));
                 }
                 // An analysis may have grown the cache: a routine budget
                 // pass, spaced machine-wide.
@@ -776,11 +1006,33 @@ impl Host {
     }
 
     /// Starts the server once the job gate admits it, for `why` (one
-    /// event line once the child exists). A pooled daemon starts its
-    /// server over the whole active set — the founding roots plus every
-    /// joined worktree — so a join admitted while the server was down (or
-    /// a restart after a fault) does not silently drop the joiners' roots.
-    fn start(
+    /// event line once the child exists). With the warm posture on, the
+    /// standby is adopted instead of spawned when its facts still hold
+    /// ([`standby_admit`]) — a fresh `analysis.setAnalysisRoots` on a
+    /// rootless server is fresh-spawn semantics. A pooled daemon starts
+    /// its server over the whole active set — the founding roots plus
+    /// every joined worktree — so a join admitted while the server was
+    /// down (or a restart after a fault) does not silently drop the
+    /// joiners' roots.
+    fn start(&mut self, launch: &Launch, client: &UnixStream, why: &'static str) -> Result<(), Fault> {
+        match standby_admit(
+            self.warm,
+            self.standby.is_some(),
+            self.sdk_facts_current(),
+        ) {
+            None => self.start_fresh(launch, client, why),
+            Some(Adopt::Adopt) => self.start_by_adoption(launch, client),
+            Some(Adopt::Miss) => self.start_fresh(launch, client, "warm-miss"),
+            Some(Adopt::StaleSdk) => {
+                self.stop_standby("warm-stale-sdk");
+                self.start_fresh(launch, client, "warm-miss")
+            }
+        }
+    }
+
+    /// The fresh-spawn arm of [`Host::start`]: exactly the start the
+    /// daemon always ran, under its own event reason.
+    fn start_fresh(
         &mut self,
         launch: &Launch,
         client: &UnixStream,
@@ -802,7 +1054,8 @@ impl Host {
         }
         let roots = self.roots();
         let (brake, disk) = (&mut self.brake, &self.disk);
-        let server = Server::start(launch, &roots, self.budget, || sample(disk, brake))?;
+        let started = Server::start(launch, &roots, self.budget, || sample(disk, brake));
+        let server = started?;
         self.files.event(&format!(
             "dartq analyze: analyzer pid {} started ({why})",
             server.pid()
@@ -818,6 +1071,65 @@ impl Host {
         Ok(())
     }
 
+    /// The adoption arm of [`Host::start`]: the standby becomes the
+    /// borrower's serving server over the whole active root set, under
+    /// the normal serving lease (gate semantics unchanged — a standby
+    /// holds no slot, so adopting under `max_concurrent = 1` is the same
+    /// gate pass a fresh spawn waits). The standby's slotless lease frees
+    /// as the serving one lands. A lease the gate cannot grant restores
+    /// the standby for the next ask; an adoption that faults kills the
+    /// standby (`warm-fault`) and falls to a fresh spawn; a budget or
+    /// yield surfaces as the fresh start's own fault would.
+    fn start_by_adoption(
+        &mut self,
+        launch: &Launch,
+        client: &UnixStream,
+    ) -> Result<(), Fault> {
+        let lease = match self.lease_slot(client) {
+            Ok(lease) => lease,
+            // The gate wait failed: the request yields as a fresh start's
+            // would, and the standby stays for the next ask.
+            Err(fault) => return Err(fault),
+        };
+        let standby = self.standby.take().expect("the admit checked a standby");
+        let pid = standby.pid();
+        // The standby's slotless booking leaves with it; the serving lease
+        // replaces it before the child is named on it.
+        self.standby_lease = None;
+        let roots = self.roots();
+        let (brake, disk) = (&mut self.brake, &self.disk);
+        match Server::adopt(standby, launch, &roots, || sample(disk, brake)) {
+            Ok(server) => {
+                // The standby's original pid is the serving pid — the
+                // continuity the events log proves adoption by.
+                self.files.event(&format!(
+                    "dartq analyze: analyzer pid {pid} started (warm-adopt)"
+                ));
+                let _ = std::fs::write(&self.files.server_pid, server.pid().to_string());
+                self.lease = lease.map(|mut lease| {
+                    lease.track(server.pid());
+                    lease
+                });
+                self.server = Some(server);
+                Ok(())
+            }
+            // A budget or yield kill is the adoption's answer, exactly as
+            // a fresh start's would be — the caller maps it.
+            Err(fault @ (Fault::Budget { .. } | Fault::Yield { .. })) => Err(fault),
+            Err(fault) => {
+                // The standby never became a server: one stop line with
+                // its pid, the fault on stderr for a hand-run daemon, and
+                // a fresh spawn under the warm-miss reason.
+                eprintln!("dartq analyze: standby adoption failed: {fault}");
+                self.files.event(&format!(
+                    "dartq analyze: analyzer pid {pid} stopped (warm-fault)"
+                ));
+                drop(lease);
+                self.start_fresh(launch, client, "warm-miss")
+            }
+        }
+    }
+
     /// Takes the server's job slot and its expected peak for its life,
     /// releasing idle residents or waiting as the gate decides; its notes
     /// reach the client. The server is a resident the gate may release
@@ -828,8 +1140,11 @@ impl Host {
         client: &UnixStream,
     ) -> Result<Option<dartq_toolchain::ledger::Lease>, Fault> {
         use dartq_toolchain::ledger::{self, Face, Releasable, Request};
-        let (bytes, sized) =
-            ledger::sizing_with_source(&self.peak_key, Face::AnalysisServer, self.source_bytes);
+        let (bytes, sized) = ledger::sizing_with_source(
+            &self.peak_key,
+            Face::AnalysisServer,
+            self.source_bytes,
+        );
         let request = Request {
             face: Face::AnalysisServer,
             label: self
@@ -850,11 +1165,41 @@ impl Host {
             source_bytes: self.source_bytes,
         };
         let deadline = Instant::now() + MEMORY_WAIT;
-        match ledger::acquire(request, bytes, self.max_percent, deadline, |text| {
+        // A park at this gate was stderr-only — invisible in events.log,
+        // which is why #4249's gate-band steps looked inexplicable. One
+        // events line when the wait enters (the ledger's own note says
+        // what and who holds) and one when it leaves: admitted, or
+        // faulted at the 30-minute bound.
+        let mut waited_since: Option<Instant> = None;
+        let files = &self.files;
+        let granted = ledger::acquire(request, bytes, self.max_percent, deadline, |text| {
+            if waited_since.is_none()
+                && let Some(what) = text.strip_prefix("dartq: waiting ")
+            {
+                waited_since = Some(Instant::now());
+                files.event(&format!("dartq analyze: analyzer gate-wait ({what})"));
+            }
             note(client, text.to_owned());
-        }) {
-            Ok(lease) => Ok(lease),
-            Err(error @ ledger::Error::Timeout { .. }) => Err(Fault::Memory(error.to_string())),
+        });
+        match granted {
+            Ok(lease) => {
+                if let Some(at) = waited_since {
+                    files.event(&format!(
+                        "dartq analyze: analyzer gate-admit (waited {}s)",
+                        at.elapsed().as_secs()
+                    ));
+                }
+                Ok(lease)
+            }
+            Err(error @ ledger::Error::Timeout { .. }) => {
+                if let Some(at) = waited_since {
+                    files.event(&format!(
+                        "dartq analyze: analyzer gate-fault (waited {}s: {error})",
+                        at.elapsed().as_secs()
+                    ));
+                }
+                Err(Fault::Memory(error.to_string()))
+            }
             Err(ledger::Error::Io(_) | ledger::Error::Stopped) => Ok(None),
         }
     }
@@ -869,8 +1214,13 @@ impl Host {
     /// The growth brake's bookkeeping: the observed tree peak is a lower
     /// bound (the job was still growing at the yield), recorded as a
     /// floor — never over an earlier full measurement, so the client's
-    /// re-queued ask is admitted on the honest figure.
-    fn yield_peak(&self, peak: u64) {
+    /// re-queued ask is admitted on the honest figure. The floor record
+    /// changes the persisted figure by a path the completion arm's
+    /// elision memory does not see, so the memory is forgotten here: the
+    /// next completion records unconditionally (a lowered figure must
+    /// land, not be elided as "already persisted").
+    fn yield_peak(&mut self, peak: u64) {
+        self.persisted_peak = None;
         dartq_toolchain::ledger::record_peak_floor(
             &self.peak_key,
             dartq_toolchain::ledger::Face::AnalysisServer,
@@ -886,6 +1236,145 @@ impl Host {
 /// hot root's place is refused instead, and the worktree's own daemon
 /// serves it.
 const POOL_HOT: Duration = Duration::from_secs(5 * 60);
+
+/// The standby lease's booking: a fixed small figure above a rootless
+/// server's measured tree (~37 MB) — never a slot, never an unsized
+/// first-run placeholder. Five standbys book ~320 MB against a budget
+/// where one unsized resident books 1 GiB.
+const STANDBY_LEASE: u64 = 64 << 20;
+/// How long a standby's lease wait may run: the standby is an
+/// optimization, never a wait — a memory-tight host simply gets none.
+const STANDBY_LEASE_WAIT: Duration = Duration::from_secs(10);
+
+/// The warm posture's decision for one server start, pure — the policy
+/// half of [`Host::start`]'s adoption arm, mirroring [`admit`]'s
+/// policy-only shape so the matrix is testable without a server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Adopt {
+    /// The standby's facts hold: it becomes the serving server
+    /// (`warm-adopt`).
+    Adopt,
+    /// Warm on, no standby to adopt: a fresh spawn (`warm-miss`).
+    Miss,
+    /// The standby's SDK facts went stale under it: kill it
+    /// (`warm-stale-sdk`), a fresh spawn (`warm-miss`).
+    StaleSdk,
+}
+
+/// [`Host::start`]'s whole adoption policy, pure: warm off answers `None`
+/// (the ordinary start path unchanged); with warm on, an absent standby
+/// is a miss, a standby whose launch facts no longer match the SDK on
+/// disk is stale, and a current standby is adopted.
+fn standby_admit(warm: bool, standby: bool, facts_current: bool) -> Option<Adopt> {
+    if !warm {
+        return None;
+    }
+    if !standby {
+        return Some(Adopt::Miss);
+    }
+    if !facts_current {
+        return Some(Adopt::StaleSdk);
+    }
+    Some(Adopt::Adopt)
+}
+
+/// Resolves the warm posture daemon-side: `DARTQ_WARM_SERVERS` over the
+/// spec's `warm` over the default (off since 0.1.23 — the prewarm
+/// balloon is transient spawn-time memory pressure, the wrong default on
+/// memory-tight hosts; `warm_servers: true` in dartq.yaml or the env is
+/// the opt-in) — a spec written before the knob existed behaves as the
+/// default, and A/B arms need no CLI wiring. The
+/// TTL resolves the same way (`DARTQ_WARM_TTL_SECS`, spec, 900 s), with a
+/// 1 s floor. An unparseable override falls through to the next tier —
+/// fail-open like every other knob here.
+fn warm_config(spec: &Spec) -> (bool, Duration) {
+    let servers = std::env::var("DARTQ_WARM_SERVERS").ok();
+    let ttl = std::env::var("DARTQ_WARM_TTL_SECS").ok();
+    warm_config_with(spec, servers.as_deref(), ttl.as_deref())
+}
+
+/// [`warm_config`]'s testable core: the two override strings passed in.
+fn warm_config_with(
+    spec: &Spec,
+    env_servers: Option<&str>,
+    env_ttl: Option<&str>,
+) -> (bool, Duration) {
+    let servers = env_servers
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(spec.warm);
+    let ttl = env_ttl
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(u64::from(if spec.warm_ttl_secs == 0 {
+            900
+        } else {
+            spec.warm_ttl_secs
+        }))
+        .max(1);
+    (servers > 0, Duration::from_secs(ttl))
+}
+
+/// The standby's lease request, pure: memory-only (`slot: false` — a
+/// standby never blocks a per-run analysis under
+/// `memory.max_concurrent`), booked at [`STANDBY_LEASE`] as a deliberate
+/// figure, releasable while the daemon is idle.
+fn standby_request(label: String, busy: PathBuf) -> dartq_toolchain::ledger::Request {
+    dartq_toolchain::ledger::Request {
+        face: dartq_toolchain::ledger::Face::AnalysisServer,
+        label,
+        bytes: STANDBY_LEASE,
+        pid: None,
+        release: Some(dartq_toolchain::ledger::Releasable {
+            pid: std::process::id(),
+            busy,
+        }),
+        slot: false,
+        cap: 0,
+        sized: true,
+        peak_key: None,
+        source_bytes: None,
+    }
+}
+
+/// The idle loop's tiering transition, pure: an expired window enters
+/// Tier 2 (stand up a standby, live on for the TTL) exactly when the
+/// warm posture is on, the daemon's SDK can serve, and no standby is
+/// live — the remaining case (a standby's own TTL expiry) is Tier 3.
+fn enters_tier2(warm: bool, standby: bool, serving_sdk: bool) -> bool {
+    warm && !standby && serving_sdk
+}
+
+/// Whether the host sits at the ledger monitor's own low-memory line —
+/// the same figures `Pressure::tick` samples, mirrored here because a
+/// Tier-2 daemon sheds its standby at that signal before any peer's
+/// monitor would release a whole fat resident. `kernel_warn` is the
+/// macOS pressure level's warn-or-worse verdict (upstream's own
+/// blinding of a free-bytes figure under compressor pressure).
+fn host_low(max_percent: u8) -> bool {
+    low_memory(
+        dartq_toolchain::ledger::total_memory(),
+        dartq_toolchain::ledger::available_memory(),
+        max_percent,
+        #[cfg(target_os = "macos")]
+        dartq_toolchain::ledger::pressure_level().is_some_and(|level| level >= 2),
+        #[cfg(not(target_os = "macos"))]
+        false,
+    )
+}
+
+/// [`host_low`]'s pure core: available memory under the reserve
+/// (`(100 − max_percent)%` of physical, never below the ledger's floor),
+/// or the kernel's own warn level. An unreadable figure is never low.
+fn low_memory(total: u64, available: Option<u64>, max_percent: u8, kernel_warn: bool) -> bool {
+    if total == 0 {
+        return false;
+    }
+    let share = u64::try_from(
+        u128::from(total) * u128::from(100 - max_percent.clamp(1, 100)) / 100,
+    )
+    .unwrap_or(u64::MAX);
+    let reserve = share.max(dartq_toolchain::ledger::RESERVE_FLOOR);
+    available.is_some_and(|available| available < reserve) || kernel_warn
+}
 
 /// The pooled admission policy: append `joining` to `active`, evicting
 /// least-recently-used cold non-primary roots (index 0 is the founding
@@ -970,9 +1459,8 @@ fn degradation_note(
         // see above), a journal answer, or a by-design walk — the
         // covering walk after an arm or a stream restart, a pool
         // rebase: none count, the streak starts over.
-        Some(WalkReason::First | WalkReason::Rebase | WalkReason::CookieTimeout) | None => {
-            return (0, None);
-        }
+        Some(WalkReason::First | WalkReason::Rebase | WalkReason::CookieTimeout)
+        | None => return (0, None),
     };
     let streak = streak.saturating_add(1);
     (streak, (streak >= 2).then_some(why))
@@ -983,6 +1471,19 @@ fn degradation_note(
 fn sample(disk: &crate::disk::Disk, brake: &mut dartq_toolchain::ledger::GrowthBrake) -> bool {
     disk.tick();
     brake.check(std::process::id())
+}
+
+/// Whether an incremental edit's settle may yield to the growth brake:
+/// never. The brake exists to stop a cold or whole-root analysis that is
+/// growing the server under machine memory pressure; an incremental
+/// settle cannot grow the tree, but on a swapping host the brake fires
+/// on it every time and turns each edit into a full server restart +
+/// whole-root re-analysis (the #4249 failure class: 88-155 s steps).
+/// The other in-analysis samples — a fresh start's, a root-set change's,
+/// an idle wait's — keep the brake through [`sample`]; the budget check
+/// and peak sampling inside the settle are untouched either way.
+fn incremental_settle_yields() -> bool {
+    false
 }
 
 /// The ledger peak key for a set of roots: the git common dir plus the
@@ -1034,31 +1535,24 @@ fn git_root(root: &Path) -> Option<(PathBuf, String)> {
     Some((common.canonicalize().ok()?, rel))
 }
 
-/// The analyzed Dart source size under `roots`: a bounded stat walk
-/// (`.dart` files only, no reads). Cheap beside a minutes-long cold
-/// analysis; feeds the ledger's ratio estimate.
-fn source_bytes(roots: &[PathBuf]) -> Option<u64> {
-    let mut total = 0u64;
-    for root in roots {
-        sum_dart_bytes(root, &mut total);
-    }
-    (total > 0).then_some(total)
+/// Whether this request may skip the freshness check: a daemon with no
+/// live server and no installed baseline — the cold first ask (or a
+/// later one while the server is down and the background prime still
+/// runs). The answer comes from the fresh server's own full analysis;
+/// the diff would only name files that analysis reads from disk anyway.
+fn cold_freshness_skip(server_live: bool, primed: bool) -> bool {
+    !server_live && !primed
 }
 
-fn sum_dart_bytes(dir: &Path, total: &mut u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if meta.is_dir() {
-            sum_dart_bytes(&entry.path(), total);
-        } else if entry.path().extension().is_some_and(|ext| ext == "dart") {
-            *total += meta.len();
-        }
-    }
+/// Whether the completion's (peak, source) figure must be persisted to
+/// the peaks store: only when it differs from the last figure this
+/// daemon persisted — a quiet answer re-records identical bytes, and the
+/// file already holds exactly those. `None` (nothing persisted yet, or
+/// forgotten after the growth brake's floor record changed the store by
+/// another path) always lands, so a genuinely changed figure is never
+/// elided.
+fn peak_persist_moved(persisted: Option<(u64, Option<u64>)>, peak: u64, source: Option<u64>) -> bool {
+    persisted.is_none_or(|(peak_was, source_was)| peak != peak_was || source != source_was)
 }
 
 #[cfg(test)]
@@ -1101,7 +1595,8 @@ mod tests {
         assert!(!served.contains(&Path::new("/w/a")));
         // The primary never leaves: two joins on a 2-cap pool refuse —
         // dropping the primary is not a join, it is another daemon.
-        let mut small: Vec<(PathBuf, Instant)> = vec![(PathBuf::from("/w/primary"), at(1500))];
+        let mut small: Vec<(PathBuf, Instant)> =
+            vec![(PathBuf::from("/w/primary"), at(1500))];
         assert_eq!(
             admit(&mut small, &roots(&["/w/x", "/w/y"]), 2, now),
             None,
@@ -1136,14 +1631,7 @@ mod tests {
         let evicted = admit(&mut active, &[PathBuf::from("/w/c")], 3, now).expect("admitted");
         assert_eq!(evicted, vec![PathBuf::from("/w/b")]);
         let served: Vec<&Path> = active.iter().map(|(root, _)| root.as_path()).collect();
-        assert_eq!(
-            served,
-            [
-                Path::new("/w/primary"),
-                Path::new("/w/a"),
-                Path::new("/w/c")
-            ]
-        );
+        assert_eq!(served, [Path::new("/w/primary"), Path::new("/w/a"), Path::new("/w/c")]);
 
         // Two joiners need two places; one cold root cannot give both.
         let mut mixed: Vec<(PathBuf, Instant)> = vec![
@@ -1153,12 +1641,7 @@ mod tests {
         ];
         let before = mixed.clone();
         assert_eq!(
-            admit(
-                &mut mixed,
-                &[PathBuf::from("/w/x"), PathBuf::from("/w/y")],
-                3,
-                now
-            ),
+            admit(&mut mixed, &[PathBuf::from("/w/x"), PathBuf::from("/w/y")], 3, now),
             None
         );
         assert_eq!(mixed, before, "a refused join evicts nothing");
@@ -1178,11 +1661,8 @@ mod tests {
         std::fs::create_dir_all(&gitdir).expect("worktree git dir");
         std::fs::write(gitdir.join("commondir"), "../..\n").expect("commondir");
         std::fs::create_dir_all(&linked).expect("linked worktree");
-        std::fs::write(
-            linked.join(".git"),
-            format!("gitdir: {}\n", gitdir.display()),
-        )
-        .expect("linked .git");
+        std::fs::write(linked.join(".git"), format!("gitdir: {}\n", gitdir.display()))
+            .expect("linked .git");
         let common = main.join(".git").canonicalize().expect("common dir");
         let key = |roots: &[PathBuf]| repo_key(roots);
         assert_eq!(
@@ -1190,11 +1670,7 @@ mod tests {
             Some(format!("{}:", common.display())),
             "the main worktree's top"
         );
-        assert_eq!(
-            key(&[linked.clone()]),
-            key(&[main.clone()]),
-            "a linked sibling"
-        );
+        assert_eq!(key(&[linked.clone()]), key(&[main.clone()]), "a linked sibling");
         let sub = Path::new("pkgs").join("a");
         assert_eq!(
             key(&[linked.join(&sub)]),
@@ -1207,20 +1683,83 @@ mod tests {
         std::fs::create_dir_all(&module).expect("module git dir");
         let submodule = main.join("m");
         std::fs::create_dir_all(&submodule).expect("submodule");
-        std::fs::write(
-            submodule.join(".git"),
-            format!("gitdir: {}\n", module.display()),
-        )
-        .expect("submodule .git");
-        assert_ne!(
-            key(&[submodule]),
-            key(&[main.clone()]),
-            "its own common dir"
-        );
+        std::fs::write(submodule.join(".git"), format!("gitdir: {}\n", module.display()))
+            .expect("submodule .git");
+        assert_ne!(key(&[submodule]), key(&[main.clone()]), "its own common dir");
 
         let other = tmp.path().join("other");
         std::fs::create_dir_all(other.join(".git")).expect("other repo");
         assert_eq!(key(&[main, other]), None, "two repos share no key");
+    }
+
+    /// An incremental edit's settle never yields to the growth brake —
+    /// the #4249 exemption: each edit settles in place, never restarts
+    /// into a whole-root re-analysis. The cold/whole-root samples keep
+    /// the brake through [`sample`].
+    #[test]
+    fn an_incremental_settle_never_yields_to_the_growth_brake() {
+        assert!(!incremental_settle_yields());
+    }
+
+    /// The cold freshness skip's whole policy: it fires only while no
+    /// server lives AND the priming baseline is still out — the cold
+    /// first ask, or a later ask while the server is down and the
+    /// background walk still runs. A live server always pays the check
+    /// (its diff drives the incremental overlay push), and an installed
+    /// baseline always pays it even server-less (a rebuild decision
+    /// observes the diff).
+    #[test]
+    fn the_freshness_skip_fires_only_on_the_cold_unprimed_ask() {
+        assert!(
+            cold_freshness_skip(false, false),
+            "no server, no baseline: the cold first ask, and any later\
+             \nask while the server is down and the prime still runs"
+        );
+        assert!(
+            !cold_freshness_skip(true, false),
+            "a live server observes the diff — always checked"
+        );
+        assert!(
+            !cold_freshness_skip(true, true),
+            "the steady state: checked"
+        );
+        assert!(
+            !cold_freshness_skip(false, true),
+            "no server but a baseline: a rebuild decision observes it"
+        );
+    }
+
+    /// The bookkeeping elision's decision: an identical (peak, source)
+    /// figure is elided — the peaks file already holds those bytes —
+    /// while a moved peak, a moved source size, or nothing yet persisted
+    /// (first record, or forgotten after the growth brake's floor
+    /// record) always lands.
+    #[test]
+    fn quiet_turns_elide_the_peak_record_and_changes_land() {
+        assert!(
+            !peak_persist_moved(Some((7, Some(3))), 7, Some(3)),
+            "the quiet turn: the identical figure is already on disk"
+        );
+        assert!(
+            peak_persist_moved(Some((7, Some(3))), 8, Some(3)),
+            "a moved peak records"
+        );
+        assert!(
+            peak_persist_moved(Some((7, Some(3))), 7, Some(4)),
+            "a moved source size records"
+        );
+        assert!(
+            peak_persist_moved(Some((7, Some(3))), 7, None),
+            "a vanished source size records"
+        );
+        assert!(
+            peak_persist_moved(None, 7, Some(3)),
+            "the first record lands"
+        );
+        assert!(
+            peak_persist_moved(None, 7, None),
+            "the post-yield forgotten memory lands the next completion"
+        );
     }
 
     /// A daemon's socket identity follows the file, not the path: the same
@@ -1245,7 +1784,9 @@ mod tests {
     #[test]
     fn the_face_header_refuses_over_cap_and_writes_in_cap() {
         let meta = crate::face::FaceMeta::default();
-        let over = usize::try_from(crate::client::MAX_FACE_BYTES).expect("cap fits usize") + 1;
+        let over = usize::try_from(crate::client::MAX_FACE_BYTES)
+            .expect("cap fits usize")
+            + 1;
         assert_eq!(face_header(&meta, over), None);
         assert_eq!(face_header(&meta, usize::MAX), None, "u32 overflow");
         let line = face_header(&meta, 42).expect("in-cap header");
@@ -1289,10 +1830,7 @@ mod tests {
     #[test]
     fn two_consecutive_degraded_checks_note_the_reason() {
         let shapes = [
-            (
-                WalkReason::CookieBlocked,
-                "its sync files cannot be written",
-            ),
+            (WalkReason::CookieBlocked, "its sync files cannot be written"),
             (WalkReason::StreamLost, "its event stream lost events"),
             (WalkReason::Unarmed, "its watcher is unavailable"),
         ];
@@ -1315,11 +1853,7 @@ mod tests {
     /// persistence, so an interrupted streak starts over.
     #[test]
     fn journal_and_by_design_answers_reset_the_streak() {
-        assert_eq!(
-            degradation_note(1, None, false),
-            (0, None),
-            "a journal answer"
-        );
+        assert_eq!(degradation_note(1, None, false), (0, None), "a journal answer");
         assert_eq!(
             degradation_note(1, Some(WalkReason::CookieTimeout), false),
             (0, None),
@@ -1350,5 +1884,138 @@ mod tests {
             degradation_note(0, Some(WalkReason::CookieBlocked), true),
             (0, None)
         );
+    }
+
+    /// The adoption arm's validation matrix: warm off leaves the ordinary
+    /// start path alone (`None`); warm on with no standby is a miss; a
+    /// standby whose SDK facts went stale is killed, never adopted; a
+    /// current standby is.
+    #[test]
+    fn standby_admit_decides_the_adoption_arm() {
+        assert_eq!(standby_admit(false, false, false), None, "warm off");
+        assert_eq!(standby_admit(false, true, true), None);
+        assert_eq!(
+            standby_admit(true, false, true),
+            Some(Adopt::Miss),
+            "no standby to adopt"
+        );
+        assert_eq!(
+            standby_admit(true, true, false),
+            Some(Adopt::StaleSdk),
+            "the SDK moved under the standby"
+        );
+        assert_eq!(
+            standby_admit(true, true, true),
+            Some(Adopt::Adopt),
+            "a current standby"
+        );
+    }
+
+    /// The warm posture's resolution tiers, oldest spec first: a spec
+    /// from before the knobs existed resolves warm-off (the 0.1.23
+    /// default) with the default TTL, the spec's own values come next,
+    /// the env overrides win (the A/B arm), and a garbage override fails
+    /// open to the tier below.
+    #[test]
+    fn warm_config_resolves_env_over_spec_over_default() {
+        let spec = |warm: u32, ttl: u32| Spec {
+            sdk_root: PathBuf::from("/sdk"),
+            sdk_version: "3.13.7".to_owned(),
+            roots: vec![PathBuf::from("/w/a")],
+            packages: None,
+            budget: 0,
+            idle_secs: 60,
+            max_percent: 90,
+            max_concurrent: 0,
+            pool: true,
+            max_roots: 3,
+            warm,
+            warm_ttl_secs: ttl,
+        };
+        assert_eq!(
+            warm_config_with(&spec(0, 0), None, None),
+            (false, Duration::from_secs(900)),
+            "an old spec behaves as the default: warm off, 900 s"
+        );
+        assert_eq!(
+            warm_config_with(&spec(1, 60), None, None),
+            (true, Duration::from_secs(60)),
+            "the spec's opt-in carries its TTL"
+        );
+        assert_eq!(
+            warm_config_with(&spec(0, 0), Some("0"), None),
+            (false, Duration::from_secs(900)),
+            "the env's off arm"
+        );
+        assert_eq!(
+            warm_config_with(&spec(0, 0), Some("1"), None),
+            (true, Duration::from_secs(900)),
+            "the env's on arm is the config-less opt-in"
+        );
+        assert_eq!(
+            warm_config_with(&spec(1, 900), Some("1"), Some("300")),
+            (true, Duration::from_secs(300)),
+            "the env wins over the spec"
+        );
+        assert_eq!(
+            warm_config_with(&spec(0, 0), Some("not-a-number"), Some("")),
+            (false, Duration::from_secs(900)),
+            "a garbage override fails open to the default"
+        );
+        assert_eq!(
+            warm_config_with(&spec(0, 1), None, Some("0")),
+            (false, Duration::from_secs(1)),
+            "the TTL floors at one second"
+        );
+    }
+
+    /// The standby's lease is memory-only: no job slot (it never blocks a
+    /// per-run analysis under `max_concurrent`, even at 1), a small
+    /// fixed booking, and a releasable that names this daemon — the
+    /// ledger's cheapest victim.
+    #[test]
+    fn the_standby_lease_is_slotless_memory_only_and_releasable() {
+        let request = standby_request("warm standby 3.13.7".to_owned(), PathBuf::from("/d/busy.lock"));
+        assert!(!request.slot, "no job slot");
+        assert_eq!(request.cap, 0);
+        assert_eq!(request.bytes, STANDBY_LEASE);
+        assert!(request.sized, "a deliberate booking, not a guess");
+        assert!(request.bytes < dartq_toolchain::ledger::DEFAULT_LEASE);
+        let release = request.release.expect("releasable while idle");
+        assert_eq!(release.pid, std::process::id());
+        assert_eq!(release.busy, Path::new("/d/busy.lock"));
+        assert_eq!(request.face, dartq_toolchain::ledger::Face::AnalysisServer);
+    }
+
+    /// The idle tiering transition: warm on with a servable SDK and no
+    /// standby yet enters Tier 2; a live standby (its TTL expiring) is
+    /// Tier 3's exit, and warm off or a PerRun SDK never tier.
+    #[test]
+    fn tier_two_needs_warm_a_servable_sdk_and_no_standby_yet() {
+        assert!(enters_tier2(true, false, true), "the Tier-2 entry");
+        assert!(!enters_tier2(true, true, true), "Tier 3: the standby's own expiry");
+        assert!(!enters_tier2(false, false, true), "warm off exits as ever");
+        assert!(!enters_tier2(true, false, false), "a PerRun SDK never tiers");
+    }
+
+    /// The standby's pressure line, mirroring the ledger monitor's own:
+    /// available under the reserve (the percent share, floored at the
+    /// ledger's reserve), the kernel's warn level on its own, and never
+    /// low on an unreadable figure or a boundary-equal sample.
+    #[test]
+    fn low_memory_sits_at_the_ledger_monitors_line() {
+        let gib = 1 << 30;
+        let total = 16 * gib;
+        // 90 percent: the share is 1.6 GiB, the 2 GiB floor dominates.
+        let reserve = dartq_toolchain::ledger::RESERVE_FLOOR;
+        assert!(!low_memory(total, Some(reserve), 90, false), "boundary equal");
+        assert!(low_memory(total, Some(reserve - 1), 90, false), "one byte under");
+        // 50 percent: the 8 GiB share dominates the floor.
+        let share = 8 * gib;
+        assert!(!low_memory(total, Some(share), 50, false));
+        assert!(low_memory(total, Some(share - 1), 50, false));
+        assert!(low_memory(total, Some(u64::MAX), 90, true), "the kernel's own warn");
+        assert!(!low_memory(total, None, 90, false), "unreadable is never low");
+        assert!(!low_memory(0, Some(0), 90, false));
     }
 }

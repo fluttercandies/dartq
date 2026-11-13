@@ -294,17 +294,18 @@ pub const INVALID_EXPORT_OF_INTERNAL_ELEMENT: ResolutionCodeInfo = ResolutionCod
 /// member. One report per matching signature type, no early exit
 /// (`best_practices_verifier.dart:1029-1049` walks parameter types, return
 /// type, and type-parameter bounds).
-pub const INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY: ResolutionCodeInfo = ResolutionCodeInfo {
-    name: "invalid_export_of_internal_element_indirectly",
-    machine: "INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY",
-    message: concat!(
-        "The member '{0}' can't be exported as a part of a package's public ",
-        "API, but is indirectly exported as part of the signature of '{1}'."
-    ),
-    correction: Some("Try using a hide clause to hide '{1}'."),
-    dtype: DiagnosticType::StaticWarning,
-    has_published: true,
-};
+pub const INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY: ResolutionCodeInfo =
+    ResolutionCodeInfo {
+        name: "invalid_export_of_internal_element_indirectly",
+        machine: "INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY",
+        message: concat!(
+            "The member '{0}' can't be exported as a part of a package's public ",
+            "API, but is indirectly exported as part of the signature of '{1}'."
+        ),
+        correction: Some("Try using a hide clause to hide '{1}'."),
+        dtype: DiagnosticType::StaticWarning,
+        has_published: true,
+    };
 
 /// A constant's value recursively depends on itself — registry row verbatim
 /// (`diagnostic.g.dart:14376`, dart 3.13.7). `COMPILE_TIME_ERROR`,
@@ -949,10 +950,7 @@ mod tests {
             RECURSIVE_INTERFACE_INHERITANCE.message,
             "'{0}' can't be a superinterface of itself: {1}."
         );
-        assert_eq!(
-            RECURSIVE_INTERFACE_INHERITANCE_EXTENDS.message,
-            "'{0}' can't extend itself."
-        );
+        assert_eq!(RECURSIVE_INTERFACE_INHERITANCE_EXTENDS.message, "'{0}' can't extend itself.");
         assert_eq!(
             RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS.message,
             "'{0}' can't implement itself."

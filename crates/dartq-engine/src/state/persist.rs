@@ -36,12 +36,12 @@ use serde::{Deserialize, Serialize};
 use dartq_diagnostics::{
     CodeInfo, CodeRegistry, ContextMessage, Diagnostic, DiagnosticType, Severity,
 };
-use dartq_index::{LibraryIndex, NameRow, RefKind, RefRow, SubtypeEdge, TargetRef};
 use dartq_package::{PackageIdentity, PackageTable, SourceCategory};
 use dartq_resolution::{
     CombinatorClause, Combinators, Configuration, ResolutionCode, ResolvedTarget,
 };
 use dartq_sdk::SdkSnapshot;
+use dartq_index::{LibraryIndex, NameRow, RefKind, RefRow, SubtypeEdge, TargetRef};
 use dartq_semantic::ApiSignature;
 use dartq_semantic::persisted::{PersistedElements, PersistedRange};
 use dartq_source::{ContentId, FileId, FileTable, LineIndex, SourceRange, StringId, StringTable};
@@ -878,6 +878,256 @@ pub(crate) fn lint_rows_key(
     bytes.extend_from_slice(content.as_bytes());
     bytes.extend_from_slice(&fingerprint.to_le_bytes());
     dartq_source::content_hash(&bytes)
+}
+
+/// The face a persisted answer record serves (#4243): the analyze face's
+/// output spellings. The tag folds into the envelope key, so records of
+/// different faces never alias — a format's bytes are its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerFace {
+    /// The LON machine document.
+    AnalyzeLon,
+    /// The JSON machine envelope, no memory key.
+    AnalyzeJson,
+    /// The JSON machine envelope whose `memory` member the serving
+    /// process re-splices (the recorded blob holds the pre-splice bytes).
+    AnalyzeJsonMemory,
+    /// The human text face.
+    AnalyzeText,
+}
+
+impl AnswerFace {
+    /// The key's tag byte — one stable byte per face, folded first.
+    fn tag(self) -> u8 {
+        match self {
+            Self::AnalyzeLon => 0,
+            Self::AnalyzeJson => 1,
+            Self::AnalyzeJsonMemory => 2,
+            Self::AnalyzeText => 3,
+        }
+    }
+}
+
+/// One ask target of an answer shape, the canonicalized spelling the key
+/// folds (the `aims_key` discipline): variant-tagged, path-sorted, deduped
+/// asks name the same coverage and reuse one record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnswerAim {
+    /// A directory aim — analysis rooted at the directory.
+    Dir(PathBuf),
+    /// A file aim.
+    File(PathBuf),
+}
+
+impl AnswerAim {
+    /// The key's pair: the variant tag and the path bytes.
+    fn leg(&self) -> (u8, &Path) {
+        match self {
+            Self::Dir(path) => (0, path.as_path()),
+            Self::File(path) => (1, path.as_path()),
+        }
+    }
+}
+
+/// The answer's shape (#4243): the face plus the canonicalized target set
+/// — everything about the ask, besides the workspace inputs the header,
+/// grants, and stamps pin, that the rendered bytes depend on. An empty
+/// aim set is the full-workspace ask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnswerShape {
+    /// The served face.
+    pub face: AnswerFace,
+    /// The canonicalized targets (sorted, deduped — the constructor
+    /// normalizes; the fields are pub for the builder tests).
+    pub aims: Vec<AnswerAim>,
+}
+
+impl AnswerShape {
+    /// The canonical form: aims sorted by (variant tag, path bytes) and
+    /// deduped, so two asks naming the same coverage in different orders
+    /// derive one key.
+    #[must_use]
+    pub fn new(face: AnswerFace, aims: Vec<AnswerAim>) -> Self {
+        let mut aims = aims;
+        aims.sort_by(|a, b| a.leg().cmp(&b.leg()));
+        aims.dedup_by(|a, b| a.leg() == b.leg());
+        Self { face, aims }
+    }
+}
+
+/// The answered-turn envelope key (#4243): blake3-128 over the generation
+/// header (SDK identity, package-graph fingerprint, context salt — the
+/// analyzer build, context root, target, declared variables, and options
+/// bytes all live in the salt), the feature-grants fingerprint (the
+/// experiment configuration a run's output depends on, the same u64 the
+/// run keys fold), and the canonical answer shape. Every input is
+/// available at assembly time — zero store I/O — so two processes over
+/// the same workspace, SDK, options, and build derive identical keys for
+/// identical asks. The single derivation point: the daemon turn cache
+/// (#4240) and the CLI probe read one spelling, never their own.
+#[must_use]
+pub fn envelope_key(header: &dartq_snapshot::GenerationHeader, grants: u64, shape: &AnswerShape) -> [u8; 16] {
+    let mut bytes = Vec::with_capacity(96);
+    bytes.extend_from_slice(&shape.face.tag().to_le_bytes());
+    bytes.extend_from_slice(&header.format_version.to_le_bytes());
+    bytes.extend_from_slice(&header.semantic_version.to_le_bytes());
+    field(&mut bytes, header.sdk_identity.as_bytes());
+    field(&mut bytes, &header.package_graph_fingerprint);
+    field(&mut bytes, &header.context_salt);
+    bytes.extend_from_slice(&grants.to_le_bytes());
+    bytes.extend_from_slice(&(shape.aims.len() as u32).to_le_bytes());
+    for aim in &shape.aims {
+        let (tag, path) = aim.leg();
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        field(&mut bytes, path.as_os_str().as_encoded_bytes());
+    }
+    blake3_128(&bytes)
+}
+
+/// One file's freshness stamp over the trust boundary the refresh guard
+/// and the host freshness walk already accept (#2596), widened to the
+/// full identity tuple: device and inode (same-bytes-same-file across
+/// renames), mtime in nanoseconds, and size. `None` when the path cannot
+/// stat — the caller omits the file from the stamp set, and its
+/// appearance later changes the set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerStamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub mtime_ns: u64,
+    pub size: u64,
+}
+
+impl AnswerStamp {
+    /// Stats `path` into the stamp tuple. Nanoseconds saturate at zero
+    /// for a pre-epoch mtime; non-unix hosts fold zero device/inode
+    /// columns (the mtime/size pair still pins the bytes).
+    #[must_use]
+    pub fn capture(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |span| u64::try_from(span.as_nanos()).unwrap_or(u64::MAX));
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
+        Some(Self {
+            dev,
+            ino,
+            mtime_ns,
+            size: meta.len(),
+        })
+    }
+}
+
+/// The counts and severity presence a served answer replays (#4243): the
+/// metrics the run reported and the flags the exit tier re-derives
+/// against the serving process's own fatal posture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerSummary {
+    pub files: u64,
+    pub loc: u64,
+    pub diagnostics: u64,
+    pub libraries_analyzed: u64,
+    pub libraries_from_cache: u64,
+    pub has_error: bool,
+    pub has_warning: bool,
+    pub has_info: bool,
+}
+
+/// The answered-turn record's sidecar payload (#4243): the rendered
+/// bytes' content-store id (hex — the [`ContentId`] wire spelling, no
+/// serde feature dependency), the read-time stamp set the serving probe
+/// re-derives and compares, and the summary a hit replays. Bincode under
+/// the `encode_run` discipline — a decode failure of any kind is a miss,
+/// the accelerator contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnsweredRecord {
+    /// The payload codec version; a mismatched record decodes to a miss.
+    pub version: u32,
+    /// The rendered bytes' content id — the blob the store serves — in
+    /// the `Display` hex spelling ([`ContentId::parse_hex`] on read; a
+    /// foreign spelling decodes to a miss).
+    pub blob: String,
+    /// The stamp set captured at read time by the run that rendered the
+    /// bytes — read time only, never a post-render re-walk — sorted by
+    /// path.
+    pub stamps: Vec<(PathBuf, AnswerStamp)>,
+    /// The metrics/tier faces a hit replays.
+    pub summary: AnswerSummary,
+}
+
+/// The answer record's codec version.
+pub const ANSWER_RECORD_VERSION: u32 = 1;
+
+/// Encodes an answer record (the [`encode_run`] discipline): positional
+/// bincode; `None` when the payload cannot encode (the miss posture).
+pub(crate) fn encode_answer(record: &AnsweredRecord) -> Option<Vec<u8>> {
+    bincode_next::serde::encode_to_vec(record, bincode_next::config::standard()).ok()
+}
+
+/// Decodes a stored answer record; `None` on any failure (foreign bytes,
+/// a torn sidecar, a future codec) — a miss, never an error.
+pub(crate) fn decode_answer(bytes: &[u8]) -> Option<AnsweredRecord> {
+    let (record, _) =
+        bincode_next::serde::decode_from_slice::<AnsweredRecord, _>(bytes, bincode_next::config::standard())
+            .ok()?;
+    (record.version == ANSWER_RECORD_VERSION).then_some(record)
+}
+
+/// Why an answer probe missed: the trace taxonomy's machine keys — every
+/// miss is the full path (the pure-accelerator contract), the reason only
+/// observes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerMiss {
+    /// No armed content store — nothing to read.
+    NoStore,
+    /// No sidecar under the derived key (a first run, an evicted record,
+    /// or a forked header/grants/shape dimension).
+    NoRecord,
+    /// The sidecar decoded to nothing (torn write, future codec).
+    Decode,
+    /// The workspace stamp set moved against the record's read-time
+    /// capture — the tree changed, the answer must re-render.
+    Stamps,
+    /// The record's blob is gone from the store (evicted between the
+    /// sidecar write and this probe).
+    Blob,
+}
+
+impl AnswerMiss {
+    /// The trace row's machine key.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::NoStore => "no_store",
+            Self::NoRecord => "no_record",
+            Self::Decode => "decode",
+            Self::Stamps => "stamp_mismatch",
+            Self::Blob => "blob_missing",
+        }
+    }
+}
+
+/// One answer probe's outcome (#4243): the served bytes and replayed
+/// summary on a hit, the miss reason on a miss.
+#[derive(Debug, PartialEq)]
+pub enum AnswerProbe {
+    /// The rendered bytes a full run produced under inputs pinned equal,
+    /// with the summary the metrics and exit tier replay.
+    Hit {
+        /// The stored blob's bytes, served verbatim.
+        bytes: Vec<u8>,
+        /// The recorded counts and severity presence.
+        summary: AnswerSummary,
+    },
+    /// A miss — the caller takes today's full path unchanged.
+    Miss(AnswerMiss),
 }
 
 /// One extracted `@docImport` in payload form — the mirror of
@@ -3962,7 +4212,8 @@ mod tests {
             .load::<PersistedFacts>(&header)
             .expect("generation");
         assert_eq!(edited.ingest_facts_snapshot(snapshot), 1);
-        let main_edited = edited.set_content(&main_path, b"void main() { var x = 1; }\n");
+        let main_edited =
+            edited.set_content(&main_path, b"void main() { var x = 1; }\n");
         let mut edited_hits = 0;
         let mut edited_recomputes = 0;
         let mut on_event = |event: EngineEvent| {
@@ -3997,6 +4248,551 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A pubspec-less workspace with a caller-chosen `lib/` file set — the
+    /// [`bare_workspace`] shape for the multi-library targeted-turn pins.
+    fn bare_workspace_with(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-targeted-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib")).expect("fixture dir");
+        for (name, text) in files {
+            std::fs::write(root.join("lib").join(name), text).expect("fixture file");
+        }
+        root
+    }
+
+    /// One synthetic SDK root for engines that must share the grants
+    /// fingerprint (the run key folds the SDK lib root, so per-engine roots
+    /// fork every key and every replay would be a miss).
+    fn shared_sdk_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-targeted-sdk-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib/_internal")).expect("sdk dirs");
+        std::fs::write(root.join("version"), "3.13.1\n").expect("version");
+        std::fs::write(root.join("lib/libraries.json"), SDK_LIBRARIES).expect("libraries");
+        std::fs::write(
+            root.join("lib/_internal/allowed_experiments.json"),
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        )
+        .expect("experiments");
+        root
+    }
+
+    /// A diagnostic set projected onto every output-bearing column, with
+    /// file ids resolved to basenames so two engines' sets compare (file
+    /// ids are process-local).
+    fn row_projection(engine: &Engine, rows: &[Diagnostic]) -> Vec<RowProjection> {
+        let basename = |file| {
+            engine
+                .file_table()
+                .path(file)
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        rows.iter()
+            .map(|row| {
+                (
+                    basename(row.file),
+                    row.range.offset,
+                    row.range.length,
+                    row.code.name,
+                    row.code.machine,
+                    row.severity,
+                    row.message.as_str().to_owned(),
+                    row.correction.as_deref().map(str::to_owned),
+                    row.context.as_ref().map(|context| {
+                        context
+                            .iter()
+                            .map(|message| {
+                                (
+                                    basename(message.file),
+                                    message.range.offset,
+                                    message.range.length,
+                                    message.message.as_str().to_owned(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    /// The row projection's element shape — spelled out once so the
+    /// expected and actual sets share one tuple type.
+    type RowProjection = (
+        String,
+        u32,
+        u32,
+        &'static str,
+        &'static str,
+        Severity,
+        String,
+        Option<String>,
+        Option<Vec<(String, u32, u32, String)>>,
+    );
+
+    /// #4234: a file-aim ("targeted") warm turn replays only the aim's
+    /// library. Before this, the warm single-file face read, decoded,
+    /// materialized, surface-installed, and merged all 1,318 cockpit
+    /// libraries per turn; a targeted turn adopts the aim library's stored
+    /// run and defers the rest, returning exactly the full turn's rows for
+    /// the aim file — the rows the CLI's `covered` filter keeps, byte for
+    /// byte — while the next untargeted turn drains the deferred
+    /// libraries and reproduces the whole set.
+    #[test]
+    fn targeted_turn_replays_only_the_aim_library_and_restores_the_full_set() {
+        let root = bare_workspace_with(
+            "aim",
+            &[
+                ("a.dart", "import 'b.dart';\nvoid a() { b(); var x = ; }\n"),
+                ("b.dart", "void b() {}\n"),
+                ("c.dart", "void c() { var z = ; }\n"),
+            ],
+        );
+        let sdk_root = shared_sdk_root("aim");
+        let snap_root = snapshot_cache_dir();
+        let store_root = snapshot_cache_dir();
+        let cancel = CancellationToken::new();
+        let config = || crate::store::StoreConfig {
+            root: store_root.clone(),
+            size_limit: 16 << 20,
+        };
+
+        // The producer: one cold full turn, every run persisted, the facts
+        // saved for the warm shape.
+        let mut producer = bare_engine_over_sdk(&root, &sdk_root);
+        producer.open_content_store(&config()).expect("open store");
+        assert_eq!(producer.discover_workspace().expect("discover").file_count, 3);
+        let cold_rows = producer
+            .analyze(&[], &mut |_| {}, &cancel)
+            .expect("cold analyze");
+        let full = row_projection(&producer, &cold_rows);
+        assert_eq!(
+            full.iter()
+                .map(|row| row.0.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["a.dart", "c.dart"].into_iter().collect(),
+            "fixture sanity: the parse errors land on the two broken files"
+        );
+        let snapshot_store = SnapshotStore::open(SnapshotConfig {
+            root: Some(snap_root.clone()),
+            capacity_bytes: 64 << 20,
+        })
+        .expect("open snapshot store");
+        assert_eq!(
+            producer.save_facts_snapshot(&snapshot_store).expect("save"),
+            3
+        );
+        let header = producer.snapshot_header();
+        drop(producer);
+
+        // The warm full turn: the whole-store replay the targeted turn must
+        // match for the aim, and the full set a later untargeted turn must
+        // restore.
+        let mut full_engine = bare_engine_over_sdk(&root, &sdk_root);
+        full_engine.open_content_store(&config()).expect("open store");
+        let snapshot = snapshot_store
+            .load::<PersistedFacts>(&header)
+            .expect("generation");
+        assert_eq!(full_engine.ingest_facts_snapshot(snapshot), 3);
+        full_engine.discover_workspace().expect("discover");
+        let warm_full_rows = full_engine
+            .analyze(&[], &mut |_| {}, &cancel)
+            .expect("warm full");
+        assert_eq!(
+            row_projection(&full_engine, &warm_full_rows),
+            full,
+            "the warm full turn reproduces the cold set"
+        );
+        assert_eq!(
+            full_engine.last_analyze_stats(),
+            (0, 3),
+            "every library served from the standing runs"
+        );
+
+        // The targeted turn: only a.dart's library replays; b.dart and
+        // c.dart defer instead of decoding and merging.
+        let mut aim_engine = bare_engine_over_sdk(&root, &sdk_root);
+        aim_engine.open_content_store(&config()).expect("open store");
+        let snapshot = snapshot_store
+            .load::<PersistedFacts>(&header)
+            .expect("generation");
+        assert_eq!(aim_engine.ingest_facts_snapshot(snapshot), 3);
+        aim_engine.discover_workspace().expect("discover");
+        let aim = aim_engine
+            .file_table()
+            .try_file_id(&root.join("lib/a.dart"))
+            .expect("aim id");
+        let aim_rows = aim_engine
+            .analyze(&[aim], &mut |_| {}, &cancel)
+            .expect("targeted analyze");
+        let expected: Vec<RowProjection> = full
+            .iter()
+            .filter(|row| row.0 == "a.dart")
+            .cloned()
+            .collect();
+        assert_eq!(
+            row_projection(&aim_engine, &aim_rows),
+            expected,
+            "the targeted turn returns the full turn's aim rows, row for row"
+        );
+        assert_eq!(
+            aim_engine.last_analyze_stats(),
+            (0, 1),
+            "one library served, nothing recomputed"
+        );
+        assert_eq!(
+            aim_engine.state.results.len(),
+            1,
+            "only the aim's library was replayed from the store"
+        );
+        assert_eq!(
+            aim_engine.state.slice_deferred.len(),
+            2,
+            "the other invalidated libraries deferred instead of recomputing"
+        );
+
+        // The deferred set rejoins the next untargeted turn: the two
+        // libraries replay nothing (staging was consumed) and recompute,
+        // and the output is whole again.
+        let restored = aim_engine
+            .analyze(&[], &mut |_| {}, &cancel)
+            .expect("restore");
+        assert_eq!(
+            row_projection(&aim_engine, &restored),
+            full,
+            "the full turn after a targeted one is whole"
+        );
+        assert!(
+            aim_engine.state.slice_deferred.is_empty(),
+            "the deferral drained"
+        );
+        assert_eq!(
+            aim_engine.state.results.len(),
+            3,
+            "every live library holds a run again"
+        );
+        let _ = std::fs::remove_dir_all(&snap_root);
+        let _ = std::fs::remove_dir_all(&store_root);
+        let _ = std::fs::remove_dir_all(&sdk_root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The targeted turn's part-file aim: a `part` file resolves through
+    /// its defining library (`library_of_file`), so the aim adopts the one
+    /// run that carries the part's rows and emits them — the full turn's
+    /// part rows, row for row.
+    #[test]
+    fn targeted_turn_resolves_a_part_file_aim_to_its_library() {
+        let root = bare_workspace_with(
+            "part",
+            &[
+                ("host.dart", "part 'piece.dart';\nvoid host() { var x = ; }\n"),
+                ("piece.dart", "part of 'host.dart';\nvoid piece() { var y = ; }\n"),
+                ("other.dart", "void other() { var z = ; }\n"),
+            ],
+        );
+        let sdk_root = shared_sdk_root("part");
+        let snap_root = snapshot_cache_dir();
+        let store_root = snapshot_cache_dir();
+        let cancel = CancellationToken::new();
+        let config = || crate::store::StoreConfig {
+            root: store_root.clone(),
+            size_limit: 16 << 20,
+        };
+
+        let mut producer = bare_engine_over_sdk(&root, &sdk_root);
+        producer.open_content_store(&config()).expect("open store");
+        producer.discover_workspace().expect("discover");
+        let cold_rows = producer
+            .analyze(&[], &mut |_| {}, &cancel)
+            .expect("cold analyze");
+        let full = row_projection(&producer, &cold_rows);
+        assert!(
+            full.iter().any(|row| row.0 == "piece.dart"),
+            "fixture sanity: the part file carries its own rows"
+        );
+        let snapshot_store = SnapshotStore::open(SnapshotConfig {
+            root: Some(snap_root.clone()),
+            capacity_bytes: 64 << 20,
+        })
+        .expect("open snapshot store");
+        assert_eq!(
+            producer.save_facts_snapshot(&snapshot_store).expect("save"),
+            3
+        );
+        let header = producer.snapshot_header();
+        drop(producer);
+
+        let mut aim_engine = bare_engine_over_sdk(&root, &sdk_root);
+        aim_engine.open_content_store(&config()).expect("open store");
+        let snapshot = snapshot_store
+            .load::<PersistedFacts>(&header)
+            .expect("generation");
+        assert_eq!(aim_engine.ingest_facts_snapshot(snapshot), 3);
+        aim_engine.discover_workspace().expect("discover");
+        let aim = aim_engine
+            .file_table()
+            .try_file_id(&root.join("lib/piece.dart"))
+            .expect("part id");
+        let aim_rows = aim_engine
+            .analyze(&[aim], &mut |_| {}, &cancel)
+            .expect("targeted analyze");
+        // The aim resolves to the DEFINING library, so the turn returns
+        // that library's rows — the part's own rows plus its defining
+        // file's (the part's diagnostics live in the one run). The
+        // caller's `covered` filter keeps the part's rows, and those must
+        // equal the full turn's part rows.
+        let aimed: Vec<RowProjection> = full
+            .iter()
+            .filter(|row| row.0 == "piece.dart" || row.0 == "host.dart")
+            .cloned()
+            .collect();
+        let projected = row_projection(&aim_engine, &aim_rows);
+        assert_eq!(
+            projected, aimed,
+            "the part aim serves its defining library's rows"
+        );
+        assert_eq!(
+            projected
+                .into_iter()
+                .filter(|row| row.0 == "piece.dart")
+                .collect::<Vec<_>>(),
+            full.iter()
+                .filter(|row| row.0 == "piece.dart")
+                .cloned()
+                .collect::<Vec<_>>(),
+            "the covered view (the part's own rows) is the full turn's, row for row"
+        );
+        assert_eq!(
+            aim_engine.state.results.len(),
+            1,
+            "one library — the part's defining library — replayed"
+        );
+        assert_eq!(aim_engine.state.slice_deferred.len(), 1, "other.dart deferred");
+        let _ = std::fs::remove_dir_all(&snap_root);
+        let _ = std::fs::remove_dir_all(&store_root);
+        let _ = std::fs::remove_dir_all(&sdk_root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The targeted turn's fallback: a target with no live library (a path
+    /// the analysis never claimed — an options file, a stray id) keeps the
+    /// full replay, because such a target's rows are not a library run's
+    /// and a slice could drop them.
+    #[test]
+    fn targeted_turn_falls_back_when_a_target_has_no_library() {
+        let root = bare_workspace_with(
+            "fallback",
+            &[("a.dart", "void a() { var x = ; }\n"), ("b.dart", "void b() { var y = ; }\n")],
+        );
+        let sdk_root = shared_sdk_root("fallback");
+        let snap_root = snapshot_cache_dir();
+        let store_root = snapshot_cache_dir();
+        let cancel = CancellationToken::new();
+        let config = || crate::store::StoreConfig {
+            root: store_root.clone(),
+            size_limit: 16 << 20,
+        };
+
+        let mut producer = bare_engine_over_sdk(&root, &sdk_root);
+        producer.open_content_store(&config()).expect("open store");
+        producer.discover_workspace().expect("discover");
+        let cold_rows = producer
+            .analyze(&[], &mut |_| {}, &cancel)
+            .expect("cold analyze");
+        let full = row_projection(&producer, &cold_rows);
+        let snapshot_store = SnapshotStore::open(SnapshotConfig {
+            root: Some(snap_root.clone()),
+            capacity_bytes: 64 << 20,
+        })
+        .expect("open snapshot store");
+        assert_eq!(
+            producer.save_facts_snapshot(&snapshot_store).expect("save"),
+            2
+        );
+        let header = producer.snapshot_header();
+        drop(producer);
+
+        let mut aim_engine = bare_engine_over_sdk(&root, &sdk_root);
+        aim_engine.open_content_store(&config()).expect("open store");
+        let snapshot = snapshot_store
+            .load::<PersistedFacts>(&header)
+            .expect("generation");
+        assert_eq!(aim_engine.ingest_facts_snapshot(snapshot), 2);
+        aim_engine.discover_workspace().expect("discover");
+        // An interned path no analysis claims: the live-path ceiling seam
+        // interns without content or residency.
+        aim_engine.note_live_path_ceiling(&root.join("lib/stray.dart"));
+        let stray = aim_engine
+            .file_table()
+            .try_file_id(&root.join("lib/stray.dart"))
+            .expect("stray id");
+        let rows = aim_engine
+            .analyze(&[stray], &mut |_| {}, &cancel)
+            .expect("fallback analyze");
+        assert_eq!(
+            row_projection(&aim_engine, &rows),
+            full,
+            "the unmapped target keeps the full turn's output"
+        );
+        assert_eq!(
+            aim_engine.state.results.len(),
+            2,
+            "the full replay adopted both libraries"
+        );
+        assert!(
+            aim_engine.state.slice_deferred.is_empty(),
+            "the fallback defers nothing"
+        );
+        let _ = std::fs::remove_dir_all(&snap_root);
+        let _ = std::fs::remove_dir_all(&store_root);
+        let _ = std::fs::remove_dir_all(&sdk_root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Successive targeted turns on ONE warm engine (#4234): the staging a
+    /// first targeted turn claims is gone, so the second turn takes the
+    /// no-staging arm — the deferred set must requeue and the slice must
+    /// retarget, or the second aim's library (no standing result, never
+    /// recomputed) silently drops out of the turn's rows. The pin: each
+    /// aim answers its own library's rows — the full turn's rows for
+    /// that file — and the final untargeted turn restores the whole set.
+    #[test]
+    fn successive_targeted_turns_each_serve_their_own_aim() {
+        let root = bare_workspace_with(
+            "chain",
+            &[
+                ("a.dart", "import 'b.dart';\nvoid a() { b(); var x = ; }\n"),
+                ("b.dart", "void b() {}\n"),
+                ("c.dart", "void c() { var z = ; }\n"),
+            ],
+        );
+        let sdk_root = shared_sdk_root("chain");
+        let snap_root = snapshot_cache_dir();
+        let store_root = snapshot_cache_dir();
+        let cancel = CancellationToken::new();
+        let config = || crate::store::StoreConfig {
+            root: store_root.clone(),
+            size_limit: 16 << 20,
+        };
+
+        let mut producer = bare_engine_over_sdk(&root, &sdk_root);
+        producer.open_content_store(&config()).expect("open store");
+        producer.discover_workspace().expect("discover");
+        let cold_rows = producer
+            .analyze(&[], &mut |_| {}, &cancel)
+            .expect("cold analyze");
+        let full = row_projection(&producer, &cold_rows);
+        let snapshot_store = SnapshotStore::open(SnapshotConfig {
+            root: Some(snap_root.clone()),
+            capacity_bytes: 64 << 20,
+        })
+        .expect("open snapshot store");
+        assert_eq!(
+            producer.save_facts_snapshot(&snapshot_store).expect("save"),
+            3
+        );
+        let header = producer.snapshot_header();
+        drop(producer);
+
+        let mut engine = bare_engine_over_sdk(&root, &sdk_root);
+        engine.open_content_store(&config()).expect("open store");
+        let snapshot = snapshot_store
+            .load::<PersistedFacts>(&header)
+            .expect("generation");
+        assert_eq!(engine.ingest_facts_snapshot(snapshot), 3);
+        engine.discover_workspace().expect("discover");
+        let aim_of = |name: &str| root.join(format!("lib/{name}"));
+        let a_id = engine
+            .file_table()
+            .try_file_id(&aim_of("a.dart"))
+            .expect("a id");
+        let c_id = engine
+            .file_table()
+            .try_file_id(&aim_of("c.dart"))
+            .expect("c id");
+
+        // Turn one — aim a.dart: the staged replay adopts the aim library
+        // alone, deferring the other two.
+        let first = engine
+            .analyze(&[a_id], &mut |_| {}, &cancel)
+            .expect("first targeted");
+        assert_eq!(
+            row_projection(&engine, &first)
+                .into_iter()
+                .map(|row| row.0)
+                .collect::<Vec<_>>(),
+            vec!["a.dart".to_owned()],
+            "the first aim answers its own rows"
+        );
+        assert_eq!(engine.state.slice_deferred.len(), 2);
+
+        // Turn two — aim c.dart on the SAME engine, staging consumed: the
+        // deferred set requeues, the slice retargets, and c.dart's library
+        // recomputes (no standing result, nothing stored to hit under a
+        // consumed staging) instead of vanishing from the output. The
+        // returned set is the merge over standing runs — a.dart's rows ride
+        // along; the covered view (the caller's filter) is the contract.
+        let second = engine
+            .analyze(&[c_id], &mut |_| {}, &cancel)
+            .expect("second targeted");
+        let projected = row_projection(&engine, &second);
+        let covered: Vec<RowProjection> = projected
+            .iter()
+            .filter(|row| row.0 == "c.dart")
+            .cloned()
+            .collect();
+        let expected: Vec<RowProjection> = full
+            .iter()
+            .filter(|row| row.0 == "c.dart")
+            .cloned()
+            .collect();
+        assert_eq!(
+            covered, expected,
+            "the second aim's covered view is the full turn's c.dart rows — \
+             the rows a stale partial merge would have dropped"
+        );
+        assert!(
+            projected.iter().all(|row| row.0 != "b.dart"),
+            "the never-aimed, never-adopted library contributes nothing"
+        );
+        assert_eq!(
+            engine.state.results.len(),
+            2,
+            "two libraries hold runs: a.dart's standing, c.dart's fresh"
+        );
+        assert_eq!(
+            engine.state.slice_deferred.len(),
+            1,
+            "the non-aim remainder deferred again"
+        );
+
+        // The untargeted close: the deferral drains and the whole set
+        // returns.
+        let restored = engine.analyze(&[], &mut |_| {}, &cancel).expect("restore");
+        assert_eq!(
+            row_projection(&engine, &restored),
+            full,
+            "the full turn after the targeted chain is whole"
+        );
+        assert!(engine.state.slice_deferred.is_empty());
+        assert_eq!(engine.state.results.len(), 3);
+        let _ = std::fs::remove_dir_all(&snap_root);
+        let _ = std::fs::remove_dir_all(&store_root);
+        let _ = std::fs::remove_dir_all(&sdk_root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The run payload's own contract, pinned at the JSON face: a well-formed
     /// entry round-trips into a faithful `LibraryResult` (rows, context,
     /// fingerprint) plus its reference surface (the resolved ref, the
@@ -4025,7 +4821,8 @@ mod tests {
             r#""strings":["greet","Missing","C","p"]},"#,
             r#""files":["/w/lib/main.dart","/w/lib/other.dart"]}"#,
         );
-        let payload: PersistedLibraryRun = serde_json::from_str(json).expect("decode");
+        let payload: PersistedLibraryRun =
+            serde_json::from_str(json).expect("decode");
         let fingerprint =
             ApiSignature::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
         let mut files = FileTable::new();
@@ -4086,8 +4883,7 @@ mod tests {
 
         // The embedded fingerprint check: a different expected face never
         // serves, even though the store key would have matched the fold.
-        let moved =
-            ApiSignature::from_bytes([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+        let moved = ApiSignature::from_bytes([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
         assert!(
             payload
                 .clone()
@@ -4101,7 +4897,8 @@ mod tests {
         // A file the loading engine never interned: the run cannot be
         // attributed faithfully, so nothing serves.
         let ghost_json = json.replace("/w/lib/other.dart", "/w/lib/ghost.dart");
-        let ghost: PersistedLibraryRun = serde_json::from_str(&ghost_json).expect("decode");
+        let ghost: PersistedLibraryRun =
+            serde_json::from_str(&ghost_json).expect("decode");
         assert!(
             ghost
                 .materialize(&fingerprint, &codes, &strings, &mut |path| {
@@ -4138,13 +4935,7 @@ mod tests {
         let key_packages = lint_rows_key(build, grants, [8u8; 16], content, fingerprint);
         assert_ne!(key1, key_packages, "packages move re-keys");
 
-        let key_content = lint_rows_key(
-            build,
-            grants,
-            packages,
-            content_hash(b"int y = 2;"),
-            fingerprint,
-        );
+        let key_content = lint_rows_key(build, grants, packages, content_hash(b"int y = 2;"), fingerprint);
         assert_ne!(key1, key_content, "content move re-keys");
 
         let key_fp = lint_rows_key(build, grants, packages, content, 100);
@@ -4239,5 +5030,135 @@ mod tests {
             &with_part,
         );
         assert_ne!(key1, key_part, "member-set growth re-keys");
+    }
+
+    /// The answer record codec roundtrips and rejects foreign versions
+    /// (#4243): the `encode_run` discipline's miss posture — a decode
+    /// failure of any kind (torn bytes, a future `version`) is a miss,
+    /// never an error.
+    #[test]
+    fn answer_record_codec_roundtrips_and_rejects_foreign_versions() {
+        let record = AnsweredRecord {
+            version: ANSWER_RECORD_VERSION,
+            blob: content_hash(b"rendered answer").to_string(),
+            stamps: vec![
+                (
+                    PathBuf::from("/w/lib/a.dart"),
+                    AnswerStamp {
+                        dev: 1,
+                        ino: 2,
+                        mtime_ns: 3,
+                        size: 4,
+                    },
+                ),
+                (
+                    PathBuf::from("/w/pubspec.yaml"),
+                    AnswerStamp {
+                        dev: 1,
+                        ino: 9,
+                        mtime_ns: 8,
+                        size: 7,
+                    },
+                ),
+            ],
+            summary: AnswerSummary {
+                files: 12,
+                loc: 3400,
+                diagnostics: 56,
+                libraries_analyzed: 10,
+                libraries_from_cache: 9,
+                has_error: true,
+                has_warning: false,
+                has_info: true,
+            },
+        };
+        let bytes = encode_answer(&record).expect("encodes");
+        assert_eq!(decode_answer(&bytes).as_ref(), Some(&record), "roundtrip");
+        // A future codec version never serves.
+        let mut future = record.clone();
+        future.version = ANSWER_RECORD_VERSION + 1;
+        let future = encode_answer(&future).expect("encodes");
+        assert_eq!(decode_answer(&future), None, "future version misses");
+        // Foreign bytes miss.
+        assert_eq!(decode_answer(b"not bincode at all"), None);
+    }
+
+    /// The envelope key is stable for equal inputs and forks on every
+    /// key-relevant dimension: each header column,
+    /// the grants fingerprint, the face tag, and the aim set — while the
+    /// canonicalized aim spelling (order, duplicates) folds to one key.
+    #[test]
+    fn envelope_key_is_stable_and_forks_on_every_dimension() {
+        let header = dartq_snapshot::GenerationHeader {
+            format_version: 3,
+            semantic_version: 25,
+            sdk_identity: "dart-sdk 3.13.1 revision x libraries y target vm".to_owned(),
+            package_graph_fingerprint: [1u8; 16],
+            context_salt: [2u8; 16],
+        };
+        let shape = AnswerShape::new(
+            AnswerFace::AnalyzeLon,
+            vec![AnswerAim::Dir(PathBuf::from("/w/lib"))],
+        );
+        let key = envelope_key(&header, 42, &shape);
+        assert_eq!(key, envelope_key(&header, 42, &shape), "stable");
+
+        // Aim canonicalization: order and duplicates fold to one key.
+        let canonical = AnswerShape::new(
+            AnswerFace::AnalyzeLon,
+            vec![
+                AnswerAim::File(PathBuf::from("/w/lib/a.dart")),
+                AnswerAim::Dir(PathBuf::from("/w/lib")),
+                AnswerAim::Dir(PathBuf::from("/w/lib")),
+            ],
+        );
+        assert_eq!(
+            canonical.aims,
+            vec![
+                AnswerAim::Dir(PathBuf::from("/w/lib")),
+                AnswerAim::File(PathBuf::from("/w/lib/a.dart")),
+            ],
+            "sorted, deduped"
+        );
+        assert_ne!(
+            key,
+            envelope_key(&header, 42, &canonical),
+            "a different aim set forks"
+        );
+        let folded = AnswerShape::new(
+            AnswerFace::AnalyzeLon,
+            vec![
+                AnswerAim::Dir(PathBuf::from("/w/lib")),
+                AnswerAim::Dir(PathBuf::from("/w/lib")),
+                AnswerAim::File(PathBuf::from("/w/lib/a.dart")),
+            ],
+        );
+        assert_eq!(
+            envelope_key(&header, 42, &canonical),
+            envelope_key(&header, 42, &folded),
+            "aim order/duplicates fold to one key"
+        );
+
+        // Every dimension forks.
+        let mut forked = header.clone();
+        forked.sdk_identity.push('!');
+        assert_ne!(key, envelope_key(&forked, 42, &shape), "sdk identity");
+        let mut forked = header.clone();
+        forked.package_graph_fingerprint = [3u8; 16];
+        assert_ne!(key, envelope_key(&forked, 42, &shape), "package graph");
+        let mut forked = header.clone();
+        forked.context_salt = [4u8; 16];
+        assert_ne!(key, envelope_key(&forked, 42, &shape), "context salt");
+        let mut forked = header.clone();
+        forked.semantic_version += 1;
+        assert_ne!(key, envelope_key(&forked, 42, &shape), "semantic version");
+        assert_ne!(key, envelope_key(&header, 43, &shape), "grants");
+        let other_face = AnswerShape::new(
+            AnswerFace::AnalyzeJson,
+            vec![AnswerAim::Dir(PathBuf::from("/w/lib"))],
+        );
+        assert_ne!(key, envelope_key(&header, 42, &other_face), "face tag");
+        let other_aims = AnswerShape::new(AnswerFace::AnalyzeLon, vec![]);
+        assert_ne!(key, envelope_key(&header, 42, &other_aims), "aim set");
     }
 }

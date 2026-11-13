@@ -32,25 +32,26 @@
 use super::FileReport;
 use super::test_rig::report_ops;
 
-/// Every `argument_type_not_assignable` message in report order, with the
-/// analyzer's trailing space trimmed (the machine format appends one; the
-/// wording and both type spellings stay byte-exact).
+/// Every `argument_type_not_assignable` message in report order, raw:
+/// the message ends at `'. ` even with the appendix empty (the oracle's
+/// machine-format face — messages.yaml:1363's `#additionalInfo`
+/// substitution keeps the separating space).
 fn argument_rows(report: &FileReport) -> Vec<String> {
     report
         .diagnostics
         .iter()
         .filter(|row| row.code.name == "argument_type_not_assignable")
-        .map(|row| row.message.to_string().trim_end().to_string())
+        .map(|row| row.message.to_string())
         .collect()
 }
 
-/// Every `invalid_assignment` message, same trimming discipline.
+/// Every `invalid_assignment` message, raw.
 fn assignment_rows(report: &FileReport) -> Vec<String> {
     report
         .diagnostics
         .iter()
         .filter(|row| row.code.name == "invalid_assignment")
-        .map(|row| row.message.to_string().trim_end().to_string())
+        .map(|row| row.message.to_string())
         .collect()
 }
 
@@ -81,7 +82,7 @@ fn nullable_formal_still_refuses_the_never_function() {
     assert_eq!(
         argument_rows(&report),
         [
-            "The argument type 'void Function(Never)' can't be assigned to the parameter type 'void Function(Null)'."
+            "The argument type 'void Function(Never)' can't be assigned to the parameter type 'void Function(Null)'. "
         ],
     );
 }

@@ -216,8 +216,14 @@ fn cross_library_sealed_scrutinee_reports_the_missing_subclass() {
 }
 
 /// A foreign enum with a missing constant reports the public row; a
-/// foreign private-constant witness is the `_private` family the face
-/// does not model, so it stays silent (constant_verifier.dart:1110).
+/// foreign private-constant witness reports the PRIVATE template of the
+/// same shared code — "The enum 'E' isn't exhaustively matched by the
+/// switch cases because some of the enum constants are private." at the
+/// `switch` keyword (oracle-pinned, dart analyze 3.13.7 on the two-file
+/// rig: NON_EXHAUSTIVE_SWITCH_EXPRESSION, the private variant of
+/// constant_verifier.dart:1110; the earlier silence expectation misread
+/// the private arm as a suppress — it reports with its own text, and the
+/// re-pin records the disproof).
 #[test]
 fn cross_library_enum_scrutinee_reports_and_private_witness_suppresses() {
     let report = foreign_unit_report(
@@ -234,10 +240,20 @@ fn cross_library_enum_scrutinee_reports_and_private_witness_suppresses() {
         "import 'other.dart'; int f(E e) => switch (e) { E.a => 1 };",
         "enum E { a, _b }",
     );
-    assert!(
-        codes_sans_core(&private).is_empty(),
+    assert_eq!(
+        codes_sans_core(&private),
+        ["non_exhaustive_switch_expression"],
         "{:?}",
         code_names(&private)
+    );
+    let row = private
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "non_exhaustive_switch_expression")
+        .expect("the private covering row");
+    assert_eq!(
+        row.message,
+        "The enum 'E' isn't exhaustively matched by the switch cases because some of the enum constants are private."
     );
 }
 
@@ -996,6 +1012,7 @@ fn foreign_static_call_formals_render_through_the_boundary() {
         false,
         false,
         true,
+        true,
         StrictModes::default(),
         &posture,
         None,
@@ -1194,6 +1211,7 @@ fn boundary_reinterns_foreign_types_and_memoizes_slots() {
         false,
         false,
         false,
+        true,
         true,
         StrictModes::default(),
         &posture,

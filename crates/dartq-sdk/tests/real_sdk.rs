@@ -208,19 +208,17 @@ fn the_fvm_flutter_root_loads_to_the_embedded_snapshot() {
         return;
     };
     let home = std::path::Path::new(&home);
-    let flutter = [
-        home.join("fvm").join("default"),
-        home.join(".fvm").join("default"),
-    ]
-    .into_iter()
-    .find(|root| root.join("bin").join("cache").join("dart-sdk").is_dir());
+    let flutter = [home.join("fvm").join("default"), home.join(".fvm").join("default")]
+        .into_iter()
+        .find(|root| root.join("bin").join("cache").join("dart-sdk").is_dir());
     let Some(flutter) = flutter else {
         eprintln!("skipped: no fvm default flutter root");
         return;
     };
     let through_flutter = SdkSnapshot::load(&flutter, None).expect("the fvm flutter root loads");
-    let direct = SdkSnapshot::load(&flutter.join("bin").join("cache").join("dart-sdk"), None)
-        .expect("the embedded root loads");
+    let direct =
+        SdkSnapshot::load(&flutter.join("bin").join("cache").join("dart-sdk"), None)
+            .expect("the embedded root loads");
     assert_eq!(through_flutter.id, direct.id, "one SDK however spelled");
     assert_eq!(
         through_flutter.dart_sdk_root(),

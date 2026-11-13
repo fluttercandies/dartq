@@ -42,16 +42,22 @@ fn generic_function_tearoff_spells_type_param_group() {
 }
 
 /// A generic method's qualified tear-off (`c.m < other`): the member
-/// entry's signature carries `<T extends num>` (`type_param_names` +
+/// entry's signature carries `<T extends B>` (`type_param_names` +
 /// `type_param_bounds`), and the receiver face spells the bounded group.
+/// The bound spells a custom class — the bare rig seeds no core types, so
+/// a `num` bound reads `undefined_class` and the group's face never
+/// renders (the module's own custom-types-only rule). Oracle-pinned,
+/// dart analyze 3.13.7 on the custom-bound shape: UNDEFINED_OPERATOR
+/// "The operator '<' isn't defined for the type 'void Function<T extends
+/// Num>(T)'."
 #[test]
 fn generic_method_tearoff_spells_bounded_group() {
-    let source = "class C {\n  void m<T extends num>(T a) {}\n}\nmain() {\n  var c = C();\n  c.m < c.m;\n}\n";
+    let source = "class Num {}\nclass C {\n  void m<T extends Num>(T a) {}\n}\nmain() {\n  var c = C();\n  c.m < c.m;\n}\n";
     let report = rows(source);
     assert!(
         report
             .iter()
-            .any(|(_, _, m)| m.contains("T extends num") || m.contains("<T>")),
+            .any(|(_, _, m)| m.contains("T extends Num") || m.contains("<T>")),
         "expected the generic method's bounded group in the type face, got {report:?}"
     );
 }

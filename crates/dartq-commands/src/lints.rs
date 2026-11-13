@@ -753,11 +753,7 @@ fn fold_names(names: &FxHashSet<String>) -> u64 {
 /// covers every library file's directory).
 #[must_use]
 #[expect(clippy::too_many_lines)] // serial precompute then per-file row emit; the phases share locally scoped state
-pub fn analyze_lints(
-    engine: &mut Engine,
-    roots: &[PathBuf],
-    memo: &mut LintMemo,
-) -> Vec<Diagnostic> {
+pub fn analyze_lints(engine: &mut Engine, roots: &[PathBuf], memo: &mut LintMemo) -> Vec<Diagnostic> {
     let mut files: Vec<FileId> = engine
         .libraries()
         .into_iter()
@@ -4074,10 +4070,8 @@ void stray() {}
 
         // The edited file's row recomputed from the new bytes: one row, and
         // its span moved with the call.
-        let a_rows2: Vec<&(String, u32, String)> = rows2
-            .iter()
-            .filter(|(p, _, _)| p.ends_with("lib/a.dart"))
-            .collect();
+        let a_rows2: Vec<&(String, u32, String)> =
+            rows2.iter().filter(|(p, _, _)| p.ends_with("lib/a.dart")).collect();
         assert_eq!(a_rows2.len(), 1, "one row for the edited file: {a_rows2:?}");
         let a_offset1 = rows1
             .iter()

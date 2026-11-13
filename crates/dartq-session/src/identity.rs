@@ -116,11 +116,14 @@ pub fn binary_stamp() -> String {
     if let Some(s) = STAMP.get() {
         return s.clone();
     }
-    let digest = match std::env::current_exe().ok().and_then(|exe| {
-        std::fs::canonicalize(&exe)
-            .ok()
-            .map(|path| (path.clone(), stamp(&path)))
-    }) {
+    let digest = match std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            std::fs::canonicalize(&exe)
+                .ok()
+                .map(|path| (path.clone(), stamp(&path)))
+        })
+    {
         Some((path, Some(s))) => {
             let mut hasher = blake3::Hasher::new();
             add(&mut hasher, path.to_string_lossy().as_ref());
@@ -165,10 +168,7 @@ mod tests {
             &root.join(".dart_tool/package_config.json"),
             "{\"configVersion\":2,\"packages\":[]}",
         );
-        write(
-            &root.join("analysis_options.yaml"),
-            "linter:\n  rules:\n    - lints\n",
-        );
+        write(&root.join("analysis_options.yaml"), "linter:\n  rules:\n    - lints\n");
         let base = environment_fingerprint(&sdk);
         assert_eq!(environment_fingerprint(&sdk), base, "deterministic");
 
@@ -178,14 +178,8 @@ mod tests {
             "{\"configVersion\":2,\"packages\":[{\"name\":\"x\",\"rootUri\":\"/x\"}]}",
         );
         write(&root.join("pubspec.lock"), "packages: {}\n");
-        write(
-            &root.join("pubspec_overrides.yaml"),
-            "dependency_overrides: {}\n",
-        );
-        write(
-            &root.join("analysis_options.yaml"),
-            "linter:\n  rules:\n    - core\n",
-        );
+        write(&root.join("pubspec_overrides.yaml"), "dependency_overrides: {}\n");
+        write(&root.join("analysis_options.yaml"), "linter:\n  rules:\n    - core\n");
         assert_eq!(
             environment_fingerprint(&sdk),
             base,

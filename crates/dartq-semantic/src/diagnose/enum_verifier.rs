@@ -528,18 +528,51 @@ impl<'a> Engine<'a> {
                     });
                     let mut satisfied = by_super;
                     for (index, (prior, prior_file)) in previous.iter().enumerate() {
-                        let answer = constraint_id.and_then(|sup| {
-                            self.face_subtype(
-                                *prior,
-                                *prior_file,
-                                container
-                                    .with_clause_args
-                                    .get(index)
-                                    .copied()
-                                    .unwrap_or(crate::model::ArgListId::EMPTY),
-                                sup,
-                            )
-                        });
+                        let written = container
+                            .with_clause_args
+                            .get(index)
+                            .copied()
+                            .unwrap_or(crate::model::ArgListId::EMPTY);
+                        // A prior entry applied with no written type
+                        // arguments infers its own face from its `on`
+                        // constraints against the base (the official's
+                        // per-application inference): the next entry's
+                        // `on M1<int>` asks the inferred `M1<int>`, never
+                        // the bounds-erased `M1<dynamic>`.
+                        let inferred = if written == crate::model::ArgListId::EMPTY {
+                            let base = self.boundary.ty(
+                                self.file,
+                                crate::model::Ty::Named {
+                                    name: implicit_super,
+                                    nullable: false,
+                                    args: if container.superclass.is_some() {
+                                        container.superclass_args
+                                    } else {
+                                        crate::model::ArgListId::EMPTY
+                                    },
+                                },
+                            );
+                            self.resolve_clause_face(name, self.file, scope_lib, *prior)
+                                .and_then(|(mixin, mixin_file)| {
+                                    let pool = self.boundary.args.borrow();
+                                    self.ops?.inferred_mixin_application(
+                                        *prior,
+                                        mixin_file,
+                                        &mixin.on_clause,
+                                        &mixin.on_clause_args,
+                                        &mixin.type_param_names,
+                                        base,
+                                        &pool,
+                                    )
+                                })
+                        } else {
+                            None
+                        };
+                        let answer = match (inferred, constraint_id) {
+                            (Some(face), Some(sup)) => Some(self.ops.is_some_and(|ops| ops.subtype_ids(face, sup))),
+                            _ => constraint_id
+                                .and_then(|sup| self.face_subtype(*prior, *prior_file, written, sup)),
+                        };
                         if answer.unwrap_or_else(|| {
                             self.supertype_reaches(
                                 *prior,

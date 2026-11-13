@@ -219,9 +219,12 @@ fn pin_creation_head_span_tail() {
         .collect();
     assert_eq!(rows.len(), 1, "one undefined_identifier: {rows:?}");
     let (offset, length, _) = rows[0];
-    // `unresolved.Class` spans 16 columns from offset 8 (after `var x = `);
-    // the head must NOT extend through `<int>` (21) or `.new`.
+    // `unresolved.Class` spans 16 columns starting 8 columns into the
+    // fixture (`var x = `) — the rig prepends `CORE_PRELUDE`, so the
+    // absolute anchor is the prelude length plus the fixture-relative 8.
+    // The head must NOT extend through `<int>` or `.new`.
     let source_len = "unresolved.Class".len() as u32;
+    let fixture_base = super::test_rig::CORE_PRELUDE.len() as u32;
     assert_eq!(length, source_len, "the class-name span: {rows:?}");
-    assert_eq!(offset, 8, "the head offset: {rows:?}");
+    assert_eq!(offset, fixture_base + 8, "the head offset: {rows:?}");
 }

@@ -35,11 +35,12 @@
 //!   upstream Dart SDK source,
 //!   pkg/analyzer/lib/src/dart/element/replacement_visitor.dart:251/256);
 //! - `ffi_verifier.dart`'s `?.`-chain arm reads a `var` local bound
-//!   from a core-map index (`var f = invocation.argumentList.arguments2[0]`
-//!   over the `List<Expression>` face), where the `?.` continuation's
-//!   null-aware latch joins the nullable face the `Map`/`List` result
-//!   already stages (upstream Dart SDK source,
-//!   pkg/analyzer/lib/src/generated/ffi_verifier.dart:1806);
+//!   from a core-list index (`var f = invocation.argumentList.arguments2[0]`
+//!   over the `List<Expression>` face), where the NON-nullable element
+//!   face makes the `?.` continuation's receiver never-null and the
+//!   null-aware row fires at the `?.` (upstream Dart SDK source,
+//!   pkg/analyzer/lib/src/generated/ffi_verifier.dart:1806; probed
+//!   dart analyze 3.13.7);
 //! - `typed_literal_resolver.dart`'s context walk binds
 //!   `var elementType = literalType.typeArguments[0]` and reads the
 //!   `iterableType` param face off it — a `List<TypeImpl>` element that
@@ -297,10 +298,14 @@ void f(Node node, int i) {
     /// `var f = invocation.argumentList.arguments2[0]` binds the
     /// `List<Expression>` element face `Expression`, and `f?.name`
     /// reads the member through the null-aware latch — the `?.`
-    /// chain carries the nullable continuation the oracle's own
-    /// face joins, and no unchecked-use verdict fires on the
-    /// chain's tail (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/generated/ffi_verifier.dart:1806).
+    /// chain carries the element face the oracle's own face reports on:
+    /// `List<Expression>[0]` binds the NON-nullable `Expression` element,
+    /// so the `f?.name` continuation's receiver can't be null and the
+    /// verifier's `_checkForUnnecessaryNullAware` row fires at the `?.`
+    /// (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/generated/ffi_verifier.dart:1806's chain shape;
+    /// probed dart analyze 3.13.7: one INVALID_NULL_AWARE_OPERATOR
+    /// WARNING at `?.`, nothing else — the silent-prior record was wrong).
     #[test]
     fn list_index_binds_element_then_null_aware_chain() {
         let source = r#"
@@ -324,13 +329,17 @@ String? f(Invocation invocation) {
         let report = unit_report(source);
         assert_eq!(
             codes(&report),
-            Vec::<&'static str>::new(),
+            vec!["invalid_null_aware_operator"],
             "{:?}",
             report
                 .diagnostics
                 .iter()
                 .map(|d| d.message.to_string())
                 .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report.diagnostics[0].message.to_string(),
+            "The receiver can't be null, so the null-aware operator '?.' is unnecessary."
         );
     }
 

@@ -993,8 +993,7 @@ pub(crate) fn compute_dep_unit(
     // model and the index capture observe the same event stream they do in
     // `compute_unit`, so both faces come out byte-identical.
     let mut decl = dartq_semantic::DeclarationCollector::new(text, &scanned.tokens, strings);
-    let mut capture =
-        dartq_index::Capturer::declarations_only(file, text, &scanned.tokens, strings);
+    let mut capture = dartq_index::Capturer::declarations_only(file, text, &scanned.tokens, strings);
     Parser::new(
         text,
         &scanned.tokens,

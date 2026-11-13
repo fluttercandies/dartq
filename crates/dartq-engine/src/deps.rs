@@ -284,7 +284,8 @@ impl DepIndex {
                                 .sum::<usize>()
                     })
                     .sum::<usize>();
-            captures += size_of::<dartq_index::FileCapture>() + unit.capture.heap_bytes();
+            captures +=
+                size_of::<dartq_index::FileCapture>() + unit.capture.heap_bytes();
             targets += unit.targets.len() * size_of::<ResolvedTarget>();
         }
         let as_u64 = |b: usize| b as u64;
@@ -314,7 +315,8 @@ impl DepIndex {
             (
                 "dep_sdk_libraries",
                 as_u64(
-                    self.sdk_libraries.capacity() * (size_of::<(String, Vec<FileId>)>() + 1)
+                    self.sdk_libraries.capacity()
+                        * (size_of::<(String, Vec<FileId>)>() + 1)
                         + self
                             .sdk_libraries
                             .values()
@@ -607,7 +609,9 @@ fn load_parallel(state: &mut EngineState, seed_files: Vec<FileId>) {
             else {
                 continue;
             };
-            let dependency = state.files.intern_normalized(raw, canonical.to_path_buf());
+            let dependency = state
+                .files
+                .intern_normalized(raw, canonical.to_path_buf());
             *id = Some(dependency);
             if state.residency.contains_key(&dependency)
                 || state.deps.units.contains_key(&dependency)
@@ -654,9 +658,7 @@ fn load_parallel(state: &mut EngineState, seed_files: Vec<FileId>) {
     let clauses: Vec<dartq_semantic::ClauseTrees> = ordered
         .par_iter()
         .map(|(file, path)| {
-            let probe = probes
-                .get(path)
-                .expect("ordered file has a discovery probe");
+            let probe = probes.get(path).expect("ordered file has a discovery probe");
             let text = probe.text.as_ref().expect("ordered file carries its text");
             let version = probe
                 .unit
@@ -918,8 +920,9 @@ fn probe_dep(state: &EngineState, path: &Path, full: bool) -> DepProbe {
     let mut local = FileTable::new();
     let file = local.intern_normalized(path, path.to_path_buf());
     let local_paths = std::cell::RefCell::new(vec![path.to_path_buf()]);
-    let local_seen =
-        std::cell::RefCell::new(rustc_hash::FxHashSet::from_iter([path.to_path_buf()]));
+    let local_seen = std::cell::RefCell::new(rustc_hash::FxHashSet::from_iter([
+        path.to_path_buf(),
+    ]));
     let resident = |id: FileId| {
         local_paths
             .borrow()
@@ -975,11 +978,8 @@ fn probe_dep(state: &EngineState, path: &Path, full: bool) -> DepProbe {
                 targets.push(ProbeTarget::Missing);
                 continue;
             }
-            let resolution = resolver.resolve(
-                file,
-                directive.uri.as_deref(),
-                UriDirectiveKind::ImportExport,
-            );
+            let resolution =
+                resolver.resolve(file, directive.uri.as_deref(), UriDirectiveKind::ImportExport);
             let target = match resolution.target {
                 ResolvedTarget::Missing => ProbeTarget::Missing,
                 ResolvedTarget::External => ProbeTarget::External,
@@ -1012,11 +1012,7 @@ fn probe_dep(state: &EngineState, path: &Path, full: bool) -> DepProbe {
         }
         unit = Some(computed);
     }
-    DepProbe {
-        text,
-        unit,
-        targets,
-    }
+    DepProbe { text, unit, targets }
 }
 
 /// The file's language version from its path alone — the worker-side twin

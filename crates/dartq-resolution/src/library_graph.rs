@@ -758,7 +758,13 @@ impl<'t> LibraryGraphBuilder<'t> {
     /// [`Self::declare_extension`], so a re-exported face entry answers
     /// [`LibraryGraph::face_kind`] identically at any distance. First kind
     /// wins on a duplicate spelling (the `declare` posture).
-    pub fn declare_face(&mut self, lib: LibraryId, name: StringId, file: FileId, kind: FaceKind) {
+    pub fn declare_face(
+        &mut self,
+        lib: LibraryId,
+        name: StringId,
+        file: FileId,
+        kind: FaceKind,
+    ) {
         self.declare(lib, name, file);
         self.face_kinds.entry((file, name)).or_insert(kind);
     }

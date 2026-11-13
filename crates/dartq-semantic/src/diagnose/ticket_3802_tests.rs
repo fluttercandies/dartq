@@ -11,11 +11,23 @@
 //! `check_null_assert`'s `non_null_form` rewrite makes the row read
 //! strictly non-nullable.
 //!
+//! The resolver's own `_resolveNullCheck` arm answers the same fixture
+//! with a row of its own (upstream Dart SDK source,
+//! `pkg/analyzer/lib/src/resolver/postfix_expression_resolver.dart`:
+//! 196-205): the bare `super!` reports the parser-tier selector row
+//! (`missing_assignable_selector`) over the whole `super!` node, both
+//! the operand and the node type `dynamic`, and the walk returns before
+//! any promotion — so the `?[` that follows reads a `dynamic` receiver
+//! and every null-aware question on it stays silent (probed dart
+//! analyze 3.13.7: one MISSING_ASSIGNABLE_SELECTOR at `super!`,
+//! nothing else).
+//!
 //! The listener's index face decides from that rewritten row
 //! (`handle_indexed_expression`), so the pins below hold both directions:
-//! a `super` receiver stays silent, and the ordinary `?[`/`?..[` faces —
-//! which share the emit — keep reporting on a non-nullable receiver and
-//! stay silent on a nullable one.
+//! a `super` receiver stays silent on the null-aware face and carries
+//! the resolver's selector row instead, and the ordinary `?[`/`?..[`
+//! faces — which share the emit — keep reporting on a non-nullable
+//! receiver and stay silent on a nullable one.
 //!
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs`
 //! is a live-lane file out of this ticket's write scope; `#[path]` keeps
@@ -55,11 +67,12 @@ fn anchors(report: &FileReport) -> Vec<(u32, u32)> {
     at
 }
 
-/// `super!?[0]`: the `!` rewrites the receiver row to the non-nullable
-/// container face, but the official check returns on the `super` target —
-/// no row.
+/// `super!?[0]`: the resolver's `_resolveNullCheck` SuperExpression arm
+/// reports the parser-tier selector row over the whole `super!` node and
+/// types it `dynamic` — the `?[` face never fires (probed dart analyze
+/// 3.13.7: one MISSING_ASSIGNABLE_SELECTOR at `super!`, nothing else).
 #[test]
-fn super_receiver_index_is_silent() {
+fn super_receiver_index_reports_the_selector_row() {
     let fixture = "\
 class A {
   int operator [](int i) => 0;
@@ -75,6 +88,33 @@ class B extends A {
         messages(&report),
         Vec::<String>::new(),
         "`super!?[0]` reports no null-aware row; got: {:?}",
+        report.diagnostics
+    );
+    let rows: Vec<_> = report
+        .diagnostics
+        .iter()
+        .map(|d| {
+            (
+                d.code.name,
+                d.severity,
+                d.range.offset,
+                d.range.end() - d.range.offset,
+                d.message.to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "missing_assignable_selector",
+                dartq_diagnostics::Severity::Error,
+                at(fixture, "super!"),
+                6u32,
+                "Missing selector such as '.identifier' or '[0]'.".to_string()
+            ),
+        ],
+        "the resolver's selector row over `super!`, and nothing else; got: {:?}",
         report.diagnostics
     );
 }

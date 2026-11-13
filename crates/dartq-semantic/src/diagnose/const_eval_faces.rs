@@ -762,9 +762,16 @@ impl<'a> Engine<'a> {
             .as_ref()
             .and_then(|node| self.nonconst_member_span(node));
         let member_wins = match (&verdict, member_span) {
-            (Verdict::Fault(..) | Verdict::Value(_), _) | (_, None) => false,
+            (Verdict::Fault(..), _) | (_, None) => false,
             (Verdict::NotConstant(s) | Verdict::Unresolved(s), Some(m)) => m.offset < s.offset,
-            (Verdict::Constant, Some(_)) => true,
+            // A `Constant` verdict defers every static face silently, and a
+            // `Value` collection CONTAINING such a deferred read (`const l =
+            // [C.c]` folds a list whose element defers) keeps the same
+            // blind spot — the walk re-decides both against the resolution
+            // layer (probed 3.13.7: the oracle reports
+            // `const_initialized_with_non_constant_value` at the `C.c`
+            // inside the list, beside the element face).
+            (Verdict::Value(_) | Verdict::Constant, Some(_)) => true,
         };
         if let Some(span) = member_span.filter(|_| member_wins) {
             self.emit(
@@ -1934,6 +1941,20 @@ impl<'a> Engine<'a> {
                 }
                 _ => {}
             }
+        }
+        // A DECLARED LOCAL FUNCTION is an `ExecutableElement` callee: the
+        // constant evaluator answers `constEvalMethodInvocation` at the
+        // call (`const i = x()` over `int x() => 1;`), never the
+        // `FunctionExpressionInvocation` rewrite a local VARIABLE or a
+        // function-typed formal takes. The tear-off capture rides the
+        // same enclosing frame as the `locals` entry (`local_fn_sigs`,
+        // #2842), so the pair decides the face under one scope walk.
+        if self
+            .frames
+            .iter()
+            .any(|f| f.locals.contains(&name) && f.local_fn_sigs.contains_key(&name))
+        {
+            return CallClass::Invocable;
         }
         if self.frames.iter().any(|f| f.locals.contains(&name))
             || self.const_scopes.iter().any(|s| s.contains_key(&name))
@@ -3693,8 +3714,10 @@ impl<'a> Engine<'a> {
 
     /// Pushes a closed const literal's value onto the capture: its
     /// structural value when every element was constant and known
-    /// (`payload` — the duplicate twins compare by value), the
-    /// opaque-kind instance when any element's value is unknown, else the
+    /// (`payload` — the duplicate twins compare by value), the caller's
+    /// `deferred` structure node when any element's value is unknown
+    /// (evaluating to the same opaque-kind instance while keeping the
+    /// element subnodes), else the
     /// failing element's leaf — `Verdict::Fault` is an allow-listed
     /// `constEval*` failure pushed as a fault leaf (the enclosing
     /// declaration's site default swaps to the fault's code at the
@@ -3715,6 +3738,7 @@ impl<'a> Engine<'a> {
         literal: SourceRange,
         kind: crate::const_eval::InstanceKind,
         payload: Option<ConstantValue>,
+        deferred: Option<crate::const_eval::Expr>,
     ) {
         // The ERROR-tier duplicate twins of a const literal (#2261): the
         // capture staged this literal's parts at its close; the oracle's
@@ -3745,9 +3769,24 @@ impl<'a> Engine<'a> {
             {
                 self.const_capture.push_non_constant(span);
             }
-            _ => self
-                .const_capture
-                .push_value(end, payload.unwrap_or(ConstantValue::Instance(kind))),
+            _ => {
+                // The all-deferred fallback (`payload` unknown and no
+                // element failed): the STRUCTURE node replaces the opaque
+                // kind value — `eval` folds it to the identical
+                // `Value(Instance(kind))`, while the element subnodes stay
+                // reachable for the declaration-close walks (a silently
+                // deferred non-const static read inside a const collection
+                // still reports `const_initialized_with_non_constant_value`
+                // at the read, probed 3.13.7 — probe40: list/set/map-value/
+                // record-field shapes all pair the element face with the
+                // declaration row).
+                if let Some(expr) = deferred {
+                    self.const_capture.push_expr(literal, expr);
+                } else {
+                    self.const_capture
+                        .push_value(end, payload.unwrap_or(ConstantValue::Instance(kind)));
+                }
+            }
         }
     }
 
@@ -4776,7 +4815,12 @@ mod face_tests {
         // `-'a'`/`~'a'` applications additionally report `undefined_operator`
         // — `String` declares no `unary-`/`~` member (oracle probe 3.13.7 on
         // this exact shape: `CONST_EVAL_TYPE_NUM` + `UNDEFINED_OPERATOR` at
-        // `-'a'`, `CONST_EVAL_TYPE_INT` + `UNDEFINED_OPERATOR` at `~'a'`).
+        // `-'a'`, `CONST_EVAL_TYPE_INT` + `UNDEFINED_OPERATOR` at `~'a'`,
+        // and `CONST_EVAL_TYPE_BOOL` + `NON_BOOL_OPERAND` for `f && 1` —
+        // the one-lib rig projects the last pair to a single
+        // `non_bool_operand` at the `1` operand: `f`'s static type IS the
+        // rig's own `bool` spelling, so only the right operand faults,
+        // while the real-library oracle faults both operands).
         let rep = unit_report(
             "class V { const V(); }\n\
              class bool { final V? v; const bool.fromEnvironment(this.v); }\n\
@@ -4784,17 +4828,18 @@ mod face_tests {
              const a = !1;\n\
              const b = -'a';\n\
              const c = ~'a';\n\
-             const d = f && 1;",
+             const d = f && 1;\n",
         );
         assert_eq!(
             code_names(&rep),
             [
                 "const_eval_type_bool",
                 "const_eval_type_num",
-                "undefined_operator",
                 "const_eval_type_int",
-                "undefined_operator",
+                "non_bool_operand",
                 "const_eval_type_bool",
+                "undefined_operator",
+                "undefined_operator",
             ],
             "{:?}",
             code_names(&rep)

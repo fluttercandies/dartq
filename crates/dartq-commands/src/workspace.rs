@@ -366,9 +366,9 @@ fn named_sdk_root(named: &Path) -> Result<PathBuf, ResolveSdkError> {
 /// The `dartq.yaml` step: the governing config's `sdk:` locator, resolved
 /// to a candidate root (`None` when no config or no declaration).
 fn config_sdk_root(dir: &Path) -> Result<Option<PathBuf>, ResolveSdkError> {
-    let Some(config) = crate::config::discover(dir)
-        .map_err(|error| ResolveSdkError::Config(format!("dartq.yaml unreadable: {error}")))?
-    else {
+    let Some(config) = crate::config::discover(dir).map_err(|error| {
+        ResolveSdkError::Config(format!("dartq.yaml unreadable: {error}"))
+    })? else {
         return Ok(None);
     };
     match config.sdk {
@@ -3063,12 +3063,10 @@ mod tests {
     /// dying with "Invalid Dart SDK path".
     #[test]
     fn a_flutter_root_sdk_loads_through_the_assembly() {
-        let root = workspace("ws_sdk_flutter", &[])
-            .canonicalize()
-            .expect("root");
+        let root = workspace("ws_sdk_flutter", &[]).canonicalize().expect("root");
         let flutter = write_flutter_sdk(&root, "flutter");
-        let (config, _, _) =
-            engine_config_with_advisory(&root, Some(&flutter)).expect("the Flutter root assembles");
+        let (config, _, _) = engine_config_with_advisory(&root, Some(&flutter))
+            .expect("the Flutter root assembles");
         assert_eq!(config.sdk.dart.version, "3.13.1");
         assert_eq!(
             config.sdk.dart_sdk_root(),

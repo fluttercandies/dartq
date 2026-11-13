@@ -49,12 +49,7 @@ fn rows_of(
                         .to_owned()
                 })
                 .unwrap_or_default();
-            (
-                tail,
-                row.range.offset,
-                row.range.length,
-                row.message.to_string(),
-            )
+            (tail, row.range.offset, row.range.length, row.message.to_string())
         })
         .collect()
 }
@@ -65,8 +60,7 @@ fn rows_of(
 /// carries the citation at file scope, so position does not matter).
 #[test]
 fn ignore_for_file_suppresses_uri_does_not_exist() {
-    const TEST: &str =
-        "library lib;\n\npart 'missing.dart';\n\n// ignore_for_file: uri_does_not_exist\n";
+    const TEST: &str = "library lib;\n\npart 'missing.dart';\n\n// ignore_for_file: uri_does_not_exist\n";
 
     let fixture = Fixture::new(&[("lib/test.dart", TEST)]);
     let mut engine = fixture.engine();
@@ -144,11 +138,7 @@ fn a_file_uri_part_include_reports_part_of_different_library() {
         .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
     let rows = rows_of(&engine, &diagnostics, "part_of_different_library");
-    assert_eq!(
-        rows.len(),
-        1,
-        "the file:-include reports one mismatch row: {diagnostics:?}"
-    );
+    assert_eq!(rows.len(), 1, "the file:-include reports one mismatch row: {diagnostics:?}");
     // `{1}` is the included file's discovery URI — `file:`-spelled, not the
     // `package:` canonical spelling `canonical_uri_spelling` would produce.
     assert!(
@@ -174,10 +164,7 @@ fn a_relative_part_include_attaches_silently() {
 
     let mut engine = fixture.engine();
     engine.set_content(&fixture.path("lib/lib.dart"), "part 'p2.dart';".as_bytes());
-    engine.set_content(
-        &fixture.path("lib/p2.dart"),
-        "part of 'lib.dart';".as_bytes(),
-    );
+    engine.set_content(&fixture.path("lib/p2.dart"), "part of 'lib.dart';".as_bytes());
 
     let diagnostics = engine
         .analyze(&[], &mut |_| {}, &CancellationToken::default())

@@ -280,6 +280,29 @@ impl TraceSink {
             face,
         });
     }
+
+    /// Records an answered-turn probe hit (#4243): the envelope key's hex
+    /// spelling identifies the served record. Trace-only — no
+    /// `EngineEvent` variant (the g485 D3 posture), the event goldens
+    /// stay byte-stable.
+    pub(crate) fn answer_hit(&mut self, key: &[u8; 16]) {
+        let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.write_line(&AnswerHitTrace {
+            event: "AnswerHit",
+            key: &hex,
+        });
+    }
+
+    /// Records an answered-turn probe miss (#4243): `reason` is the
+    /// taxonomy's machine key (`no_store` | `no_record` | `decode` |
+    /// `stamp_mismatch` | `blob_missing`, or a caller gate's `gated-*`
+    /// spelling). Trace-only — no `EngineEvent` variant.
+    pub(crate) fn answer_miss(&mut self, reason: &'static str) {
+        self.write_line(&AnswerMissTrace {
+            event: "AnswerMiss",
+            reason,
+        });
+    }
 }
 
 /// Wall time as additive microseconds (integer — float durations would not
@@ -378,6 +401,18 @@ struct ResidencyDegradeTrace<'a> {
     face: &'a str,
 }
 
+#[derive(Serialize)]
+struct AnswerHitTrace<'a> {
+    event: &'static str,
+    key: &'a str,
+}
+
+#[derive(Serialize)]
+struct AnswerMissTrace {
+    event: &'static str,
+    reason: &'static str,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +493,30 @@ mod tests {
         assert_eq!(
             capture,
             "{\"event\":\"ResidencyDegrade\",\"uri\":\"/w/lib/a.dart\",\"face\":\"capture\"}\n"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The answered-turn rows' wire contracts (#4243): exact bytes, stable
+    /// field order, the same additive-row discipline — emitted only by
+    /// the probe/persist path, so the healthy-event captures above stay
+    /// byte-frozen.
+    #[test]
+    fn answer_rows_are_pinned() {
+        let (mut sink, path) = temp_sink("answer");
+        sink.answer_hit(&[0x0a, 0xbc, 0xef, 0x10, 0x00, 0xff, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e,
+                          0x6f, 0x70, 0x81, 0x92, 0xa3]);
+        sink.answer_miss("stamp_mismatch");
+        sink.answer_miss("gated-plugins");
+        drop(sink);
+        let capture = std::fs::read_to_string(&path).expect("capture readable");
+        assert_eq!(
+            capture,
+            concat!(
+                "{\"event\":\"AnswerHit\",\"key\":\"0abcef1000ff1a2b3c4d5e6f708192a3\"}\n",
+                "{\"event\":\"AnswerMiss\",\"reason\":\"stamp_mismatch\"}\n",
+                "{\"event\":\"AnswerMiss\",\"reason\":\"gated-plugins\"}\n",
+            )
         );
         let _ = std::fs::remove_file(&path);
     }

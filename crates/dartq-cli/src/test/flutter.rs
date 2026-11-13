@@ -1011,7 +1011,9 @@ fn run_shards(
         profile,
         target,
         wanted,
-        crate::memory_max_percent(root),
+        crate::memory_max_percent(
+            dartq_commands::config::discover(root).ok().flatten().as_ref(),
+        ),
         deadline,
     )?;
     let (shards, workers) = match &lease {
@@ -1425,7 +1427,9 @@ fn grouped_pass(
     let (lease, workers) = dartq_test::lease(
         profile,
         target,
-        crate::memory_max_percent(&plan.root),
+        crate::memory_max_percent(
+            dartq_commands::config::discover(&plan.root).ok().flatten().as_ref(),
+        ),
         deadline,
     )?;
     let index_of: FxHashMap<&Path, usize> = hosted

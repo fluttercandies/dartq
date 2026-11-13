@@ -165,13 +165,11 @@ fn face_rows<'a>(rows: &[&'a Row]) -> (Vec<FaceRow<'a>>, FaceMeta) {
         meta.has_warning |= row.severity == "WARNING";
         meta.has_info |= row.severity == "INFO";
         let Some(sev) = modelable_severity(&row.severity) else {
-            meta.unparsed
-                .push(serde_json::to_string(row).expect("a row serializes"));
+            meta.unparsed.push(serde_json::to_string(row).expect("a row serializes"));
             continue;
         };
         if modelable_type(&row.kind).is_none() {
-            meta.unparsed
-                .push(serde_json::to_string(row).expect("a row serializes"));
+            meta.unparsed.push(serde_json::to_string(row).expect("a row serializes"));
             continue;
         }
         meta.has_diag_error |= row.severity == "ERROR";
@@ -355,18 +353,8 @@ fn bare_eligible(text: &str) -> bool {
                 || code == 0x5C
                 || matches!(
                     code,
-                    0x20 | 0x09
-                        ..=0x0D
-                            | 0x28
-                            | 0x29
-                            | 0x2C
-                            | 0x3A
-                            | 0x3B
-                            | 0x5B
-                            | 0x5D
-                            | 0x7B
-                            | 0x7C
-                            | 0x7D
+                    0x20 | 0x09..=0x0D | 0x28 | 0x29 | 0x2C | 0x3A | 0x3B | 0x5B | 0x5D
+                        | 0x7B | 0x7C | 0x7D
                 )
                 || (code == 0x27 && at_edge)
             {
@@ -470,19 +458,7 @@ fn is_reserved_ascii(bytes: &[u8]) -> bool {
 }
 
 const AMBIGUOUS_LITERALS: [&str; 13] = [
-    "null",
-    "true",
-    "false",
-    "undefined",
-    "none",
-    "nil",
-    "yes",
-    "no",
-    "on",
-    "off",
-    "y",
-    "n",
-    "~",
+    "null", "true", "false", "undefined", "none", "nil", "yes", "no", "on", "off", "y", "n", "~",
 ];
 
 fn is_non_ascii_nan_inf(body: &[u8]) -> bool {
@@ -790,7 +766,11 @@ mod tests {
 
     /// The DOM path's expected bytes for one face over `files`' rows —
     /// `OfficialRun` is the single source the CLI printed from.
-    fn dom_bytes(files: &[(&str, Vec<Row>)], root: Option<PathBuf>, format: FaceFormat) -> Vec<u8> {
+    fn dom_bytes(
+        files: &[(&str, Vec<Row>)],
+        root: Option<PathBuf>,
+        format: FaceFormat,
+    ) -> Vec<u8> {
         let report = Report::from_files(files.iter().map(|(f, r)| (*f, r.as_slice())));
         let run = OfficialRun::of_report(report, true, false, root);
         let output = run.output();
@@ -813,7 +793,14 @@ mod tests {
     ) -> Vec<u8> {
         let report = Report::from_files(files.iter().map(|(f, r)| (*f, r.as_slice())));
         let rows: Vec<&Row> = report.rows.iter().collect();
-        render_official_face(&rows, &Face { format, root }).bytes
+        render_official_face(
+            &rows,
+            &Face {
+                format,
+                root,
+            },
+        )
+        .bytes
     }
 
     /// The byte-identity pin on which the single-writer contract stands:

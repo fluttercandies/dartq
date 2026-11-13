@@ -2173,6 +2173,54 @@ impl<'a> Bounds<'a> {
                 })
                 .collect()
         }
+        /// Signature windows nested inside a bound tree: a function
+        /// column (`X extends void Function<U extends …>()`) keeps its
+        /// own `<U>` window, and the site walk already descends it with
+        /// the window's scope plus the enclosing declaration's
+        /// (`walk_named_tree`'s function arm) — the oracle checks each
+        /// written `NamedType` exactly once (`checkNamedType` per node),
+        /// so the walk's visit is the one that stands.
+        fn nested_windows(tree: &TypeTree, out: &mut Vec<Vec<(StringId, u32)>>) {
+            if tree.poisoned {
+                return;
+            }
+            if let Some((positional, named)) = &tree.record {
+                for field in positional.iter().chain(named.iter().map(|(_, ty)| ty)) {
+                    nested_windows(field, out);
+                }
+                return;
+            }
+            if let Some(function) = &tree.function {
+                if !function.type_params_named.is_empty() {
+                    out.push(
+                        function
+                            .type_params_named
+                            .iter()
+                            .map(|(name, bound)| {
+                                (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset))
+                            })
+                            .collect(),
+                    );
+                    for bound in function.type_params_named.iter().filter_map(|(_, b)| b.as_ref())
+                    {
+                        nested_windows(bound, out);
+                    }
+                }
+                if let Some(ret) = &function.ret {
+                    nested_windows(ret, out);
+                }
+                for formal in &function.positional {
+                    nested_windows(formal, out);
+                }
+                for (_, ty) in &function.named {
+                    nested_windows(ty, out);
+                }
+                return;
+            }
+            for arg in &tree.args {
+                nested_windows(arg, out);
+            }
+        }
         let adopted: Vec<Vec<(StringId, u32)>> = self
             .index
             .containers
@@ -2210,6 +2258,38 @@ impl<'a> Bounds<'a> {
                 }
             }))
             .collect();
+        let mut adopted = adopted;
+        // Nested signature windows the site walks already cover — same
+        // poison gates as the site arms, so a window whose enclosing
+        // tree will NOT be walked keeps its unclaimed-arm report.
+        for capture in self.index.containers.values() {
+            for (bound, poisoned) in &capture.bounds {
+                if let (Some(tree), false) = (bound.as_ref(), *poisoned) {
+                    nested_windows(tree, &mut adopted);
+                }
+            }
+        }
+        for capture in self.index.aliases.values() {
+            for (_, bound, poisoned) in &capture.params {
+                if let (Some(tree), false) = (bound.as_ref(), *poisoned) {
+                    nested_windows(tree, &mut adopted);
+                }
+            }
+            if let AliasRhs::Fn { type_params, .. } = &*capture.rhs {
+                for (_, bound, poisoned) in type_params {
+                    if let (Some(tree), false) = (bound.as_ref(), *poisoned) {
+                        nested_windows(tree, &mut adopted);
+                    }
+                }
+            }
+        }
+        for window in &self.index.param_windows {
+            for (_, bound, _) in window {
+                if let Some(tree) = bound.as_ref() {
+                    nested_windows(tree, &mut adopted);
+                }
+            }
+        }
         // (bound range offset, bound tree, owner declaration, adopted
         // window) — `owner` drives the decl scope for container/alias
         // sites; `window` carries the adopted-window scope facts for the

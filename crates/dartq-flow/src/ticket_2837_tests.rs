@@ -341,8 +341,15 @@ void test({required int intValue, required int Function() intFunction, required 
 }
 "#;
     let dead = enabled(source);
-    assert_eq!(dead.len(), 2, "{dead:?}");
-    assert!(dead.iter().all(|row| row.contains("other")), "{dead:?}");
+    // Probed dart analyze 3.13.7 on this exact fixture: ONE generic
+    // `dead_code` row at the first `?? other` (upstream's
+    // `_firstDeadNode` stays open — no `flowEnd` runs on an if-null
+    // expression — so the second arm's RHS folds into the same interval
+    // and reports nothing of its own), and the
+    // `dead_null_aware_expression` pair carries the dedicated faces
+    // (semantic layer's emit, outside this fact set).
+    assert_eq!(dead.len(), 1, "{dead:?}");
+    assert!(dead[0].contains("?? other"), "{dead:?}");
 }
 
 /// The `pattern_not_matching_null_test` twin: `case int()` over a

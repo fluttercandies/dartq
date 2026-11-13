@@ -321,7 +321,8 @@ fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
                 .iter()
                 .any(|&kid| c.kind(kid) == NodeKind::DotAccess)
     });
-    let member = slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() || adopted;
+    let member =
+        slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() || adopted;
     // The every-object exemptions (:103-114) need a receiver.
     if member {
         let name = c.lexeme(c.head_token(selector_row));
@@ -436,8 +437,7 @@ fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     // that verdict (the every-object exemptions count arguments).
     let adopted = pos == 0
         && kids.len() == 1
-        && c.ancestor(1)
-            .is_some_and(|row| c.kind(row) == NodeKind::Assignment);
+        && c.ancestor(1).is_some_and(|row| c.kind(row) == NodeKind::Assignment);
     let (raw, selector) = if adopted {
         let Some(assignment) = c.ancestor(1) else {
             return;

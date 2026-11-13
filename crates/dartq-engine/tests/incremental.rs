@@ -601,9 +601,10 @@ fn interpolated_part_of_is_an_orphan_singleton() {
         "the include reports the URI-form mismatch on the includer: {diagnostics:?}"
     );
     assert!(
-        diagnostics.iter().any(
-            |diagnostic| diagnostic.file == p && diagnostic.code.name == "undefined_identifier"
-        ),
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.file == p
+                && diagnostic.code.name == "undefined_identifier"),
         "the orphan still gets its body errors: {diagnostics:?}"
     );
     assert_eq!(engine.libraries().len(), 2, "a plus the p orphan singleton");

@@ -144,14 +144,14 @@ fn context_seeded_creation_reports_each_conflicting_argument() {
     assert!(
         rows[0]
             .2
-            .contains("The argument type 'String' can't be assigned to the parameter type 'int'."),
+            .contains("The argument type 'String' can't be assigned to the parameter type 'int'. "),
         "got {:?}",
         rows[0].2
     );
     assert!(
         rows[1]
             .2
-            .contains("The argument type 'int' can't be assigned to the parameter type 'String'."),
+            .contains("The argument type 'int' can't be assigned to the parameter type 'String'. "),
         "got {:?}",
         rows[1].2
     );
@@ -187,7 +187,7 @@ fn keyword_creation_reports_unseeded_argument_mismatch() {
     assert!(
         rows[0]
             .2
-            .contains("The argument type 'String' can't be assigned to the parameter type 'int'."),
+            .contains("The argument type 'String' can't be assigned to the parameter type 'int'. "),
         "got {:?}",
         rows[0].2
     );

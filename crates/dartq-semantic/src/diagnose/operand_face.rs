@@ -252,6 +252,15 @@ impl<'a> Engine<'a> {
             }
             ty = self.alias_expanded_operand_ty(ty);
             if ty == Ty::Null {
+                // The resolved lane's own `Null` arm reports the bare
+                // operand it owns at the read row
+                // (`check_operator_expr_in`'s arm) — the same
+                // `bare_operator_operand` ownership question the nullable
+                // tail takes below keeps the row single (#3000: `n + 1`
+                // reported at both the operand and this operator token).
+                if !latched && self.bare_operator_operand(probe, true) {
+                    continue;
+                }
                 self.emit_operand_null_row(op_range, out);
                 continue;
             }
@@ -323,6 +332,13 @@ impl<'a> Engine<'a> {
             }
             ty = self.alias_expanded_operand_ty(ty);
             if ty == Ty::Null {
+                // The adjacent-operator arm owns the bare prefix operand
+                // (`-n`'s read row reports at its own anchor) — the same
+                // ownership gate the nullable tail takes below keeps the
+                // `Null` swap single.
+                if !latched && self.bare_operator_operand(probe, false) {
+                    continue;
+                }
                 self.emit_operand_null_row(op_span, out);
                 continue;
             }

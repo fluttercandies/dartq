@@ -1118,10 +1118,7 @@ pub(crate) enum ProxyError {
     /// A domain failure the daemon answered (constructed by the unix
     /// transport and the debug faces' tests; the standalone platforms
     /// only ever see the transport arm).
-    #[cfg_attr(
-        not(unix),
-        expect(dead_code, reason = "the unix socket transport constructs it")
-    )]
+    #[cfg_attr(not(unix), expect(dead_code, reason = "the unix socket transport constructs it"))]
     Daemon(i64, String),
     Transport(String),
 }
@@ -1732,7 +1729,7 @@ mod tests {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            let frame = match read_frame(&mut stream) {
+            let frame = match read_frame(&mut stream, &mut Vec::new()) {
                 Ok(frame) => frame,
                 Err(_) => return,
             };
@@ -1954,12 +1951,12 @@ mod tests {
         )
         .expect("write frame");
         mine.flush().expect("flush");
-        let answer = read_frame(&mut theirs).expect("frame");
+        let answer = read_frame(&mut theirs, &mut Vec::new()).expect("frame");
         assert_eq!(answer["result"]["ok"], true);
         write!(mine, "X-Other: 1\r\n\r\nno length").expect("write headerless");
         mine.flush().expect("flush");
         assert!(matches!(
-            read_frame(&mut theirs),
+            read_frame(&mut theirs, &mut Vec::new()),
             Err(ReadError::Malformed(message)) if message == "missing Content-Length"
         ));
 
@@ -1970,7 +1967,59 @@ mod tests {
         reader
             .set_read_timeout(Some(Duration::from_millis(50)))
             .expect("timeout");
-        assert!(matches!(read_frame(&mut reader), Err(ReadError::Wedged)));
+        assert!(matches!(
+            read_frame(&mut reader, &mut Vec::new()),
+            Err(ReadError::Wedged)
+        ));
+    }
+
+    /// The chunked header scan (#4260): one read that spans a frame's
+    /// terminator into its body — and into the next frame — parses the
+    /// first frame without losing the overlap; the carried leftover
+    /// answers the second frame's read. A partial header without its
+    /// terminator under a read deadline is the wedge signal, not a
+    /// malformed frame.
+    #[test]
+    fn read_frame_scans_chunks_and_carries_the_overlap() {
+        let (mut mine, mut theirs) = UnixStream::pair().expect("socketpair");
+        let first = r#"{"jsonrpc":"2.0","id":7,"result":{"chunked":true}}"#;
+        let second = r#"{"jsonrpc":"2.0","id":8,"result":{"second":true}}"#;
+        // One write, two whole frames: the reader's first chunk read
+        // necessarily spans the first frame's terminator and body into
+        // the second frame's bytes.
+        write!(
+            mine,
+            "Content-Length: {}\r\n\r\n{}Content-Length: {}\r\n\r\n{}",
+            first.len(),
+            first,
+            second.len(),
+            second
+        )
+        .expect("write both frames");
+        mine.flush().expect("flush");
+        let mut leftover = Vec::new();
+        let answer = read_frame(&mut theirs, &mut leftover).expect("first frame");
+        assert_eq!(answer["id"], 7);
+        assert_eq!(answer["result"]["chunked"], true);
+        // The overlap returns through `leftover`: the second frame reads
+        // without the terminator ever being missed.
+        let answer = read_frame(&mut theirs, &mut leftover).expect("second frame");
+        assert_eq!(answer["id"], 8);
+        assert_eq!(answer["result"]["second"], true);
+        assert!(leftover.is_empty(), "both frames consumed exactly");
+
+        // A header that arrived without its terminator under a deadline:
+        // the wedge signal (the peer may still be writing), never a
+        // malformed verdict.
+        write!(mine, "Content-Length: 42\r\n").expect("partial header");
+        mine.flush().expect("flush");
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout");
+        assert!(matches!(
+            read_frame(&mut theirs, &mut Vec::new()),
+            Err(ReadError::Wedged)
+        ));
     }
 
     /// A daemon proxy against an engine that never answers fails within

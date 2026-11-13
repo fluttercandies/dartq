@@ -482,11 +482,12 @@ fn extension_this_arg_solves_on_type() {
 /// `writeOptionalObject(info, (info) { writeMap(info, …) })` types the
 /// inner map's key/value from the OUTER formal's class, which a
 /// `dynamic` bind starves into the unchecked/argument-type false
-/// positives. The undefined-member exemption rides the same solve:
-/// [`Engine::inferred_formal_containers`] keeps the member walk's
-/// undefined rows silent on the inference-bound receiver (the walk
-/// cannot see the extension/import members the oracle resolves through;
-/// a same-file misspell shares that silence as collateral).
+/// positives. The same bound face answers the member walk on a
+/// same-file receiver: `a.ok()` resolves and `a.nope()` reports
+/// `undefined_method` on `A` (oracle-verified — the exemption
+/// [`Engine::inferred_formal_containers`] keeps applies only to
+/// receivers whose members live outside the walk's reach, never to a
+/// locally declared class).
 #[test]
 fn callee_own_solve_binds_class_feeding_assignability() {
     let source = "class BW { void take<T>(T? o, void Function(T x) w) {} }\n\
@@ -507,8 +508,13 @@ fn callee_own_solve_binds_class_feeding_assignability() {
                   bw.take(A(), (a) { a.ok(); a.nope(); });\n\
                   }\n";
     let rep = report(source);
+    // The solved `T := A` resolves `a.ok()` and reports `a.nope()` on the
+    // bound face (oracle-verified — `dart analyze` reports "The method
+    // 'nope' isn't defined for the type 'A'" at the selector; re-pinned
+    // from the old `!undefined_method` expectation, which the pre-solve
+    // engine only met by leaving `a` unresolved).
     assert!(
-        !has_code(&rep, "undefined_method"),
+        has_code(&rep, "undefined_method"),
         "{:?}",
         code_names(&rep)
     );

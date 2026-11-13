@@ -459,15 +459,15 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
             return exit::USAGE;
         }
     };
-    let (config, _dir, advisory) = match crate::engine_config_with_advisory(&root, Some(&sdk_root))
-    {
-        Ok(faces) => faces,
-        Err(error) => {
-            eprintln!("dartq: session serve: {error}");
-            cleanup(&layout, &root);
-            return exit::USAGE;
-        }
-    };
+    let (config, _dir, advisory) =
+        match crate::engine_config_with_advisory(&root, Some(&sdk_root)) {
+            Ok(faces) => faces,
+            Err(error) => {
+                eprintln!("dartq: session serve: {error}");
+                cleanup(&layout, &root);
+                return exit::USAGE;
+            }
+        };
     // The engine trace — the cold-analysis progress substrate
     // (`dartq events progress` reads it; the file truncates per serve, so
     // each resident generation's sweep starts at zero).
@@ -613,7 +613,8 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     // it hosts a debug session it gives the slot up (debugging is never
     // restricted) and keeps the memory booked.
     let peak_key = format!("session:{}", root.display());
-    let max_percent = crate::memory_max_percent(&root);
+    let yaml = dartq_commands::config::discover(&root).ok().flatten();
+    let max_percent = crate::memory_max_percent(yaml.as_ref());
     let mut busy = Busy::open(&layout.dir.join("busy.lock"));
     let mut pressure = dartq_toolchain::ledger::Pressure::default();
     let mut lease = match lease_session(&peak_key, &root, &layout, &signalled) {
@@ -634,6 +635,14 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
         }
     };
     let _peak = PeakOnExit(peak_key.clone());
+    // The next client's answer must not queue behind a sleep: the loop's
+    // idle wait is a poll on the listener (waking the instant a connection
+    // lands) and is skipped entirely right after a served client, so a
+    // queued client is accepted immediately and back-to-back clients never
+    // pay a TICK between them. Housekeeping keeps its TICK cadence: the
+    // poll times out once per window when nobody connects (#4246 — the
+    // plain sleep added up to one TICK of latency to every turn).
+    let mut served;
     loop {
         if signalled.load(std::sync::atomic::Ordering::Relaxed) {
             stop_accepting(listener, &layout);
@@ -650,6 +659,7 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                served = true;
                 accept_failures = 0;
                 last_client = Instant::now();
                 let _ = stream.set_nonblocking(false);
@@ -678,9 +688,11 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                 );
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                served = false;
                 busy.hold(hosting(&session) > 0);
             }
             Err(error) => {
+                served = false;
                 accept_failures += 1;
                 if accept_failures == 1 || accept_failures % 20 == 0 {
                     eprintln!(
@@ -758,8 +770,32 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                 exit::CLEAN,
             );
         }
-        std::thread::sleep(TICK);
+        if !served {
+            wait_listener(&listener, TICK);
+        }
     }
+}
+
+/// The idle wait between accept polls: `poll(2)` on the listener for the
+/// `tick` window — a connection arriving mid-wait wakes the loop at once
+/// instead of at the next tick, and an empty window times out into the
+/// loop-top housekeeping as the plain sleep did. A spurious readiness (a
+/// connection that vanished from the backlog) costs one `WouldBlock` accept
+/// and re-enters the wait; a signal ends the wait early (`EINTR`) for the
+/// loop-top flag check.
+#[cfg(unix)]
+fn wait_listener(listener: &UnixListener, tick: Duration) {
+    use std::os::unix::io::AsRawFd as _;
+    let mut poll = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = i32::try_from(tick.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: a poll over one owned fd; the return value (ready count,
+    // 0 on timeout, -1 on a signal) needs no branch — every outcome
+    // returns to the loop top.
+    unsafe { libc::poll(&mut poll, 1, millis) };
 }
 
 /// The shared pressure monitor lives in `dartq_toolchain::ledger`
@@ -895,6 +931,8 @@ fn lease_session(
         return Ok(None);
     }
     let (bytes, sized) = ledger::sizing(peak_key, Face::Session);
+    // One discovery feeds both the gate's cap and its memory share.
+    let yaml = dartq_commands::config::discover(root).ok().flatten();
     let request = Request {
         face: Face::Session,
         label: root.display().to_string(),
@@ -905,13 +943,13 @@ fn lease_session(
             busy: layout.dir.join("busy.lock"),
         }),
         slot: true,
-        cap: crate::job_cap(root),
+        cap: crate::job_cap(yaml.as_ref()),
         sized,
         peak_key: Some(peak_key.to_owned()),
         source_bytes: None,
     };
     let deadline = Instant::now() + SESSION_MEMORY_WAIT;
-    let max_percent = crate::memory_max_percent(root);
+    let max_percent = crate::memory_max_percent(yaml.as_ref());
     match ledger::acquire_or_stop(request, bytes, max_percent, deadline, signalled, |note| {
         eprintln!("{note}");
     }) {

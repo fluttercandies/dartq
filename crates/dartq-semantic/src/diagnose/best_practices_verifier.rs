@@ -300,10 +300,19 @@ impl<'a> Engine<'a> {
             );
         }
         if legs.template {
+            // The same usage-bucket + dedup route the sibling legs take:
+            // two call paths reach this chain for one reference (the
+            // row-driven and the reference post-pass funnels), and the
+            // engine-sink `emit` the old arm used landed BOTH copies in
+            // `report.diagnostics` — the `access_row_reported` guard only
+            // reads the usage bucket, so neither copy was suppressed
+            // (#2777's duplicated row).
             let code = SemanticCode::InvalidUseOfVisibleForTemplateMember;
-            if !self.access_row_reported(code.code_info(), anchor.offset) {
-                self.emit(code, anchor, display, &uri);
-            }
+            self.report_invalid_access(
+                code.code_info(),
+                anchor,
+                code.message(display, &uri),
+            );
         }
         if legs.testing {
             self.report_invalid_access(
@@ -547,6 +556,16 @@ impl<'a> Engine<'a> {
         // Overlapping plain reads are absorbed by the per-row idempotence.
         let member_refs = std::mem::take(&mut self.report.member_refs);
         for edge in &member_refs {
+            // The synthetic element-credit edge
+            // (`credit_constructor_selector`'s zero-length span) carries no
+            // use anchor — the oracle's row anchors the `ConstructorName`
+            // node, which the real ctor-use edge beside it already
+            // publishes; a zero-length span can only emit a phantom at
+            // offset 0 (probed 3.13.7: `new A.named()` reports exactly one
+            // `deprecated_member_use` over `A.named`).
+            if edge.range.length == 0 {
+                continue;
+            }
             let Some(elements) = index.get(edge.target_file) else {
                 continue;
             };
@@ -946,6 +965,11 @@ impl Engine<'_> {
         let mut reported: FxHashSet<(u32, u8)> = FxHashSet::default();
         let member_refs = std::mem::take(&mut self.report.member_refs);
         for edge in &member_refs {
+            // The zero-length credit edge carries no anchor (see the
+            // invalid-access drain's skip above).
+            if edge.range.length == 0 {
+                continue;
+            }
             let spelled = self.strings.resolve(edge.target_name);
             let display = spelled.strip_suffix('=').unwrap_or(spelled).to_owned();
             self.check_target_annotations(

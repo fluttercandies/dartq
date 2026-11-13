@@ -119,11 +119,11 @@ fn assignment_target_visits_stay_in_the_prefix() {
          void main() {{ B b = B(); String a; a = {tail}b.x; \
          int i = 1; i += {chain}\"x\"; int c; c = \"{interp}\"; }}"
     );
-    ASSIGNMENT_TARGET_VISITS.store(0, std::sync::atomic::Ordering::Relaxed);
-    ASSIGNMENT_TARGET_MAX_TAIL.store(0, std::sync::atomic::Ordering::Relaxed);
+    ASSIGNMENT_TARGET_VISITS.with(|visits| visits.set(0));
+    ASSIGNMENT_TARGET_MAX_TAIL.with(|tail| tail.set(0));
     let report = report(&source);
-    let visits = ASSIGNMENT_TARGET_VISITS.load(std::sync::atomic::Ordering::Relaxed);
-    let max_tail = ASSIGNMENT_TARGET_MAX_TAIL.load(std::sync::atomic::Ordering::Relaxed);
+    let visits = ASSIGNMENT_TARGET_VISITS.with(|visits| visits.get());
+    let max_tail = ASSIGNMENT_TARGET_MAX_TAIL.with(|tail| tail.get());
     // The interpolation assignment's element rows stay live at check
     // time: at least one call saw a >4000-row post-operator tail the old
     // `.rev().find` walked element by element.

@@ -113,7 +113,15 @@ fn report(source: &str) -> FileReport {
 /// The two-library rig: `main.dart` imports `a.dart` as `p`; `a.dart` is a
 /// graph node whose directives the rig mirrors (the export edge carries the
 /// written combinators), and the `dart:core` node carries its face names.
-fn report_with_prefix(source: &str, core_names: &[&str], show_dynamic_export: bool) -> FileReport {
+/// `core_prefix` mirrors a written `import 'dart:core' as <name>;` — the
+/// direct prefixed-`dynamic` face needs the prefix bound to the core node
+/// exactly the way the oracle's workspace binds the real directive.
+fn report_with_prefix(
+    source: &str,
+    core_names: &[&str],
+    show_dynamic_export: bool,
+    core_prefix: Option<&str>,
+) -> FileReport {
     let strings = StringTable::new();
     let mut files = FileTable::new();
     let file = files.intern(Path::new("main.dart"));
@@ -166,6 +174,18 @@ fn report_with_prefix(source: &str, core_names: &[&str], show_dynamic_export: bo
             combinators: Combinators::unfiltered(),
         },
     );
+    if let Some(prefix) = core_prefix {
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(core),
+                prefix: Some(strings.intern(prefix)),
+                deferred: false,
+                non_library: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+    }
     let mut index = ElementIndex::default();
     index.insert(file, elements.clone());
     for (name, decl) in elements.declarations() {
@@ -229,13 +249,19 @@ fn function_operand_reports_full_render() {
 
 /// A generic function tear-off's bare read carries its full signature —
 /// the corpus's exact ambiguity-disambiguation message
-/// (`ambiguities_A12_t02`: `String Function<T1, T2>(int)`).
+/// (`ambiguities_A12_t02`: `String Function<T1, T2>(int)`). The anchor
+/// is the RELATIONAL `<` of the application, never the declaration's
+/// type-parameter bracket: oracle receipt (`dart analyze` 3.13.7,
+/// machine format) pins the row at the applied operator token —
+/// `3|9|1|The operator '<' isn't defined for the type
+/// 'String Function<T1, T2>(int)'.` over the same fixture — the
+/// `_getErrorRange` default the member rows share.
 #[test]
 fn generic_tearoff_operand_reports_signature_display() {
     let source = "String a<T1, T2>(int x) => \"\";\nvoid f() { if (a < 1) {} }\n";
     let r = report(source);
     let rows = operator_rows(&r);
-    let at = source.find('<').expect("anchor") as u32;
+    let at = source.rfind('<').expect("anchor") as u32;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].1, at);
     assert_eq!(
@@ -246,7 +272,17 @@ fn generic_tearoff_operand_reports_signature_display() {
 
 /// A type-parameter receiver answers on its bound (the upstream
 /// `resolveToBound` consult): `T extends num` keeps `t + 1` and `t++`
-/// silent when `num` declares `+`; an unbounded `T` reports.
+/// silent when `num` declares `+`. An unbounded `T` is potentially
+/// nullable (its implicit bound is `Object?`), so the oracle's
+/// `isNullable` tail fires ahead of the member consult — the row is the
+/// shared unchecked code at the operator, never `undefined_operator`.
+///
+/// Oracle row (`dart analyze` 3.13.7, full fixture):
+/// `error - :10:5 - The operator '+' can't be unconditionally invoked
+/// because the receiver can be 'null'. Try adding a null check to the
+/// target ('!'). - unchecked_use_of_nullable_value` (beside the
+/// argument/assignment rows real `dart:core` adds; the bare rig keeps
+/// only the operator face).
 #[test]
 fn bound_carries_operator_face() {
     let source = "\
@@ -263,13 +299,18 @@ void g<T>(T t) {
 }
 ";
     let r = report(source);
-    let rows = operator_rows(&r);
+    assert_eq!(operator_rows(&r), vec![], "{:?}", r.diagnostics);
+    let unchecked: Vec<_> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "unchecked_use_of_nullable_value")
+        .collect();
     let plus_at = source.rfind("+ 1").expect("anchor") as u32;
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].1, plus_at);
+    assert_eq!(unchecked.len(), 1, "{:?}", r.diagnostics);
+    assert_eq!(unchecked[0].range.offset, plus_at);
     assert_eq!(
-        rows[0].3,
-        "The operator '+' isn't defined for the type 'T'."
+        unchecked[0].message.as_str(),
+        "The operator '+' can't be unconditionally invoked because the receiver can be 'null'."
     );
 }
 
@@ -395,7 +436,7 @@ fn typed_receiver_row_answers_operator_face() {
 #[test]
 fn prefixed_type_miss_spans_whole_name() {
     let source = "import 'a.dart' as p;\n\nvoid f(p.Unresolved<int> x) {}\n";
-    let r = report_with_prefix(source, &[], false);
+    let r = report_with_prefix(source, &[], false, None);
     let rows = class_rows(&r);
     let prefix = source.find("p.Unresolved").expect("anchor") as u32;
     assert_eq!(rows.len(), 1, "{rows:?}");
@@ -413,7 +454,7 @@ fn prefixed_type_miss_spans_whole_name() {
 #[test]
 fn prefixed_dynamic_resolves_through_reexport() {
     let source = "import 'a.dart' as p;\n\np.dynamic f() => 1 as p.dynamic;\n";
-    let r = report_with_prefix(source, &["dynamic"], true);
+    let r = report_with_prefix(source, &["dynamic"], true, None);
     assert_eq!(class_rows(&r), vec![], "{:?}", r.diagnostics);
 }
 
@@ -422,6 +463,6 @@ fn prefixed_dynamic_resolves_through_reexport() {
 #[test]
 fn core_prefixed_dynamic_resolves_directly() {
     let source = "import 'dart:core' as core;\n\ncore.dynamic f() => 1 as core.dynamic;\n";
-    let r = report_with_prefix(source, &["dynamic"], false);
+    let r = report_with_prefix(source, &["dynamic"], false, Some("core"));
     assert_eq!(class_rows(&r), vec![], "{:?}", r.diagnostics);
 }

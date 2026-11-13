@@ -85,6 +85,7 @@ fn member_formal(
         false,
         false,
         true,
+        true,
         StrictModes::default(),
         &posture,
         None,

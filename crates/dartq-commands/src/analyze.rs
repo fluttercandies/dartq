@@ -55,8 +55,14 @@ pub(crate) fn prelude(engine: &mut Engine) -> Result<(), AnalyzeError> {
 /// One [`Engine::analyze`] pass: the merged diagnostics, the wall-clock,
 /// the `LibraryAnalyzed` counters (fresh, cached), and the version-skew
 /// degrade notices (#1311) — [`run_overlaid`]'s second half.
+///
+/// `targets` is the file-aim set (#4234): non-empty marks a targeted
+/// turn, where the engine replays only the target files' libraries and
+/// returns their rows — exactly the rows the caller's `covered` filter
+/// keeps; empty is the full-workspace turn.
 fn analyze_pass(
     engine: &mut Engine,
+    targets: &[FileId],
 ) -> Result<(Vec<Diagnostic>, Duration, usize, usize, Vec<String>), AnalyzeError> {
     let mut notices: Vec<String> = Vec::new();
     let mut on_event = |event: EngineEvent| match event {
@@ -72,7 +78,7 @@ fn analyze_pass(
     };
     let analyze_at = std::time::Instant::now();
     let diagnostics = engine
-        .analyze(&[], &mut on_event, &CancellationToken::default())
+        .analyze(targets, &mut on_event, &CancellationToken::default())
         .map_err(|_: Cancelled| AnalyzeError::Cancelled)?;
     // The honest per-turn library counts (#4205): the event stream's
     // `LibraryAnalyzed` cache hits fire for asked-for targets only, so a
@@ -217,7 +223,7 @@ pub fn run_overlaid<'a>(
     }
 
     let (mut diagnostics, analysis, libraries_analyzed, libraries_from_cache, mut event_notices) =
-        analyze_pass(engine)?;
+        analyze_pass(engine, &[])?;
     notices.append(&mut event_notices);
     let lints_at = std::time::Instant::now();
     if !roots.is_empty() {
@@ -330,6 +336,33 @@ pub fn covered(path: &Path, targets: &[Target]) -> bool {
     })
 }
 
+/// The engine's file-aim set for a target list (#4234): every `.dart` file
+/// target's id, resolved against the table discovery and target injection
+/// filled. Empty — the full-turn fallback — when a directory target rides
+/// along (its covered set spans whole libraries, not one library's rows
+/// per aim) or a `.dart` target is not in the table (a skipped or excluded
+/// file may still carry workspace-level rows). Non-`.dart` file targets
+/// are skipped: [`covered`] never emits a row for them, so they cannot
+/// move the emitted set.
+fn file_aim_ids(engine: &Engine, targets: &[Target]) -> Vec<FileId> {
+    let mut aim = Vec::with_capacity(targets.len());
+    for target in targets {
+        match target {
+            Target::Dir(_) => return Vec::new(),
+            Target::File(path) => {
+                if !path.extension().is_some_and(|ext| ext == "dart") {
+                    continue;
+                }
+                let Some(file) = engine.file_table().try_file_id(path) else {
+                    return Vec::new();
+                };
+                aim.push(file);
+            }
+        }
+    }
+    aim
+}
+
 /// [`run_overlaid`] over an explicit target set — the multi-argument
 /// `dart analyze` face. The engine analyzes the whole assembled workspace
 /// (the file/dir targets' containing context, upstream's model: a target's
@@ -392,8 +425,16 @@ pub fn run_targets<'a>(
         engine.set_content(path, bytes);
     }
 
+    // #4234: a file-only aim drives the engine's targeted turn — only the
+    // libraries owning the target `.dart` files replay from the store, and
+    // the engine returns exactly their rows (the set the `covered` retain
+    // below keeps for a file target). Any directory target widens the
+    // covered set past "the aim's libraries", and a file the table cannot
+    // resolve may carry workspace-level rows, so both keep the full turn.
+    let aim = file_aim_ids(engine, targets);
+
     let (mut diagnostics, analysis, libraries_analyzed, libraries_from_cache, mut event_notices) =
-        analyze_pass(engine)?;
+        analyze_pass(engine, &aim)?;
     notices.append(&mut event_notices);
     // The loaded options set lives past the roots block: the plugin weave's
     // per-directory gate consumes the same governing directories.

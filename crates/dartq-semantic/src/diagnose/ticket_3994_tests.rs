@@ -90,6 +90,7 @@ fn with_clause_args(
         features.variance_enabled,
         false,
         features.patterns_enabled,
+        features.triple_shift_enabled,
         StrictModes::default(),
         &class_modifiers,
         None,

@@ -3942,6 +3942,53 @@ impl<'a> ResolvedTypeOps<'a> {
         ))
     }
 
+    /// [`Self::try_subtype_strict`]'s unmodeled-head extension: a head the
+    /// strict map refuses because it resolves-but-has-no-element-model
+    /// (`non_containers`) still carries a REAL face — its opaque
+    /// declaration with the written arguments riding the `Interface`
+    /// (#2288), so `Stream<File>` and `Stream<Uint8List>` read as two
+    /// instantiations of one opaque `Stream` and the relation answers
+    /// "unrelated" instead of collapsing through the name-level lattice's
+    /// optimism. Every other miss (a genuinely unresolvable head, an
+    /// undefined argument — either side) declines with `None` and the
+    /// caller keeps its name-level verdict: the oracle's `InvalidType`
+    /// argument face is the vacuous 0c subtype arm (#3443), which the
+    /// name level already spells.
+    pub(crate) fn try_subtype_with_opaque(
+        &self,
+        sub: Ty,
+        sup: Ty,
+        pool: &crate::model::ArgPool,
+    ) -> Option<bool> {
+        fn map(ops: &ResolvedTypeOps, ty: Ty, pool: &crate::model::ArgPool) -> Option<TypeId> {
+            if let Some(strict) = ops.map_ty_strict(ty, pool) {
+                return Some(strict);
+            }
+            // The unmodeled head's opaque face: the written arguments map
+            // recursively — an opaque argument keeps its own declaration,
+            // a strict-mappable one its real face, anything else declines
+            // the whole ask.
+            let Ty::Named {
+                name,
+                nullable,
+                args,
+            } = ty
+            else {
+                return None;
+            };
+            if !ops.snapshot.non_containers.contains(&name) {
+                return None;
+            }
+            let mapped: Vec<TypeId> = pool
+                .get(args)
+                .iter()
+                .map(|&arg| map(ops, arg, pool))
+                .collect::<Option<_>>()?;
+            Some(ops.opaque_ty(name, mapped, nullable))
+        }
+        Some(self.system.is_subtype(map(self, sub, pool)?, map(self, sup, pool)?))
+    }
+
     /// Whether `ty` mentions a `TypeParameter` leaf anywhere in its
     /// structure — the strict path's decline signal: `is_subtype`'s
     /// M1 parameter arms answer `false` where the oracle reads the
@@ -4172,6 +4219,93 @@ impl<'a> ResolvedTypeOps<'a> {
         };
         self.work_exit(owner);
         instantiated
+    }
+
+    /// [`Self::instantiated_on`]'s binding map: the `on` type's parameter
+    /// leaves bound against the receiver's projected arguments, without
+    /// the bound gate [`Self::extension_applies_strict_walk`] runs.
+    pub(crate) fn instantiated_on_map(
+        &self,
+        receiver: Ty,
+        on_ty: Ty,
+        face_params: &[(TypeParamId, Option<TypeId>)],
+        pool: &crate::model::ArgPool,
+    ) -> Option<Vec<(TypeParamId, TypeId)>> {
+        let owner = self.work_enter();
+        let map = if self.work_tick() {
+            match (
+                self.map_ty_strict(receiver, pool),
+                self.map_ty_strict(on_ty, pool),
+            ) {
+                (Some(receiver), Some(on)) => {
+                    let ids: Vec<TypeParamId> = face_params.iter().map(|(id, _)| *id).collect();
+                    self.unify_extended(receiver, on, &ids).map(|(_, map)| map)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.work_exit(owner);
+        map
+    }
+
+    /// A generic mixin applied with NO written type arguments infers them
+    /// from its own `on` constraints unified against the application's
+    /// base face (`mixin M1<T> on I<T>` over `I<int>` binds `T := int`,
+    /// so a later entry's `on M1<int>` asks the inferred application
+    /// `M1<int>`, never the bounds-erased `M1<dynamic>` — the official's
+    /// per-application inference, `mixin_inferrer.dart`'s constraint
+    /// solve). Answers the mixin's instantiated application face; `None`
+    /// when a parameter stays unbound or a face does not map into the
+    /// snapshot (the caller keeps the bounds-erased posture).
+    pub(crate) fn inferred_mixin_application(
+        &self,
+        mixin: StringId,
+        mixin_file: FileId,
+        on_clause: &[StringId],
+        on_clause_args: &[crate::model::ArgListId],
+        type_param_names: &[StringId],
+        base: Ty,
+        pool: &crate::model::ArgPool,
+    ) -> Option<TypeId> {
+        let count = type_param_names.len();
+        if count == 0 || on_clause.is_empty() {
+            return None;
+        }
+        let face_params: Vec<(TypeParamId, Option<TypeId>)> = type_param_names
+            .iter()
+            .map(|name| self.param_id(*name, mixin_file).map(|id| (id, None)))
+            .collect::<Option<Vec<_>>>()?;
+        let mut map: Vec<(TypeParamId, TypeId)> = Vec::new();
+        for (slot, constraint) in on_clause.iter().enumerate() {
+            let args = on_clause_args
+                .get(slot)
+                .copied()
+                .unwrap_or(crate::model::ArgListId::EMPTY);
+            let on_ty = Ty::Named {
+                name: *constraint,
+                nullable: false,
+                args,
+            };
+            if let Some(bindings) = self.instantiated_on_map(base, on_ty, &face_params, pool) {
+                for binding in bindings {
+                    if !map.iter().any(|(param, _)| *param == binding.0) {
+                        map.push(binding);
+                    }
+                }
+            }
+        }
+        let args: Vec<TypeId> = face_params
+            .iter()
+            .map(|&(param, _)| map.iter().find(|(p, _)| *p == param).map(|&(_, ty)| ty))
+            .collect::<Option<Vec<_>>>()?;
+        let decl = *self.snapshot.registry.get(&mixin)?;
+        Some(
+            self.snapshot
+                .table
+                .intern(UninternedType::Interface { decl, args }, false),
+        )
     }
 
     /// [`Self::extension_applies_strict`]'s walk.
@@ -5245,6 +5379,30 @@ impl TypeOps for ResolvedTypeOps<'_> {
         if left.base == Base::Function && right.base == Base::Function {
             return false;
         }
+        // The bare `Function` interface spelling against a
+        // signature-carrying head (`Base::Function` — the flow lattice
+        // spells every function type with the signature dropped at the
+        // event seam): the pair is decidable WITHOUT the signature, by
+        // the interface rule alone — every function type is a subtype of
+        // `Function` (subtype.dart:502-510's Function arm), and the
+        // interface is a subtype of no specific signature. The map below
+        // folds both sides onto the same `Function` interface, so the
+        // second question answered by identity read `true` — folding
+        // branches the oracle keeps live and refusing real promotion
+        // steps (`Function? x; x is C1<int> Function()?` promoted
+        // nothing, #3593).
+        let bare_function_interface = |ty: FlowTy, args: u32| match ty.base {
+            Base::Name(id) if args == EMPTY_ARGS => {
+                names.get(id as usize).is_some_and(|n| &**n == "Function")
+            }
+            _ => false,
+        };
+        if left.base == Base::Function && bare_function_interface(right, right_args) {
+            return !left.nullable || right.nullable;
+        }
+        if bare_function_interface(left, left_args) && right.base == Base::Function {
+            return false;
+        }
         let l = self.map_scrutinee(left, left_args, arena, names);
         let r = self.map_tested(right, right_args, arena, names);
         // Fuel trip (#2636): a tripped mapping answers `Invalid`, whose
@@ -5272,6 +5430,25 @@ impl TypeOps for ResolvedTypeOps<'_> {
         }
         self.observe_names(names);
         let mark = self.work_mark();
+        // The bare `Function` interface's promotion gate over a
+        // signature-carrying spelling (`Function? x; x is C1<int>
+        // Function()?`): both strict-gate asks are decidable by the
+        // interface rule alone (subtype.dart:502-510 — every function
+        // type is a subtype of the `Function` interface, and the
+        // interface is a subtype of no specific signature), so the step
+        // stands exactly when the tested nullability sits under the
+        // declared one. The mapped ask below folds both sides onto the
+        // same interface and answers the second question by identity,
+        // refusing every such step (#3593: the promoted read never
+        // staged, and the if-null composite joined the declared bare
+        // `Function`).
+        if to.base == Base::Function
+            && from_args == EMPTY_ARGS
+            && let Base::Name(from_id) = from.base
+            && names.get(from_id as usize).is_some_and(|n| &**n == "Function")
+        {
+            return (from.nullable || !to.nullable).then_some(to);
+        }
         let t = self.map_tested(to, to_args, arena, names);
         let f = self.map_scrutinee(from, from_args, arena, names);
         // The strict-subtype gate (`isValidPromotionStep`,
@@ -6045,19 +6222,33 @@ typedef U<T> = T Function();
     }
 
     /// #2288: an unmodeled `is`-test compares the written instantiations,
-    /// not just the heads. `Stream<List<int>>` and `Stream<Uint8List>` are
-    /// two instantiations of one opaque `Stream` (covariance decides), so
-    /// the test can fail and the else branch stays live — the dio
-    /// `progress_stream/io_progress_stream.dart:13` face. With the written
-    /// arguments dropped, both sides shared one argument-less declaration,
-    /// the test read as guaranteed true, and the else body deaded.
+    /// not just the heads. Two opaque instantiations of one `Stream`
+    /// (covariance decides), so the test can fail and the else branch
+    /// stays live — the dio `progress_stream/io_progress_stream.dart:13`
+    /// face. With the written arguments dropped, both sides shared one
+    /// argument-less declaration, the test read as guaranteed true, and
+    /// the else body deaded.
+    ///
+    /// Oracle proofs (dart analyze 3.13.7): the RESOLVED analog
+    /// (`Stream<List<int>> stream; stream is Stream<Uint8List>` over
+    /// dart:async/dart:typed_data/dart:core) reports NOTHING — distinct
+    /// resolved instantiations keep both branches live. The former fixture
+    /// spelled `Stream<List<int>>` with `List` outside the rig's declared
+    /// names — the UNDEFINED-argument universe, whose oracle face
+    /// (`import 'dart:core' hide List`) is the OPPOSITE:
+    /// `non_type_as_type_argument` + `unnecessary_type_check` (always
+    /// 'true') + `dead_code` on the else — the InvalidType argument's
+    /// vacuous 0c subtype arm (#3443), which the engine answers
+    /// faithfully. Both written arguments must resolve for the
+    /// distinguishing rule to be the deciding face; `File` joins the
+    /// rig's names so both sides are opaque instantiations.
     #[test]
     fn unmodeled_generic_is_test_distinguishes_written_arguments() {
         let codes = diagnose_codes_unmodeled(
-            "int f(Stream<List<int>> stream) { \
+            "int f(Stream<File> stream) { \
                if (stream is Stream<Uint8List>) { return 1; } else { return 2; } \
              }",
-            &["Stream", "Uint8List"],
+            &["Stream", "Uint8List", "File"],
         );
         assert!(
             !codes.contains(&"dead_code"),

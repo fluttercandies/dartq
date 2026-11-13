@@ -428,8 +428,8 @@ impl StringTable {
     pub fn heap_bytes(&self) -> Vec<(&'static str, u64)> {
         let mut shard_slots = 0usize;
         for shard in &self.shards {
-            shard_slots +=
-                shard.0.read().capacity() * (std::mem::size_of::<(&'static str, StringId)>() + 1);
+            shard_slots += shard.0.read().capacity()
+                * (std::mem::size_of::<(&'static str, StringId)>() + 1);
         }
         let mut slot_arena = 0usize;
         for bucket in &self.slots {

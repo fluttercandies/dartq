@@ -96,7 +96,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dartq_source::{ContentId, content_hash};
@@ -247,6 +247,69 @@ pub fn default_root() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".cache").join("dartq"))
 }
 
+/// The answered-turn sidecar's path under a store root (#4243):
+/// `<root>/answers/<key-hex>.answer` — the small mutable record beside
+/// the content-addressed blob the store holds (stamps move on every
+/// touch, so the record cannot live under content addressing).
+#[must_use]
+pub fn answer_record_path(root: &Path, key: &[u8; 16]) -> PathBuf {
+    let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+    root.join("answers").join(format!("{hex}.answer"))
+}
+
+/// A content blob's on-disk path under a store root: the two-hex shard
+/// directory, then the full hex name (#4260's unassembled probe reads
+/// blobs by path without opening the books; [`ContentStore::blob_path`]
+/// delegates here, one spelling for both).
+#[must_use]
+pub fn answer_blob_path(root: &Path, id: &ContentId) -> PathBuf {
+    let hex = id.to_string();
+    root.join("store").join(&hex[..2]).join(hex)
+}
+
+/// The temp-file counter for [`write_answer_record`]'s sibling temps.
+static ANSWER_TMP_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Writes one answer-record sidecar atomically (#4243): a unique sibling
+/// temp file, then a same-filesystem rename over the destination — the
+/// snapshot store's save discipline (a torn write leaves the previous
+/// record or none, both misses; durability is deliberately omitted, a
+/// young record lost to power loss is an acceptable miss).
+///
+/// # Errors
+///
+/// Any [`std::io::Error`] from creating the answers directory or the
+/// write-rename pair — the caller treats a failed persist as a future
+/// miss, never an error.
+pub fn write_answer_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("answer");
+    let tmp = path.with_file_name(format!(
+        "{name}.tmp-{}-{}",
+        std::process::id(),
+        ANSWER_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Reads one answer-record sidecar; any I/O failure is the caller's miss.
+///
+/// # Errors
+///
+/// Any [`std::io::Error`] from the read (absent, unreadable, torn).
+pub fn read_answer_record(path: &Path) -> std::io::Result<Vec<u8>> {
+    fs::read(path)
+}
+
 /// The open-time knobs: where the store lives and how many bytes it may
 /// hold.
 #[derive(Debug, Clone)]
@@ -301,6 +364,9 @@ struct EntryMeta {
 /// posture; the daemon drives the pin surface through
 /// [`crate::Engine::content_store_mut`].
 pub struct ContentStore {
+    /// The cache root the config named — the answer-record sidecars'
+    /// parent (`<root>/answers`) and the blob directory's parent.
+    root: PathBuf,
     /// The blob directory: `<root>/store`, shard subdirectories beneath.
     dir: PathBuf,
     limit: u64,
@@ -351,6 +417,7 @@ impl ContentStore {
         let dir = config.root.join("store");
         fs::create_dir_all(&dir).map_err(|error| StoreError::CreateDir(dir.clone(), error))?;
         let mut store = Self {
+            root: config.root.clone(),
             dir,
             limit: config.size_limit,
             entries: BTreeMap::new(),
@@ -371,6 +438,13 @@ impl ContentStore {
         // and absorbs any journal the previous session left.
         store.compact();
         Ok(store)
+    }
+
+    /// The cache root this store was opened under — the answer-record
+    /// sidecars' parent (`<root>/answers`, [#4243](crate::state::persist)).
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Files one payload under its content digest and books it.
@@ -909,8 +983,7 @@ impl ContentStore {
 
     /// The blob's path: `dir/<first two hex chars>/<full hex>`.
     fn blob_path(&self, id: &ContentId) -> PathBuf {
-        let hex = id.to_string();
-        self.dir.join(&hex[..2]).join(hex)
+        answer_blob_path(&self.root, id)
     }
 
     #[cfg(test)]

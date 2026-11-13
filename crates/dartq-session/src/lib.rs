@@ -68,6 +68,7 @@ use serde::{Deserialize, Serialize};
 
 mod identity;
 
+
 pub use identity::{binary_stamp, environment_fingerprint};
 
 /// How often the serve loop rewrites `state.json` (the liveness signal).
@@ -179,6 +180,7 @@ fn realpath(path: &Path) -> PathBuf {
 fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
+
 
 // ---------------------------------------------------------------------------
 // Layout and state
@@ -1211,7 +1213,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
             debug_sessions: 0,
-            used_ms: 0,
+                        used_ms: 0,
         }
         .write(layout)
         .expect("state");
@@ -1240,7 +1242,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
             debug_sessions: 0,
-            used_ms: 0,
+                        used_ms: 0,
         }
         .write(layout)
         .expect("state");
@@ -1485,7 +1487,7 @@ mod tests {
             heartbeat_ms: 123_456,
             triple: SessionTriple::compute(&root, &root),
             debug_sessions: 2,
-            used_ms: 0,
+                        used_ms: 0,
         };
         state.write(&layout).expect("write");
         assert_eq!(SessionState::read(&layout).as_ref(), Some(&state));
@@ -1550,7 +1552,7 @@ mod tests {
             heartbeat_ms: 0,
             triple: triple.clone(),
             debug_sessions: 0,
-            used_ms: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1644,7 +1646,7 @@ mod tests {
             heartbeat_ms: 0,
             triple: foreign,
             debug_sessions: 0,
-            used_ms: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1669,7 +1671,7 @@ mod tests {
             heartbeat_ms: 0,
             triple: triple.clone(),
             debug_sessions: 0,
-            used_ms: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1713,7 +1715,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: stale,
             debug_sessions: 0,
-            used_ms: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1861,7 +1863,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
             debug_sessions: 0,
-            used_ms: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("placeholder");
@@ -1902,7 +1904,7 @@ mod tests {
             heartbeat_ms: spent_heartbeat,
             triple: current.clone(),
             debug_sessions: 0,
-            used_ms: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("placeholder");
@@ -1935,7 +1937,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: foreign,
             debug_sessions: 0,
-            used_ms: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("placeholder");
@@ -1972,7 +1974,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms().saturating_sub(10 * STALE_HEARTBEAT.as_millis()),
             triple: triple.clone(),
             debug_sessions: 0,
-            used_ms: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -2020,7 +2022,7 @@ mod tests {
                     ..triple.clone()
                 },
                 debug_sessions: 0,
-                used_ms: 0,
+                        used_ms: 0,
             }
             .write(&layout)
             .expect("state");
@@ -2389,7 +2391,7 @@ mod tests {
                 sdk_version: String::new(),
                 fvmrc: None,
                 environment_fingerprint: String::new(),
-                binary_stamp: binary.to_owned(),
+                    binary_stamp: binary.to_owned(),
             };
             let pid = bring_up_child(&layout, &triple);
             Record {
@@ -2399,7 +2401,7 @@ mod tests {
                     heartbeat_ms: heartbeat,
                     triple,
                     debug_sessions: 0,
-                    used_ms: 0,
+                        used_ms: 0,
                 },
             }
         };
@@ -2431,7 +2433,7 @@ mod tests {
                     binary_stamp: "bin1".to_owned(),
                 },
                 debug_sessions: 0,
-                used_ms: 0,
+                        used_ms: 0,
             },
         };
         registry.upsert(&dead).expect("upsert");
@@ -2483,7 +2485,7 @@ mod tests {
                 sdk_version: String::new(),
                 fvmrc: None,
                 environment_fingerprint: String::new(),
-                binary_stamp: "bin".to_owned(),
+                    binary_stamp: "bin".to_owned(),
             };
             let pid = bring_up_child(&layout, &triple);
             Record {
@@ -2493,7 +2495,7 @@ mod tests {
                     heartbeat_ms: heartbeat,
                     triple,
                     debug_sessions: 0,
-                    used_ms: 0,
+                        used_ms: 0,
                 },
             }
         };
@@ -2581,12 +2583,10 @@ mod tests {
         }
         .write(&layout)
         .expect("state");
-        drop(
-            std::process::Command::new("kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .status(),
-        );
+        drop(std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status());
         for _ in 0..100 {
             SESSION_CHILDREN.with(|children| {
                 for c in children.borrow_mut().iter_mut() {

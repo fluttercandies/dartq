@@ -683,6 +683,30 @@ pub(crate) fn is_always_exhaustive(world: &NameWorld<'_>, ty: NameTy) -> bool {
     always_exhaustive_within(world, ty, 8)
 }
 
+/// An in-scope type-parameter scrutinee's SPACE delegation: upstream's
+/// `getStaticType` wraps a type-parameter value's static type over its
+/// BOUND's (`WrappedStaticType`, shared.dart:281-285 — the space the
+/// exhaustiveness walk judges and the witnesses it names are the bound's),
+/// while the message's type TEXT keeps the parameter spelling (the static
+/// type is `T`; probed 3.13.7: `f<T extends St>(T t)` reports
+/// `non_exhaustive_switch_statement` naming the missing `'St.b'` beside
+/// the type text `'T'`). Delegates only when the bound is itself
+/// always-exhaustive — an open bound's space is an opaque leaf either way
+/// and the `must_be_exhaustive` gate stays silent, so nothing is guessed
+/// there. A scrutinee the world can resolve, or a parameter with no bound
+/// in scope, keeps its own face.
+pub(crate) fn param_bound_scrutinee(world: &NameWorld<'_>, scrutinee: Ty) -> Option<Ty> {
+    let NameTy::Named(name, false) = NameTy::from_semantic(scrutinee) else {
+        return None;
+    };
+    let engine = fold_engine()?;
+    if !engine.is_scope_param(name) {
+        return None;
+    }
+    let bound = engine.param_bound(name)?;
+    always_exhaustive_within(world, NameTy::from_semantic(bound), 8).then_some(bound)
+}
+
 /// [`is_always_exhaustive`] with a recursion budget: `FutureOr` chains
 /// (`FutureOr<FutureOr<S>>`) and bound chains spend one unit each; an
 /// exhausted chain answers `false`, the conservative arm.

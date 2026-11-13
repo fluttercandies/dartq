@@ -899,32 +899,22 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
         // this node (`_reportError` swaps the code, not the entity).
         Expr::Faulted(fault) => Verdict::Fault(*fault, node.span),
         // An `if` element folds like the oracle's `_buildListConstant` arm:
-        // the condition's `InvalidConstant` propagates, a known bool skips
-        // the dead branch and folds the live one in place, an
-        // unknown-but-constant condition leaves the collection's value
-        // unknown (the literal's elements stay individually checked — the
-        // verdict only feeds value-carrying consumers).
+        // the condition's `InvalidConstant` propagates, and a known bool
+        // folds ONLY the live branch — the dead branch is skipped outright,
+        // never npc-scanned (`branchResult` stays null for a false
+        // condition with no else, and the dead side's element faces belong
+        // to the literal verifier, not the value; probed 3.13.7 — probe41:
+        // `[if (false) nonConst]`, `[if (false) nonConst else 1]`, and
+        // `[if (true) 1 else nonConst]` all report the element face + dead
+        // code with NO declaration row). An unknown-but-constant condition
+        // leaves the collection's value unknown (the literal's elements
+        // stay individually checked — the verdict only feeds value-carrying
+        // consumers).
         Expr::IfElement { cond, then, els } => match fold(cond, lookup, depth) {
-            Verdict::Value(ConstantValue::Bool(true)) => {
-                match els
-                    .as_deref()
-                    .and_then(|els| not_potentially_constant(els, lookup))
-                {
-                    // Upstream scans the dead else branch's
-                    // not-potentially-constant shapes before folding the
-                    // live branch (evaluation.dart's dead-branch check).
-                    Some(npc) => Verdict::NotConstant(npc),
-                    None => fold(then, lookup, depth),
-                }
-            }
-            Verdict::Value(ConstantValue::Bool(false)) => {
-                match not_potentially_constant(then, lookup) {
-                    Some(npc) => Verdict::NotConstant(npc),
-                    None => els
-                        .as_deref()
-                        .map_or(Verdict::Constant, |e| fold(e, lookup, depth)),
-                }
-            }
+            Verdict::Value(ConstantValue::Bool(true)) => fold(then, lookup, depth),
+            Verdict::Value(ConstantValue::Bool(false)) => els
+                .as_deref()
+                .map_or(Verdict::Constant, |e| fold(e, lookup, depth)),
             // A known non-bool condition faults at the condition node
             // (`nonBoolCondition` — `const_eval_for_element`'s sibling
             // allow-list face reports it at `element.expression`).
@@ -4565,6 +4555,21 @@ impl ConstCapture {
             },
             true,
         );
+    }
+
+    /// Pushes a closed const collection as its STRUCTURE node: the engine
+    /// builds it for a literal whose payload stayed unknown (a silently
+    /// deferred element read). `eval` folds it to the same
+    /// `Value(Instance(kind))` the opaque [`Self::push_value`] produced
+    /// (`eval_each`'s deferral arm), but the element subnodes survive for
+    /// the declaration-close re-decisions — the deferred non-const static
+    /// read's `const_initialized_with_non_constant_value` walk (probed
+    /// 3.13.7: `const l = [C.c]` reports beside the element face, and the
+    /// set/map-value/record-field shapes behave the same).
+    pub fn push_expr(&mut self, span: SourceRange, expr: Expr) {
+        if self.open() {
+            self.push(Node { expr, span }, true);
+        }
     }
 
     /// The implicit named creation `C.named(...)`: the capture keeps the

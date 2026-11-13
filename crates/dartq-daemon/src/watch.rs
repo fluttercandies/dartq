@@ -1382,11 +1382,18 @@ mod tests {
     /// in the workspace's own path form — inside a bounded window. The
     /// substrate must start for the test to mean anything: a fallback to
     /// poll would fail loudly at the `expect`, not pass vacuously.
+    ///
+    /// The stream is flushed warm first: FSEvents holds back its first
+    /// delivery batch for as long as fseventsd lags under host load
+    /// (sub-second quiet, measured past 30s at load 5-8 — every post-arm
+    /// write rides that one batch), so a phase pinned against a cold
+    /// stream would time the daemon's backlog, not our kinds.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn os_event_source_reports_kinds() {
-        let (root, _main) = workspace("os-events");
+        let (root, main) = workspace("os-events");
         let mut source = NotifySource::new(&root).expect("the OS substrate starts");
+        flush_first_batch(&mut source, &main);
 
         let extra = root.join("lib/extra.dart");
         fs::write(&extra, "var b = 2;\n").expect("create");
@@ -1405,11 +1412,54 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// Bound for the substrate's first delivery batch to flush: the arm's
+    /// registration travels with fseventsd's journal, and a saturated host
+    /// (load 5-8 from sustained parallel builds) delays that first
+    /// callback past half a minute — measured, not guessed. Quiet hosts
+    /// answer within a second, so the headroom costs nothing there; a
+    /// substrate that stays silent for the whole window is breakage, and
+    /// fails the test.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    const FIRST_BATCH_WINDOW: Duration = Duration::from_secs(60);
+
+    /// Bound for one kind's phase against the warm stream: deliveries
+    /// after the first batch land in milliseconds, so only a starved or
+    /// instrumented build approaches the bound (the `SETTLE_WINDOW`
+    /// rationale) — it costs nothing on normal targets.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    const KIND_WINDOW: Duration = Duration::from_secs(15);
+
+    /// Drives the substrate until its first delivery batch flushes:
+    /// rewrites of `path` retrigger until the Modify for it surfaces —
+    /// the same idiom `settle_rewrite` uses for the asynchronous arm, and
+    /// for the same reason. Every write made before the flush rides the
+    /// same first batch, so the pinned phases run only once the stream is
+    /// warm and their windows measure our kinds, not the daemon's
+    /// backlog. Bounded: a substrate that never delivers fails the test,
+    /// never hangs it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn flush_first_batch(source: &mut NotifySource, path: &Path) {
+        let deadline = Instant::now() + FIRST_BATCH_WINDOW;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no first batch from the OS substrate within the window"
+            );
+            fs::write(path, "var a = 1;\n").expect("warm-up write");
+            for event in source.drain() {
+                if event.kind == EventKind::Modify && event.path == path {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Drains until an event of `kind` for `path` arrives, or the window
     /// closes and the test fails — bounded, never a hang.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn wait_for_event(source: &mut NotifySource, kind: EventKind, path: &Path) -> PathBuf {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + KIND_WINDOW;
         loop {
             for event in source.drain() {
                 if event.kind == kind && event.path == path {

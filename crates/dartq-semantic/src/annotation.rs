@@ -59,6 +59,21 @@ use dartq_source::{FileId, SourceRange, StringId, StringTable};
 
 use crate::model::Annotation;
 
+/// The spelling-level form of [`is_meta_getter`]: whether a written
+/// annotation spelling (as captured on a declaration site) names
+/// package:meta's `getter` for `lib` — the decl-site walk's gate. The
+/// site model keeps bare spellings, not resolved annotations, so the
+/// shadow/import legs of [`meta_face`] run against the raw text.
+pub fn is_meta_spelling(
+    spelling: &str,
+    getter: &str,
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    lib: LibraryId,
+) -> bool {
+    meta_face(spelling, getter, strings, graph, lib)
+}
+
 /// Whether `annotation` is the package:meta top-level getter named
 /// `getter` for `lib`, per the import faces of `graph`.
 pub fn is_meta_getter(
@@ -381,10 +396,15 @@ fn is_dart_core_file(graph: &LibraryGraph, file: FileId) -> bool {
 }
 
 /// Whether the graph carries a `dart:core` node — the engine registers one
-/// per `dart:` library, a hand-built rig usually registers none. Cold path:
-/// only a name that resolves nowhere asks.
+/// per `dart:` library, a hand-built rig usually registers none. A rig's
+/// name-only stub (interned for the prefixed-edge face, carrying no unit
+/// files) does not count: without mounted units the implicit import is not
+/// modelled either, so the graph is in the rig posture however the node is
+/// spelled. Cold path: only a name that resolves nowhere asks.
 fn has_dart_core(graph: &LibraryGraph) -> bool {
-    graph.libraries().any(|lib| graph.uri(lib) == "dart:core")
+    graph
+        .libraries()
+        .any(|lib| graph.uri(lib) == "dart:core" && !graph.unit_files(lib).is_empty())
 }
 
 // —— the deprecation KIND face (#3353) ————————————————————————————————————

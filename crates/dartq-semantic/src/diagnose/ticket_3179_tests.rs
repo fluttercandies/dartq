@@ -61,17 +61,27 @@ fn ticket_3179_named_record_head_makes_the_tail_dead() {
     );
 }
 
-/// The bare `on (…)` recovery with no type at all (`parser-fe/record/on`,
-/// `on_clauses_A02_t01`): still one clause on the list, still catch-all.
+/// The bare `on(…)` recovery with garbage (`parser-fe/record/on`): the
+/// recovered clause yields the PARSE face alone — probed 3.13.7
+/// `dart analyze --format machine`, the oracle reports
+/// `expected_type_name` + `expected_token` at the head's garbage and
+/// `record_type_one_positional_no_trailing_comma` + `expected_body` at
+/// the tail, with NO `dead_code_catch_following_catch` row (the
+/// recovered clause never joins the dead-code walk's clause list).
 #[test]
-fn ticket_3179_paren_garbage_head_makes_the_tail_dead() {
+fn ticket_3179_paren_garbage_head_reports_the_parse_face_only() {
     let fixture = "void f() {\n  try {\n  } on int {\n  }\n  on(42, n: \"x\");\n}";
     assert_eq!(
         rows_of(fixture),
-        vec![(
-            "dead_code_catch_following_catch",
-            fixture.find("on(42").unwrap()
-        )],
+        vec![
+            ("expected_type_name", fixture.find("42").unwrap()),
+            ("expected_token", fixture.find("42").unwrap()),
+            (
+                "record_type_one_positional_no_trailing_comma",
+                fixture.find(");").unwrap()
+            ),
+            ("expected_body", fixture.find(");").unwrap()),
+        ],
         "{:#?}",
         rows_of(fixture)
     );

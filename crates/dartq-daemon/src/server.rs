@@ -33,7 +33,7 @@ use crate::codec::{self, FrameError};
 use crate::commands;
 use crate::debug;
 use crate::jsonrpc::{self, Message, Notification, Request, Response, codes};
-use crate::session::{FixJob, FixMail, Publish, Session, SessionError, Turn};
+use crate::session::{AnswerPayload, FixJob, FixMail, Publish, Session, SessionError, Turn};
 use crate::test;
 use crate::watch::{WatchOptions, Watcher, is_config_input};
 use crate::wire::DiagnosticsParams;
@@ -420,6 +420,15 @@ where
         write_turn(&mut output, session.service())?;
         write_turn(&mut output, session.complete_fix(None))?;
         on_turn();
+        // #4220: the turn's answer bytes are on the wire (write_turn
+        // flushed above) — return what the turn's churn freed to the OS
+        // now, never between render and write (collection is about the
+        // between-turns floor, not mid-turn latency). After the caller's
+        // hook so any booking it does still observes the pre-collect
+        // size. The daemon process runs under the CLI binary's mimalloc
+        // (#4220's immediate-purge posture installed at process start).
+        // SAFETY: mimalloc's forced collection walks its own heaps only.
+        unsafe { libmimalloc_sys::mi_collect(true) };
     }
 
     // #306: the clean-shutdown write, window or no window.
@@ -433,6 +442,11 @@ where
     if reader.is_finished() {
         let _ = reader.join();
     }
+    // #4220: the connection's own churn returns to the OS before the
+    // daemon goes back to its accept wait (the session itself outlives
+    // this run — the serve loop's next client reuses it).
+    // SAFETY: mimalloc's forced collection walks its own heaps only.
+    unsafe { libmimalloc_sys::mi_collect(true) };
     Ok(exit_code.unwrap_or(EXIT_CLEAN))
 }
 
@@ -985,7 +999,9 @@ fn failed(method: &str, error: &SessionError) {
 
 /// Writes one turn's output in contract order: publishes, then the turn's
 /// notifications (the fix progress notices ride the same pipeline), then
-/// the request answers.
+/// the request answers. A cached answer's serialized payload writes
+/// verbatim (#4258) — no value is materialized and nothing re-serializes
+/// on a cache hit.
 fn write_turn(output: &mut impl Write, turn: Turn) -> io::Result<()> {
     for publish in turn.publishes {
         send_publish(output, publish)?;
@@ -994,13 +1010,42 @@ fn write_turn(output: &mut impl Write, turn: Turn) -> io::Result<()> {
         write_message(output, &Message::Notification(notification))?;
     }
     for (id, answer) in turn.answers {
-        let response = match answer {
-            Ok(result) => Response::ok(id, result),
-            Err(error) => answer_error(id, &error),
-        };
-        write_message(output, &Message::Response(response))?;
+        match answer {
+            Ok(AnswerPayload::Wire(bytes)) => write_wire_response(output, id, &bytes)?,
+            Ok(AnswerPayload::Value(result)) => {
+                write_message(output, &Message::Response(Response::ok(id, result)))?
+            }
+            Err(error) => write_message(output, &Message::Response(answer_error(id, &error)))?,
+        }
     }
     Ok(())
+}
+
+/// A response frame whose `result` payload is already serialized: the
+/// envelope is byte-identical to `write_message`'s output over
+/// `Response::ok(id, value)` with the payload spliced in verbatim —
+/// `{"jsonrpc":"2.0","id":<id>,"result":` + payload + `}`, the key order
+/// being `Message::to_value`'s insertion order (jsonrpc, id, result).
+fn write_wire_response(
+    output: &mut impl Write,
+    id: jsonrpc::RequestId,
+    payload: &[u8],
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(payload.len() + 64);
+    body.extend_from_slice(br#"{"jsonrpc":"2.0","id":"#);
+    match id {
+        jsonrpc::RequestId::Num(id) => {
+            // serde_json serializes an i64 as its plain decimal digits.
+            body.extend_from_slice(id.to_string().as_bytes());
+        }
+        jsonrpc::RequestId::Str(id) => {
+            body.extend_from_slice(&serde_json::to_vec(&id).expect("ids serialize"));
+        }
+    }
+    body.extend_from_slice(b",\"result\":");
+    body.extend_from_slice(payload);
+    body.push(b'}');
+    codec::write_frame(output, &body)
 }
 
 fn send_publish(output: &mut impl Write, publish: Publish) -> io::Result<()> {
@@ -1036,6 +1081,54 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    /// #4258: a wire-served (cached) answer's frame is byte-identical to
+    /// the frame `write_message` produces over `Response::ok` with the
+    /// deserialized value — the splice construction must never diverge
+    /// from the value construction, over both id kinds and payload shapes
+    /// that exercise string escaping.
+    #[test]
+    fn a_wire_answer_frame_equals_the_value_answer_frame() {
+        let payloads = [
+            serde_json::json!({ "stdout": "clean", "v": 3 }),
+            serde_json::json!({ "quote": "a \"quoted\" string", "uni": "λ→λ" }),
+            serde_json::json!({ "diags": [{ "file": "lib/main.dart", "line": 1 }] }),
+            serde_json::Value::Null,
+        ];
+        let ids = [
+            jsonrpc::RequestId::Num(0),
+            jsonrpc::RequestId::Num(-42),
+            jsonrpc::RequestId::Num(i64::MAX),
+            jsonrpc::RequestId::Str("agent \"buffer\" λ".into()),
+        ];
+        for id in &ids {
+            for value in &payloads {
+                let expected = {
+                    let mut output = Vec::new();
+                    write_message(
+                        &mut output,
+                        &Message::Response(Response::ok(id.clone(), value.clone())),
+                    )
+                    .expect("the value frame writes");
+                    output
+                };
+                let spliced = {
+                    let mut output = Vec::new();
+                    write_wire_response(
+                        &mut output,
+                        id.clone(),
+                        &serde_json::to_vec(value).expect("payload serializes"),
+                    )
+                    .expect("the wire frame writes");
+                    output
+                };
+                assert_eq!(
+                    spliced, expected,
+                    "the {id:?} frame over {value} is byte-identical"
+                );
+            }
+        }
+    }
 
     /// #2632: the exit-signal close-out answers every queued request with
     /// exactly one structured error (silence is not a well-formed close)

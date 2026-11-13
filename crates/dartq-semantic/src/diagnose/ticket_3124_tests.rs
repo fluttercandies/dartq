@@ -81,8 +81,13 @@ fn enum_static_getter_index_conflicts() {
     );
 }
 
-/// An enum CONSTANT is a static field whose induced getter joins the
-/// enum's instance surface — a static member named the same reports.
+/// An enum CONSTANT and a same-named static member are two same-scope
+/// STATIC declarations — the oracle reports `duplicate_definition` at
+/// the static member's name with the constant as the first-definition
+/// context, never `conflicting_static_and_instance` (the interface
+/// probe never sees a constant). Re-pinned 3.13.7 against the live
+/// oracle: `enum E { a, b; static int a = 0; }` → `duplicate_definition`
+/// at 3:14 with the context row at the constant.
 #[test]
 fn enum_constant_vs_static_member_conflicts() {
     let report = report_ops(
@@ -91,10 +96,21 @@ fn enum_constant_vs_static_member_conflicts() {
          \x20 static int a = 0;\n\
          }\n",
     );
-    let rows = conflicts(&report);
+    let rows: Vec<(u32, u32)> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "duplicate_definition")
+        .map(|d| (d.range.offset, d.range.length))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "constant and static member are duplicate definitions: {rows:?}"
+    );
     assert!(
-        !rows.is_empty(),
-        "enum constant 'a' collides with static member 'a': {rows:?}"
+        conflicts(&report).is_empty(),
+        "the interface probe never sees a constant: {:?}",
+        conflicts(&report)
     );
 }
 

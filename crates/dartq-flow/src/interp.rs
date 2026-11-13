@@ -1030,6 +1030,18 @@ pub(crate) struct DeadWindow {
 }
 
 impl DeadWindow {
+    /// Opens the SUPPRESSED interval a `??` face parks after its eager
+    /// report: upstream's `_firstDeadNode` is not retired by the row —
+    /// only a covering `flowEnd` resets it — so the interval keeps
+    /// folding every later unreachable node into the same span while
+    /// emitting nothing of its own (`close_covered`'s suppressed
+    /// early-return). interp_expr.rs's if-null close is the only opener.
+    pub(crate) fn suppressed_at(depth: usize, anchor: TokenSpan) -> Self {
+        let mut window = Self::at(depth, anchor);
+        window.suppressed = true;
+        window
+    }
+
     /// Opens the interval at the first dead node.
     fn at(depth: usize, anchor: TokenSpan) -> Self {
         Self {

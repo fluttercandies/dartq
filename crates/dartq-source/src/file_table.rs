@@ -189,15 +189,15 @@ impl FileTable {
             .flatten()
             .map(|p| p.as_os_str().len() + std::mem::size_of::<Arc<Path>>())
             .sum();
-        let ids_slots =
-            self.ids_by_path.capacity() * (std::mem::size_of::<(Arc<Path>, FileId)>() + 1);
+        let ids_slots = self.ids_by_path.capacity()
+            * (std::mem::size_of::<(Arc<Path>, FileId)>() + 1);
         // The memo's keys are `Arc<Path>`: a canonical spelling's key is the
         // canonical lease itself (zero extra bytes), a dirty spelling's is
         // one owned allocation. Count only the distinct-key allocations —
         // pointer-sharing against the values keeps the walk exact.
         let memo_entries = self.memo.canonical.len();
-        let memo_slots =
-            self.memo.canonical.capacity() * (std::mem::size_of::<(Arc<Path>, Arc<Path>)>() + 1);
+        let memo_slots = self.memo.canonical.capacity()
+            * (std::mem::size_of::<(Arc<Path>, Arc<Path>)>() + 1);
         let memo_bytes: usize = self
             .memo
             .canonical

@@ -1797,8 +1797,17 @@ impl<'a> Engine<'a> {
         if completion != expected {
             return None;
         }
+        Some(self.pending_window_group().unwrap_or_default())
+    }
+
+    /// The latched type-variables window as a mapped `<T extends B>`
+    /// group, written order (`window_type_params`' mapping half without
+    /// the name check — the closure-literal seed's adjacency gate plays
+    /// the discriminator instead). `None` = no latch.
+    pub(crate) fn pending_window_group(&self) -> Option<Vec<(StringId, Option<Ty>)>> {
         Some(
-            window
+            self.bounds
+                .pending_window()?
                 .iter()
                 .map(|(name, bound, _)| (*name, bound.as_ref().map(|tree| self.tree_ty(tree))))
                 .collect(),
@@ -1982,6 +1991,7 @@ impl<'a> Engine<'a> {
             ctx,
             ctx_from_arg,
             type_params: 0,
+            type_param_group: Vec::new(),
         });
     }
 
@@ -2300,11 +2310,26 @@ impl<'a> Engine<'a> {
             } else {
                 ret
             };
-            let ty =
+            // The literal's own `<T extends B…>` group rides the interned
+            // type (the official `staticType` carries the declared group —
+            // `<Y extends num>() {}` under `void Function<Y extends num>()`
+            // is `void Function<Y extends num>()`, never the count-only
+            // `void Function()`; oracle-pinned, dart analyze 3.13.7). A
+            // group-less literal keeps the count-only producer.
+            let ty = if capture.type_param_group.is_empty() {
                 self.boundary
                     .args
                     .borrow_mut()
-                    .function(0, ret, &capture.positional, &[], false);
+                    .function(0, ret, &capture.positional, &[], false)
+            } else {
+                self.boundary.args.borrow_mut().function_generic(
+                    &capture.type_param_group,
+                    ret,
+                    &capture.positional,
+                    &[],
+                    false,
+                )
+            };
             Some((capture.offset, ty, true))
         })
         .or_else(|| bare.map(|ty| (capture.offset, ty, false)))

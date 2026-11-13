@@ -228,22 +228,21 @@ fn null_aware_spread_over_null_constant_stays_silent() {
     }
 }
 
-/// The `...` counterpart: a `Null` operand under a non-aware spread is
-/// `not_null_aware_null_spread`, and in a const literal the same
-/// operand ALSO owes its const-shape row — upstream's
-/// `toListValue() == null` path reports `const_spread_expected_map` on
-/// `...a` where `a` is `null`.
+/// The `...` counterpart in a CONST literal: upstream's const evaluator
+/// owns the only row — `toMapValue()`'s null arm reports
+/// `const_spread_expected_map` on `...a`, and the iterability checker's
+/// `not_null_aware_null_spread` never fires inside the const context
+/// (the const verifier's own report wins the face; the non-const twin
+/// below still owes `not_null_aware_null_spread` alone). Probed dart
+/// analyze 3.13.7: one CONST_SPREAD_EXPECTED_MAP at `a`, nothing else.
 #[test]
-fn non_aware_spread_over_null_reports_both_faces() {
+fn non_aware_spread_over_null_reports_the_const_face_only() {
     let fixture = "const a = null;\nconst Map<String, int> x = {'k': 0, ...a};\n";
     let names = code_names(&report_ops(fixture));
-    assert!(
-        names.contains(&"not_null_aware_null_spread"),
-        "expected not_null_aware_null_spread, got {names:?}"
-    );
-    assert!(
-        names.contains(&"const_spread_expected_map"),
-        "expected const_spread_expected_map, got {names:?}"
+    assert_eq!(
+        names,
+        ["const_spread_expected_map"],
+        "the const literal's own row is the only face; got {names:?}"
     );
 }
 

@@ -192,12 +192,11 @@ fn dmu_new_selector_constructor_use() {
 
 // —— deprecated_member_use: the named-constructor use ——————————————————
 
-/// A deprecated named constructor invoked cross-package reports once.
-/// Upstream's displayName is the dot-joined `'A.named'`
-/// (element.dart:843); the verifier's member arm displays the edge's
-/// `target_name` verbatim, so this model emits the selector spelling —
-/// the code fires at the `A.named` compound with the selector's own
-/// display. Residual: the `A.` display prefix is a known-diffs entry.
+/// A deprecated named constructor invoked cross-package reports once,
+/// under the oracle's `ConstructorElement.displayName` — the dot-joined
+/// `'A.named'` for a named face (element.dart:839-847; the 0.1.21 wave
+/// closed the old selector-only residual, aligning this face with the
+/// `deprecated_constructor_use` family's own spelling).
 #[test]
 fn dmu_named_constructor_use() {
     let report = member_use_report(
@@ -209,13 +208,13 @@ fn dmu_named_constructor_use() {
     assert_eq!(rows.len(), 1, "{report:?}");
     assert_eq!(
         rows[0].message,
-        "'named' is deprecated and shouldn't be used."
+        "'A.named' is deprecated and shouldn't be used."
     );
 }
 
 /// The `new A.named()` spelling lands the same edge — the reduced
 /// parser's constructor-reference posture folds through the named-
-/// selector arm.
+/// selector arm — under the same dot-joined displayName.
 #[test]
 fn dmu_new_named_constructor_use() {
     let report = member_use_report(
@@ -227,7 +226,7 @@ fn dmu_new_named_constructor_use() {
     assert_eq!(rows.len(), 1, "{report:?}");
     assert_eq!(
         rows[0].message,
-        "'named' is deprecated and shouldn't be used."
+        "'A.named' is deprecated and shouldn't be used."
     );
 }
 

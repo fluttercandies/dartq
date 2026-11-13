@@ -29,6 +29,22 @@
 //!   the watcher off for a bounded backoff, then re-arm — a transient
 //!   storm costs minutes of walking, never the daemon's life.
 //!
+//! * **Quiet turns — the health trust window.** The barrier is the
+//!   only multi-millisecond wait an otherwise idle daemon pays, and a
+//!   quiet tree pays it for nothing. After [`HEALTHY_FOR`] of
+//!   uninterrupted, punctual streaming — no strike pending, no
+//!   straggler under evaluation, the liveness proof fresh and the
+//!   journal drained empty — a request serves from the journal verdict
+//!   alone: it still writes the next cookies (their delivery, off the
+//!   request path, is what the following request's trust keys on) and
+//!   still re-stats the unwatched configs, but the fseventsd round
+//!   trip leaves the answer path. An edit whose event has delivered is
+//!   in the journal and the full path serves it; an edit still in
+//!   flight can defer exactly one ask, and the trusted serve's own
+//!   cookie guarantees the next ask sees it. A stream that silently
+//!   stops delivering loses trust inside [`TRUST_WINDOW`]: the barrier
+//!   returns, and its timeout and strike machinery with it.
+//!
 //! * **Fallbacks, all to the same walk.** `walk_required` is raised on
 //!   the stream's rescan flags (FSEvents
 //!   MustScanSubDirs/UserDropped/KernelDropped, inotify Q_OVERFLOW), on
@@ -111,6 +127,17 @@ const COOKIE_TIMEOUTS: u32 = 3;
 const COOL_OFF: Duration = Duration::from_secs(60);
 const COOL_OFF_MAX: Duration = Duration::from_secs(30 * 60);
 const HEALTHY_FOR: Duration = Duration::from_secs(10 * 60);
+
+/// How fresh the stream's last proven delivery (a cookie event the
+/// drain observed) must be for a request to serve from the journal
+/// verdict alone. Every trusted serve writes its own cookies — their
+/// delivery milliseconds later re-stamps the proof — so an engaged
+/// window feeds itself while turns continue, and a stream that
+/// silently stops delivering is caught within one window plus one ask
+/// (the next request's barrier takes the timeout path). Five seconds:
+/// far above any healthy delivery, far below the deferral a dead
+/// stream could otherwise serve.
+const TRUST_WINDOW: Duration = Duration::from_secs(5);
 
 /// A late cookie's expiry deadline in production; the tests substitute
 /// a shorter one so a strike is exercised in milliseconds. Absolute
@@ -213,14 +240,15 @@ pub(crate) enum CheckMode {
     Walk,
 }
 
-/// Why a check took the walk path. `First` and `Rebase` are by design —
-/// never a degradation; the rest are the shapes that make a daemon walk
-/// every request.
+    /// Why a check took the walk path. `First` and `Rebase` are by design —
+    /// never a degradation; the rest are the shapes that make a daemon walk
+    /// every request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WalkReason {
-    /// A by-design covering walk: the construction-time one (the initial
-    /// take predates the stream, so the first request re-walks once), or
-    /// the one a macOS stream restart over a changed watch set flags.
+    /// A by-design covering walk: the one a macOS stream restart over a
+    /// changed watch set flags (the predecessor's in-flight events die
+    /// with it — construction's included, when the priming install
+    /// moves the stream to the discovered surface).
     First,
     /// The sync cookie could not be created (an unwritable tree) — an
     /// environment fact, not watcher evidence.
@@ -268,9 +296,7 @@ fn cookie_dir(dir: &Path, root: bool) -> PathBuf {
         let stale = std::time::SystemTime::now() - COOKIE_STALE;
         for entry in entries.flatten() {
             let name = entry.file_name();
-            if name
-                .to_str()
-                .is_some_and(|name| name.starts_with(COOKIE_PREFIX))
+            if name.to_str().is_some_and(|name| name.starts_with(COOKIE_PREFIX))
                 && entry
                     .metadata()
                     .and_then(|meta| meta.modified())
@@ -289,12 +315,16 @@ fn cookie_dir(dir: &Path, root: bool) -> PathBuf {
 /// removes each as its event arrives, and a request's barrier ends when
 /// its own cookies are all gone. `late` holds the cookie file NAMES of
 /// barriers that already timed out — a straggler's create or delete
-/// event inside its expiry still proves the stream alive.
+/// event inside its expiry still proves the stream alive. `proven` is
+/// the instant a cookie's event was last observed delivered — the
+/// liveness proof the health trust window keys on, stamped by the
+/// drain thread on any cookie-name event.
 struct Journal {
     dirty: FxHashSet<PathBuf>,
     walk: bool,
     cookies: FxHashSet<PathBuf>,
     late: FxHashSet<String>,
+    proven: Option<Instant>,
 }
 
 impl Journal {
@@ -356,14 +386,16 @@ impl Shared {
     /// Folds one batch of delivered paths into the journal — the one
     /// fold both substrates share: a cookie name resolves its pending
     /// barrier (a timed-out barrier's name still proves the stream
-    /// alive — its create OR delete event delivered the straggler);
-    /// every other path joins the dirty set (capped). Wakes the waiters.
+    /// alive — its create OR delete event delivered the straggler) and
+    /// stamps the liveness proof; every other path joins the dirty set
+    /// (capped). Wakes the waiters.
     fn record<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) {
         let mut journal = self.journal.lock();
         for path in paths {
             if let Some(name) = cookie_name(path) {
                 journal.late.remove(&name);
                 journal.cookies.remove(path);
+                journal.proven = Some(Instant::now());
             } else {
                 journal.dirty_path(self.normalize(path));
             }
@@ -476,12 +508,7 @@ impl Watcher {
         // The dirs the live stream carries now — empty for a fresh
         // watcher (a cool-off's re-arm included: the abandon cleared the
         // lost stream's set).
-        let have: Vec<PathBuf> = shared
-            .watched
-            .lock()
-            .iter()
-            .map(|w| w.dir.clone())
-            .collect();
+        let have: Vec<PathBuf> = shared.watched.lock().iter().map(|w| w.dir.clone()).collect();
         // macOS FSEvents only enrolls directories that exist when the
         // stream starts; a cookie dir created after its root was armed
         // would never report the barrier's writes, timing every sync
@@ -538,21 +565,13 @@ impl Watcher {
     /// complaint, so the check is ours), `None` on a stream failure. An
     /// unchanged set leaves the stream alone.
     #[cfg(target_os = "macos")]
-    fn apply(
-        &mut self,
-        have: &[PathBuf],
-        want: &[PathBuf],
-        shared: &Shared,
-    ) -> Option<Vec<PathBuf>> {
+    fn apply(&mut self, have: &[PathBuf], want: &[PathBuf], shared: &Shared) -> Option<Vec<PathBuf>> {
         let (kept, dropped): (Vec<PathBuf>, Vec<PathBuf>) = want
             .iter()
             .cloned()
             .partition(|dir| have.contains(dir) || dir.exists());
         for dir in &dropped {
-            eprintln!(
-                "dartq-analyzer-host: watch: {} vanished — dropping it",
-                dir.display()
-            );
+            eprintln!("dartq-analyzer-host: watch: {} vanished — dropping it", dir.display());
         }
         if kept.len() == have.len() && kept.iter().all(|dir| have.contains(dir)) {
             return Some(dropped);
@@ -585,12 +604,7 @@ impl Watcher {
     /// vanished before their watch could arm, `None` on a real watch
     /// failure.
     #[cfg(not(target_os = "macos"))]
-    fn apply(
-        &mut self,
-        have: &[PathBuf],
-        want: &[PathBuf],
-        _shared: &Shared,
-    ) -> Option<Vec<PathBuf>> {
+    fn apply(&mut self, have: &[PathBuf], want: &[PathBuf], _shared: &Shared) -> Option<Vec<PathBuf>> {
         use notify::Watcher as _;
         for dir in have.iter().filter(|dir| !want.contains(dir)) {
             if let Err(error) = self.stream.watcher.unwatch(dir) {
@@ -598,19 +612,12 @@ impl Watcher {
                 {
                     self.errors += 1;
                 }
-                eprintln!(
-                    "dartq-analyzer-host: unwatch {} failed: {error}",
-                    dir.display()
-                );
+                eprintln!("dartq-analyzer-host: unwatch {} failed: {error}", dir.display());
             }
         }
         let mut dropped: Vec<PathBuf> = Vec::new();
         for dir in want.iter().filter(|dir| !have.contains(dir)) {
-            if let Err(error) = self
-                .stream
-                .watcher
-                .watch(dir, notify::RecursiveMode::Recursive)
-            {
+            if let Err(error) = self.stream.watcher.watch(dir, notify::RecursiveMode::Recursive) {
                 if !dir.exists() {
                     // The target vanished between the plan and the arm
                     // — not stream evidence. Drop it and keep the rest
@@ -629,10 +636,7 @@ impl Watcher {
                 {
                     self.errors += 1;
                 }
-                eprintln!(
-                    "dartq-analyzer-host: watch {} failed: {error}",
-                    dir.display()
-                );
+                eprintln!("dartq-analyzer-host: watch {} failed: {error}", dir.display());
                 return None;
             }
         }
@@ -657,6 +661,45 @@ enum Arm {
     Dropped,
 }
 
+/// The background first take's landing cell: one result, consumed by
+/// exactly one [`Freshness::settle_priming`]. The outer `Option` is the
+/// arrival (the thread landed or not yet); the inner one carries a
+/// failed take (`None` — the take panicked mid-walk), which the
+/// settling check answers with an inline walk.
+#[derive(Default)]
+struct Priming {
+    state: Mutex<Option<Option<Primed>>>,
+    done: Condvar,
+}
+
+/// One completed first take: the baseline snapshot, its companion plan,
+/// and the take's own duration (the adaptive wait bound's seed).
+struct Primed {
+    snapshot: Snapshot,
+    plan: WalkPlan,
+    take: Duration,
+}
+
+impl Priming {
+    /// The thread's side: publish the take — or its failure — and wake
+    /// the settling check.
+    fn land(&self, primed: Option<Primed>) {
+        *self.state.lock() = Some(primed);
+        self.done.notify_all();
+    }
+
+    /// The settling check's side: block until the thread lands.
+    fn wait(&self) -> Option<Primed> {
+        let mut state = self.state.lock();
+        loop {
+            if let Some(primed) = state.take() {
+                return primed;
+            }
+            self.done.wait(&mut state);
+        }
+    }
+}
+
 /// The daemon's freshness oracle: the maintained [`Snapshot`], its
 /// companion [`WalkPlan`], the journaled dirty set, and the watcher —
 /// or none, when the daemon runs in walk mode (watcher unarmed or
@@ -668,6 +711,16 @@ pub(crate) struct Freshness {
     plan: WalkPlan,
     shared: Arc<Shared>,
     watcher: Option<Watcher>,
+    /// The first take, running on its own thread since construction
+    /// armed the stream over the pre-plan surface: the daemon's cold ask
+    /// never waits for it (its diff is dead weight with no live
+    /// server), and the first `check` installs it. `None` once
+    /// installed; the cell always exists at construction (a thread that
+    /// cannot start lands the take inline before construction returns).
+    priming: Option<Arc<Priming>>,
+    /// Whether the baseline is installed — the daemon's cold arm reads
+    /// this to skip a check whose diff no answer observes.
+    primed: bool,
     /// Config files re-stat'ed every request because no watch covers
     /// them (out-of-root ancestors) plus the walked set's non-directory
     /// entries (a file root is its own re-stat).
@@ -695,6 +748,18 @@ pub(crate) struct Freshness {
     /// The instant the cool-off was entered — the healthy clock's
     /// baseline. `None` while armed.
     since: Option<Instant>,
+    /// The instant the stream's current health streak began — set at
+    /// every (re)arm and stream restart, restarted by a cookie that
+    /// missed its wait bound. [`HEALTHY_FOR`] of streak is the trust
+    /// window's age gate: a young stream is an unproven stream.
+    health_since: Option<Instant>,
+    /// The last trusted serve's cookie files — unlinked (and their
+    /// pending registrations dropped) by the next request, whose own
+    /// barrier or trusted cookies replace them.
+    pending_cookies: Vec<PathBuf>,
+    /// How many requests served from the journal verdict alone — the
+    /// tests' and measurements' evidence the window engaged.
+    trusted: usize,
     /// The adaptive sync-wait bound: `0.5 * EWMA(walk)` clamped into
     /// [`WAIT_MIN`]..=[`WAIT_MAX`], seeded by the first measured walk —
     /// nanos, kept fractional so the average never floors to zero.
@@ -716,11 +781,12 @@ pub(crate) struct Freshness {
     /// How the last `check` answered — one Copy write per request, read
     /// by the daemon to make a degraded watcher visible.
     last_check: CheckDiag,
-    /// A by-design covering walk is pending: the arm's own (the initial
-    /// take predates the stream), or a macOS stream restart over a
-    /// changed set (the predecessor's in-flight events die with it). The
-    /// walk-flag fallback it causes reports [`WalkReason::First`] instead
-    /// of [`WalkReason::StreamLost`]. Any full take consumes it.
+    /// A by-design covering walk is pending: a macOS stream restart over
+    /// a changed set (the predecessor's in-flight events die with it —
+    /// including the priming install's own move to the discovered
+    /// surface). The walk-flag fallback it causes reports
+    /// [`WalkReason::First`] instead of [`WalkReason::StreamLost`]. Any
+    /// full take consumes it.
     first_walk: bool,
     /// Test hook: the journal's inputs arrive by injection, not by
     /// stream proofs — the sync barrier resolves at once. A saturated
@@ -733,43 +799,85 @@ pub(crate) struct Freshness {
 }
 
 impl Freshness {
-    /// Builds the freshness oracle over `roots`: the initial plan and
-    /// snapshot, then the watcher armed over the same walked set. A
-    /// watcher that cannot arm leaves the daemon in walk mode — the
-    /// first `check` walks as the unsubscribed daemon always did.
+    /// Builds the freshness oracle over `roots`: the watcher armed over
+    /// the discovery-free surface FIRST — every event from here on is
+    /// journaled — then the first take walked on its own thread. The
+    /// daemon's cold ask answers from the server's own full analysis
+    /// while that walk runs; the first `check` installs its result as
+    /// the baseline and moves the watch to the surface the walk
+    /// discovered. A watcher that cannot arm leaves the daemon in walk
+    /// mode (the baseline still primes — the first armed-server check
+    /// settles it); a priming thread that cannot start takes inline
+    /// here, the serial construction the daemon always paid, never a
+    /// worse one.
     pub(crate) fn new(roots: &[PathBuf], packages: Option<&Path>, sdk_home: &Path) -> Self {
-        let start = Instant::now();
-        let (snapshot, plan) = Snapshot::take_with_plan(roots, packages, sdk_home);
         let shared = Arc::new(Shared {
             journal: Mutex::new(Journal {
                 dirty: FxHashSet::default(),
                 walk: false,
                 cookies: FxHashSet::default(),
                 late: FxHashSet::default(),
+                proven: None,
             }),
             delivered: Condvar::new(),
             map: Mutex::new(Vec::new()),
             watched: Mutex::new(Vec::new()),
         });
         let mut watcher = Watcher::spawn(&shared);
+        let plan = Snapshot::preplan(roots, packages, sdk_home);
         let armed = watcher
             .as_mut()
-            .is_some_and(|watcher| !matches!(watcher.reconcile(&plan, &shared), Arm::Failed));
-        if armed {
-            // The take above ran before the stream started, and neither
-            // FSEvents nor inotify replays what predates its own start:
-            // an edit landing between the two would be served stale. The
-            // first request walks once to cover that window.
-            shared.journal.lock().walk = true;
-        } else {
+            .is_some_and(|watcher| {
+                let armed = !matches!(watcher.reconcile(&plan, &shared), Arm::Failed);
+                armed
+            });
+        if !armed {
             watcher = None;
+        }
+        // The priming thread: one full take, concurrent with the
+        // daemon's serving. `catch_unwind` keeps a panicking take from
+        // wedging the first check — a `None` landing settles inline.
+        // A thread that cannot start lands the take right here: the
+        // serial construction the daemon always paid, never a worse
+        // one (the first check installs it like any other landing).
+        let priming = Arc::new(Priming::default());
+        let spawned = std::thread::Builder::new()
+            .name("dartq-analyzer-prime".to_owned())
+            .spawn({
+                let cell = Arc::clone(&priming);
+                let roots = roots.to_vec();
+                let packages = packages.map(Path::to_path_buf);
+                let sdk_home = sdk_home.to_path_buf();
+                move || {
+                    let take = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let start = Instant::now();
+                        let primed =
+                            Snapshot::take_with_plan(&roots, packages.as_deref(), &sdk_home);
+                        (primed, start.elapsed())
+                    }))
+                    .ok()
+                    .map(|((snapshot, plan), take)| Primed { snapshot, plan, take });
+                    cell.land(take);
+                }
+            });
+        if let Err(error) = spawned {
+            eprintln!("dartq-analyzer-host: watch: priming thread unavailable: {error}");
+            let start = Instant::now();
+            let (snapshot, plan) = Snapshot::take_with_plan(roots, packages, sdk_home);
+            priming.land(Some(Primed {
+                snapshot,
+                plan,
+                take: start.elapsed(),
+            }));
         }
         let unwatched = unwatched_of(&plan);
         Self {
-            snapshot,
+            snapshot: Snapshot::default(),
             plan,
             shared,
             watcher,
+            priming: Some(priming),
+            primed: false,
             unwatched,
             carry_dirs: Vec::new(),
             late: Vec::new(),
@@ -780,10 +888,13 @@ impl Freshness {
                 Some((Instant::now(), 0))
             },
             since: (!armed).then(Instant::now),
-            // The adaptive bound seeds from the first measured walk —
-            // the initial take, discounted (it is planning too, which
-            // later walks never pay).
-            wait_ns: (start.elapsed().as_nanos() as f64 / 2.0).clamp(1.0, f64::MAX),
+            health_since: armed.then(Instant::now),
+            pending_cookies: Vec::new(),
+            trusted: 0,
+            // The adaptive bound seeds at install (the priming take's
+            // measured duration, discounted as before) — a journal
+            // check never runs before then.
+            wait_ns: 1.0,
             abandoned: false,
             seq: 0,
             last_request: Instant::now(),
@@ -791,7 +902,7 @@ impl Freshness {
             mismatches: 0,
             walks: 0,
             last_check: CheckDiag::default(),
-            first_walk: armed,
+            first_walk: false,
             #[cfg(test)]
             injected_journal: false,
         }
@@ -802,6 +913,70 @@ impl Freshness {
     /// streamed.
     fn armed(&self) -> bool {
         self.watcher.is_some() && !self.abandoned
+    }
+
+    /// Whether the first take's baseline is installed — the daemon's
+    /// cold arm reads this: with no live server, a check before the
+    /// baseline exists is dead weight (any diff starts the server over
+    /// the same roots the same way), so the first ask answers without
+    /// waiting for the background walk to land.
+    pub(crate) fn primed(&self) -> bool {
+        self.primed
+    }
+
+    /// The analyzed Dart source size once the baseline is installed —
+    /// the ledger's sizing figure off the walk the oracle already paid,
+    /// never a second one.
+    pub(crate) fn dart_bytes(&self) -> Option<u64> {
+        self.primed.then(|| self.snapshot.dart_bytes())
+    }
+
+    /// Installs the background first take, exactly once — the first
+    /// `check`'s opening step. A failed landing (the take panicked)
+    /// walks right here: the serial construction the daemon always
+    /// paid.
+    fn settle_priming(&mut self) {
+        let Some(priming) = self.priming.take() else {
+            return;
+        };
+        let primed = priming.wait();
+        self.primed = true;
+        let (snapshot, plan, take) = match primed {
+            Some(primed) => (primed.snapshot, primed.plan, primed.take),
+            None => {
+                let roots = self.plan_roots();
+                let packages = self.plan_packages();
+                let sdk = self.plan_sdk_home();
+                let start = Instant::now();
+                let (snapshot, plan) =
+                    Snapshot::take_with_plan(&roots, packages.as_deref(), &sdk);
+                (snapshot, plan, start.elapsed())
+            }
+        };
+        self.install(snapshot, plan, take);
+    }
+
+    /// Makes a completed first take the oracle's state: the baseline
+    /// snapshot and its companion plan, the adaptive wait bound seeded
+    /// from the measured take (discounted — it is planning too, which
+    /// later walks never pay), and the watcher moved to the surface the
+    /// take discovered. Dirs that joined the watch set were unwatched
+    /// while the take read them, so they are marked dirty: the next
+    /// merge re-covers that window the way a fresh arm's covering walk
+    /// always did, without the walk (a macOS stream move flags its own
+    /// covering walk; either shape is the same correctness).
+    fn install(&mut self, snapshot: Snapshot, plan: WalkPlan, take: Duration) {
+        self.wait_ns = (take.as_nanos() as f64 / 2.0).clamp(1.0, f64::MAX);
+        self.snapshot = snapshot;
+        self.plan = plan;
+        self.carry_dirs.clear();
+        let before = self.covered();
+        self.reconcile();
+        if self.armed() {
+            self.since = None;
+        }
+        self.unwatched = unwatched_of(&self.plan);
+        self.mark_newly_covered(&before);
     }
 
     /// The EWMA's half-life in walks: ~4 samples to halve a stale
@@ -816,10 +991,10 @@ impl Freshness {
     /// This request's sync-cookie wait: half the running walk average,
     /// clamped — proportional to what the fallback it triggers costs.
     fn wait_bound(&self) -> Duration {
-        Duration::from_nanos(
-            (self.wait_ns / 2.0).clamp(WAIT_MIN.as_nanos() as f64, WAIT_MAX.as_nanos() as f64)
-                as u64,
-        )
+        Duration::from_nanos((self.wait_ns / 2.0).clamp(
+            WAIT_MIN.as_nanos() as f64,
+            WAIT_MAX.as_nanos() as f64,
+        ) as u64)
     }
 
     /// Sweeps the late set: entries whose expiry passed undelivered are
@@ -901,6 +1076,9 @@ impl Freshness {
             .iter()
             .map(|w| w.dir.clone())
             .collect();
+        // A spawn (initial arm or a cool-off's re-arm) is an unproven
+        // stream: its health streak begins here.
+        let spawned = self.watcher.is_none();
         let failed = match self.watcher.as_mut() {
             Some(watcher) => watcher.reconcile(&self.plan, &self.shared),
             None => {
@@ -922,7 +1100,13 @@ impl Freshness {
                 .collect();
             if after != before {
                 self.first_walk = true;
+                // The restarted stream is a new stream: its health
+                // streak — and with it the trust window — begins now.
+                self.health_since = Some(Instant::now());
             }
+        }
+        if spawned && self.watcher.is_some() {
+            self.health_since = Some(Instant::now());
         }
         if matches!(failed, Arm::Failed) {
             self.abandon("a watch call failed");
@@ -943,9 +1127,7 @@ impl Freshness {
         // dir newly covered.
         self.shared.watched.lock().clear();
         self.shared.map.lock().clear();
-        let healthy = self
-            .since
-            .is_none_or(|since| since.elapsed() >= HEALTHY_FOR);
+        let healthy = self.since.is_none_or(|since| since.elapsed() >= HEALTHY_FOR);
         let strikes = match self.cool_off {
             Some((_, strikes)) if !healthy => strikes + 1,
             _ => 0,
@@ -972,6 +1154,8 @@ impl Freshness {
     /// never a phantom divergence. Returns the [`Diff`] against the
     /// previous request's snapshot.
     pub(crate) fn check(&mut self, roots: &[PathBuf]) -> Diff {
+        self.settle_priming();
+        self.sweep_pending_cookies();
         let due = roots == self.plan.roots()
             && self.armed()
             && self.last_request.elapsed() >= VERIFY_IDLE
@@ -1097,11 +1281,23 @@ impl Freshness {
     /// runs, so the diff is byte-identical to a fresh take's. A cookie
     /// that outlived its barrier keeps listening from `late` — expired
     /// undelivered cookies are the strikes, delivered ones clear them.
+    /// A request inside the health trust window skips the barrier wait
+    /// entirely ([`Freshness::trust_ready`]).
     fn journal_check(&mut self) -> Diff {
         let start = Instant::now();
         self.sweep_late();
         if !self.armed() {
             return self.walk_check(WalkReason::Unarmed);
+        }
+        // The health trust window: with the streak aged, no doubt
+        // pending, the liveness proof fresh and the journal drained
+        // empty, the verdict needs no round trip. A cookie that cannot
+        // be created falls through — the barrier below reports it
+        // (`Blocked`) and walks, exactly as before.
+        if self.trust_ready()
+            && let Some(diff) = self.trusted_serve()
+        {
+            return diff;
         }
         let mut retried = false;
         let sync = loop {
@@ -1158,9 +1354,9 @@ impl Freshness {
         let mut dirty = dirty;
         let consumed = std::mem::take(&mut self.carry_dirs);
         dirty.extend(consumed.iter().cloned());
-        let (diff, merged) = self
-            .snapshot
-            .take_into(&mut self.plan, &dirty, &self.unwatched, true);
+        let (diff, merged) =
+            self.snapshot
+                .take_into(&mut self.plan, &dirty, &self.unwatched, true);
         self.carry_dirs = merged
             .into_iter()
             .filter(|dir| !consumed.contains(dir))
@@ -1255,18 +1451,12 @@ impl Freshness {
         diff
     }
 
-    /// The sync barrier: register one uniquely named cookie path per
-    /// watched stream, create the files, then block until the watcher
-    /// delivered every one (or the wait bound ends). Per-stream
-    /// ordering means every change predating a cookie is in the journal
-    /// once it lands. Files are deleted on the way out, success or
-    /// timeout; a pending set left at timeout is cleared so a straggler
-    /// event can never resolve a later barrier.
-    fn sync(&mut self) -> Sync {
-        #[cfg(test)]
-        if self.injected_journal {
-            return Sync::Held;
-        }
+    /// Registers and creates one uniquely named cookie per watched
+    /// stream — the barrier's first half, and the trusted serve's whole
+    /// proof obligation. `None` when a create failed: the registrations
+    /// are rolled back and the caller decides (the barrier reports
+    /// `Blocked`; a trusted serve defers to it).
+    fn create_cookies(&mut self) -> Option<(String, Vec<PathBuf>)> {
         self.seq += 1;
         let name = format!("{COOKIE_PREFIX}{}-{}", std::process::id(), self.seq);
         let cookies: Vec<PathBuf> = self
@@ -1277,7 +1467,7 @@ impl Freshness {
             .map(|w| w.cookie_dir.join(&name))
             .collect();
         if cookies.is_empty() {
-            return Sync::Held;
+            return None;
         }
         {
             let mut journal = self.shared.journal.lock();
@@ -1294,8 +1484,29 @@ impl Freshness {
                 journal.cookies.remove(cookie);
                 let _ = fs::remove_file(cookie);
             }
-            return Sync::Blocked;
+            return None;
         }
+        Some((name, cookies))
+    }
+
+    /// The sync barrier: register one uniquely named cookie path per
+    /// watched stream, create the files, then block until the watcher
+    /// delivered every one (or the wait bound ends). Per-stream
+    /// ordering means every change predating a cookie is in the journal
+    /// once it lands. Files are deleted on the way out, success or
+    /// timeout; a pending set left at timeout is cleared so a straggler
+    /// event can never resolve a later barrier.
+    fn sync(&mut self) -> Sync {
+        #[cfg(test)]
+        if self.injected_journal {
+            return Sync::Held;
+        }
+        if self.shared.watched.lock().is_empty() {
+            return Sync::Held;
+        }
+        let Some((name, cookies)) = self.create_cookies() else {
+            return Sync::Blocked;
+        };
         let deadline = Instant::now() + self.wait_bound();
         let mut journal = self.shared.journal.lock();
         let held = loop {
@@ -1323,10 +1534,98 @@ impl Freshness {
         // delete event inside the expiry still proves the stream
         // alive, and only expiring undelivered is a strike. Cookie
         // names are unique per sync, so a straggler can never resolve
-        // a later barrier.
+        // a later barrier. The missed bound also restarts the health
+        // streak: the trust window re-earns itself after
+        // [`HEALTHY_FOR`] of punctual delivery.
         journal.late.insert(name.clone());
         self.late.push((name, Instant::now() + late_expiry()));
+        self.health_since = Some(Instant::now());
         Sync::Timeout
+    }
+
+    /// Whether this request may serve from the journal verdict alone —
+    /// the health trust window. All of:
+    ///
+    /// * no strike is pending (`timeouts == 0`) and no straggler is
+    ///   under evaluation (`late` empty);
+    /// * no merged dir waits out its one-more-request re-coverage
+    ///   (`carry_dirs` empty);
+    /// * the stream's health streak spans [`HEALTHY_FOR`] — armed
+    ///   continuously since the last arm, restart, or missed bound;
+    /// * the stream proved liveness inside [`TRUST_WINDOW`] (a
+    ///   cookie's event observed delivered);
+    /// * the journal itself is drained empty with no walk flag.
+    ///
+    /// The staleness contract: an edit whose event has delivered is in
+    /// the journal — the peek sees it and this returns `false`, the
+    /// full barrier path serves the edit. An edit still in flight can
+    /// defer exactly one ask, and the trusted serve's own cookie
+    /// guarantees the next ask sees it (per-stream ordering: the edit
+    /// precedes that cookie, and the window reopens only once the
+    /// cookie's delivery is observed). Any doubt takes today's path.
+    fn trust_ready(&self) -> bool {
+        self.timeouts == 0
+            && self.late.is_empty()
+            && self.carry_dirs.is_empty()
+            && self
+                .health_since
+                .is_some_and(|since| since.elapsed() >= HEALTHY_FOR)
+            && {
+                let journal = self.shared.journal.lock();
+                !journal.walk
+                    && journal.dirty.is_empty()
+                    && journal
+                        .proven
+                        .is_some_and(|proven| proven.elapsed() <= TRUST_WINDOW)
+            }
+    }
+
+    /// One trusted serve: write the next cookies without waiting for
+    /// them (their delivery, off the request path, stamps the liveness
+    /// proof the following request keys on), then answer through the
+    /// same unwatched re-stat every journal request runs — a config
+    /// move re-plans inside [`Snapshot::take_into`] exactly as on the
+    /// barrier path. `None` when a cookie could not be created: the
+    /// environment fact is the barrier's to report, not the window's.
+    fn trusted_serve(&mut self) -> Option<Diff> {
+        let start = Instant::now();
+        let (_, cookies) = self.create_cookies()?;
+        self.pending_cookies = cookies;
+        let (diff, _) = self
+            .snapshot
+            .take_into(&mut self.plan, &[], &self.unwatched, true);
+        if self.walked_changed() {
+            let before = self.covered();
+            self.reconcile();
+            self.mark_newly_covered(&before);
+        }
+        self.unwatched = unwatched_of(&self.plan);
+        self.trusted += 1;
+        self.last_check = CheckDiag {
+            mode: CheckMode::Journal,
+            walk_reason: None,
+            elapsed_ms: elapsed_ms(start.elapsed()),
+            changed: count_changed(&diff),
+        };
+        Some(diff)
+    }
+
+    /// Removes the last trusted serve's cookie files and their pending
+    /// registrations. Their create events have delivered (the serve's
+    /// own eligibility required a fresh proof) — or never will, and
+    /// must not pin the registration set. A straggler's delete event
+    /// still resolves the name and still stamps the proof, so even the
+    /// sweep pays its way.
+    fn sweep_pending_cookies(&mut self) {
+        let pending = std::mem::take(&mut self.pending_cookies);
+        if pending.is_empty() {
+            return;
+        }
+        let mut journal = self.shared.journal.lock();
+        for cookie in &pending {
+            journal.cookies.remove(cookie);
+            let _ = fs::remove_file(cookie);
+        }
     }
 
     /// The defense-in-depth verification, run only at a synchronized
@@ -1364,17 +1663,16 @@ impl Freshness {
         let moved = {
             let journal = self.shared.journal.lock();
             journal.walk
-                || journal
-                    .dirty
-                    .iter()
-                    .any(|path| match merge_target(&self.plan, path) {
+                || journal.dirty.iter().any(|path| {
+                    match merge_target(&self.plan, path) {
                         Some(target) => {
                             !fs::symlink_metadata(&target).is_ok_and(|m| m.is_file())
                                 || recorded(&target)
                                 || self.plan.configs.contains(&target)
                         }
                         None => false,
-                    })
+                    }
+                })
         };
         if moved {
             return None;
@@ -1455,7 +1753,12 @@ fn unwatched_of(plan: &WalkPlan) -> Vec<PathBuf> {
         .iter()
         .zip(plan.watched.iter())
         .filter_map(|(file, watched)| (!watched).then(|| file.clone()))
-        .chain(plan.walked.iter().filter(|root| !root.is_dir()).cloned())
+        .chain(
+            plan.walked
+                .iter()
+                .filter(|root| !root.is_dir())
+                .cloned(),
+        )
         .collect()
 }
 
@@ -1774,16 +2077,9 @@ mod fsevents {
                 if let Some(done) = mail.done.take() {
                     return done;
                 }
-                if self
-                    .mailbox
-                    .changed
-                    .wait_until(&mut mail, deadline)
-                    .timed_out()
-                {
+                if self.mailbox.changed.wait_until(&mut mail, deadline).timed_out() {
                     return mail.done.take().unwrap_or_else(|| {
-                        Err(format!(
-                            "the stream thread did not apply within {APPLY_MAX:?}"
-                        ))
+                        Err(format!("the stream thread did not apply within {APPLY_MAX:?}"))
                     });
                 }
             }
@@ -2012,9 +2308,7 @@ mod fsevents {
                 .map(|(&path, _)| {
                     // SAFETY: a NUL-terminated path the framework keeps
                     // alive for the whole call.
-                    Path::new(OsStr::from_bytes(
-                        unsafe { CStr::from_ptr(path) }.to_bytes(),
-                    ))
+                    Path::new(OsStr::from_bytes(unsafe { CStr::from_ptr(path) }.to_bytes()))
                 }),
         );
     }
@@ -2101,7 +2395,11 @@ mod tests {
             }
             fs::create_dir_all(&sdk).expect("sdk");
             fs::write(app.join("pubspec.yaml"), "name: app\n").expect("pubspec");
-            fs::write(app.join("analysis_options.yaml"), "analyzer: {}\n").expect("options");
+            fs::write(
+                app.join("analysis_options.yaml"),
+                "analyzer: {}\n",
+            )
+            .expect("options");
             fs::write(
                 app.join(".dart_tool/package_config.json"),
                 r#"{"configVersion":2,"packages":[
@@ -2245,7 +2543,8 @@ mod tests {
                     if let Some(parent) = path.parent() {
                         fs::create_dir_all(parent).ok();
                     }
-                    fs::write(path, format!("ignored {}\n", rng.next())).expect("ignored write");
+                    fs::write(path, format!("ignored {}\n", rng.next()))
+                        .expect("ignored write");
                 }
                 Self::RemoveDartTool(dir) => {
                     let _ = fs::remove_dir_all(dir);
@@ -2275,7 +2574,8 @@ mod tests {
                     // into a missing tree would be a create, not an
                     // edit through the link.
                     if path.parent().is_some_and(|dir| dir.exists()) {
-                        fs::write(path, format!("var through = {};\n", rng.next())).expect("write");
+                        fs::write(path, format!("var through = {};\n", rng.next()))
+                            .expect("write");
                     }
                 }
             }
@@ -2319,7 +2619,9 @@ mod tests {
                     2 if rng.below(3) == 0 => {
                         // A directory rename — one event pair moves a tree.
                         let from = tree.app.join(&tree.dirs[rng.below(tree.dirs.len())]);
-                        let to = tree.app.join(format!("lib/renamed{}", rng.below(3)));
+                        let to = tree
+                            .app
+                            .join(format!("lib/renamed{}", rng.below(3)));
                         Op::Rename(from, to)
                     }
                     2 => {
@@ -2329,7 +2631,9 @@ mod tests {
                     }
                     3 => Op::Mkdir(tree.app.join(&tree.dirs[rng.below(tree.dirs.len())])),
                     4 => Op::Rmdir(tree.app.join(&tree.dirs[rng.below(2)])),
-                    5 => Op::WriteConfig(tree.app.join(".dart_tool/package_config.json")),
+                    5 => Op::WriteConfig(
+                        tree.app.join(".dart_tool/package_config.json"),
+                    ),
                     6 if !link.exists() => Op::LinkCreate(link.clone(), tree.dep.clone()),
                     6 => Op::LinkRemove(link.clone()),
                     7 => Op::WriteThroughLink(link.join("lib/d.dart")),
@@ -2337,7 +2641,9 @@ mod tests {
                     9 if tree.app.join(".dart_tool").is_dir() => {
                         Op::RemoveDartTool(tree.app.join(".dart_tool"))
                     }
-                    9 => Op::CreateDartTool(tree.app.join(".dart_tool/package_config.json")),
+                    9 => Op::CreateDartTool(
+                        tree.app.join(".dart_tool/package_config.json"),
+                    ),
                     10 => Op::WriteIgnored(ignored[rng.below(ignored.len())].clone()),
                     _ => {
                         // An out-of-root dep file — watched through the
@@ -2351,9 +2657,8 @@ mod tests {
                 // backends — include them at random to cover both
                 // shapes.
                 if rng.below(3) == 0
-                    && let Some(parent) = dirty.first().and_then(|p| p.parent())
-                {
-                    dirty.push(parent.to_path_buf());
+                    && let Some(parent) = dirty.first().and_then(|p| p.parent()) {
+                        dirty.push(parent.to_path_buf());
                 }
                 let previous = snapshot.clone();
                 let (diff, _) = snapshot.take_into(&mut plan, &dirty, &unwatched, true);
@@ -2381,10 +2686,13 @@ mod tests {
     /// Gives the fixture's adaptive barrier real headroom: a tiny
     /// tree's EWMA seeds the wait near the [`WAIT_MIN`] floor — below
     /// real FSEvents latency, so a healthy stream's cookie would time
-    /// out spuriously. Tests that exercise the journal path (not the
-    /// timeout path) pin the bound to 500 ms — the production floor
-    /// still applies on real trees where delivery outruns the walk.
+    /// out spuriously. The priming baseline settles first (its install
+    /// re-seeds the bound from the take), then tests that exercise the
+    /// journal path (not the timeout path) pin the bound to 500 ms —
+    /// the production floor still applies on real trees where delivery
+    /// outruns the walk.
     fn generous_wait(freshness: &mut Freshness) {
+        freshness.settle_priming();
         freshness.wait_ns = 1_000_000_000.0; // bound = 0.5 s, inside the clamps
     }
 
@@ -2457,14 +2765,20 @@ mod tests {
     /// injection, no request).
     fn assert_live_delivery(freshness: &Freshness, file: &Path) {
         fs::write(file, "var live = 1;\n").expect("create");
+        await_live_delivery(freshness, file);
+    }
+
+    /// Blocks until the stream delivers `file` into the journal's dirty
+    /// set — the suite's way of giving a real edit its delivery without
+    /// a fixed sleep: a saturated `fseventsd` delivers in seconds
+    /// (measured), and the wait returns the moment the event lands,
+    /// bounded by [`LIVE_BOUND`].
+    fn await_live_delivery(freshness: &Freshness, file: &Path) {
         let shared = &freshness.shared;
         let deadline = Instant::now() + LIVE_BOUND;
         let mut journal = shared.journal.lock();
         while !journal.dirty.contains(file) {
-            let timed_out = shared
-                .delivered
-                .wait_until(&mut journal, deadline)
-                .timed_out();
+            let timed_out = shared.delivered.wait_until(&mut journal, deadline).timed_out();
             assert!(
                 !timed_out || journal.dirty.contains(file),
                 "the stream never delivered {} within {LIVE_BOUND:?} (walk flag {})",
@@ -2519,23 +2833,80 @@ mod tests {
         fs::remove_dir_all(&tree.base).ok();
     }
 
-    /// The initial take predates the stream, and no substrate replays
-    /// what predates its own start: the arm flags one covering walk, so
-    /// an edit landing between the take and the stream's start is never
-    /// served stale.
+    /// The arm predates the first take: construction flags no covering
+    /// walk (the old design's mandatory first-request walk is gone),
+    /// and the post-baseline window is served by the journal — an edit
+    /// made after the baseline arrives as a journal event and merges
+    /// without any walk, exactly as the old covering walk's re-take
+    /// would have caught it. The journal is driven by injection — a
+    /// saturated `fseventsd` can delay delivery past any barrier bound
+    /// (see `a_merged_dir_stays_dirty_one_more_request`), and this
+    /// test's contract is the design's walk-freedom, not the OS
+    /// substrate's latency.
     #[test]
-    fn the_arm_flags_one_covering_walk() {
+    fn the_arm_predates_the_first_take() {
         let _serial = serial();
         let tree = Tree::build("armwalk");
         let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
-        generous_wait(&mut freshness);
         assert!(freshness.armed());
+        assert!(!freshness.primed(), "the baseline primes in the background");
         assert!(
-            freshness.shared.journal.lock().walk,
-            "the arm flags the take-to-start window"
+            !freshness.shared.journal.lock().walk,
+            "the arm-before-take leaves no construction window"
         );
-        let _ = freshness.check(&tree.roots());
-        assert_eq!(freshness.walks, 1, "the first request covered the window");
+        assert!(
+            !freshness.first_walk,
+            "no by-design covering walk is pending either"
+        );
+        // The barrier needs headroom before the first check (its
+        // install re-seeds the bound from the take).
+        freshness.settle_priming();
+        freshness.wait_ns = 1_000_000_000.0;
+        freshness.journal_by_injection();
+        // An edit after the baseline, before the first check: only the
+        // armed stream can carry it — the take already ran. The injected
+        // dirty entry is the event the stream would have delivered.
+        let edit = tree.app.join("lib/after_prime.dart");
+        fs::write(&edit, "var p;\n").expect("edit");
+        freshness.inject_dirty(&[edit.clone()]);
+        let diff = freshness.check(&tree.roots());
+        assert_eq!(
+            freshness.last_check().mode,
+            CheckMode::Journal,
+            "the journal path serves the post-baseline edit"
+        );
+        assert!(diff.rebuild, "a Dart file appeared — the rebuild flag");
+        assert_eq!(
+            *freshness.snapshot(),
+            oracle(&tree),
+            "the post-baseline edit arrived — never stale"
+        );
+        assert!(freshness.primed(), "the first check installed the baseline");
+        // The converged tree answers quietly — and the whole scenario,
+        // baseline install plus post-baseline edit, never walked once.
+        let diff = freshness.check(&tree.roots());
+        assert_eq!(freshness.last_check().mode, CheckMode::Journal);
+        assert!(diff.is_empty(), "a quiet pass after the merge reports nothing");
+        assert_eq!(freshness.walks, 0, "the entire scenario is walk-free");
+        fs::remove_dir_all(&tree.base).ok();
+    }
+
+    /// The cold posture the daemon's skip arm relies on: `primed` stays
+    /// false until a check settles the background take, and the
+    /// source-size figure arrives with the baseline — the ledger's
+    /// figure off the walk the oracle already paid.
+    #[test]
+    fn priming_installs_the_baseline_and_the_source_figure() {
+        let _serial = serial();
+        let tree = Tree::build("primed");
+        let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
+        assert!(!freshness.primed());
+        assert_eq!(freshness.dart_bytes(), None, "no figure before the baseline");
+        generous_wait(&mut freshness);
+        assert!(freshness.primed());
+        let expected = oracle(&tree).dart_bytes();
+        assert_eq!(freshness.dart_bytes(), Some(expected));
+        assert!(expected > 0, "the fixture holds Dart sources");
         fs::remove_dir_all(&tree.base).ok();
     }
 
@@ -2671,6 +3042,234 @@ mod tests {
         fs::remove_dir_all(&tree.base).ok();
     }
 
+    /// Opens the health trust window deterministically: the streak is
+    /// aged past [`HEALTHY_FOR`], the liveness proof refreshed, and the
+    /// straggler bookkeeping cleared — a barrier that missed its bound
+    /// under parallel-suite load keeps listening from `late` (measured:
+    /// cookie delivery in seconds against a 500 ms bound), and that
+    /// pending liveness evidence is not the mechanism under test here.
+    /// The journal's catch of edits and the cookies' real writes and
+    /// deliveries stay real.
+    fn open_trust(freshness: &mut Freshness) {
+        freshness.health_since = Some(Instant::now() - HEALTHY_FOR - Duration::from_secs(1));
+        freshness.late.clear();
+        let mut journal = freshness.shared.journal.lock();
+        journal.late.clear();
+        journal.proven = Some(Instant::now());
+    }
+
+    /// The trust window narrows on every doubt: a pending strike, a
+    /// straggler under evaluation, a carried dir, a young stream, a
+    /// stale liveness proof, a non-empty journal, the walk flag — each
+    /// ALONE keeps the request on today's full barrier path. Driven by
+    /// injection: eligibility is the unit, the OS is not involved.
+    #[test]
+    fn the_trust_window_narrows_on_doubt() {
+        let _serial = serial();
+        let tree = Tree::build("trust-narrow");
+        let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
+        generous_wait(&mut freshness);
+        freshness.journal_by_injection();
+        assert!(freshness.armed());
+        open_trust(&mut freshness);
+        assert!(freshness.trust_ready(), "the window opens");
+        freshness.timeouts = 1;
+        assert!(!freshness.trust_ready(), "a pending strike closes it");
+        freshness.timeouts = 0;
+        freshness
+            .late
+            .push((format!("{COOKIE_PREFIX}straggler"), Instant::now() + late_expiry()));
+        assert!(!freshness.trust_ready(), "a straggler closes it");
+        freshness.late.clear();
+        freshness.carry_dirs.push(tree.app.join("lib"));
+        assert!(!freshness.trust_ready(), "a carried dir closes it");
+        freshness.carry_dirs.clear();
+        freshness.health_since = Some(Instant::now());
+        assert!(!freshness.trust_ready(), "a young stream closes it");
+        open_trust(&mut freshness);
+        freshness.shared.journal.lock().proven =
+            Some(Instant::now() - TRUST_WINDOW - Duration::from_secs(1));
+        assert!(!freshness.trust_ready(), "a stale proof closes it");
+        freshness.shared.journal.lock().proven = Some(Instant::now());
+        freshness.inject_dirty(&[tree.app.join("lib/a.dart")]);
+        assert!(!freshness.trust_ready(), "a landed edit closes it");
+        freshness.shared.journal.lock().dirty.clear();
+        freshness.inject_walk();
+        assert!(!freshness.trust_ready(), "the walk flag closes it");
+        freshness.shared.journal.lock().walk = false;
+        assert!(
+            freshness.trust_ready(),
+            "the window reopens once the doubt clears"
+        );
+        fs::remove_dir_all(&tree.base).ok();
+    }
+
+    /// Adversarial (edit-between-turns): an edit landing between a
+    /// trusted serve and the next ask MUST surface — the journal's
+    /// dirty set catches the delivered event and the next ask serves
+    /// it, never a stale answer. The journal is driven with real
+    /// events and the trusted serve writes real cookies; only the
+    /// barrier's OS wait is elided by injection (a saturated
+    /// `fseventsd` delivers in seconds — the barrier is not the
+    /// mechanism under test, the journal catch is).
+    #[test]
+    fn a_trusted_serve_serves_edits_between_turns() {
+        let _serial = serial();
+        let tree = Tree::build("trust-edit");
+        let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
+        generous_wait(&mut freshness);
+        freshness.journal_by_injection();
+        assert!(freshness.armed());
+        // Consume the install's covering walk, then merge the arm's own
+        // events; whatever a saturated host still holds in flight is
+        // dot-path noise the merge ignores by design — dropped.
+        let _ = freshness.check(&tree.roots());
+        std::thread::sleep(Duration::from_millis(600));
+        let _ = freshness.check(&tree.roots());
+        freshness.shared.journal.lock().dirty.clear();
+        freshness.carry_dirs.clear();
+        open_trust(&mut freshness);
+        let diff = freshness.check(&tree.roots());
+        assert_eq!(
+            freshness.trusted, 1,
+            "the quiet turn served from the journal verdict alone"
+        );
+        assert!(diff.is_empty(), "a quiet turn diffs nothing; {diff:?}");
+        // THE edit: between the trusted serve and the next ask. Its
+        // delivery is awaited off the ask (the suite's live bound), so
+        // the ask under test is the first one after the journal holds
+        // the event — the mechanism the window relies on.
+        let file = tree.app.join("lib/a.dart");
+        fs::write(&file, "var trusted = 1;\n").expect("edit");
+        await_live_delivery(&freshness, &file);
+        let diff = freshness.check(&tree.roots());
+        assert_eq!(
+            diff.changed,
+            vec![file.clone()],
+            "the edit between turns surfaces (trusted {})",
+            freshness.trusted
+        );
+        assert_eq!(
+            *freshness.snapshot(),
+            oracle(&tree),
+            "journal == walk — never stale"
+        );
+        // The trusted serve's cookie files left with the ask that
+        // replaced them: no strays.
+        let strays = fs::read_dir(tree.app.join(".dart_tool/dartq"))
+            .expect("cookie dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(COOKIE_PREFIX))
+            .count();
+        assert_eq!(strays, 0, "trusted cookies are swept by the next ask");
+        fs::remove_dir_all(&tree.base).ok();
+    }
+
+    /// Adversarial (rapid-edit cadence): edits chasing asks
+    /// back-to-back under an engaged window are never lost — the
+    /// deferred ones (events still in flight at their ask) surface at
+    /// the first ask after delivery, and the settled tree equals the
+    /// walk's, byte for byte. Real events, real cookie writes; the
+    /// barrier's OS wait elided by injection (the journal catch is the
+    /// mechanism under test).
+    #[test]
+    fn a_rapid_edit_cadence_is_never_lost_under_trust() {
+        let _serial = serial();
+        let tree = Tree::build("trust-cadence");
+        let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
+        generous_wait(&mut freshness);
+        freshness.journal_by_injection();
+        assert!(freshness.armed());
+        let _ = freshness.check(&tree.roots());
+        std::thread::sleep(Duration::from_millis(600));
+        let _ = freshness.check(&tree.roots());
+        freshness.shared.journal.lock().dirty.clear();
+        freshness.carry_dirs.clear();
+        open_trust(&mut freshness);
+        let _ = freshness.check(&tree.roots());
+        assert_eq!(
+            freshness.trusted, 1,
+            "the quiet phase opened the window"
+        );
+        // The cadence: an edit lands with every ask, no spacing — the
+        // events chase the requests through the window.
+        let file = tree.app.join("lib/a.dart");
+        for round in 0..25 {
+            fs::write(&file, format!("var cadence{round} = {round};\n")).expect("edit");
+            let _ = freshness.check(&tree.roots());
+        }
+        // Settle: the final edit surfaces at the first ask after its
+        // delivery. The wait parks until the journal gains the path
+        // (bounded by the suite's live bound); any ask that finds it
+        // re-stats the file as it is NOW — the final content — so the
+        // maintained snapshot converges to the walk's, byte for byte.
+        let deadline = Instant::now() + LIVE_BOUND;
+        while *freshness.snapshot() != oracle(&tree) {
+            let mut journal = freshness.shared.journal.lock();
+            if journal.dirty.contains(&file) {
+                drop(journal);
+                let _ = freshness.check(&tree.roots());
+            } else {
+                let timed_out = freshness
+                    .shared
+                    .delivered
+                    .wait_until(&mut journal, deadline)
+                    .timed_out();
+                assert!(
+                    !timed_out,
+                    "the cadence lost an edit under the trust window"
+                );
+            }
+        }
+        assert_eq!(
+            *freshness.snapshot(),
+            oracle(&tree),
+            "the cadence lost an edit under the trust window"
+        );
+        fs::remove_dir_all(&tree.base).ok();
+    }
+
+    /// Adversarial (stream restart): a moved watch set restarts the
+    /// macOS stream (the predecessor's in-flight events die with it)
+    /// and drops the trust window to zero immediately — the streak
+    /// restarts, and no ask after the restart serves from the verdict
+    /// alone until [`HEALTHY_FOR`] re-earns it. The real restart is
+    /// the mechanism; the barrier's OS wait is elided by injection.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stream_restart_drops_the_trust_window() {
+        let _serial = serial();
+        let tree = Tree::build("trust-restart");
+        let other = Tree::build("trust-restart-b");
+        let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
+        generous_wait(&mut freshness);
+        freshness.journal_by_injection();
+        assert!(freshness.armed());
+        let _ = freshness.check(&tree.roots());
+        std::thread::sleep(Duration::from_millis(600));
+        let _ = freshness.check(&tree.roots());
+        freshness.shared.journal.lock().dirty.clear();
+        freshness.carry_dirs.clear();
+        open_trust(&mut freshness);
+        let _ = freshness.check(&tree.roots());
+        assert_eq!(freshness.trusted, 1, "the window was open");
+        // The restart shape: the root set moves (a pool join).
+        let _ = freshness.check(&other.roots());
+        assert!(
+            freshness
+                .health_since
+                .is_some_and(|since| since.elapsed() < HEALTHY_FOR),
+            "the restart restarted the streak — trust is zero"
+        );
+        // Neither the covering walk's ask nor the quiet one after it
+        // trusts.
+        let _ = freshness.check(&other.roots());
+        let _ = freshness.check(&other.roots());
+        assert_eq!(freshness.trusted, 1, "no ask after the restart trusted");
+        fs::remove_dir_all(&tree.base).ok();
+        fs::remove_dir_all(&other.base).ok();
+    }
+
     /// The adaptive wait bound: seeded by the first walk, moved by
     /// every measured take, and clamped into [`WAIT_MIN`]..=[`WAIT_MAX`]
     /// — a large tree's barrier waits toward the cap while a trivial
@@ -2733,10 +3332,9 @@ mod tests {
         assert!(freshness.armed());
         // Seed the dir into the plan's walked set and arm it.
         freshness.plan.walked.push(gone.clone());
-        let armed = freshness
-            .watcher
-            .as_mut()
-            .map(|w| w.reconcile(&freshness.plan, &freshness.shared));
+        let armed = freshness.watcher.as_mut().map(|w| {
+            w.reconcile(&freshness.plan, &freshness.shared)
+        });
         assert!(matches!(armed, Some(Arm::Ok)));
         let watched: Vec<PathBuf> = freshness
             .shared
@@ -2746,8 +3344,7 @@ mod tests {
             .map(|w| w.dir.clone())
             .collect();
         assert!(
-            watched.iter().any(|dir| gone.starts_with(dir)
-                || dir == &gone
+            watched.iter().any(|dir| gone.starts_with(dir) || dir == &gone
                 || gone.starts_with(dir.parent().unwrap_or(dir))),
             "the new target armed; {watched:?}"
         );
@@ -2756,10 +3353,9 @@ mod tests {
         // want list) while `have` still arms it: the unwatch path runs.
         fs::remove_dir_all(&gone).expect("vanish");
         let before = freshness.watcher.as_ref().map(|w| w.errors).unwrap_or(0);
-        let outcome = freshness
-            .watcher
-            .as_mut()
-            .map(|w| w.reconcile(&freshness.plan, &freshness.shared));
+        let outcome = freshness.watcher.as_mut().map(|w| {
+            w.reconcile(&freshness.plan, &freshness.shared)
+        });
         // Unwatching a deleted dir is not a stream failure — the rest
         // of the surface stays armed.
         assert!(
@@ -2846,8 +3442,16 @@ mod tests {
         fs::remove_dir_all(&tree.base).ok();
     }
 
-    /// The construction-time covering walk reports itself as `First` —
-    /// the by-design walk, never a degradation.
+    /// The diag names its by-design covering walks `First` — never a
+    /// degradation. Under the arm-before-take design construction flags
+    /// NO walk (the stream is armed before the baseline take runs, so
+    /// nothing is left uncovered — the old construction-time `First`
+    /// walk is gone); the by-design `First` window that remains is the
+    /// macOS stream restart a live reconcile forces when the watch set
+    /// moves (a root-set change): its in-flight events die with the old
+    /// stream, and the next request's covering walk names itself
+    /// `First` because the restart was by design, not degradation.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_diag_names_the_first_walk() {
         let _serial = serial();
@@ -2855,13 +3459,33 @@ mod tests {
         let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
         generous_wait(&mut freshness);
         assert!(freshness.armed());
-        assert!(freshness.first_walk, "the arm leaves its walk pending");
+        assert!(
+            !freshness.first_walk,
+            "the arm predates the take — no walk is pending at construction"
+        );
+        // The first check never reports the by-design reason: nothing
+        // was left uncovered (its reason is the journal's or a fallback's).
         let _ = freshness.check(&tree.roots());
+        assert_ne!(
+            freshness.last_check().walk_reason,
+            Some(WalkReason::First),
+            "construction reports no covering walk"
+        );
+        // A root-set move restarts the macOS stream — the by-design
+        // window. The rebase itself reports `Rebase`; the NEXT request
+        // consumes the restart's covering walk as `First`. The journal
+        // is driven by injection so the barrier holds without stream
+        // proof — this test names the reason, not the OS latency.
+        let other = Tree::build("diag-first-b");
+        freshness.journal_by_injection();
+        let _ = freshness.check(&other.roots());
+        let _ = freshness.check(&other.roots());
         let diag = freshness.last_check();
         assert_eq!(diag.mode, CheckMode::Walk);
         assert_eq!(diag.walk_reason, Some(WalkReason::First));
         assert!(!freshness.first_walk, "the walk spent it");
         fs::remove_dir_all(&tree.base).ok();
+        fs::remove_dir_all(&other.base).ok();
     }
 
     /// The unwritable-cookie fixture (see
@@ -3199,17 +3823,25 @@ mod tests {
                 let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
                 while !stop.load(AtomicOrdering::Relaxed) {
                     let op = match rng.below(7) {
-                        0 => Op::Write(tree.app.join(&tree.files[rng.below(tree.files.len())])),
+                        0 => Op::Write(
+                            tree.app.join(&tree.files[rng.below(tree.files.len())]),
+                        ),
                         1 => Op::Remove(tree.app.join(&tree.files[rng.below(4)])),
                         2 => Op::Rename(
                             tree.app.join(format!("lib/r{}.dart", rng.below(6))),
                             tree.app.join(format!("lib/r{}.dart", rng.below(6))),
                         ),
-                        3 => Op::Mkdir(tree.app.join(&tree.dirs[rng.below(tree.dirs.len())])),
+                        3 => Op::Mkdir(
+                            tree.app.join(&tree.dirs[rng.below(tree.dirs.len())]),
+                        ),
                         4 => Op::Rmdir(tree.app.join(&tree.dirs[rng.below(2)])),
-                        5 if !link.exists() => Op::LinkCreate(link.clone(), tree.dep.clone()),
+                        5 if !link.exists() => {
+                            Op::LinkCreate(link.clone(), tree.dep.clone())
+                        }
                         5 => Op::LinkRemove(link.clone()),
-                        _ => Op::Write(big.join(format!("w{:04}.dart", rng.below(1_500)))),
+                        _ => Op::Write(
+                            big.join(format!("w{:04}.dart", rng.below(1_500))),
+                        ),
                     };
                     // Chaos ops may land on a path a previous op
                     // removed — a partial failure still produced real
@@ -3390,7 +4022,7 @@ mod tests {
         };
         {
             let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
-            generous_wait(&mut freshness);
+        generous_wait(&mut freshness);
             assert!(freshness.armed());
             std::thread::sleep(Duration::from_millis(100));
             let _ = freshness.check(&tree.roots());
@@ -3409,22 +4041,33 @@ mod tests {
 
     /// The idle verification: a snapshot the journal corrupted (a
     /// simulated missed event) is caught by the audit walk and the
-    /// daemon stays in walk mode for its life.
+    /// daemon stays in walk mode for its life. The journal is driven by
+    /// injection — the audit's second barrier (`verify_at_sync`'s sync)
+    /// must HOLD for the comparison to conclude, and a saturated
+    /// `fseventsd` delivers past any barrier bound (measured at seconds
+    /// per event against the 1 s clamp), which starved every retry into
+    /// the inconclusive arm without ever touching the audit logic. The
+    /// injection removes only the OS-latency variable: the audit's own
+    /// walk, comparison, restore, mismatch count, and the drop of the
+    /// watcher all run for real.
     #[test]
     fn verify_idle_catches_a_diverged_snapshot() {
         let _serial = serial();
         let tree = Tree::build("verify");
         let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
         generous_wait(&mut freshness);
+        freshness.journal_by_injection();
+        assert!(freshness.armed());
         // The arm's own `.dart_tool/dartq` create lands as a pending
         // event — drain it so the audit runs at a quiet point (an
         // in-flight event makes the audit inconclusive by design).
         std::thread::sleep(Duration::from_millis(600));
         let _ = freshness.check(&tree.roots());
+        freshness.carry_dirs.clear();
         // Simulate a latent watcher bug: the maintained snapshot lost
         // an entry the walk sees.
         freshness.snapshot = Snapshot::default();
-        // A real OS event landing mid-audit makes the comparison
+        // A late OS event landing mid-audit makes the comparison
         // inconclusive by design — the audit retries next period, so
         // retry the due check until the verdict lands.
         for _ in 0..20 {
@@ -3437,11 +4080,7 @@ mod tests {
             freshness.snapshot = Snapshot::default();
         }
         assert!(!freshness.armed(), "the mismatch dropped the watcher");
-        assert_eq!(
-            *freshness.snapshot(),
-            oracle(&tree),
-            "the audit restored truth"
-        );
+        assert_eq!(*freshness.snapshot(), oracle(&tree), "the audit restored truth");
         // The drop came from the verdict, or — under parallel load — a
         // transient cookie strike cooling the watcher off first; either
         // way the truth is restored and nothing stays silently armed.
@@ -3454,13 +4093,15 @@ mod tests {
         fs::remove_dir_all(&tree.base).ok();
     }
 
-    /// Per-request freshness cost, walk path vs cookie path, median of
-    /// `rounds` — run by hand against a real tree:
+    /// Per-request freshness cost, walk path vs cookie path vs trusted
+    /// path, median of `rounds` — run by hand against a real tree:
     /// `DQ_FRESH_BENCH=/path/to/root[,rounds] cargo test -p
     /// dartq-analyzer-host --lib bench_freshness -- --ignored
     /// --nocapture`. The walk leg forces `walk_check` per round
     /// (abandoned), the cookie leg runs the armed journal path with no
-    /// changes and then with a one-file edit between rounds.
+    /// changes and then with a one-file edit between rounds, and the
+    /// trusted leg opens the health trust window and measures quiet
+    /// turns on it.
     #[test]
     #[ignore = "manual benchmark — needs a corpus path in DQ_FRESH_BENCH"]
     fn bench_freshness() {
@@ -3523,14 +4164,36 @@ mod tests {
                 edit.push(start.elapsed().as_micros());
             }
         }
+        // The trusted leg: the health window open — the streak aged
+        // past HEALTHY_FOR, the liveness proof stamped, the straggler
+        // bookkeeping of a saturated host cleared (see `open_trust`) —
+        // quiet turns serve from the verdict alone.
+        let mut trusted = Vec::new();
+        {
+            let mut freshness = Freshness::new(&roots, None, &roots[0]);
+            assert!(freshness.armed(), "the corpus root must be watchable");
+            let _ = freshness.check(&roots);
+            open_trust(&mut freshness);
+            for _ in 0..rounds {
+                let start = Instant::now();
+                let _ = freshness.check(&roots);
+                trusted.push(start.elapsed().as_micros());
+            }
+            assert_eq!(
+                freshness.trusted, rounds,
+                "the leg measured the trusted path"
+            );
+        }
         eprintln!(
             "bench {} ({} dart files, {rounds} rounds, µs median):\n  \
-             walk        {}\n  cookie idle {}\n  cookie edit {}",
+             walk         {}\n  cookie idle  {}\n  cookie edit  {}\n  \
+             trusted idle {}",
             roots[0].display(),
             dart.len(),
             median(walk),
             median(idle),
             median(edit),
+            median(trusted),
         );
     }
 }

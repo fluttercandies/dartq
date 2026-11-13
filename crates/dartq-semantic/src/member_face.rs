@@ -403,7 +403,7 @@ pub(crate) fn core_member_return(head: &str, member: &str) -> Option<CoreRet> {
 /// `[]`/`[]=` on `Map`, the `num` arithmetic/comparison set plus `int`'s
 /// bit operators, `[]`/`+`/`*` on `String`, `&`/`|`/`^` on `bool`), or
 /// `undefined_operator` mis-decides a declared operator as absent (#2235).
-pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 14] = [
+pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 15] = [
     (
         "Object",
         &["hashCode", "runtimeType", "noSuchMethod", "toString", "=="],
@@ -944,6 +944,15 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 14] = [
             "where",
             "whereType",
         ],
+    ),
+    (
+        // `sdk/lib/core/symbols.dart` — `Symbol` declares no instance
+        // member beyond `Object`'s face: every user selector and every
+        // operator spelling is a DECIDABLE miss (the frozen tables know
+        // the face, so an unmounted-SDK unit still reports
+        // `#void[0]`'s `undefined_operator '[]'`).
+        "Symbol",
+        &[],
     ),
 ];
 

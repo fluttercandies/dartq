@@ -41,6 +41,15 @@ impl Engine<'_> {
                 dartq_scanner::TokenKind::OpenSquare
                     | dartq_scanner::TokenKind::OpenCurly
                     | dartq_scanner::TokenKind::Lt
+                    // The EMPTY list literal is the scanner's fused `[]`
+                    // token (`TokenKind::Index`) — one token, never an
+                    // `OpenSquare` + closer pair (`[]=` is the compound
+                    // operator, a different token). The empty-literal write
+                    // face reads the target's non-null declared type the
+                    // same as any other literal spelling (`chunk ??= []`
+                    // promotes `List<int>?` to `List<int>` — oracle-silent
+                    // yield, dart analyze 3.13.7).
+                    | dartq_scanner::TokenKind::Index
             )
         )
     }

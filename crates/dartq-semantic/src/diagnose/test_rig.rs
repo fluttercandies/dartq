@@ -170,10 +170,17 @@ fn fixture_language_version(source: &str) -> LanguageVersion {
 }
 
 fn scan_fixture(source: &str, file: dartq_source::FileId) -> dartq_scanner::ScanResult {
+    // `triple-shift` is a lexical gate (scanner crate docs): a pre-2.14
+    // fixture splits `>>>` into `>>`+`>` and the parser's split-shape
+    // recovery re-merges the operator, so the scan follows the fixture's
+    // own language version exactly as the parse features below do.
     let scanned = dartq_scanner::scan(
         source,
         ScanConfig {
-            enable_triple_shift: true,
+            enable_triple_shift: FeatureSet::for_language_version(fixture_language_version(
+                source,
+            ))
+            .is_enabled(Feature::TripleShift),
             enable_augmentations: true,
         },
         file,

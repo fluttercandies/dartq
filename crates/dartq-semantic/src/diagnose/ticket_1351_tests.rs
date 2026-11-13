@@ -1864,3 +1864,4 @@ fn declared_setter_write_target_stays_silent() {
         code_names(&report)
     );
 }
+

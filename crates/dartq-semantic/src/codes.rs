@@ -1035,6 +1035,15 @@ pub enum SemanticCode {
     /// type is exactly `Null` (`visitNullAssertionExpression`,
     /// best_practices_verifier.dart:795-799).
     NullCheckAlwaysFails,
+    /// `Missing selector such as '.identifier' or '[0]'.` — the resolver's
+    /// `_resolveNullCheck` SuperExpression arm (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/resolver/postfix_expression_resolver.dart`:
+    /// 196-205): a bare `super!` has no selector to assert on, so the whole
+    /// `super!` node reports the selector row, the operand and node both
+    /// type `dynamic`, and the walk returns before any promotion — the
+    /// null-aware faces that follow (`super!?[0]`) stay silent. Syntax
+    /// tier upstream (`ParserErrorCode` name, `SYNTACTIC_ERROR`).
+    MissingAssignableSelector,
     /// `The operand can't be 'null', so the condition is always 'false'.` —
     /// an `e == null` whose operand is provably never null
     /// (`_checkForInvariantNullComparison`, `best_practices_verifier.dart`:
@@ -2983,6 +2992,9 @@ impl SemanticCode {
                 ("type_check_with_null", "TYPE_CHECK_WITH_NULL")
             }
             Self::NullCheckAlwaysFails => ("null_check_always_fails", "NULL_CHECK_ALWAYS_FAILS"),
+            Self::MissingAssignableSelector => {
+                ("missing_assignable_selector", "MISSING_ASSIGNABLE_SELECTOR")
+            }
             Self::UnnecessaryNullComparisonFalse | Self::UnnecessaryNullComparisonTrue => {
                 ("unnecessary_null_comparison", "UNNECESSARY_NULL_COMPARISON")
             }
@@ -3783,6 +3795,9 @@ impl SemanticCode {
                 // The #3768 syntax-tier gate row carries none either
                 // (syntax-codes.tsv, hasPublishedDocs: false).
                 | Self::ExperimentNotEnabled
+                // The `super!` selector row carries none either
+                // (analyzer-codes.tsv, hasPublishedDocs: false).
+                | Self::MissingAssignableSelector
         );
         CodeInfo::new(name, machine, dtype, published)
     }
@@ -3815,7 +3830,11 @@ impl SemanticCode {
             // analyzer-codes.tsv) except the two compile-time rows.
             | Self::PrivateOptionalParameter
             | Self::ExperimentNotEnabled
-            | Self::PrivateNamedNonFieldParameter => DiagnosticType::SyntacticError,
+            | Self::PrivateNamedNonFieldParameter
+            // The `super!` selector row is syntax tier upstream too (a
+            // `ParserErrorCode` name reported from the resolver,
+            // analyzer-codes.tsv).
+            | Self::MissingAssignableSelector => DiagnosticType::SyntacticError,
             Self::InvalidNullAwareOperator
             | Self::UnreachableSwitchCase
             | Self::UnreachableSwitchDefault
@@ -4101,6 +4120,9 @@ impl SemanticCode {
                 "This null-check will always throw an exception because the expression will always evaluate to 'null'."
                     .to_string()
             }
+            // The verbatim selector template (syntax-codes.tsv; the
+            // registry-backed mirror, no placeholders).
+            Self::MissingAssignableSelector => registry_message("missing_assignable_selector"),
             Self::UnnecessaryNullComparisonFalse => {
                 "The operand can't be 'null', so the condition is always 'false'.".to_string()
             }
@@ -5512,12 +5534,18 @@ impl SemanticCode {
             Self::InvalidUseOfVisibleForTemplateMember => {
                 format!("The member '{a0}' can only be used within '{a1}' or a template library.")
             }
-            // The trailing space is the template's: `{2}` is the record
-            // appendix, empty at M1 (`error_detection_helpers.dart`).
+            // `{2}` is the record appendix (`error_detection_helpers`
+            // .dart's `additionalInfo.join(' ')`), substituted into the
+            // single upstream template `"... '#expectedStaticType'.
+            // #additionalInfo"` (messages.yaml:1363): an EMPTY appendix
+            // leaves the message ending at `'. ` — the trailing space is
+            // the oracle's own render (probed 3.13.7: `dart analyze
+            // --format=machine` on `void g(int x) {} void f() { g(1.5); }`
+            // emits `... parameter type 'int'. ` with the space before the
+            // newline, byte-confirmed by od); a present appendix joins
+            // with that one separating space.
             Self::ArgumentTypeNotAssignable => {
-                format!(
-                    "The argument type '{a0}' can't be assigned to the parameter type '{a1}'. {a2}"
-                )
+                format!("The argument type '{a0}' can't be assigned to the parameter type '{a1}'. {a2}")
             }
             // `{0}` is the receiver type, `{1}` the extended type
             // (diagnostic.g.dart:5760-5762).
@@ -7477,6 +7505,9 @@ mod tests {
         // (syntax-codes.tsv); its message renders filled from the local arm
         // (the template's `{0}` is this gate's fixed feature flag).
         "experiment_not_enabled",
+        // The #3802 `super!` selector row (syntax-codes.tsv, no
+        // placeholders — the template renders verbatim).
+        "missing_assignable_selector",
     ];
 
     /// The exhaustive enum walk: one arm per `SemanticCode` variant, no
@@ -7955,6 +7986,10 @@ mod tests {
             | SemanticCode::PrivateNamedParameterDuplicatePublicName
             | SemanticCode::DeprecatedColonForDefaultValue
             | SemanticCode::AbstractSuperMemberReference(_)
+            // The #3802 `super!` selector row: a syntax-tier
+            // `REGISTRY_BACKED` row whose message renders through
+            // `registry_message`.
+            | SemanticCode::MissingAssignableSelector
             => code.code_info(),
         }
     }
@@ -8133,6 +8168,7 @@ mod tests {
             SemanticCode::NotInitializedNonNullableVariable,
             SemanticCode::NullArgumentToNonNullType,
             SemanticCode::NullCheckAlwaysFails,
+            SemanticCode::MissingAssignableSelector,
             SemanticCode::NullableTypeInCatchClause,
             SemanticCode::ObsoleteColonForDefaultValue,
             SemanticCode::OverrideOnNonOverridingField,

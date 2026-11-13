@@ -101,9 +101,15 @@ fn index_expression_write_argument_check() {
 }
 
 /// The compound faces (`a['0'] += 0`, `++a['0']`, `a['0']++`): read AND
-/// write elements both apply (`hasRead: true`), each checked against its
-/// own first formal — an `int` `[]` and an `int` `[]=` each report the
-/// `String` index, so two ATAs land at the same span.
+/// write elements both apply (`hasRead: true`, each checked against its
+/// own first formal — error_detection_helpers.dart:260-288 runs the read
+/// and write checks), but two IDENTICAL rows collapse to one on the
+/// oracle's report surface: probed 3.13.7 `dart analyze --format
+/// machine`, an `int` `[]` + `int` `[]=` over a `String` index reports
+/// the row exactly once per compound form (`+=` at 6:5, `++a[...]` at
+/// 7:7, `a[...]++` at 8:5), while DIFFERENT formal spellings (a `bool`
+/// `[]` beside a `String` `[]=`) report both rows — the dedup keys the
+/// whole `(code, offset, message)` triple.
 #[test]
 fn index_expression_compound_checks_both_faces() {
     for expr in ["a['0'] += 0;", "++a['0'];", "a['0']++;"] {
@@ -119,8 +125,8 @@ fn index_expression_compound_checks_both_faces() {
         let report = report_ops(&source);
         assert_eq!(
             ata_rows(&report),
-            vec![span_of(&source, "'0'"), span_of(&source, "'0'")],
-            "compound {expr} reports on both operator faces: {:#?}",
+            vec![span_of(&source, "'0'")],
+            "compound {expr} reports the identical pair once: {:#?}",
             rows(&report)
         );
     }

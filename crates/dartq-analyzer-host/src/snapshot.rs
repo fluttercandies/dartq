@@ -71,6 +71,11 @@ impl Stat {
             mtime_ns,
         }
     }
+
+    /// The file's size — the ledger's sizing figure.
+    fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 /// One file's stat facts.
@@ -203,12 +208,7 @@ impl WalkPlan {
     /// `walked` and `configs` — the same code path a `take` runs, so a
     /// config edit can never desynchronize the plan from the walk.
     fn refresh(&mut self, snapshot: &Snapshot) {
-        let next = plan_of(
-            &self.roots,
-            self.packages.as_deref(),
-            &self.sdk_home,
-            Some(snapshot),
-        );
+        let next = plan_of(&self.roots, self.packages.as_deref(), &self.sdk_home, Some(snapshot));
         self.walked = next.walked;
         self.configs = next.configs;
         self.watched = next.watched;
@@ -343,6 +343,17 @@ impl Snapshot {
         let mut plan = plan_of(roots, packages, sdk_home, None);
         take_parts(&mut snapshot, &mut plan);
         (snapshot, plan)
+    }
+
+    /// The plan `take` opens with, computed without walking: the
+    /// analysis roots, the ancestor config candidates, and the local
+    /// package roots the root-level configs name. The freshness oracle
+    /// arms its watcher over this surface before the first take runs,
+    /// so the take happens entirely behind live coverage (the surface
+    /// the take discovers beyond this joins the watch when the take
+    /// installs, its unread window re-covered through the dirty set).
+    pub(crate) fn preplan(roots: &[PathBuf], packages: Option<&Path>, sdk_home: &Path) -> WalkPlan {
+        plan_of(roots, packages, sdk_home, None)
     }
 
     /// The journal-maintained freshness pass: `plan` is this snapshot's
@@ -591,8 +602,7 @@ impl Snapshot {
 
     /// `binary_search` on the sorted entry vector.
     fn index(&self, path: &Path) -> Result<usize, usize> {
-        self.0
-            .binary_search_by(|entry| entry.path.as_ref().cmp(path))
+        self.0.binary_search_by(|entry| entry.path.as_ref().cmp(path))
     }
 
     /// Drops the entry at `path` plus every entry under it (a deleted
@@ -653,7 +663,10 @@ impl Snapshot {
         // path is this file's earlier form.
         let mut index = self.index(dir).unwrap_or_else(|index| index);
         while index < self.0.len() && self.0[index].path.starts_with(dir) {
-            if entries.iter().any(|entry| entry.path == self.0[index].path) {
+            if entries
+                .iter()
+                .any(|entry| entry.path == self.0[index].path)
+            {
                 index += 1;
             } else {
                 let gone = self.0.remove(index);
@@ -668,7 +681,10 @@ impl Snapshot {
             }
             let mut index = self.index(&canonical).unwrap_or_else(|index| index);
             while index < self.0.len() && self.0[index].path.starts_with(&canonical) {
-                if entries.iter().any(|entry| entry.path == self.0[index].path) {
+                if entries
+                    .iter()
+                    .any(|entry| entry.path == self.0[index].path)
+                {
                     index += 1;
                 } else {
                     let gone = self.0.remove(index);
@@ -731,6 +747,18 @@ impl Snapshot {
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// The total size of the `.dart` files the snapshot records — the
+    /// ledger's source-size figure off the walk the oracle already paid,
+    /// never a second one.
+    #[must_use]
+    pub fn dart_bytes(&self) -> u64 {
+        self.0
+            .iter()
+            .filter(|entry| is_dart(&entry.path))
+            .map(|entry| entry.stat.size())
+            .sum()
     }
 
     #[must_use]
@@ -825,7 +853,9 @@ fn walk(
     let mut emit = emit.to_path_buf();
     if let Ok(canonical) = fs::canonicalize(dir) {
         if canonical != emit {
-            links.lock().push((canonical.clone(), dir.to_path_buf()));
+            links
+                .lock()
+                .push((canonical.clone(), dir.to_path_buf()));
             emit = canonical.clone();
         }
         if !visited.lock().insert(canonical) {

@@ -59,7 +59,6 @@ fn ticket_3153_alias_named_rhs_reports_once() {
         bounds.end_group(range(21, 1)).is_none(),
         "the alias capture owns the RHS — no site tree closes"
     );
-    bounds.alias_leaf(c, false, range(13, 1));
     bounds.alias_begin_group(Some((c, range(13, 1))));
     bounds.alias_leaf(string, false, range(15, 6));
     bounds.alias_end_group(range(21, 1));
@@ -90,7 +89,6 @@ fn ticket_3153_alias_function_rhs_return_reports_once() {
         bounds.end_group(range(22, 1)).is_none(),
         "the alias capture owns the RHS"
     );
-    bounds.alias_leaf(c, false, range(14, 1));
     bounds.alias_begin_group(Some((c, range(14, 1))));
     bounds.alias_leaf(string, false, range(16, 6));
     bounds.alias_end_group(range(22, 1));
@@ -130,8 +128,14 @@ fn ticket_3153_extension_on_clause_checks_with_super_pass() {
     assert_eq!(issues.len(), 1, "expected exactly one issue");
     assert_eq!(issues[0].argument, "String");
     assert_eq!(issues[0].bound, "num");
-    // The super pass ran: the context face carries the inverted type.
-    assert_eq!(issues[0].inverted_type.as_deref(), Some("C<Never>"));
+    // The super pass ran: the context face carries the inverted type —
+    // `replaceTopAndBottom(C<String>)` flips nothing (`String` is neither
+    // top nor bottom), so the instantiation the failing pass checked is
+    // `C<String>` itself ("The inverted type 'C<String>' is also not
+    // regular-bounded…", type_arguments_verifier.dart:421-427; the second
+    // fixture's `C<dynamic>` inverts to `C<Never>`, satisfies `num`, and
+    // stays silent).
+    assert_eq!(issues[0].inverted_type.as_deref(), Some("C<String>"));
 }
 
 /// The bound-annotation face's function columns: `class D<X extends void

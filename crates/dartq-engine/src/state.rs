@@ -919,7 +919,10 @@ impl FeatureGrants {
             // its subtree from the CLI base) and `Some([])` resolve
             // identically today — fold the distinction anyway so a future
             // semantic split cannot alias old keys.
-            field(&mut bytes, &[u8::from(flags.is_some())]);
+            field(
+                &mut bytes,
+                &[u8::from(flags.is_some())],
+            );
             for flag in flags.unwrap_or_default() {
                 field(&mut bytes, format!("{flag:?}").as_bytes());
             }
@@ -1864,6 +1867,19 @@ pub(crate) struct EngineState {
     /// directly could instead resurrect ids retired by an intervening remove
     /// (#230), and analyze unwraps every queued id's info.
     pub invalidated: Vec<LibraryId>,
+    /// The libraries a targeted turn deferred (#4234): a file-aim turn
+    /// replays only the libraries owning the aim files, so every other
+    /// library left in [`Self::invalidated`] moves here instead of
+    /// recomputing — the one-shot CLI's merged output is filtered to the
+    /// aim's rows anyway, and materializing the other 1,317 cockpit
+    /// libraries (store read + decode + surface install + merge) is the
+    /// whole-store replay this ticket removes from the turn. The set
+    /// rejoins `invalidated` at the next untargeted analyze
+    /// ([`Self::drain_slice_deferred`]), so no later turn can serve a
+    /// full output with holes; a library that found a standing result in
+    /// the meantime drops out. Empty on every engine whose turns are all
+    /// untargeted — the field costs one empty `Vec`.
+    pub(crate) slice_deferred: Vec<LibraryId>,
     /// Whether any signature-bearing face moved since the last analyze (the
     /// analyze phase's rebuild gate): the flag drives the condensation
     /// re-derivation and the structure-digest refresh; the resolution graph
@@ -2175,6 +2191,7 @@ impl EngineState {
             library_generations: FxHashMap::default(),
             merged: None,
             invalidated: Vec::new(),
+            slice_deferred: Vec::new(),
             structure_dirty: false,
             condensation: crate::cycle::Condensation::default(),
             reachability: Mutex::new(ReachabilityMemo::default()),
@@ -2266,25 +2283,50 @@ impl EngineState {
     /// the adopted records standing and skips their recompute — the
     /// in-process gate's exact equality, fed from disk.
     ///
-    /// Every other shape returns before any work: an engine without
-    /// staged facts cannot have stored runs under this build (the key
-    /// folds the build), and an engine whose staging was already consumed
-    /// has its runs in `results` or freshly invalidated by the ordinary
-    /// incremental path. Adoption is all-or-nothing per library — a
-    /// payload that fails its embedded fingerprint check or decodes badly
-    /// is a miss for that library, and the plain recompute serves it. A
-    /// payload's file paths are minted on demand ([`mint_run_paths`]), so
-    /// a declaration target the warm turn has not discovered is no miss.
+    /// An engine without staged facts cannot have stored runs under this
+    /// build (the key folds the build), and an engine whose staging was
+    /// already consumed has its runs in `results` or freshly invalidated
+    /// by the ordinary incremental path — both shapes skip the replay
+    /// fan-out. Adoption is all-or-nothing per library — a payload that
+    /// fails its embedded fingerprint check or decodes badly is a miss
+    /// for that library, and the plain recompute serves it. A payload's
+    /// file paths are minted on demand ([`mint_run_paths`]), so a
+    /// declaration target the warm turn has not discovered is no miss.
+    ///
+    /// # Targeted turns (#4234)
+    ///
+    /// A non-empty `targets` set marks a *file-aim* turn: only the
+    /// libraries owning the target files replay ([`Self::aim_libraries`]);
+    /// every other invalidated library moves to
+    /// [`Self::slice_deferred`] instead of being decoded, materialized,
+    /// surface-installed, and merged — the store read/decode/install
+    /// share that dominated the warm single-file turn. The returned bool
+    /// reports the slice, so the caller can drop a partial standing merge
+    /// instead of letting a later untargeted turn splice onto it. On a
+    /// persistent engine (staging consumed, the incremental path) the
+    /// turn instead requeues exactly the aim's deferred libraries
+    /// ([`Self::unstrand_aim`]) — an aim stranded in the deferred set
+    /// holds neither a standing result nor a scheduled recompute, and
+    /// would otherwise silently vanish from the turn's rows — while the
+    /// ordinary invalidated work (an edit's cascade) completes exactly as
+    /// an untargeted turn's would. An empty set is the full turn,
+    /// unchanged; a target that maps to no live library (an options file,
+    /// a path the analysis never claimed) falls back to the full replay,
+    /// because its rows may be workspace-level rather than any library's.
     pub(crate) fn replay_library_runs(
         &mut self,
         on_event: &mut dyn FnMut(crate::event::EngineEvent),
-    ) {
+        targets: &[FileId],
+    ) -> bool {
+        if targets.is_empty() {
+            self.drain_slice_deferred();
+        }
         if self.warm_start.is_empty() {
-            return;
+            return self.unstrand_aim(targets);
         }
         let applied = crate::l1::apply(self, on_event);
         if applied.changed.is_empty() && applied.removed.is_empty() {
-            return;
+            return self.slice_invalidated_to(targets);
         }
         // The L3 write batch the analyze head would flush for this apply —
         // a replayed turn must leave the store exactly as the plain path.
@@ -2295,6 +2337,7 @@ impl EngineState {
         });
         drop(salvage);
         self.condensation = built;
+        let targeted = self.slice_invalidated_to(targets);
         let build = persist::analyzer_build();
         let grants = self.feature_grants.fingerprint();
         let packages = persist::package_graph_fingerprint(&self.packages);
@@ -2316,7 +2359,9 @@ impl EngineState {
             ..
         } = self;
         let Some(store) = l3.as_ref() else {
-            return;
+            // The slice above already shaped the turn: report it honestly
+            // so the caller drops the partial standing merge.
+            return targeted;
         };
         // Phase 1 — the lookup fan-out: one content-store read + decode per
         // library, independent — the same parallel shape as the recompute
@@ -2384,10 +2429,12 @@ impl EngineState {
         let adopted: Vec<(LibraryId, [u8; 16], LibraryResult, LibraryIndex)> = decoded
             .into_par_iter()
             .filter_map(|(library, key, fingerprint, payload)| {
-                let (run, surface) =
-                    payload.materialize(&fingerprint, &codes, strings, &mut |path| {
-                        minted.get(path).copied()
-                    })?;
+                let (run, surface) = payload.materialize(
+                    &fingerprint,
+                    &codes,
+                    strings,
+                    &mut |path| minted.get(path).copied(),
+                )?;
                 Some((library, key, run, surface))
             })
             .collect();
@@ -2416,6 +2463,102 @@ impl EngineState {
             self.set_surface(library, surface, view, &mut listings);
         }
         self.list_references(&mut listings);
+        targeted
+    }
+
+    /// The libraries a targeted turn aims at (#4234): every target file's
+    /// owning library, or `None` when the caller is untargeted (`targets`
+    /// empty — the full turn) or any target has no live library (an
+    /// options file, a path discovery never claimed): such a target's
+    /// rows are not a library run's, so slicing would drop them. The map
+    /// is the apply's own (`library_of_file`, defining and part files
+    /// alike), so a part-file aim resolves to its defining library — the
+    /// one whose stored run carries the part's rows.
+    fn aim_libraries(&self, targets: &[FileId]) -> Option<FxHashSet<LibraryId>> {
+        if targets.is_empty() {
+            return None;
+        }
+        let mut aim = FxHashSet::default();
+        for &file in targets {
+            let library = *self.library_of_file.get(&file)?;
+            self.libraries.info(library)?;
+            aim.insert(library);
+        }
+        Some(aim)
+    }
+
+    /// Narrows a targeted turn's invalidated set to the aim's libraries
+    /// (#4234), deferring the rest. Returns whether anything was deferred
+    /// — a targeted turn whose aim covers the whole invalidated set is a
+    /// full turn and reports `false`, so no partial-merge bookkeeping
+    /// rides on it.
+    fn slice_invalidated_to(&mut self, targets: &[FileId]) -> bool {
+        let Some(aim) = self.aim_libraries(targets) else {
+            return false;
+        };
+        let mut deferred = Vec::new();
+        self.invalidated.retain(|library| {
+            if aim.contains(library) {
+                return true;
+            }
+            deferred.push(*library);
+            false
+        });
+        if deferred.is_empty() {
+            return false;
+        }
+        self.slice_deferred.extend(deferred);
+        true
+    }
+
+    /// Re-queues the libraries a targeted turn deferred (#4234) for the
+    /// next untargeted analyze: only ids still lacking a standing result
+    /// and still live — a targeted turn that recomputed one (its run was
+    /// a miss) or a library retired since needs nothing. The recompute
+    /// path then serves them exactly as an ordinary dirty turn would, so
+    /// the deferred set can never leave a full turn's output short.
+    fn drain_slice_deferred(&mut self) {
+        if self.slice_deferred.is_empty() {
+            return;
+        }
+        let deferred: Vec<LibraryId> = std::mem::take(&mut self.slice_deferred)
+            .into_iter()
+            .filter(|&library| {
+                !self.results.contains_key(&library) && self.libraries.info(library).is_some()
+            })
+            .collect();
+        self.invalidated.extend(deferred);
+    }
+
+    /// A targeted turn on a persistent engine (#4234) — staging consumed,
+    /// no stored runs to replay. Requeues exactly the aim libraries an
+    /// earlier targeted turn deferred: an aim stranded in the deferred set
+    /// holds neither a standing result nor a scheduled recompute, so
+    /// without this the turn's rows would silently omit it. The ordinary
+    /// invalidated work (an edit's cascade) is untouched — it completes
+    /// exactly as an untargeted turn's would — and an aim that already
+    /// holds a standing result is left there (the reuse gate serves it).
+    /// A target with no live library takes the fallback's full drain: its
+    /// rows may be workspace-level, which only the whole set carries.
+    /// Returns whether libraries remain deferred — the partial-merge
+    /// signal the caller drops the standing merge on.
+    fn unstrand_aim(&mut self, targets: &[FileId]) -> bool {
+        let Some(aim) = self.aim_libraries(targets) else {
+            self.drain_slice_deferred();
+            return false;
+        };
+        if !self.slice_deferred.is_empty() {
+            let mut stranded = Vec::new();
+            self.slice_deferred.retain(|library| {
+                if aim.contains(library) {
+                    stranded.push(*library);
+                    return false;
+                }
+                true
+            });
+            self.invalidated.extend(stranded);
+        }
+        !self.slice_deferred.is_empty()
     }
 
     /// The post-analyze half of the L3 run cache (#4199): writes every
@@ -2483,7 +2626,8 @@ impl EngineState {
             else {
                 continue;
             };
-            let Some(payload) = persist::PersistedLibraryRun::of(result, surface, files, strings)
+            let Some(payload) =
+                persist::PersistedLibraryRun::of(result, surface, files, strings)
             else {
                 continue;
             };
@@ -2987,11 +3131,7 @@ impl EngineState {
             ),
             ("scanned_cache_tokens", as_u64(scanned), "exact"),
             ("scanned_map_slots", as_u64(scanned_slots), "exact"),
-            (
-                "scanned_cache_hits",
-                self.scanned_hits.load(Ordering::Relaxed),
-                "count",
-            ),
+            ("scanned_cache_hits", self.scanned_hits.load(Ordering::Relaxed), "count"),
             (
                 "scanned_cache_misses",
                 self.scanned_misses.load(Ordering::Relaxed),
@@ -3360,8 +3500,7 @@ mod tests {
         let minted = mint_run_paths(&mut files, spellings.into_iter());
 
         assert_eq!(
-            minted[Path::new("/w/lib/main.dart")],
-            existing,
+            minted[Path::new("/w/lib/main.dart")], existing,
             "a pre-existing path keeps its id — the mint never re-allocates"
         );
         let sdk_id = minted[sdk];

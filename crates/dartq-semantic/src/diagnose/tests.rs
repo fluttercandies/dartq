@@ -168,19 +168,46 @@ fn code_names(report: &FileReport) -> Vec<&'static str> {
 /// invocation face (`undefined_function` on `catch`, `undefined_identifier`
 /// on `e` only), exactly as in an all-ASCII file (oracle 3.13.1, probed
 /// with an em dash in a leading comment).
+///
+/// Oracle proof (dart analyze 3.13.7, both this fixture and its all-ASCII
+/// twin): the recovery face is 4 rows —
+/// `expected_identifier_but_got_keyword` 5|5 "'catch' can't be used as an
+/// identifier because it's a keyword.", `undefined_function` 5|5 "The
+/// function 'catch' isn't defined.", `undefined_identifier` 5|12
+/// "Undefined name 'e'.", `expected_token` 5|13 "Expected to find ';'.".
+/// The `undefined_function` row is pinned exactly: a `catch (…) {}` clause
+/// parsed as an expression statement must not register as a local function
+/// (reserved words are not declaration names), whose scope would otherwise
+/// swallow the miss as a phantom self-recursive call.
 #[test]
 fn non_ascii_prefix_keeps_callee_adjacency() {
     let source = "// \u{2014}\nvoid t() {\n  try {\n  } finally {\n  } catch (e) {\n  }\n}\n";
-    let names = code_names(&report(source));
-    assert!(names.contains(&"undefined_function"), "{names:?}");
+    let rows: Vec<(&'static str, u32, u32)> = report(source)
+        .diagnostics
+        .iter()
+        .map(|d| (d.code.name, d.range.offset, d.range.length))
+        .collect();
     assert_eq!(
-        names
-            .iter()
-            .filter(|n| **n == "undefined_identifier")
-            .count(),
-        1,
-        "{names:?}"
+        rows,
+        vec![
+            ("expected_identifier_but_got_keyword", 42, 5),
+            ("undefined_function", 42, 5),
+            ("undefined_identifier", 49, 1),
+            ("expected_token", 50, 1),
+        ],
+        "{rows:?}"
     );
+    // The all-ASCII twin is the same face shape (same codes, same
+    // lengths, offsets shifted only by the comment line's own width —
+    // the em dash is one UTF-16 unit, so nothing before `catch` drifts):
+    // no callee-adjacency shift from the non-ASCII prefix.
+    let plain = "// plain\nvoid t() {\n  try {\n  } finally {\n  } catch (e) {\n  }\n}\n";
+    let plain_rows: Vec<(&'static str, u32, u32)> = report(plain)
+        .diagnostics
+        .iter()
+        .map(|d| (d.code.name, d.range.offset - 4, d.range.length))
+        .collect();
+    assert_eq!(rows, plain_rows, "ASCII twin drifted");
 }
 
 /// #2165: an unnamed factory keys as `new` in the duplicate-constructor
@@ -745,11 +772,15 @@ fn promotion_over_written_args_local_cleans_the_promoted_branch() {
     );
 }
 
-/// The conversion's drop rule at the seam: `void` and `Never` promoted
-/// types return `None` (never stage); the special bases map one-to-one
-/// onto the M1 lattice.
+/// The conversion's drop rule at the seam: `void` never stages (a `void`
+/// promotion cannot arise, `tryPromoteToType` only subtype-narrows,
+/// type_system.dart:1729); `Never` stages its spelled type — non-null
+/// `Never`, nullable `Null` — because the staged-check join reads it
+/// (`receiver_of_type_never` first, and `Never <: T` vacuously cleans
+/// every assignability face, subtype.dart Right Bottom); the other special
+/// bases map one-to-one onto the M1 lattice.
 #[test]
-fn staged_promotion_drops_void_and_never() {
+fn staged_promotion_drops_void_and_spells_never() {
     let strings = StringTable::new();
     let mut pool = ArgPool::default();
     let scanned = dartq_scanner::scan(
@@ -761,16 +792,43 @@ fn staged_promotion_drops_void_and_never() {
         FileTable::new().intern(Path::new("test.dart")),
     );
     let flow = Flow::new(&scanned.tokens, "");
-    let mut never_stages =
-        |ty| staged_promotion(ty, dartq_flow::ty::EMPTY_ARGS, &flow, &strings, &mut pool).is_none();
-    assert!(never_stages(FlowTy {
-        base: FlowBase::Void,
-        nullable: false
-    }));
-    assert!(never_stages(FlowTy {
-        base: FlowBase::Never,
-        nullable: false
-    }));
+    assert!(staged_promotion(
+        FlowTy {
+            base: FlowBase::Void,
+            nullable: false
+        },
+        dartq_flow::ty::EMPTY_ARGS,
+        &flow,
+        &strings,
+        &mut pool
+    )
+    .is_none());
+    assert_eq!(
+        staged_promotion(
+            FlowTy {
+                base: FlowBase::Never,
+                nullable: false
+            },
+            dartq_flow::ty::EMPTY_ARGS,
+            &flow,
+            &strings,
+            &mut pool
+        ),
+        Some(Ty::Never)
+    );
+    assert_eq!(
+        staged_promotion(
+            FlowTy {
+                base: FlowBase::Never,
+                nullable: true
+            },
+            dartq_flow::ty::EMPTY_ARGS,
+            &flow,
+            &strings,
+            &mut pool
+        ),
+        Some(Ty::Null)
+    );
     assert_eq!(
         staged_promotion(
             FlowTy {
@@ -914,11 +972,22 @@ fn core_top_level_annotation_names_stay_silent() {
 #[test]
 fn missing_annotation_reports_over_the_at_sign() {
     let report = report("class A {} @gone void f() {} @A void g() {}");
-    assert_eq!(code_names(&report), ["undefined_annotation"]);
+    // Re-recorded from the pinned oracle (3.13.7, probe48): the bare
+    // `@A` over the class's implicit non-const constructor also fires
+    // `non_constant_annotation_constructor` at the constructor reference —
+    // the two rows always pair here.
+    assert_eq!(
+        code_names(&report),
+        ["undefined_annotation", "non_constant_annotation_constructor"]
+    );
     let d = &report.diagnostics[0];
     assert_eq!(d.message, "Undefined name 'gone' used as an annotation.");
     assert_eq!(u32::try_from("class A {}@".len()).unwrap(), d.range.offset);
     assert_eq!(u32::try_from("@gone".len()).unwrap(), d.range.length);
+    assert_eq!(
+        report.diagnostics[1].message,
+        "Annotation creation can only call a const constructor."
+    );
 }
 
 /// The metadata path skips the broken-import shown-name guard: an
@@ -2055,30 +2124,26 @@ fn primitive_receivers_report_the_member_trio() {
     let report = report(
         "void f() { int x = 1; x.noSuchGetter; x.noSuchMethodHere(); x.noSuchSetter = 2; x.isEven; x.toString; }",
     );
-    // The receiver type `int` is undeclared in the harness: its type use
-    // carries the known `undefined_class` row ahead of the member trio.
-    assert_eq!(
-        code_names(&report),
-        [
-            "undefined_class",
-            "undefined_getter",
-            "undefined_method",
-            "undefined_setter",
-        ],
-        "{:?}",
-        code_names(&report)
-    );
-    assert_eq!(
-        report.diagnostics[1].message,
-        "The getter 'noSuchGetter' isn't defined for the type 'int'."
-    );
-    assert_eq!(
-        report.diagnostics[2].message,
-        "The method 'noSuchMethodHere' isn't defined for the type 'int'."
-    );
-    assert_eq!(
-        report.diagnostics[3].message,
-        "The setter 'noSuchSetter' isn't defined for the type 'int'."
+        // The receiver type `int` resolves through dart:core's
+        // final-primitive lane in every rig, so no `undefined_class` row
+        // precedes the member trio — the live oracle's posture.
+        assert_eq!(
+            code_names(&report),
+            ["undefined_getter", "undefined_method", "undefined_setter"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'noSuchGetter' isn't defined for the type 'int'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The method 'noSuchMethodHere' isn't defined for the type 'int'."
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "The setter 'noSuchSetter' isn't defined for the type 'int'."
     );
 }
 
@@ -5158,33 +5223,31 @@ fn instance_member_family_reports_by_intent() {
         "class C { int get g => 1; set p(int v) {} } \
              void f(C c) { c.h; c.s = 1; c.g = 2; c.p; }",
     );
-    assert_eq!(
-        code_names(&report),
-        [
-            "undefined_class",
-            "undefined_class",
-            "undefined_getter",
-            "undefined_setter",
-            "assignment_to_final_no_setter",
-            "undefined_getter",
-        ],
-        "{:?}",
-        code_names(&report)
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_getter",
+                "undefined_setter",
+                "assignment_to_final_no_setter",
+                "undefined_getter",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'h' isn't defined for the type 'C'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The setter 's' isn't defined for the type 'C'."
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "There isn't a setter named 'g' in class 'C'."
     );
     assert_eq!(
-        report.diagnostics[2].message,
-        "The getter 'h' isn't defined for the type 'C'."
-    );
-    assert_eq!(
-        report.diagnostics[3].message,
-        "The setter 's' isn't defined for the type 'C'."
-    );
-    assert_eq!(
-        report.diagnostics[4].message,
-        "There isn't a setter named 'g' in class 'C'."
-    );
-    assert_eq!(
-        report.diagnostics[2].range.offset,
+        report.diagnostics[0].range.offset,
         u32::try_from("class C { int get g => 1; set p(int v) {} } void f(C c) { c.".len())
             .unwrap()
     );
@@ -5284,28 +5347,26 @@ fn super_member_family_reports_by_shape() {
         "class B { int get g => 1; void m() {} set s(int v) {} } \
              class C extends B { void f() { super.g; super.m(); super.s = 1; super.q; super.q2(); super.q3 = 2; } }",
     );
-    assert_eq!(
-        code_names(&report),
-        [
-            "undefined_class",
-            "undefined_class",
-            "undefined_super_member",
-            "undefined_super_member",
-            "undefined_super_member",
-        ],
-        "{:?}",
-        code_names(&report)
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_super_member",
+                "undefined_super_member",
+                "undefined_super_member",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'q' isn't defined in a superclass of 'C'."
     );
     assert_eq!(
-        report.diagnostics[2].message,
-        "The getter 'q' isn't defined in a superclass of 'C'."
-    );
-    assert_eq!(
-        report.diagnostics[3].message,
+        report.diagnostics[1].message,
         "The method 'q2' isn't defined in a superclass of 'C'."
     );
     assert_eq!(
-        report.diagnostics[4].message,
+        report.diagnostics[2].message,
         "The setter 'q3' isn't defined in a superclass of 'C'."
     );
 }
@@ -5465,19 +5526,20 @@ fn stale_type_param_invocation_follows_live_frame() {
 /// implicit `this` of the body carries the extension type itself), so
 /// the UnqualifiedLookupDomain names the head exactly like a class
 /// body names its class, never the context-free `undefined_function`.
-/// The rig has no dart:core, so the `int i` field formal's undeclared
-/// `int` spelling carries its `undefined_class` row beside the miss.
+/// The `int i` field formal's `int` resolves through dart:core's
+/// final-primitive lane in every rig, so no `undefined_class` row joins
+/// the miss — the live oracle's posture for the same declaration.
 #[test]
 fn extension_type_body_miss_names_the_extension_type() {
     let report = report("extension type E(int i) { void f() { miss(); } }");
     assert_eq!(
         code_names(&report),
-        ["undefined_class", "undefined_method"],
+        ["undefined_method"],
         "{:?}",
         code_names(&report)
     );
     assert_eq!(
-        report.diagnostics[1].message,
+        report.diagnostics[0].message,
         "The method 'miss' isn't defined for the type 'E'."
     );
 }
@@ -6049,8 +6111,11 @@ fn record_pattern_binds_the_scrutinee_positional_slots() {
         rep.diagnostics[1].message,
         "The argument type 'String' can't be assigned to the parameter type 'num'. "
     );
-    // A named field keeps the window non-flat — the bind suppresses
-    // and `a`'s unknown type never reaches the return check.
+    // A named field binds the same way: the oracle types `(:a, :b)`'s
+    // variables from the record's named slots (live 3.13.7 probe of the
+    // exact fixture reports `return_of_invalid_type` at `a + b` and
+    // `argument_type_not_assignable` at `b`), so `a + b` reaches both
+    // checks through the bound faces.
     let named = report(
         "({int a, String b}) pair() => (a: 1, b: 'x'); \
              int sum() { final (:a, :b) = pair(); return a + b; }",
@@ -6059,8 +6124,11 @@ fn record_pattern_binds_the_scrutinee_positional_slots() {
         named
             .diagnostics
             .iter()
-            .all(|d| d.code.name != "argument_type_not_assignable"
-                && d.code.name != "return_of_invalid_type"),
+            .any(|d| d.code.name == "argument_type_not_assignable")
+            && named
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "return_of_invalid_type"),
         "{:?}",
         code_names(&named)
     );
@@ -6712,10 +6780,32 @@ fn untyped_pattern_binds_and_covers() {
 /// Hand-trace: the record pattern bracket pushes the unknown-space leaf
 /// (never a false must-match); the field patterns bind `a`/`b` through
 /// their declared-variable events, so both reads resolve.
+///
+/// Oracle proof (dart analyze 3.13.7): matching a record pattern against
+/// a non-record class DOES report — `PATTERN_NEVER_MATCHES_VALUE_TYPE`
+/// "The matched value type 'C' can never match the required type
+/// '(Object?, Object?)'." anchored at the pattern node itself (the
+/// `(C a, C b)` span, length 10). The former zero-diagnostic expectation
+/// was disproven by the probe; the binding claim rides the absence of
+/// any undefined row for the `a; b;` reads.
 #[test]
-fn record_pattern_binds_fields_without_shape_diagnostic() {
+fn record_pattern_binds_fields_beside_the_never_row() {
     let report = report("class C {} void f(C c) { if (c case (C a, C b)) { a; b; } }");
-    assert_eq!(report.diagnostics.len(), 0, "{:?}", code_names(&report));
+    let rows: Vec<(&'static str, u32, u32, &str)> = report
+        .diagnostics
+        .iter()
+        .map(|d| (d.code.name, d.range.offset, d.range.length, d.message.as_ref()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(
+            "pattern_never_matches_value_type",
+            36,
+            10,
+            "The matched value type 'C' can never match the required type '(Object?, Object?)'."
+        )],
+        "{rows:?}"
+    );
 }
 
 // —— case-root capture (the case-sink window) ———————————————————————
@@ -7993,9 +8083,11 @@ fn const_variable_type_folds_per_the_official_rules() {
 }
 
 /// Deferral shapes never fabricate a verdict: interpolation text,
-/// string repetition, index expressions, member invocations — all
-/// silent here (documented under-report, see `const_eval` module
-/// docs).
+/// index expressions, member invocations — all silent here (documented
+/// under-report, see `const_eval` module docs). String repetition is
+/// NOT deferral: `'ab' * 2` reports `const_eval_type_num` (re-recorded
+/// from the pinned oracle 3.13.7, probe60 — the operator's operands
+/// must be `num`, a String left operand fails the fold).
 #[test]
 fn deferred_shapes_stay_silent() {
     let rep = report(
@@ -8003,9 +8095,16 @@ fn deferred_shapes_stay_silent() {
              class C { const C(); } const c = C(); \
              const d = 'a$b'; const w = c;",
     );
-    // `d` interpolates an unknown constant (`b` folds deferred) —
-    // clean; `w` reads a deferred creation — clean.
-    assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    assert_eq!(
+        code_names(&rep),
+        ["const_eval_type_num"],
+        "{:?}",
+        code_names(&rep)
+    );
+    assert_eq!(
+        rep.diagnostics[0].message,
+        "In constant expressions, operands of this operator must be of type 'num'."
+    );
 }
 
 // —— invalid_override (#453) ——————————————————————————————————————
@@ -8223,7 +8322,10 @@ fn implicit_object_parameter_widening_stays_silent() {
 
 /// The gate answers on the `Object` supertype only: with `Object`
 /// declared in-file, a genuinely incomparable pair still closes its
-/// walk decisive — the widening direction keeps reporting.
+/// walk decisive — the widening direction keeps reporting. Beside the
+/// override row, both `int` literals carry their own
+/// `return_of_invalid_type` rows (re-recorded from the pinned oracle
+/// 3.13.7, probe64: three rows — at the `1`, the override, at the `2`).
 #[test]
 fn incomparable_pair_with_object_declared_still_reports() {
     let rep = report(
@@ -8232,9 +8334,17 @@ fn incomparable_pair_with_object_declared_still_reports() {
     );
     assert_eq!(
         code_names(&rep),
-        ["invalid_override"],
+        [
+            "return_of_invalid_type",
+            "invalid_override",
+            "return_of_invalid_type",
+        ],
         "{:?}",
         code_names(&rep)
+    );
+    assert_eq!(
+        rep.diagnostics[2].message,
+        "A value of type 'int' can't be returned from the method 'f' because it has a return type of 'B'."
     );
 }
 
@@ -8307,8 +8417,12 @@ fn unresolvable_head_stays_suppressed() {
 }
 
 /// Static members take no part in overriding: a static inherited
-/// member is invisible to the face walk, and a static declaration is
-/// skipped before any comparison.
+/// member is invisible to the face walk (an instance redeclaration in
+/// the subclass stays silent — the live 3.13.7 oracle reports nothing
+/// for that fixture), while a static declaration over an inherited
+/// instance member reports `conflicting_static_and_instance` (the same
+/// oracle run: "Class 'B' can't define static member 'f' and have
+/// instance member 'A.f' with the same name.").
 #[test]
 fn static_members_are_skipped() {
     let rep = report(
@@ -8318,7 +8432,12 @@ fn static_members_are_skipped() {
     let rep = report(
         "class int {} class A { void f() {} } class B extends A { static void f(int x) {} }",
     );
-    assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    assert_eq!(
+        code_names(&rep),
+        ["conflicting_static_and_instance"],
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// An unresolvable superclass suppresses the whole override check for
@@ -8455,68 +8574,64 @@ fn override_annotation_field_and_setter_faces() {
     );
 }
 
-/// Overriding a `@mustCallSuper`-annotated member without touching
-/// `super` reports `must_call_super` at the overriding member's name
-/// (a static warning); the body's `super.f()` invocation spares it.
+/// The `must_call_super` face keys on the annotation resolving to
+/// package:meta's top-level getter (`_isPackageMetaGetter`,
+/// element.dart:2010-2012), never on the raw spelling: a same-named local
+/// class shadows the name into a plain constructor annotation (the oracle
+/// 3.13.7 reports only `no_annotation_constructor_arguments` over the
+/// annotation, never the walk row), and an unbound spelling stops at
+/// `undefined_annotation` the same way. The positive face needs the meta
+/// import — the conformance corpus carries it.
 #[test]
-#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn must_call_super_requires_the_super_invocation() {
-    let source = "class int {} class mustCallSuper { const mustCallSuper(); } \
-             class A { @mustCallSuper void f() {} } \
-             class B extends A { void f() {} }";
-    let rep = report(source);
-    assert_eq!(
-        code_names(&rep),
-        ["must_call_super"],
-        "{:?}",
-        code_names(&rep)
-    );
-    let d = &rep.diagnostics[0];
-    assert_eq!(d.severity, Severity::Warning);
-    assert_eq!(
-        d.message,
-        "This method overrides a method annotated as '@mustCallSuper' in 'A', but doesn't invoke the overridden method."
-    );
-    // The name-token anchor (the oracle's `node.name`).
-    assert_eq!(
-        d.range.offset,
-        offset_of(source, "class B extends A { void ") + "class B extends A { void ".len() as u32
-    );
-    let spared = report(
+    let shadowed = report(
         "class int {} class mustCallSuper { const mustCallSuper(); } \
              class A { @mustCallSuper void f() {} } \
-             class B extends A { void f() { super.f(); } }",
+             class B extends A { void f() {} }",
     );
-    assert!(code_names(&spared).is_empty(), "{:?}", code_names(&spared));
+    assert_eq!(
+        code_names(&shadowed),
+        ["no_annotation_constructor_arguments"],
+        "{:?}",
+        code_names(&shadowed)
+    );
+    assert_eq!(
+        shadowed.diagnostics[0].message,
+        "Annotation creation must have arguments."
+    );
+    let unbound = report("class A { @mustCallSuper void f() {} }");
+    assert_eq!(
+        code_names(&unbound),
+        ["undefined_annotation"],
+        "{:?}",
+        code_names(&unbound)
+    );
 }
 
-/// The `@mustBeOverridden` walk: a concrete subclass without the member
-/// reports the missing-override row at the class name; a concrete
-/// override spares it.
+/// The `@mustBeOverridden` walk shares the meta-getter gate: the
+/// same-named local class shadows the annotation into the constructor
+/// face (oracle 3.13.7: `no_annotation_constructor_arguments` only), and
+/// an unbound spelling stops at `undefined_annotation`.
 #[test]
 fn must_be_overridden_requires_a_concrete_member() {
-    let rep = report(
+    let shadowed = report(
         "class int {} class mustBeOverridden { const mustBeOverridden(); } \
              class A { @mustBeOverridden void f() {} } \
              class B extends A {}",
     );
     assert_eq!(
-        code_names(&rep),
-        ["missing_override_of_must_be_overridden"],
+        code_names(&shadowed),
+        ["no_annotation_constructor_arguments"],
         "{:?}",
-        code_names(&rep)
+        code_names(&shadowed)
     );
-    assert_eq!(rep.diagnostics[0].severity, Severity::Warning);
+    let unbound = report("class A { @mustBeOverridden void f() {} }");
     assert_eq!(
-        rep.diagnostics[0].message,
-        "Missing a required override of 'f'."
+        code_names(&unbound),
+        ["undefined_annotation"],
+        "{:?}",
+        code_names(&unbound)
     );
-    let spared = report(
-        "class int {} class mustBeOverridden { const mustBeOverridden(); } \
-             class A { @mustBeOverridden void f() {} } \
-             class B extends A { void f() {} }",
-    );
-    assert!(code_names(&spared).is_empty(), "{:?}", code_names(&spared));
 }
 
 /// The concrete-implementation face across the two inherited shapes: the
@@ -9168,9 +9283,21 @@ fn enum_participates_with_values_exempt() {
         rep.diagnostics[0].message,
         "Missing concrete implementations of 'A.a' and 'A.b'."
     );
-    // The synthesized `values` getter satisfies the interface name.
+    // The synthesized `values` getter satisfies the interface name for
+    // the completeness face — but the inherited instance `values` still
+    // fires `illegal_enum_values` (re-recorded from the pinned oracle
+    // 3.13.7, probe62: the row at the enum's name, naming 'A').
     let rep = report("class int {} abstract class A { int get values; } enum E implements A { v }");
-    assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    assert_eq!(
+        code_names(&rep),
+        ["illegal_enum_values"],
+        "{:?}",
+        code_names(&rep)
+    );
+    assert_eq!(
+        rep.diagnostics[0].message,
+        "An instance member named 'values' can't be inherited from 'A' in a class that implements 'Enum'."
+    );
 }
 
 /// An abstract field's non-final shape misses both halves (getter and
@@ -9755,7 +9882,9 @@ fn on_type_parameter_argument_instantiates() {
     // `non_type_as_type_argument`. The failed argument slots the `on`
     // type as the oracle's `InvalidType` (`List<InvalidType>`), which
     // `List<int>` still satisfies — the face applies and the access
-    // resolves silently.
+    // resolves silently (`int` resolves as dart:core's final primitive,
+    // so the receiver's own argument stays clean; the live 3.13
+    // oracle's single row is the `T` report).
     let leaked = report(
         "class C<T> {} class List<T> {} \
              extension E on List<T> { void m() {} } \
@@ -9763,7 +9892,7 @@ fn on_type_parameter_argument_instantiates() {
     );
     assert_eq!(
         code_names(&leaked),
-        ["non_type_as_type_argument", "non_type_as_type_argument"],
+        ["non_type_as_type_argument"],
         "{:?}",
         code_names(&leaked)
     );
@@ -12496,12 +12625,17 @@ fn cast_from_null_always_fails_routes_by_operand_and_target() {
 #[test]
 fn cast_from_null_pattern_reports() {
     let r = report("void main() { switch (null) { case null as int: break; default: break; } }");
+    // `int` resolves through dart:core's final-primitive lane, so the
+    // cast target is a real `int` — no `undefined_class` row, and the
+    // non-null case covers the `null` subject's default clause (the
+    // live 3.13 oracle's row family: never-match, always-fails,
+    // covered default, dead code).
     assert_eq!(
         code_names(&r),
         [
             "pattern_never_matches_value_type",
             "cast_from_null_always_fails",
-            "undefined_class",
+            "unreachable_switch_default",
         ],
         "{:?}",
         code_names(&r)
@@ -17694,13 +17828,13 @@ fn long_cascade_resolves_linearly() {
 /// send (`if (b is Box) b.next…next.takeCb((e) => …)`) leaves the closure
 /// formal unsolved at pass 1 — the merge classifies every link `Unknown`
 /// off the `dynamic` head — and the pass-2 formal re-derivation walks the
-/// receiver chain recursively to re-derive the schema. Just under the cap
-/// the walk resolves `Box` at hop 1 (the promoted flow face) and the
-/// formal solves to the callee's parameter type, so the body's miss
-/// reports against `Idx`. Past the 1024-hop cap the walk cannot name a
-/// face — every classified receiver in the chain is `Unknown`, so the
-/// documented degrade answers `None` — the formal stays `dynamic`, and
-/// the body's miss under-reports.
+/// receiver chain recursively to re-derive the schema. Under the cap the
+/// walk resolves `Box` at hop 1 (the promoted flow face) and the formal
+/// solves to the callee's parameter type, so the body's miss reports
+/// against `Idx`. Past the 1024-hop cap the walk degrades — but the
+/// closure-context schema still solves the formal, and the body's miss
+/// reports the same row the oracle does (no cap exists upstream;
+/// oracle-pinned below).
 #[test]
 fn recv_walk_depth_cap_degrades_the_formal_schema() {
     let fixture = |hops: usize| {
@@ -17728,11 +17862,20 @@ fn recv_walk_depth_cap_degrades_the_formal_schema() {
         r.diagnostics[0].message,
         "The getter 'miss' isn't defined for the type 'Idx'."
     );
-    // 1100 hops: hop 1025 finds `recv_walk_depth` at the cap and degrades
-    // to the classified receiver — `Unknown` here, so the walk answers
-    // `None`, the formal stays unsolved, and the body's miss under-reports.
+    // 1100 hops: past the 1024-hop receiver-walk cap the formal still
+    // solves — the closure-context schema carries the formal's face
+    // without the deep receiver walk, matching the oracle (which has no
+    // cap at all). Oracle-proven, dart analyze 3.13.7 on the exact
+    // 1100-hop fixture: `undefined_getter` "The getter 'miss' isn't
+    // defined for the type 'Idx'." — the earlier silence expectation
+    // documented the walk's cap degrade as if it were oracle behavior;
+    // the re-pin records the disproof.
     let r = report(&fixture(1100));
-    assert!(code_names(&r).is_empty(), "{:?}", code_names(&r));
+    assert_eq!(code_names(&r), ["undefined_getter"], "{:?}", code_names(&r));
+    assert_eq!(
+        r.diagnostics[0].message,
+        "The getter 'miss' isn't defined for the type 'Idx'."
+    );
 }
 
 // The #3215 pins (F6-A bound-head residual — the `var`-inferred

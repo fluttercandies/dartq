@@ -146,10 +146,16 @@ fn generic_interface_substituted_members_stay_silent() {
 
 /// Pin (b), the over-suppression guard: the same inherited-concrete
 /// architecture with CONCRETE types keeps its row — `Host`'s `Base?`
-/// return is not a subtype of the interface's `Base`, so the subclass
-/// reports `invalid_implementation_override` (and the own member reports
-/// the per-member `invalid_override`), exactly as the oracle does. The
-/// gate only fires on free type parameters, never on a genuine mismatch.
+/// return is not a subtype of the interface's `Base`, so `Host.member`
+/// itself reports `invalid_override`. The subclass inherits the concrete
+/// member and reports NOTHING: the oracle's whole-file answer on this
+/// exact fixture is the single `Host.member` row (INVALID_OVERRIDE
+/// "'Host.member' ('Base? Function()') isn't a valid override of
+/// 'Iface.member' ('Base Function()')" at 6:9, dart analyze 3.13.7 — no
+/// `invalid_implementation_override` at `Sub`; the earlier expectation
+/// held a second row the oracle never emits, the re-pin records the
+/// disproof). The gate only fires on free type parameters, never on a
+/// genuine mismatch.
 #[test]
 fn concrete_type_mismatch_still_reports() {
     let source = "class Base {}\n\
@@ -165,9 +171,10 @@ fn concrete_type_mismatch_still_reports() {
         has(&names, "invalid_override"),
         "the own nullable-return member still reports: {names:?}"
     );
-    assert!(
-        has(&names, "invalid_implementation_override"),
-        "the subclass's inherited concrete member still reports against the interface: {names:?}"
+    assert_eq!(
+        names,
+        ["invalid_override"],
+        "the oracle's whole-file answer is the single Host.member row: {names:?}"
     );
 }
 

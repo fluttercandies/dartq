@@ -94,6 +94,21 @@ const POLL: Duration = Duration::from_millis(250);
 /// How long a released holder is given to exit before its lease is
 /// treated as freed anyway (its file is still locked by a dying process).
 const RELEASE_GRACE: Duration = Duration::from_secs(10);
+/// How long a sized waiter keeps its birth ask before it re-sizes toward
+/// [`DEFAULT_LEASE`]. A request sized at a recorded peak wants that
+/// historical worst case for its whole wait — a wait sized at birth can
+/// never shrink on its own — so on a host whose free band sits between
+/// the default lease and the recorded peak the waiter parks at the gate
+/// until its deadline, however long. The bound is past a peer's release
+/// grace (10 s) and any transient contention, far under the minutes a
+/// full analysis runs, and two orders under the 30-minute fault bound.
+/// The run a decayed ask admits re-measures its real peak and records
+/// it, so the under-booking self-corrects (the holder counts
+/// `max(lease, live RSS)` while it runs, and the growth brake still
+/// bounds its growth). FIFO order is untouched — the waiter keeps its
+/// ticket — and only a memory shortfall decays: a count or first-run
+/// shortfall is not the ask's size.
+const SIZED_WAIT_DECAY: Duration = Duration::from_secs(30);
 
 /// `--no-queue`: this process bypasses the gate.
 static BYPASS: AtomicBool = AtomicBool::new(false);
@@ -741,7 +756,9 @@ fn estimate(dir: &Path, face: Face, source_bytes: Option<u64>) -> Option<u64> {
     let bound = face_peak_entries(dir, face)
         .filter_map(|(peak, src)| src.map(|src| (peak, src)))
         .filter(|(_, src)| {
-            *src > 0 && *src >= my_source.div_ceil(4) && *src <= my_source.saturating_mul(4)
+            *src > 0
+                && *src >= my_source.div_ceil(4)
+                && *src <= my_source.saturating_mul(4)
         })
         .map(|(peak, src)| {
             let scale = (my_source as u128).div_ceil(src as u128);
@@ -749,14 +766,12 @@ fn estimate(dir: &Path, face: Face, source_bytes: Option<u64>) -> Option<u64> {
         })
         .max()?;
     let estimate = u64::try_from(bound).unwrap_or(u64::MAX);
-    let cap = total_memory().saturating_sub(
-        Figures {
-            total: total_memory(),
-            available: None,
-            max_percent: DEFAULT_MAX_PERCENT,
-        }
-        .reserve(),
-    );
+    let cap = total_memory().saturating_sub(Figures {
+        total: total_memory(),
+        available: None,
+        max_percent: DEFAULT_MAX_PERCENT,
+    }
+    .reserve());
     (estimate <= cap).then_some(estimate)
 }
 
@@ -1153,13 +1168,21 @@ pub fn acquire_or_stop(
         return Ok(None);
     }
     let stopped = || stop.load(Ordering::Relaxed);
-    acquire_in(&dir, request, min, deadline, &stopped, on_note, || {
-        Figures {
-            total,
-            available: available_memory(),
-            max_percent: max_percent.clamp(1, 100),
-        }
-    })
+    let figures = || Figures {
+        total,
+        available: available_memory(),
+        max_percent: max_percent.clamp(1, 100),
+    };
+    acquire_in(
+        &dir,
+        request,
+        min,
+        deadline,
+        &stopped,
+        on_note,
+        figures,
+        SIZED_WAIT_DECAY,
+    )
 }
 
 /// The nesting rule: a slot request of a process that holds a slot itself
@@ -1203,7 +1226,7 @@ fn open_gate(dir: &Path) -> io::Result<File> {
 }
 
 /// [`acquire`] over an explicit directory and figures source (the tests'
-/// seam).
+/// seam); `decay_after` is [`SIZED_WAIT_DECAY`], shortened by tests.
 fn acquire_in(
     dir: &Path,
     mut request: Request,
@@ -1212,9 +1235,11 @@ fn acquire_in(
     stop: &dyn Fn() -> bool,
     mut on_note: impl FnMut(&str),
     figures: impl Fn() -> Figures,
+    decay_after: Duration,
 ) -> Result<Option<Lease>, Error> {
     fs::create_dir_all(dir)?;
     let gate = open_gate(dir)?;
+    let started = Instant::now();
     let mut waiting: Option<Shortfall> = None;
     let mut released: Vec<(PathBuf, Instant)> = Vec::new();
     let mut ticket: Option<Ticket> = None;
@@ -1299,6 +1324,26 @@ fn acquire_in(
                         shortfall.what(ask.min),
                         describe(&snapshot)
                     ));
+                }
+                // Bounded decay: a sized wait the ledger keeps turning
+                // away on memory re-sizes toward the default lease once
+                // past the bound — the sticky-peak park (a wait sized at
+                // birth can never shrink on its own) ends in a smaller
+                // ask, never in a silent park to the deadline. The wait
+                // keeps its ticket; only the ask shrinks.
+                if shortfall == Shortfall::Memory
+                    && request.sized
+                    && request.bytes > DEFAULT_LEASE
+                    && started.elapsed() >= decay_after
+                {
+                    on_note(&format!(
+                        "dartq: {} has not fit for {}s; re-sizing the ask to the {} default lease",
+                        gib(request.bytes),
+                        started.elapsed().as_secs(),
+                        gib(DEFAULT_LEASE)
+                    ));
+                    request.bytes = DEFAULT_LEASE;
+                    min = min.min(DEFAULT_LEASE);
                 }
                 waiting = Some(shortfall);
             }
@@ -1856,6 +1901,7 @@ mod tests {
             &|| false,
             |note| notes.push(note.to_owned()),
             roomy,
+            SIZED_WAIT_DECAY,
         );
         (result, notes)
     }
@@ -2288,6 +2334,112 @@ mod tests {
         assert_eq!(lease.bytes(), GIB / 2, "its own recorded peak");
     }
 
+    /// A wait born at a sticky recorded peak — the host's free band sits
+    /// between the default lease and the peak — decays to the default
+    /// lease once the bound passes and is admitted on the smaller ask;
+    /// the wait kept its ticket and the notes tell both stories.
+    #[test]
+    fn a_sized_wait_decays_to_the_default_lease_and_admits() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        // A 24 GiB host with 4 GiB available: the reserve (2.4 GiB)
+        // leaves 1.6 GiB of room — a 3 GiB peak parks, the 1 GiB
+        // default lease fits.
+        let tight = || Figures {
+            total: 24 * GIB,
+            available: Some(4 * GIB),
+            max_percent: 90,
+        };
+        let started = Instant::now();
+        let mut notes = Vec::new();
+        let result = acquire_in(
+            dir.path(),
+            Request {
+                bytes: 3 * GIB,
+                ..slot(Face::AnalysisServer, "tree", 0, true)
+            },
+            3 * GIB,
+            Instant::now() + Duration::from_secs(10),
+            &|| false,
+            |note| notes.push(note.to_owned()),
+            tight,
+            Duration::from_millis(300),
+        );
+        let lease = result.expect("decayed and admitted").expect("a lease");
+        assert_eq!(lease.bytes(), DEFAULT_LEASE, "the decayed ask");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "the decay waits out its bound"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("dartq: waiting for host memory")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("re-sizing the ask to the")),
+            "{notes:?}"
+        );
+    }
+
+    /// The full ask never decays while it is admissible: decay touches
+    /// only a waiter the ledger itself turned away, and a bound of zero
+    /// does not pre-shrink a request that fits.
+    #[test]
+    fn a_sized_request_that_fits_never_decays() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let mut notes = Vec::new();
+        let result = acquire_in(
+            dir.path(),
+            Request {
+                bytes: 3 * GIB,
+                ..slot(Face::AnalysisServer, "tree", 0, true)
+            },
+            3 * GIB,
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+            |note| notes.push(note.to_owned()),
+            roomy,
+            Duration::ZERO,
+        );
+        let lease = result.expect("admitted at once").expect("a lease");
+        assert_eq!(lease.bytes(), 3 * GIB, "the full ask");
+        assert!(notes.is_empty(), "no wait, no decay: {notes:?}");
+    }
+
+    /// An unsized waiter never decays: it already carries the default
+    /// lease, and the first-run slot is not the ask's size — however long
+    /// it waits, it is not admitted until the first run ends.
+    #[test]
+    fn an_unsized_wait_never_decays_past_the_first_run_slot() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let (_resident, mut child, _busy) =
+            unsized_resident(dir.path(), Face::AnalysisServer, "wt1", false);
+        let mut notes = Vec::new();
+        let result = acquire_in(
+            dir.path(),
+            slot(Face::Analyze, "wt2", 0, false),
+            DEFAULT_LEASE,
+            Instant::now() + Duration::from_millis(800),
+            &|| false,
+            |note| notes.push(note.to_owned()),
+            roomy,
+            Duration::from_millis(100),
+        );
+        match result {
+            Err(Error::Timeout { what, .. }) => assert_eq!(what, "the first-run slot"),
+            other => panic!("expected a first-run timeout, got {other:?}"),
+        }
+        assert!(
+            !notes.iter().any(|note| note.contains("re-sizing")),
+            "nothing decays for the first-run slot: {notes:?}"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     /// With no live peer, a peak recorded under another key sizes a
     /// request of the same face (the largest such), and only of that face.
     #[test]
@@ -2392,6 +2544,7 @@ mod tests {
             &|| false,
             |_| {},
             roomy,
+            SIZED_WAIT_DECAY,
         )
         .expect("admitted")
         .expect("a lease");
@@ -2549,7 +2702,7 @@ mod tests {
             dir.path(),
             "repo:small",
             Face::AnalysisServer,
-            1_200_000_000,     // 1.2 GB peak
+            1_200_000_000,   // 1.2 GB peak
             Some(250_000_000), // on 250 MB of Dart source
         );
         // A 500 MB Dart source job: 250 MB is inside [125 MB, 2 GB], the
@@ -2587,13 +2740,7 @@ mod tests {
         );
         // Without source bytes the estimate is the raw peak.
         assert_eq!(
-            sized_in(
-                dir.path(),
-                Some("repo:big"),
-                Face::AnalysisServer,
-                &[],
-                None
-            ),
+            sized_in(dir.path(), Some("repo:big"), Face::AnalysisServer, &[], None),
             Some(3_000_000_000),
             "the recorded peak itself"
         );
@@ -2675,13 +2822,7 @@ mod tests {
         );
         // Unknown source → the recorded peak stands in as before.
         assert_eq!(
-            sized_in(
-                dir.path(),
-                Some("repo:new"),
-                Face::AnalysisServer,
-                &[],
-                None
-            ),
+            sized_in(dir.path(), Some("repo:new"), Face::AnalysisServer, &[], None),
             Some(2 * GIB),
             "the largest recorded peak"
         );
@@ -2731,13 +2872,7 @@ mod tests {
         record_peak_floor_at(dir.path(), key, Face::AnalysisServer, 2_200_000_000, GIB);
         assert_eq!(peak_in(dir.path(), key), Some(3 * GIB));
         // A later normal completion at 1.5 GB still books less.
-        record_peak_in(
-            dir.path(),
-            key,
-            Face::AnalysisServer,
-            3 * GIB / 2,
-            Some(GIB),
-        );
+        record_peak_in(dir.path(), key, Face::AnalysisServer, 3 * GIB / 2, Some(GIB));
         assert_eq!(peak_in(dir.path(), key), Some(3 * GIB / 2));
         // A yield above the record books the higher bound.
         record_peak_floor_at(dir.path(), key, Face::AnalysisServer, 2 * GIB, GIB);
@@ -2797,7 +2932,10 @@ mod tests {
             label: name.into(),
             bytes: 1 << 20,
             pid: None,
-            release: Some(Releasable { pid: owner, busy }),
+            release: Some(Releasable {
+                pid: owner,
+                busy,
+            }),
             slot: true,
             cap: 0,
             sized: true,
@@ -2844,11 +2982,13 @@ mod tests {
             .max_by_key(|holder| holder.since)
             .expect("an active holder");
         assert_eq!(youngest.label, "younger", "the youngest active holder");
-        let mut labels: Vec<&str> = active.iter().map(|holder| holder.label.as_str()).collect();
+        let mut labels: Vec<&str> = active
+            .iter()
+            .map(|holder| holder.label.as_str())
+            .collect();
         labels.sort_unstable();
         assert_eq!(
-            labels,
-            ["older", "younger"],
+            labels, ["older", "younger"],
             "an idle releasable is never an active holder"
         );
     }

@@ -196,6 +196,71 @@ fn local_fn_tear_off_sig(engine: &Engine<'_>, name: StringId) -> Option<super::t
     None
 }
 
+/// The whole-literal span a closed function expression anchors its const
+/// face at: upstream's `FunctionExpression` runs from its own
+/// type-parameter group (or the formals' `(` when it spells none) through
+/// the body's last token — `const a = () {};` reports
+/// `const_initialized_with_non_constant_value` over `() {}` and
+/// `const b = () => 1;` over `() => 1` (the `InvalidConstant.genericError`
+/// node anchor, probed 3.13.7). The parser's close token is not that
+/// extent: a function-expression flavor's arrow body ends AT the `=>`
+/// (`parseExpressionFunctionBody` returns the arrow when no semicolon
+/// belongs to the literal) and no flavor's token covers the head, so the
+/// span extends back over an adjacent `<...>` group and forward over an
+/// arrow body's expression (bracket depth guarded, stopping at the first
+/// depth-zero `;`/`,` or an unbalanced closer — the enclosing
+/// terminator never belongs to the body).
+fn function_expression_whole_span(engine: &Engine<'_>, begin: Token, end: Token) -> SourceRange {
+    use dartq_scanner::TokenKind as Tk;
+    let tokens = engine.tokens.as_slice();
+    let mut start = begin.range.offset;
+    let begin_idx = tokens.partition_point(|t| t.utf16_offset < start);
+    // Back over the literal's own `<...>` group (a plain `>` closer; a
+    // `>>`-scanned closer of nested groups keeps the formals' `(` — the
+    // under-anchor direction, never a wrong span).
+    if begin_idx > 0 && tokens[begin_idx - 1].kind == Tk::Gt {
+        let mut depth = 0i32;
+        for idx in (0..begin_idx - 1).rev() {
+            match tokens[idx].kind {
+                Tk::Gt => depth += 1,
+                Tk::Lt if depth == 0 => {
+                    start = tokens[idx].utf16_offset;
+                    break;
+                }
+                Tk::Lt => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    let mut finish = end.range.end();
+    let end_idx = tokens.partition_point(|t| t.utf16_offset < end.range.offset);
+    if tokens.get(end_idx).is_some_and(|t| t.kind == Tk::Function) {
+        let mut depth = 0i32;
+        let mut last = None;
+        for token in tokens.iter().skip(end_idx + 1) {
+            match token.kind {
+                Tk::OpenParen | Tk::OpenSquare | Tk::OpenCurly => depth += 1,
+                Tk::CloseParen | Tk::CloseSquare | Tk::CloseCurly => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tk::Semicolon | Tk::Comma if depth == 0 => break,
+                _ => {}
+            }
+            last = Some(token);
+        }
+        if let Some(token) = last {
+            finish = engine.utf16_of(token.byte_offset as usize + token.byte_len as usize);
+        }
+    }
+    SourceRange {
+        offset: start,
+        length: finish - start,
+    }
+}
+
 /// The formal-list member kinds a `DeclKind::Member` executable carries
 /// (methods, getters, setters — constructors' `Factory`/
 /// `PrimaryConstructor` lists never join a member face): the gate that
@@ -687,7 +752,12 @@ impl DiagnoseListener<'_> {
             Ty::Record { .. } | Ty::Function { .. } => {
                 face.render(&engine.strings, &engine.boundary.pool())
             }
-            Ty::Named { name, .. } => engine.strings.resolve(*name).to_owned(),
+            // The full render (type arguments included): the oracle prints
+            // the matched type verbatim (`case [...< 0]` over a dynamic
+            // scrutinee reports `List<dynamic>`, resolver.dart's
+            // `typePropertyResolver.resolve` message carries the written
+            // type) — a bare name drops the arguments.
+            Ty::Named { .. } => face.render(&engine.strings, &engine.boundary.pool()),
             _ => return,
         };
         engine.emit(
@@ -2657,13 +2727,17 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some((_, window_end)) = engine.pending_tv
             && engine.byte_at(window_end) == Some(b'>')
             && engine.trivia_between(window_end + 1, token.range.offset)
-            && let Some(count) = u16::try_from(engine.bounds.pending_window().map_or(0, <[_]>::len))
-                .ok()
-                .filter(|count| *count > 0)
+            && let Some(group) = engine.pending_window_group()
+            && let Some(count) = u16::try_from(group.len()).ok().filter(|count| *count > 0)
             && let Some(capture) = engine.closure_caps.last_mut()
             && capture.offset == token.range.offset
         {
             capture.type_params = count;
+            // The mapped group rides beside the count: the context path's
+            // final type spells the literal's declared `<T extends B>`
+            // verbatim (the official `staticType`), so the
+            // `relateTypeParameters` equality leg compares real bounds.
+            capture.type_param_group = group;
         }
         // The completion arm rides the same context: the context
         // function's return arms the literal's frame (the official
@@ -2677,7 +2751,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let engine = &mut self.engine;
         let literal_ty = engine.closure_capture_end(end.range.end());
-        engine.const_capture.end_opaque_group(end.range);
+        engine
+            .const_capture
+            .end_opaque_group(function_expression_whole_span(engine, begin, end));
         // The completion staging reads the literal's frame (the context
         // return armed at the begin, the body brace, the modifiers)
         // before it pops.
@@ -2939,6 +3015,49 @@ impl ParserListener for DiagnoseListener<'_> {
             // its spelled annotation — the slot is not `Unknown`.
             if self.engine.local_declared_ty(*name) == Some(Ty::UNKNOWN) {
                 self.engine.bind_var_type(*name, sem_ty.clone());
+            }
+            // The void-element arm (`_checkForEachParts`'s
+            // `sequenceElementType is VoidType && variableType is!
+            // VoidType`, error_verifier.dart): iterating a `List<void>`-
+            // shaped sequence implicitly assigns each element to the loop
+            // variable — a non-`void` variable consumes the value, so the
+            // ITERABLE itself reports `use_of_void_result` (anchored at
+            // the iterable's use-site span, the same anchor the iterable's
+            // own void face takes). Both spellings fold the alias (a
+            // typedef-`void` element counts, #3799); a `void`-spelled or
+            // inferred (`var x` over a void element) loop variable
+            // discards the element and stays silent. A `_`-shaped binder
+            // registers no local, so the variable's face re-derives from
+            // the written annotation behind the name token.
+            let loop_var_ty = self
+                .engine
+                .local_declared_ty(*name)
+                .filter(|ty| *ty != Ty::UNKNOWN)
+                .or_else(|| {
+                    self.engine
+                        .backward_type_text(name_tok.offset)
+                        .and_then(|text| self.engine.parse_annotation_ty(&text))
+                });
+            if self.engine.is_void_spelling(self.engine.fold_alias_ty(sem_ty.clone()))
+                && matches!(loop_var_ty, Some(var_ty)
+                    if !self.engine.is_void_spelling(self.engine.fold_alias_ty(var_ty)))
+            {
+                let range = self
+                    .engine
+                    .single_row_since(mark)
+                    .map(|(_, _, range)| range)
+                    .map(|range| {
+                        self.engine
+                            .rows
+                            .iter()
+                            .rev()
+                            .find(|row| row.range == range)
+                            .map(|row| self.engine.use_site_range(row))
+                            .unwrap_or(range)
+                    });
+                if let Some(range) = range {
+                    self.engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
+                }
             }
             match staged {
                 dartq_flow::ty::StagedArg::Named {
@@ -6537,8 +6656,17 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let engine = &mut self.engine;
         engine.nsm_poison();
-        let Some(text) = engine.text_of(operator) else {
-            return;
+        let text = match engine.text_of(operator) {
+            // A parser-inserted synthetic has no scanner-table entry and no
+            // source bytes (ids past the scan are partitioned to the
+            // parser's side table). The only synthetic binary operator is
+            // the `>>>` re-glue under `no-triple-shift`
+            // (`parse_triple_shift_binary_rest`, mirroring upstream
+            // `replaceNextTokensWithSyntheticToken`,
+            // parser_impl.dart:7386-7402); the merged `>>>=` twin reaches
+            // `handle_assignment_expression`, never this hook.
+            None => ">>>",
+            Some(text) => text,
         };
         // The binary-operator junction (`binary_expression_resolver.dart:
         // 442`): the left operand's row is complete at the operator token.
@@ -6573,16 +6701,20 @@ impl ParserListener for DiagnoseListener<'_> {
         if USER_OPERATORS.contains(&text) {
             // `>>>` / `>>>=` re-glue under `no-triple-shift` (`@dart=2.12`):
             // the scanner splits `>>>` into `>>`+`>` and `>>>=` into
-            // `>>=`+`>`, and the parser does NOT re-glue (upstream Dart SDK
-            // source, pkg/front_end `handleExperimentNotEnabled`). The
-            // oracle's `undefined_operator '>>>'` anchors at the `>>`/`>>=`
-            // position len 0 — the synthetic re-glued token's range. The
-            // `>`'s own `mark_operator` is a no-op on an already-marked
-            // row (the `_ => {}` arm keeps the `>>`/`>>=` consult), so the
+            // `>>`+`>=` (`scan_greater_than`'s gated third `>` — maximal
+            // munch stops at `>>`, the `=` joins the third `>`), and the
+            // parser does NOT re-glue (upstream Dart SDK source,
+            // pkg/front_end `handleExperimentNotEnabled`). The oracle's
+            // `undefined_operator '>>>'` anchors at the `>>` position len
+            // 0 — the synthetic re-glued token's range (probed 3.13.7:
+            // BOTH the binary `foo >>> 42` and the compound `foo >>>= 42`
+            // report `'>>>'` at the `>>` start, length 0). The trailing
+            // token's own `mark_operator` is a no-op on an already-marked
+            // row (the `_ => {}` arm keeps the `>>` consult), so the
             // re-glue rewrites the operand's intent to the oracle's
-            // spelling. Byte-adjacent only: a spaced `>> >` is two real
-            // operators.
-            let reglue = if text == ">"
+            // spelling. Byte-adjacent only: a spaced `>> >` / `>> >=` is
+            // two real operators.
+            let reglue = if (text == ">" || text == ">=")
                 && let Some(prev) = (operator.id as usize)
                     .checked_sub(1)
                     .and_then(|i| engine.tokens.get(i))
@@ -6721,7 +6853,18 @@ impl ParserListener for DiagnoseListener<'_> {
             // composite's own extent is statically `bool` — the
             // `non_bool_condition` checkpoint's top row sits inside it.
             Some("&&" | "||") => {
-                if let Some(right) = engine.rows.last().cloned() {
+                if let Some(mut right) = engine.rows.last().cloned() {
+                    // The operand's own extent: a member-invocation right
+                    // operand leaves its SELECTOR row on top (`e.same(x)`,
+                    // `const Equality<Apple>().same(x)` — the send stages
+                    // no composite row), a span that neither abuts the
+                    // operator nor covers the argument group; the
+                    // retargeted extent lets the junction walk below find
+                    // the operator and anchor `non_bool_operand` at the
+                    // whole operand (the oracle's `.at(operand)`,
+                    // binary_expression_resolver.dart:81-92).
+                    right.range =
+                        engine.operand_extent_after(operator.range.end(), right.range);
                     // #3240: the fold below reports BOTH operands of the
                     // lazy boolean operators (`fold_binary` runs
                     // `checkForUseOfVoidResult` on the pair), so a `void`
@@ -8077,7 +8220,7 @@ impl ParserListener for DiagnoseListener<'_> {
             && let Some(annotation) = engine.pending_annotations.last().map(|a| a.name)
         {
             let args = level.args.clone();
-            engine.check_annotation_arguments(annotation, &args);
+            engine.check_annotation_arguments(annotation, end.range, &args);
         }
         engine.close_arguments(u16::try_from(count).unwrap_or(u16::MAX), end.range);
         // The constant-pattern object shape (`case const A():`) never fires
@@ -10929,6 +11072,11 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         // `ListLiteral` is in the official used set.
         engine.ur_seal_used();
+        // One expression node: the argument-window run split never treats
+        // an interior element row as a sibling argument boundary.
+        engine
+            .literal_extents
+            .push((left.range.offset, right.range.end()));
         // No begin event brackets a list literal: the close poisons (the
         // body expression was the literal, never the bare shape).
         engine.nsm_poison();
@@ -10951,6 +11099,8 @@ impl ParserListener for DiagnoseListener<'_> {
             let payload = engine
                 .literal_payload(&elements)
                 .map(|values| ConstantValue::List(values.into()));
+            let deferred = (failed.is_none() && payload.is_none())
+                .then(|| crate::const_eval::Expr::List(elements.iter().cloned().collect()));
             engine.push_literal_value(
                 failed,
                 right.range,
@@ -10960,6 +11110,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 },
                 crate::const_eval::InstanceKind::List,
                 payload,
+                deferred,
             );
         }
         // The void-operand use (upstream `literal_element_verifier.dart`
@@ -11101,6 +11252,12 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         // `SetOrMapLiteral`/`MapLiteralEntry` are in the official used set.
         engine.ur_seal_used();
+        // One expression node: the argument-window run split never treats
+        // an interior row (a for-element's iterable, an entry's key/value)
+        // as a sibling argument boundary.
+        engine
+            .literal_extents
+            .push((left.range.offset, right.range.end()));
         // The literal's resolved kind (`_inferSetOrMapLiteralType`):
         // a `Map` context dominates, then the leaves' can-be/must-be
         // fold, then a set context's iterable fallback. `None` is the
@@ -11211,6 +11368,8 @@ impl ParserListener for DiagnoseListener<'_> {
                         );
                     }
                     let payload = engine.map_payload(&parts);
+                    let deferred = (failed.is_none() && payload.is_none())
+                        .then(|| crate::const_eval::Expr::Map(parts.iter().cloned().collect()));
                     engine.push_literal_value(
                         failed,
                         right.range,
@@ -11220,6 +11379,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         },
                         InstanceKind::Map,
                         payload,
+                        deferred,
                     );
                 }
                 SetOrMap::Set(elements) => {
@@ -11264,6 +11424,8 @@ impl ParserListener for DiagnoseListener<'_> {
                     let payload = engine
                         .literal_payload(&elements)
                         .map(|values| ConstantValue::Set(values.into()));
+                    let deferred = (failed.is_none() && payload.is_none())
+                        .then(|| crate::const_eval::Expr::Set(elements.iter().cloned().collect()));
                     engine.push_literal_value(
                         failed,
                         right.range,
@@ -11273,6 +11435,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         },
                         InstanceKind::Set,
                         payload,
+                        deferred,
                     );
                 }
             }
@@ -11685,15 +11848,23 @@ impl ParserListener for DiagnoseListener<'_> {
             .record_marks
             .last()
             .map_or(u32::MAX, |(_, open)| open.range.offset);
+        // One expression node: the argument-window run split never treats
+        // an interior field row as a sibling argument boundary.
+        if open_offset != u32::MAX {
+            engine.literal_extents.push((open_offset, token.range.end()));
+        }
         if let Some(fields) = engine.const_capture.record_literal(count, token.range) {
             let failed = engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
             let payload = engine.record_payload(&fields, &names);
+            let deferred = (failed.is_none() && payload.is_none())
+                .then(|| crate::const_eval::Expr::Record(fields.iter().cloned().collect()));
             engine.push_literal_value(
                 failed,
                 token.range,
                 token.range,
                 crate::const_eval::InstanceKind::Record,
                 payload,
+                deferred,
             );
         }
         // The literal's row: a single positional field whose type the field
@@ -14132,8 +14303,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.ur_seal_used();
     }
 
-    fn end_switch_case_when_clause(&mut self, token: Token) {
-        self.flow().end_switch_case_when_clause(token);
+    fn end_switch_case_when_clause(&mut self, token: Token) {        self.flow().end_switch_case_when_clause(token);
         // `WhenClause` is in the official used set (the guard expression).
         self.engine.ur_seal_used();
     }

@@ -1428,6 +1428,7 @@ pub fn fold_unit_with_ops<'t>(
             features.variance_enabled,
             field_promotion_enabled,
             features.patterns_enabled,
+            features.triple_shift_enabled,
             strict,
             class_modifiers,
             ops,
@@ -2854,6 +2855,7 @@ pub fn fold_unit_with_ops<'t>(
         &mut report.diagnostics,
         &engine.read_types,
         tokens,
+        strings,
         graph,
         namespaces,
         index,
@@ -4446,6 +4448,7 @@ fn gate_invalid_scrutinee_switches(
     diagnostics: &mut Vec<Diagnostic>,
     read_types: &[(SourceRange, Ty)],
     tokens: &TokenTable,
+    strings: &StringTable,
     graph: &LibraryGraph,
     namespaces: &Namespaces,
     index: &ElementIndex,
@@ -4478,7 +4481,7 @@ fn gate_invalid_scrutinee_switches(
             return true;
         };
         *resolvable.entry(name).or_insert_with(|| {
-            !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
+            !scrutinee_head_is_invalid(graph, namespaces, index, strings, lib, file, name)
         })
     })
 }
@@ -4502,6 +4505,7 @@ fn scrutinee_head_is_invalid(
     graph: &LibraryGraph,
     namespaces: &Namespaces,
     index: &ElementIndex,
+    strings: &StringTable,
     lib: LibraryId,
     file: FileId,
     name: StringId,
@@ -4509,10 +4513,32 @@ fn scrutinee_head_is_invalid(
     if resolve_container(graph, namespaces, index, lib, file, name).is_some() {
         return false;
     }
+    // An in-scope TYPE PARAMETER head (a method's own `<T extends St>`):
+    // the collector indexes the parameter's declaration while the library
+    // graph's namespace build skips `MicroKind::TypeParam` rows, so the
+    // lookup below misses — but the oracle's scope lookup finds the
+    // parameter element (a real `TypeParameterType`, never `InvalidType`),
+    // and the switch's exhaustiveness verdict runs over it (probed 3.13.7:
+    // `T extends St` reports `non_exhaustive_switch_statement` naming the
+    // missing enum constant).
+    if index
+        .get(file)
+        .is_some_and(|elements| elements.decl(name).is_some_and(|d| d.kind == MicroKind::TypeParam))
+    {
+        return false;
+    }
     let Lookup::Found(NamespaceEntry::Decl(owner)) =
         namespaces.lookup_in_file(graph, lib, Some(file), name)
     else {
-        return true;
+        // A `FutureOr` spelling the namespace cannot place is the
+        // dart:async union's import face, never the oracle's
+        // `InvalidType`: the official world always mounts dart:async, and
+        // the exhaustiveness faces treat an unshadowed `FutureOr` head as
+        // the union throughout (`switch_tracker`'s `future_or_shadowed`).
+        // A file with no async import never reaches here — the
+        // annotation's own `undefined_class` face leaves the scrutinee
+        // unresolved and the switch face suppressed upstream of this gate.
+        return strings.resolve(name) != "FutureOr";
     };
     match index.get(owner) {
         // The declaring unit was never analyzed — a resolved declaration
@@ -4696,7 +4722,7 @@ fn synthesize_invalid_scrutinee_dead_cases(
             continue;
         };
         if *resolvable.entry(name).or_insert_with(|| {
-            !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
+            !scrutinee_head_is_invalid(graph, namespaces, index, strings, lib, file, name)
         }) {
             continue;
         }
@@ -4808,7 +4834,7 @@ fn synthesize_invalid_scrutinee_dead_cases(
             }
             let name = strings.intern(tokens.lexeme(source, p));
             if *resolvable.entry(name).or_insert_with(|| {
-                !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
+                !scrutinee_head_is_invalid(graph, namespaces, index, strings, lib, file, name)
             }) && !object_pattern_property_invalid(
                 slice,
                 tokens,
@@ -5047,7 +5073,7 @@ fn object_pattern_property_invalid(
         };
         if let Ty::Named { name, .. } = ty
             && !*resolvable.entry(name).or_insert_with(|| {
-                !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
+                !scrutinee_head_is_invalid(graph, namespaces, index, strings, lib, file, name)
             })
             && !resolves_as_core_type(strings.resolve(name))
         {
@@ -5265,7 +5291,7 @@ fn synthesize_unknown_scrutinee_dead_cases(
                         || (!statement
                             && !resolves_as_core_type(strings.resolve(name))))
                     && !*resolvable.entry(name).or_insert_with(|| {
-                        !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
+                        !scrutinee_head_is_invalid(graph, namespaces, index, strings, lib, file, name)
                     })
             }
             Ty::Named { name, .. } => {
@@ -5561,7 +5587,7 @@ fn switch_clause_absorber(
         }
         let name = strings.intern(tokens.lexeme(source, p));
         if *resolvable.entry(name).or_insert_with(|| {
-            !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
+            !scrutinee_head_is_invalid(graph, namespaces, index, strings, lib, file, name)
         }) && !object_pattern_property_invalid(
             slice, tokens, source, strings, p, graph, namespaces, index, file, lib, name,
             resolvable,
