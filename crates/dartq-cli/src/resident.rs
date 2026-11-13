@@ -245,6 +245,14 @@ pub(crate) fn read_frame(
     serde_json::from_slice(&body).map_err(|error| ReadError::Malformed(error.to_string()))
 }
 
+/// The most body bytes one frame header may announce: the analyzer-host
+/// face path's `MAX_FACE_BYTES` cap (1 GiB) mirrored on the resident
+/// transport. That constant is `pub(crate)` to `dartq-analyzer-host`, so
+/// the number is restated here rather than imported; both paths refuse an
+/// over-cap announcement with their structured error, so no wire-driven
+/// allocation is ever unbounded.
+const MAX_FRAME_BODY_BYTES: usize = 1 << 30;
+
 /// Reads one Content-Length framed message's raw body bytes — the
 /// framed reader's unparsed half (#4190): the header scan is the
 /// transport's own (#4260); the body returns without a JSON parse for
@@ -252,6 +260,16 @@ pub(crate) fn read_frame(
 pub(crate) fn read_frame_body(
     stream: &mut UnixStream,
     pending: &mut Vec<u8>,
+) -> Result<Vec<u8>, ReadError> {
+    read_frame_body_capped(stream, pending, MAX_FRAME_BODY_BYTES)
+}
+
+/// [`read_frame_body`] with the announcement cap as a parameter — the
+/// test seam for the over/under-cap arms without a gigabyte fixture.
+fn read_frame_body_capped(
+    stream: &mut UnixStream,
+    pending: &mut Vec<u8>,
+    cap: usize,
 ) -> Result<Vec<u8>, ReadError> {
     let map_error = |error: std::io::Error| {
         if matches!(
@@ -308,6 +326,14 @@ pub(crate) fn read_frame_body(
             })
         })
         .ok_or_else(|| ReadError::Malformed("missing Content-Length".to_owned()))?;
+    // Fail closed before allocating or reading anything: an announcement
+    // over the cap is a corrupt or mismatched peer, and the caller's
+    // Malformed arm drops the connection (the cold fallback behind it).
+    if length > cap {
+        return Err(ReadError::Malformed(format!(
+            "frame announces {length} bytes, over the {cap}-byte cap"
+        )));
+    }
     // The chunk may already carry body bytes — this frame's start, and
     // (rarely, when a read spans a frame boundary) the next frame's
     // leading bytes, which return to `pending`.
@@ -2794,5 +2820,60 @@ mod tests {
             String::from_utf8_lossy(&after)
         );
         teardown(&root);
+    }
+
+    /// The frame reader's announcement cap (#4276): an over-cap
+    /// Content-Length is the structured Malformed arm — nothing is
+    /// allocated and nothing is read, matching the analyzer-host face
+    /// path's over-cap refusal. The body is never sent: a reader that
+    /// honored the announcement would block on it and surface as
+    /// `Wedged` under the deadline, so the Malformed verdict doubles as
+    /// the fail-closed proof.
+    #[test]
+    fn read_frame_body_refuses_an_announcement_over_the_cap() {
+        let (mut mine, mut theirs) = UnixStream::pair().expect("socketpair");
+        let announced = MAX_FRAME_BODY_BYTES + 1;
+        write!(mine, "Content-Length: {announced}\r\n\r\n").expect("write header");
+        mine.flush().expect("flush");
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout");
+        let answer = read_frame_body(&mut theirs, &mut Vec::new());
+        let expected = format!(
+            "frame announces {announced} bytes, over the {MAX_FRAME_BODY_BYTES}-byte cap"
+        );
+        assert!(
+            matches!(
+                &answer,
+                Err(ReadError::Malformed(message)) if *message == expected
+            ),
+            "an over-cap announcement fails closed: {answer:?}"
+        );
+    }
+
+    /// The cap's boundary (#4276): the announcement check is strictly
+    /// greater, so a body exactly at the cap and one just under it read
+    /// whole — the cap refuses only what it must. The cap rides as a
+    /// parameter to exercise the boundary without a gigabyte fixture.
+    #[test]
+    fn read_frame_body_reads_frames_at_and_under_the_cap() {
+        let cap = 64;
+        let (mut mine, mut theirs) = UnixStream::pair().expect("socketpair");
+        let under = vec![b'u'; cap - 1];
+        let at = vec![b'a'; cap];
+        // One write, both frames: the second also exercises the carried
+        // overlap beside the boundary.
+        for body in [&under, &at] {
+            write!(mine, "Content-Length: {}\r\n\r\n", body.len()).expect("write header");
+            mine.write_all(body).expect("write body");
+        }
+        mine.flush().expect("flush");
+        let mut leftover = Vec::new();
+        let first =
+            read_frame_body_capped(&mut theirs, &mut leftover, cap).expect("a body under the cap");
+        assert_eq!(first, under, "one byte under the cap reads whole");
+        let second =
+            read_frame_body_capped(&mut theirs, &mut leftover, cap).expect("a body at the cap");
+        assert_eq!(second, at, "a body at the cap reads whole");
     }
 }
