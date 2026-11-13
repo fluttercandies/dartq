@@ -3922,6 +3922,11 @@ pub(crate) struct Engine<'a> {
     /// friends are plain type positions, never the catch clause's `on`
     /// head.
     pub(crate) record_type_depth: u32,
+    /// The use-site capture's record level's node count at each open field
+    /// entry — [`crate::capture::TreeSink::record_entry_end`]'s hole marks,
+    /// one per open record (a record nested as a field keeps its parent's
+    /// mark under its own).
+    pub(crate) bounds_record_marks: Vec<usize>,
     /// Null-aware chains over definitely-unassigned nullable locals (the
     /// `_verifyUnassignedVariable` face, dead_code_verifier.dart:460-505):
     /// `(operator offset, chain end, receiver read span, root kind, grown by

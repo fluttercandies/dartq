@@ -1470,6 +1470,75 @@ impl<'a> Bounds<'a> {
         Some(site.done)
     }
 
+    /// A record type opened inside the use-site capture (`List<(int,
+    /// int)>`): the field list opens its own level on the site sink, so
+    /// the completed node folds into the enclosing argument group as one
+    /// record tree — the same first-class posture [`Self::begin_function`]
+    /// holds for function types. A record inside a bound window, a
+    /// container clause or the typedef RHS opens nothing here: those
+    /// captures keep [`Self::poison`]'s under-report posture.
+    pub(crate) fn begin_record(&mut self) {
+        if self.bound_sink.is_none()
+            && self.header.is_none()
+            && self.alias.is_none()
+            && let Some(site) = self.site.as_mut()
+        {
+            site.begin_record();
+        }
+    }
+
+    /// The record level's node count — [`TreeSink::record_entry_end`]'s mark.
+    pub(crate) fn record_entry_mark(&self) -> usize {
+        if self.bound_sink.is_some() || self.header.is_some() || self.alias.is_some() {
+            return 0;
+        }
+        self.site.as_ref().map_or(0, TreeSink::record_entry_mark)
+    }
+
+    /// One record field closed: a recovered hole entry still holds its
+    /// slot, so the record's arity stays honest.
+    pub(crate) fn record_entry_end(&mut self, mark: usize, range: SourceRange) {
+        if self.bound_sink.is_some() || self.header.is_some() || self.alias.is_some() {
+            return;
+        }
+        if let Some(site) = self.site.as_mut() {
+            site.record_entry_end(mark, range);
+        }
+    }
+
+    /// One record field's written name (the named region's entries pair at
+    /// the record's close).
+    pub(crate) fn record_field_name(&mut self, name: Option<StringId>) {
+        if self.bound_sink.is_some() || self.header.is_some() || self.alias.is_some() {
+            return;
+        }
+        if let Some(site) = self.site.as_mut() {
+            site.record_field_name(name);
+        }
+    }
+
+    /// The record's `{...}` named region closed with its entry count.
+    pub(crate) fn record_named_region(&mut self, count: usize) {
+        if self.bound_sink.is_some() || self.header.is_some() || self.alias.is_some() {
+            return;
+        }
+        if let Some(site) = self.site.as_mut() {
+            site.record_named_region(count);
+        }
+    }
+
+    /// The record type closed: the captured fields fold into one record
+    /// node feeding the enclosing argument group (or the parent record's
+    /// pending field).
+    pub(crate) fn end_record(&mut self, nullable: bool, end: SourceRange) {
+        if self.bound_sink.is_some() || self.header.is_some() || self.alias.is_some() {
+            return;
+        }
+        if let Some(site) = self.site.as_mut() {
+            site.end_record(nullable, end);
+        }
+    }
+
     /// A function type opened inside an open capture window: the shape's
     /// columns open their own level, so the completed node folds into a
     /// first-class function tree (`Handle Function()` survives as a
@@ -1629,18 +1698,17 @@ impl<'a> Bounds<'a> {
         }
     }
 
-    /// An unmodelable shape inside any open capture.
+    /// A record type opened inside any open capture. The bound windows and
+    /// the container clauses carry no record node in their trees, so they
+    /// poison — the under-report direction, never a field list spliced
+    /// into the enclosing argument group. The use-site capture models the
+    /// record first-class ([`Self::begin_record`]).
     pub(crate) fn poison(&mut self) {
         if let Some((_, header)) = self.header.as_mut() {
             header.sink.poison();
         }
         if let Some(sink) = self.bound_sink.as_mut() {
             sink.poison();
-        }
-        if self.alias.is_none()
-            && let Some(site) = self.site.as_mut()
-        {
-            site.poison();
         }
     }
 

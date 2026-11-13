@@ -1772,6 +1772,10 @@ impl ParserListener for DiagnoseListener<'_> {
         let depth = std::mem::take(&mut self.engine.type_arg_depth);
         self.engine.type_arg_depth_saved.push(depth);
         self.engine.bounds.poison();
+        // The use-site capture models the record first-class (#4279): a
+        // record type argument (`List<(int, int)>`) folds into one record
+        // node instead of splicing its field types into the group.
+        self.engine.bounds.begin_record();
         // A record RHS is outside the alias model (#1351).
         self.engine.bounds.alias_poison();
         self.engine.var_begin_record_type();
@@ -1871,6 +1875,16 @@ impl ParserListener for DiagnoseListener<'_> {
             offset: left_paren.range.offset,
             length: closer_end - left_paren.range.offset,
         });
+        // The use-site capture's record level closes with the same extent
+        // (#4279): the node folds into the enclosing argument group as one
+        // record tree instead of spliced field leaves.
+        engine.bounds.end_record(
+            question.is_some(),
+            SourceRange {
+                offset: left_paren.range.offset,
+                length: closer_end - left_paren.range.offset,
+            },
+        );
         // The pattern faces' `pattern.type` anchor widens to the whole
         // written record node (`(String,)` at `(`, resolver.dart:624-653
         // reports `.at(pattern.type)`): the last field's head armed the
@@ -1894,12 +1908,18 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_record_type_entry(&mut self, _first: Token) {
-        if let Some(level) = self.engine.record_ty_stack.last_mut() {
+        let engine = &mut self.engine;
+        if let Some(level) = engine.record_ty_stack.last_mut() {
             level.pending = None;
         }
+        // The use-site capture's field-entry mark (#4279): the hole splice
+        // at the entry's close reads it. Nested records stack their marks,
+        // so an enclosing field's mark survives its inner record's entries.
+        let mark = engine.bounds.record_entry_mark();
+        engine.bounds_record_marks.push(mark);
     }
 
-    fn end_record_type_entry(&mut self, _last: Token) {
+    fn end_record_type_entry(&mut self, last: Token) {
         let engine = &mut self.engine;
         if let Some(level) = engine.record_ty_stack.last_mut() {
             // A recovered hole (`(int, ,)`) never latched a pending type —
@@ -1909,18 +1929,24 @@ impl ParserListener for DiagnoseListener<'_> {
                 .fields
                 .push(level.pending.take().unwrap_or(Ty::Unknown));
         }
+        let mark = engine.bounds_record_marks.pop().unwrap_or(0);
+        engine.bounds.record_entry_end(mark, last.range);
     }
 
     fn handle_no_name(&mut self, _token: Token) {
-        if let Some(level) = self.engine.record_ty_stack.last_mut() {
+        let engine = &mut self.engine;
+        if let Some(level) = engine.record_ty_stack.last_mut() {
             level.names.resize(level.fields.len() + 1, None);
         }
+        engine.bounds.record_field_name(None);
     }
 
     fn end_record_type_named_fields(&mut self, count: usize, _left_brace: Token) {
-        if let Some(level) = self.engine.record_ty_stack.last_mut() {
+        let engine = &mut self.engine;
+        if let Some(level) = engine.record_ty_stack.last_mut() {
             level.named_count = count;
         }
+        engine.bounds.record_named_region(count);
     }
 
     /// Official `beginFormalParameter`: the written `required` keyword
@@ -5132,6 +5158,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         *slot = name;
                     }
                 }
+                engine.bounds.record_field_name(name);
             }
             _ => {}
         }
@@ -11190,8 +11217,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // `return_of_invalid_type`) ask their assignability question of it
         // exactly like a typed expression. The row spans the whole literal
         // — `const`/`>`-start through the `]` — matching the oracle's
-        // listLiteral anchor.
-        if typed.is_some() {
+        // listLiteral anchor. A group the flat reader declines but the
+        // recursive parse spells (a record argument, `<(int, int)>[]`)
+        // enters too — its `ty` comes from the rebuild below (#4279).
+        if typed.is_some() || engine.group_needs_recursive_parse(left) {
             let span_start = const_keyword.map_or_else(
                 || {
                     // Locate the `<` group's head byte for the anchor's
@@ -11226,10 +11255,12 @@ impl ParserListener for DiagnoseListener<'_> {
             };
             // The written group's nested arguments collapse under the
             // helper's flat segment scan (the segment's LAST type-use
-            // wins — `<List<int>>` reads its element as `int`): a nested
-            // group rebuilds through the recursive parse (#2317②), an
-            // unspellable shape keeps the row opaque.
-            let ty = if engine.group_has_nested_args(left) {
+            // wins — `<List<int>>` reads its element as `int`; a record
+            // argument `<(int, int)>` degrades the same way, #4279): a
+            // nested or record-shaped group rebuilds through the
+            // recursive parse (#2317②), an unspellable shape keeps the
+            // row opaque.
+            let ty = if engine.group_needs_recursive_parse(left) {
                 engine
                     .literal_group_args(left)
                     .and_then(|args| match args.as_slice() {
@@ -11501,7 +11532,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // stays assignability-only. The written group supplies the gate
         // (an untyped literal's inferred element face is not modeled here,
         // so its leaves stay silent).
-        let nested = engine.group_has_nested_args(left);
+        let nested = engine.group_needs_recursive_parse(left);
         let helper_typed = engine.typed_set_or_map_literal_ty(left);
         let (mut element, mut key, mut value) = (None, None, None);
         if !nested && let Some((_, Ty::Named { args, .. })) = helper_typed.as_ref() {
@@ -14965,7 +14996,14 @@ impl Engine<'_> {
     /// Whether the typed literal's written `<...>` group carries nested
     /// type arguments — the collapse repair's trigger (the flat segment
     /// scan attributes nested groups' type-uses to the wrong segment).
-    pub(crate) fn group_has_nested_args(&self, left: Token) -> bool {
+    /// Whether the written `<...>` group ahead of a typed literal needs
+    /// the recursive parse ([`Self::literal_group_args`]) instead of the
+    /// flat single-type-use readers ([`Self::typed_list_literal_ty`]):
+    /// a nested `<...>` argument whose head the flat scan would mis-take
+    /// for the element, or a record-shaped argument (`<(int, int)>[]`) —
+    /// the flat reader borrows a field's type-use and degrades the face
+    /// (#2317②, #4279).
+    pub(crate) fn group_needs_recursive_parse(&self, left: Token) -> bool {
         let Some(head) = typed_group_head(self, left) else {
             return false;
         };
@@ -14981,6 +15019,7 @@ impl Engine<'_> {
                     depth += 1;
                 }
                 b'>' => depth = depth.saturating_sub(1),
+                b'(' if depth == 0 => return true,
                 _ => {}
             }
         }
@@ -15037,6 +15076,16 @@ impl Engine<'_> {
     fn parse_type_arg(&self, start: usize, end: usize, allow_missing: bool) -> Option<Ty> {
         let bytes = self.source.as_bytes();
         let start = trim_ws(bytes, start, end);
+        // A record-type argument (`<(int, int)>[]`, `Map<K, ({int a})>`
+        // values): the field list parses like the annotation capture
+        // folds it (#4279) — positional fields, one trailing `{...}`
+        // named region, an optional adjacent `?` — so the typed literal's
+        // element face IS the record.
+        if bytes.get(start) == Some(&b'(')
+            && let Some(ty) = self.parse_record_type_arg(start, end, allow_missing)
+        {
+            return Some(ty);
+        }
         // The head is the segment's FIRST type-use (textual order — the
         // head precedes its arguments; the prefix form `p.C` ships one use
         // at `C`).
@@ -15115,6 +15164,149 @@ impl Engine<'_> {
             nullable,
             args,
         })
+    }
+
+    /// A record-type spelling inside a written `<...>` group (the typed
+    /// literal's element face, `<(int, int)>[]` — #4279): `(` through its
+    /// balanced `)`, the positional field segments then one trailing
+    /// `{...}` named region, an optional adjacent `?`. Mirrors the
+    /// annotation capture's fold ([`crate::capture::TreeSink::end_record`])
+    /// — a recovery hole keeps its slot as [`Ty::Unknown`] so the arity
+    /// stays honest, a legal trailing comma adds no field.
+    fn parse_record_type_arg(&self, start: usize, end: usize, allow_missing: bool) -> Option<Ty> {
+        let bytes = self.source.as_bytes();
+        let mut depth = 0usize;
+        let mut close = None;
+        let mut i = start;
+        while i < end {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let close = close?;
+        let mut after = close + 1;
+        while after < end && bytes[after].is_ascii_whitespace() {
+            after += 1;
+        }
+        let mut nullable = false;
+        if after < end && bytes[after] == b'?' {
+            nullable = true;
+            after += 1;
+            while after < end && bytes[after].is_ascii_whitespace() {
+                after += 1;
+            }
+        }
+        if after != end {
+            return None;
+        }
+        let segments = top_level_comma_segments(bytes, start + 1, close, true);
+        let segment_count = segments.len();
+        let mut positional: Vec<Ty> = Vec::new();
+        let mut named: Vec<(StringId, Ty)> = Vec::new();
+        for (index, (s, e)) in segments.into_iter().enumerate() {
+            let s = trim_ws(bytes, s, e);
+            if s == e {
+                // A legal trailing comma is the last empty segment; a hole
+                // elsewhere keeps its slot (`(int, ,)` — the analyzer
+                // splices InvalidType, arity honest).
+                if index + 1 == segment_count && !positional.is_empty() {
+                    continue;
+                }
+                if positional.is_empty() && named.is_empty() {
+                    return None;
+                }
+                positional.push(Ty::Unknown);
+                continue;
+            }
+            if bytes[s] == b'{' {
+                // The named region — always the last segment, its entries
+                // `Type name` pairing at the record's close.
+                let mut region_end = e;
+                while region_end > s && bytes[region_end - 1].is_ascii_whitespace() {
+                    region_end -= 1;
+                }
+                if bytes.get(region_end - 1) != Some(&b'}') {
+                    return None;
+                }
+                for (ns, ne) in top_level_comma_segments(bytes, s + 1, region_end - 1, true) {
+                    let Some((name, ty)) = self.parse_named_record_field(ns, ne, allow_missing)
+                    else {
+                        return None;
+                    };
+                    named.push((name, ty));
+                }
+                continue;
+            }
+            let ty = self.parse_record_field_type(s, e, allow_missing)?;
+            positional.push(ty);
+        }
+        if positional.is_empty() && named.is_empty() {
+            return None;
+        }
+        Some(
+            self.boundary
+                .args
+                .borrow_mut()
+                .record(&positional, &named, nullable),
+        )
+    }
+
+    /// One positional record field: the segment is the type alone, or the
+    /// type followed by its written name (`int x`) — the name is
+    /// decoration (the official `RecordTypeAnnotation` keeps the
+    /// positional slot nameless for type identity).
+    fn parse_record_field_type(&self, start: usize, end: usize, allow_missing: bool) -> Option<Ty> {
+        if let Some(ty) = self.parse_type_arg(start, end, allow_missing) {
+            return Some(ty);
+        }
+        let (_, e) = self.strip_trailing_identifier(start, end)?;
+        self.parse_type_arg(start, e, allow_missing)
+    }
+
+    /// One named-region entry (`Type name`): the trailing identifier run
+    /// is the field's name; the type parses from the rest of the segment.
+    fn parse_named_record_field(
+        &self,
+        start: usize,
+        end: usize,
+        allow_missing: bool,
+    ) -> Option<(StringId, Ty)> {
+        let (name_start, e) = self.strip_trailing_identifier(start, end)?;
+        let name = self.intern(&self.source[name_start..e]);
+        let ty = self.parse_type_arg(start, name_start, allow_missing)?;
+        Some((name, ty))
+    }
+
+    /// The segment's trailing identifier run (`element` in `Element
+    /// element`): `(start, end)` bounds of the run, `None` when the
+    /// segment ends in anything else (or is the identifier alone).
+    fn strip_trailing_identifier(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        let bytes = self.source.as_bytes();
+        let is_ident = |b: u8| {
+            b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+        };
+        let mut e = end;
+        while e > start && bytes[e - 1].is_ascii_whitespace() {
+            e -= 1;
+        }
+        let run_end = e;
+        let mut run_start = e;
+        while run_start > start && is_ident(bytes[run_start - 1]) {
+            run_start -= 1;
+        }
+        if run_start == run_end || run_start == start {
+            return None;
+        }
+        Some((run_start, run_end))
     }
 
     /// The map literal's entry face

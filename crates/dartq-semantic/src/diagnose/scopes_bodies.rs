@@ -8849,8 +8849,11 @@ impl<'a> Engine<'a> {
     /// keeps the name-only shape — its deeper structure is recovery
     /// residue, never a written fact. A function-form node folds through
     /// its own arm into the interned [`Ty::Function`] (the collector's
-    /// annotation arm applies the same discipline); a poisoned one
-    /// suppresses to [`Ty::Unknown`], never a fabricated shape.
+    /// annotation arm applies the same discipline); a record-form node
+    /// folds into [`Ty::Record`] the same way — the use-site capture's
+    /// `List<(int, int)>` argument is one record shape (#4279). A poisoned
+    /// node or a recovery hole suppresses to [`Ty::Unknown`], never a
+    /// fabricated shape.
     pub(crate) fn tree_ty(&self, tree: &crate::capture::TypeTree) -> Ty {
         if let Some(fn_tree) = tree.function.as_ref() {
             if tree.poisoned {
@@ -8895,6 +8898,32 @@ impl<'a> Engine<'a> {
                     tree.nullable,
                 )
             };
+        }
+        // A record-form node (`List<(int, int)>`'s argument, #4279) folds
+        // into the pool's record shape; the fields convert through the same
+        // walk (a nested record or function field included), and a field
+        // that never completed (a comma hole, `head == NONE`) rides as
+        // `Unknown` — the analyzer's InvalidType splice keeps the arity.
+        if let Some((positional_trees, named_trees)) = tree.record.as_ref() {
+            if tree.poisoned {
+                return Ty::Unknown;
+            }
+            let positional: Vec<Ty> = positional_trees
+                .iter()
+                .map(|field| self.tree_ty(field))
+                .collect();
+            let named: Vec<(StringId, Ty)> = named_trees
+                .iter()
+                .map(|(name, field)| (*name, self.tree_ty(field)))
+                .collect();
+            return self
+                .boundary
+                .args
+                .borrow_mut()
+                .record(&positional, &named, tree.nullable);
+        }
+        if tree.head == StringId::NONE {
+            return Ty::Unknown;
         }
         match self.strings.resolve(tree.head) {
             "dynamic" => return Ty::Dynamic,

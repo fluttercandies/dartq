@@ -7736,6 +7736,13 @@ impl<'a> Engine<'a> {
             // `dynamic`, never the `Unknown` the InvalidType-scrutinee
             // posture keys on.
             Ty::Dynamic => Some((element, dartq_flow::ty::StagedArg::Dynamic)),
+            // A record element (`List<(int, int)>`): the flow lattice
+            // carries no record spelling, so the staged face is the
+            // invalid marker — the loop variable reads `Unknown`, the
+            // under-report direction. The returned `Ty` keeps the real
+            // record: the pattern-head walk dispatches its fields from it
+            // (#4279).
+            Ty::Record { .. } => Some((element, dartq_flow::ty::StagedArg::Invalid)),
             _ => None,
         }
     }

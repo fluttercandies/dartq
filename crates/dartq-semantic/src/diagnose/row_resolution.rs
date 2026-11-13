@@ -5512,6 +5512,31 @@ impl<'a> Engine<'a> {
         if open + 1 >= close || self.tokens.matching_end(open) != Some(close) {
             return None;
         }
+        // A call's argument-list parens are not an expression group: when
+        // the token before the `(` can END a primary (`_pick(..)`,
+        // `a[i](..)`, `..{}(..)`, `super(..)`), the `(` opens an argument
+        // list, and re-deriving the inner span would type the send by its
+        // FIRST ARGUMENT's read row (`_pick(nullableMap, ..)` answering
+        // `Map?` — the declared return is non-null). The send's answer
+        // stays with the callee-keyed legs (the `call_ends` swap).
+        if open > 0 {
+            let mut prev = open - 1;
+            while prev > 0 && tokens[prev].is_synthetic() {
+                prev -= 1;
+            }
+            if !tokens[prev].is_synthetic() {
+                match tokens[prev].kind {
+                    dartq_scanner::TokenKind::Identifier
+                    | dartq_scanner::TokenKind::CloseParen
+                    | dartq_scanner::TokenKind::CloseSquare
+                    | dartq_scanner::TokenKind::CloseCurly => return None,
+                    dartq_scanner::TokenKind::Keyword(
+                        dartq_scanner::Keyword::This | dartq_scanner::Keyword::Super,
+                    ) => return None,
+                    _ => {}
+                }
+            }
+        }
         let begin = tokens[open + 1].utf16_offset;
         let inner = SourceRange {
             offset: begin,
@@ -6464,7 +6489,7 @@ impl<'a> Engine<'a> {
                     // receiver read's non-null static type the same way the
                     // flow-derived arm above does; the receiver's own read
                     // span keys the staged `PromotedPropertyRead` row.
-                    let record = self
+                    let mut record = self
                         .member_reads
                         .binary_search_by(|read| read.offset.cmp(&row.range.offset))
                         .ok()
@@ -6486,10 +6511,13 @@ impl<'a> Engine<'a> {
                     // The promoted-variable face: a bare-read receiver whose
                     // flow promotion stands — `r1 != null` then `r1.i` — the
                     // same stand-down `check_instance_member`'s record arm
-                    // applies. A member receiver read (`x._r.$1`) is the
-                    // promotable-field arm's job; a bare local's `Unknown`
-                    // flow marker (a record spelling carries no `Base` head)
-                    // is strictly non-null for the unchecked verdict.
+                    // applies, `?`-stripping included (a promoted record
+                    // face kept its `?` would bail `record_field_ty` and
+                    // fabricate the miss, #4279). A member receiver read
+                    // (`x._r.$1`) is the promotable-field arm's job; a bare
+                    // local's `Unknown` flow marker (a record spelling
+                    // carries no `Base` head) is strictly non-null for the
+                    // unchecked verdict.
                     if receiver_nullable
                         && let Some(read_span) = self
                             .promoted_recv_reads
@@ -6501,6 +6529,7 @@ impl<'a> Engine<'a> {
                         && (promoted == Ty::Unknown || promoted.is_strictly_non_nullable())
                     {
                         receiver_nullable = false;
+                        record = Self::non_nullable_ty(record);
                     }
                     // The type-literal head (the `dynamic` keyword or an
                     // ungrounded alias spelling) denotes the `Type`

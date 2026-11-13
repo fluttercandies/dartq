@@ -7912,3 +7912,12 @@ mod ticket_3848_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_4202_tests.rs"]
 mod ticket_4202_tests;
+
+/// The #4279 pins: a record type as a written type argument (`List<(int,
+/// int)>`) — the use-site capture folds the record into one record node,
+/// so the for-in element face, awaited `Future<...>` faces and pattern
+/// binders read the real field types (the corpus's `Object?`-faced FP
+/// family root cause).
+#[cfg(test)]
+#[path = "diagnose/ticket_4279_tests.rs"]
+mod ticket_4279_tests;

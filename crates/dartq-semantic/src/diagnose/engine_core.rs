@@ -521,6 +521,7 @@ impl<'a> Engine<'a> {
             cond_case: false,
             if_element_cond: 0,
             record_type_depth: 0,
+            bounds_record_marks: Vec::new(),
             dead_null_chains: Vec::new(),
             null_assert_staged: Vec::new(),
             null_aware_staged: Vec::new(),
