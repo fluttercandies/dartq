@@ -1601,11 +1601,12 @@ impl Pressure {
     }
 
     /// The monitor's one tick. On cadence ([`PRESSURE_SAMPLE`]) reads the
-    /// host's pressure; on [`PRESSURE_LOW_SAMPLES`] consecutive lows under
-    /// the cooldown picks the least-recently-used idle releasable ledger
-    /// holder that is not `own_pid` and releases it (SIGTERM — the holder's
-    /// own shutdown ladder). Returns the released holder's label for the
-    /// caller's note/log, `None` while idle or under cooldown.
+    /// host's pressure; a low sample arms after [`PRESSURE_LOW_SAMPLES`]
+    /// consecutive lows, a critical sample at once. Under the cooldown it
+    /// picks the least-recently-used idle releasable ledger holder that is
+    /// not `own_pid` and releases it (SIGTERM — the holder's own shutdown
+    /// ladder). Returns the released holder's label for the caller's
+    /// note/log, `None` while idle or under cooldown.
     ///
     /// `max_percent` is the resident's configured `memory.max_percent`.
     /// `self_evictable` marks the caller's own state: an analyzer daemon
@@ -1621,26 +1622,52 @@ impl Pressure {
             return None;
         }
         *due = now + PRESSURE_SAMPLE;
-        if !memory_low(max_percent) {
-            self.lows = 0;
-            return None;
+        self.tick_measured(
+            ledger_dir().as_deref(),
+            own_pid,
+            self_evictable,
+            memory_low(max_percent),
+            critical(),
+        )
+    }
+
+    /// The measured tick — the body of [`Pressure::tick`] on a host sample
+    /// the caller supplies: `low` is [`memory_low`], `critical` is
+    /// [`critical`], `dir` the ledger to pick a victim from.
+    ///
+    /// A sample under neither line disarms. The low line keeps its
+    /// [`PRESSURE_LOW_SAMPLES`] debounce. A critical sample is its own
+    /// emergency — free memory under [`critical_floor`] or the kernel's
+    /// level-4 state — so it sheds on the spot rather than wait out the
+    /// low debounce, and being at least as short as a low sample it
+    /// neither extends nor restarts the low streak (#4274).
+    fn tick_measured(
+        &mut self,
+        dir: Option<&Path>,
+        own_pid: u32,
+        self_evictable: bool,
+        low: bool,
+        critical: bool,
+    ) -> Option<String> {
+        if !critical {
+            if !low {
+                self.lows = 0;
+                return None;
+            }
+            self.lows = self.lows.saturating_add(1);
+            if self.lows < PRESSURE_LOW_SAMPLES {
+                return None;
+            }
         }
-        self.lows = self.lows.saturating_add(1);
-        if self.lows < PRESSURE_LOW_SAMPLES {
-            return None;
-        }
-        let dir = ledger_dir()?;
+        let dir = dir?;
         // The cooldown is machine-wide: any resident's last eviction paces
         // every other one's next.
-        if under_cooldown(&dir) {
+        if under_cooldown(dir) {
             return None;
         }
-        let (path, holder) = pick_victim(&dir, own_pid, self_evictable, critical())?;
+        let (path, holder) = pick_victim(dir, own_pid, self_evictable, critical)?;
         self.lows = 0;
-        let _ = fs::write(
-            cooldown_file(&dir),
-            unix_secs(SystemTime::now()).to_string(),
-        );
+        let _ = fs::write(cooldown_file(dir), unix_secs(SystemTime::now()).to_string());
         if !release_holder(&path) {
             return None;
         }
@@ -3078,6 +3105,82 @@ mod tests {
             Some("own".to_string()),
             "the idle other, never the busy self"
         );
+    }
+
+    /// #4274: the tick's gate used to early-return on `!memory_low`, so a
+    /// critical sample with the available figure above the reserve (the
+    /// macOS level-4 state, or free under the critical floor when
+    /// `max_percent` pushes the reserve below it) never reached the victim
+    /// arm the doc promises — the last idle resident sheds itself there.
+    /// A critical-only sample now sheds on its first tick: no low-sample
+    /// accrual and no other victim.
+    #[test]
+    fn a_critical_sample_sheds_with_ample_available_memory() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let (resident, mut child, _busy) =
+            unsized_resident(dir.path(), Face::AnalysisServer, "self-tree", true);
+        let mut pressure = Pressure::default();
+        // low = false (the available figure is fat), critical = true.
+        let released =
+            pressure.tick_measured(Some(dir.path()), std::process::id(), true, false, true);
+        assert_eq!(
+            released.as_deref(),
+            Some("resident analyzer self-tree"),
+            "the lone idle self sheds itself"
+        );
+        let status = child.wait().expect("the resident exits");
+        assert!(!status.success(), "the resident was signalled");
+        drop(resident);
+    }
+
+    /// The low line keeps its two-sample debounce (#4266's guard: one blip
+    /// never sheds a warm resident) and a healthy sample disarms it. A
+    /// critical sample needs no accrual — it sheds immediately.
+    #[test]
+    fn the_low_line_debounces_while_the_critical_line_does_not() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let now = SystemTime::now();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        let _victim = live_record(
+            dir.path(),
+            "idle-tree",
+            child.id(),
+            unix_secs(now),
+            true,
+            now - PRESSURE_UNUSED - Duration::from_secs(20),
+        );
+        let mut pressure = Pressure::default();
+        let own_pid = 1;
+        assert!(
+            pressure
+                .tick_measured(Some(dir.path()), own_pid, true, true, false)
+                .is_none(),
+            "one low sample arms without shedding"
+        );
+        assert!(
+            pressure
+                .tick_measured(Some(dir.path()), own_pid, true, false, false)
+                .is_none(),
+            "a healthy sample disarms"
+        );
+        assert!(
+            pressure
+                .tick_measured(Some(dir.path()), own_pid, true, true, false)
+                .is_none(),
+            "the low streak starts over"
+        );
+        assert_eq!(
+            pressure
+                .tick_measured(Some(dir.path()), own_pid, true, true, false)
+                .as_deref(),
+            Some("resident analyzer idle-tree"),
+            "two consecutive low samples shed"
+        );
+        let status = child.wait().expect("the resident exits");
+        assert!(!status.success(), "the resident was signalled");
     }
 
     /// The cooldown is machine-wide and time-boxed: a fresh timestamp
