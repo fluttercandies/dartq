@@ -353,6 +353,9 @@ impl Journal {
 /// The drain-thread state: the journal, the condvar cookie waiters
 /// block on, the canonical→walked spelling map events are normalized
 /// through, and the watched-path set the sync barrier drops cookies in.
+/// `now` is the module's single time source — every `Instant` the
+/// journal stamps flows through it, so a test can drive the proof and
+/// boundary clocks without a real-time race.
 struct Shared {
     journal: Mutex<Journal>,
     delivered: Condvar,
@@ -368,6 +371,9 @@ struct Shared {
     /// landing means every earlier change on every stream is in the
     /// journal.
     watched: Mutex<Vec<Watch>>,
+    /// The clock every journal timestamp reads — `Instant::now` in
+    /// production, a controllable cell under `cfg(test)`.
+    now: fn() -> Instant,
 }
 
 impl Shared {
@@ -407,7 +413,10 @@ impl Shared {
             if let Some(name) = cookie_name(path) {
                 journal.late.remove(&name);
                 journal.cookies.remove(path);
-                journal.proven = Some(Instant::now());
+                // The proof stamp rides the module clock so a test's
+                // controlled `now` orders it against `health_since`
+                // exactly like production's `Instant::now` does.
+                journal.proven = Some((self.now)());
             } else {
                 journal.dirty_path(self.normalize(path));
             }
@@ -825,7 +834,46 @@ impl Freshness {
     /// settles it); a priming thread that cannot start takes inline
     /// here, the serial construction the daemon always paid, never a
     /// worse one.
+    #[cfg(not(test))]
     pub(crate) fn new(roots: &[PathBuf], packages: Option<&Path>, sdk_home: &Path) -> Self {
+        Self::build(roots, packages, sdk_home, Instant::now)
+    }
+
+    /// `new` under `cfg(test)`: the same construction, delegating to the
+    /// clock-injectable [`Freshness::with_clock`] so a test that needs
+    /// deterministic trust-window ordering can pin it. The production
+    /// seam (`new` → `build`) carries `Instant::now` and never sees the
+    /// injected cell.
+    #[cfg(test)]
+    pub(crate) fn new(roots: &[PathBuf], packages: Option<&Path>, sdk_home: &Path) -> Self {
+        Self::with_clock(roots, packages, sdk_home, Instant::now)
+    }
+
+    /// `new` with the module's clock injectable: the production caller
+    /// passes `Instant::now`; a test that must pin the trust window's
+    /// proof/boundary ordering passes its own cell. No behavioral
+    /// difference — the seam exists so the trust gate's timestamps are
+    /// deterministic under parallel cargo load instead of racing
+    /// `fseventsd`'s real delivery latency.
+    #[cfg(test)]
+    fn with_clock(
+        roots: &[PathBuf],
+        packages: Option<&Path>,
+        sdk_home: &Path,
+        now: fn() -> Instant,
+    ) -> Self {
+        Self::build(roots, packages, sdk_home, now)
+    }
+
+    /// The construction body shared by `new` (production clock) and
+    /// `with_clock` (test clock): identical apart from which `now` the
+    /// [`Shared`] journal stamps proofs with.
+    fn build(
+        roots: &[PathBuf],
+        packages: Option<&Path>,
+        sdk_home: &Path,
+        now: fn() -> Instant,
+    ) -> Self {
         let shared = Arc::new(Shared {
             journal: Mutex::new(Journal {
                 dirty: FxHashSet::default(),
@@ -837,6 +885,7 @@ impl Freshness {
             delivered: Condvar::new(),
             map: Mutex::new(Vec::new()),
             watched: Mutex::new(Vec::new()),
+            now,
         });
         let mut watcher = Watcher::spawn(&shared);
         let plan = Snapshot::preplan(roots, packages, sdk_home);
@@ -900,10 +949,10 @@ impl Freshness {
             cool_off: if armed {
                 None
             } else {
-                Some((Instant::now(), 0))
+                Some((now(), 0))
             },
-            since: (!armed).then(Instant::now),
-            health_since: armed.then(Instant::now),
+            since: (!armed).then(now),
+            health_since: armed.then(now),
             pending_cookies: Vec::new(),
             trusted: 0,
             // The adaptive bound seeds at install (the priming take's
@@ -912,8 +961,8 @@ impl Freshness {
             wait_ns: 1.0,
             abandoned: false,
             seq: 0,
-            last_request: Instant::now(),
-            last_verify: Instant::now(),
+            last_request: now(),
+            last_verify: now(),
             mismatches: 0,
             walks: 0,
             last_check: CheckDiag::default(),
@@ -1017,7 +1066,7 @@ impl Freshness {
     /// names, so what remains past expiry never arrived. Late delivery
     /// in the same sweep resets the strike count.
     fn sweep_late(&mut self) {
-        let now = Instant::now();
+        let now = (self.shared.now)();
         // The drain removes a delivered name from `journal.late`; a name
         // still present at the sweep is still in flight. Delivered
         // entries drop their deadlines and clear the strike count —
@@ -1118,12 +1167,14 @@ impl Freshness {
                 self.first_walk = true;
                 // The restarted stream is a new stream: its doubt
                 // boundary — and with it the trust window's proof
-                // obligation — begins now.
-                self.health_since = Some(Instant::now());
+                // obligation — begins now. The boundary stamps the
+                // module clock so a test's controlled `now` orders it
+                // against the proof exactly like production.
+                self.health_since = Some((self.shared.now)());
             }
         }
         if spawned && self.watcher.is_some() {
-            self.health_since = Some(Instant::now());
+            self.health_since = Some((self.shared.now)());
         }
         if matches!(failed, Arm::Failed) {
             self.abandon("a watch call failed");
@@ -1156,8 +1207,8 @@ impl Freshness {
             "dartq-analyzer-host: watch: {cause} — walking for {:?}",
             backoff
         );
-        self.cool_off = Some((Instant::now(), strikes));
-        self.since = Some(Instant::now());
+        self.cool_off = Some(((self.shared.now)(), strikes));
+        self.since = Some((self.shared.now)());
         self.timeouts = 0;
         self.late.clear();
         self.shared.journal.lock().late.clear();
@@ -1192,14 +1243,14 @@ impl Freshness {
             self.walk_check(WalkReason::Unarmed)
         };
         if let Some(previous) = previous {
-            self.last_verify = Instant::now();
+            self.last_verify = (self.shared.now)();
             if self.armed()
                 && let Some(answer) = self.verify_at_sync(&previous)
             {
                 diff = answer;
             }
         }
-        self.last_request = Instant::now();
+        self.last_request = (self.shared.now)();
         diff
     }
 
@@ -1525,7 +1576,7 @@ impl Freshness {
         let Some((name, cookies)) = self.create_cookies() else {
             return Sync::Blocked;
         };
-        let deadline = Instant::now() + self.wait_bound();
+        let deadline = (self.shared.now)() + self.wait_bound();
         let mut journal = self.shared.journal.lock();
         let held = loop {
             if cookies.iter().all(|c| !journal.cookies.contains(c)) {
@@ -1559,7 +1610,7 @@ impl Freshness {
         // re-earning a punctuality streak that loaded hosts never
         // accumulate.
         journal.late.insert(name.clone());
-        self.late.push((name, Instant::now() + late_expiry()));
+        self.late.push((name, (self.shared.now)() + late_expiry()));
         Sync::Timeout
     }
 
@@ -1602,6 +1653,13 @@ impl Freshness {
                 !journal.walk
                     && journal.dirty.is_empty()
                     && journal.proven.is_some_and(|proven| {
+                        // `elapsed` reads the real clock — the only
+                        // `Instant` here that MUST stay real-time, since
+                        // it is the production staleness bound. A test
+                        // that needs the window pinned does so by
+                        // stamping `proven`/`health_since` with its own
+                        // controlled instants (see `open_trust`), not by
+                        // faking elapsed time.
                         proven.elapsed() <= TRUST_WINDOW
                             && self.health_since.is_none_or(|since| proven > since)
                     })
@@ -3101,13 +3159,22 @@ mod tests {
     /// pending liveness evidence is not the mechanism under test here.
     /// The journal's catch of edits and the cookies' real writes and
     /// deliveries stay real.
+    ///
+    /// The proof/boundary pair is stamped off the module clock seam
+    /// (`Shared::now`) rather than `Instant::now` directly, so a test
+    /// that runs under parallel cargo load never races the 5 s
+    /// [`TRUST_WINDOW`] freshness check: `proven` and `health_since`
+    /// are both set relative to the same `now()` the production drain
+    /// would stamp, keeping `proven > since` and `proven.elapsed()
+    /// <= TRUST_WINDOW` true the moment the window opens.
     fn open_trust(freshness: &mut Freshness) {
         freshness.timeouts = 0;
-        freshness.health_since = Some(Instant::now() - Duration::from_secs(1));
+        let now = (freshness.shared.now)();
+        freshness.health_since = Some(now - Duration::from_secs(1));
         freshness.late.clear();
         let mut journal = freshness.shared.journal.lock();
         journal.late.clear();
-        journal.proven = Some(Instant::now());
+        journal.proven = Some(now);
     }
 
     /// The trust window narrows on every doubt: a pending strike, a
@@ -3131,7 +3198,7 @@ mod tests {
         freshness.timeouts = 0;
         freshness
             .late
-            .push((format!("{COOKIE_PREFIX}straggler"), Instant::now() + late_expiry()));
+            .push((format!("{COOKIE_PREFIX}straggler"), (freshness.shared.now)() + late_expiry()));
         assert!(!freshness.trust_ready(), "a straggler closes it");
         freshness.late.clear();
         freshness.carry_dirs.push(tree.app.join("lib"));
@@ -3139,14 +3206,15 @@ mod tests {
         freshness.carry_dirs.clear();
         // A delivery predating the last arm/restart proves the OLD
         // stream, not the current one — the window stays shut until
-        // the current stream delivers.
-        freshness.health_since = Some(Instant::now());
+        // the current stream delivers. The boundary and the proof are
+        // stamped on the module clock so the ordering is exact.
+        freshness.health_since = Some((freshness.shared.now)());
         assert!(!freshness.trust_ready(), "an unproven stream closes it");
         open_trust(&mut freshness);
         freshness.shared.journal.lock().proven =
-            Some(Instant::now() - TRUST_WINDOW - Duration::from_secs(1));
+            Some((freshness.shared.now)() - TRUST_WINDOW - Duration::from_secs(1));
         assert!(!freshness.trust_ready(), "a stale proof closes it");
-        freshness.shared.journal.lock().proven = Some(Instant::now());
+        freshness.shared.journal.lock().proven = Some((freshness.shared.now)());
         freshness.inject_dirty(&[tree.app.join("lib/a.dart")]);
         assert!(!freshness.trust_ready(), "a landed edit closes it");
         freshness.shared.journal.lock().dirty.clear();
@@ -3392,10 +3460,24 @@ mod tests {
         // that still race the ask; the proof itself stays valid.
         std::thread::sleep(Duration::from_millis(600));
         let _ = freshness.check(&tree.roots());
+        // `proven.elapsed()` reads the REAL clock — the production
+        // staleness bound, deliberately not behind the `now` seam. Under
+        // CPU starvation the real seconds between the drain's proof
+        // stamp and this ask's trust check can exceed [`TRUST_WINDOW`]
+        // even though the proof is moments old in every causal sense.
+        // Production never hits this: every trusted serve writes its
+        // own cookie and its delivery re-stamps the proof milliseconds
+        // later — the window feeds itself. The FIRST delivery has no
+        // such follow-on round trip, so the test re-asserts the proof
+        // freshness the drain would stamp for any cookie event landing
+        // now (the delivery already happened; this only pins its age at
+        // the ask). Without this the assert raced real wall-clock under
+        // parallel cargo load.
         let mut diff = Diff::default();
         for _ in 0..4 {
             freshness.shared.journal.lock().dirty.clear();
             freshness.carry_dirs.clear();
+            freshness.shared.journal.lock().proven = Some((freshness.shared.now)());
             diff = freshness.check(&tree.roots());
             if freshness.trusted > 0 {
                 break;
