@@ -1351,25 +1351,20 @@ fn enters_tier2(warm: bool, standby: bool, serving_sdk: bool) -> bool {
 /// Whether the host sits at the ledger monitor's own low-memory line —
 /// the same figures `Pressure::tick` samples, mirrored here because a
 /// Tier-2 daemon sheds its standby at that signal before any peer's
-/// monitor would release a whole fat resident. `kernel_warn` is the
-/// macOS pressure level's warn-or-worse verdict (upstream's own
-/// blinding of a free-bytes figure under compressor pressure).
+/// monitor would release a whole fat resident.
 fn host_low(max_percent: u8) -> bool {
-    low_memory(
-        dartq_toolchain::ledger::total_memory(),
-        dartq_toolchain::ledger::available_memory(),
-        max_percent,
-        #[cfg(target_os = "macos")]
-        dartq_toolchain::ledger::pressure_level().is_some_and(|level| level >= 2),
-        #[cfg(not(target_os = "macos"))]
-        false,
-    )
+    let total = dartq_toolchain::ledger::total_memory();
+    let available = dartq_toolchain::ledger::available_memory();
+    low_memory(total, available, max_percent)
+        || critical(total, available, dartq_toolchain::ledger::pressure_level())
 }
 
-/// [`host_low`]'s pure core: available memory under the reserve
-/// (`(100 − max_percent)%` of physical, never below the ledger's floor),
-/// or the kernel's own warn level. An unreadable figure is never low.
-fn low_memory(total: u64, available: Option<u64>, max_percent: u8, kernel_warn: bool) -> bool {
+/// [`host_low`]'s shortfall core: available memory under the reserve
+/// (`(100 − max_percent)%` of physical, never below the ledger's floor).
+/// An unreadable figure is never low. The kernel's warn level is
+/// deliberately absent — it fires at 40-50% free during spawn bursts
+/// and sheds warm standbys that would have been reused (#4266, #4269).
+fn low_memory(total: u64, available: Option<u64>, max_percent: u8) -> bool {
     if total == 0 {
         return false;
     }
@@ -1378,7 +1373,23 @@ fn low_memory(total: u64, available: Option<u64>, max_percent: u8, kernel_warn: 
     )
     .unwrap_or(u64::MAX);
     let reserve = share.max(dartq_toolchain::ledger::RESERVE_FLOOR);
-    available.is_some_and(|available| available < reserve) || kernel_warn
+    available.is_some_and(|available| available < reserve)
+}
+
+/// The critical-pressure line the standby also sheds on: available under
+/// the ledger's [`critical_floor`], or the macOS kernel's level-4
+/// critical. Mirrors `ledger::critical()` — kept local because the
+/// ledger's copy is private and this daemon's shed decision is its own.
+/// `level` is `None` on non-macOS (the counter does not exist there).
+fn critical(total: u64, available: Option<u64>, level: Option<u32>) -> bool {
+    if total == 0 {
+        return false;
+    }
+    let floor = dartq_toolchain::ledger::critical_floor(total);
+    if available.is_some_and(|available| available < floor) {
+        return true;
+    }
+    level.is_some_and(|level| level >= 4)
 }
 
 /// The pooled admission policy: append `joining` to `active`, evicting
@@ -2005,22 +2016,61 @@ mod tests {
 
     /// The standby's pressure line, mirroring the ledger monitor's own:
     /// available under the reserve (the percent share, floored at the
-    /// ledger's reserve), the kernel's warn level on its own, and never
-    /// low on an unreadable figure or a boundary-equal sample.
+    /// ledger's reserve) or at critical pressure — never on warn alone,
+    /// never on an unreadable figure or a boundary-equal sample.
     #[test]
     fn low_memory_sits_at_the_ledger_monitors_line() {
         let gib = 1 << 30;
         let total = 16 * gib;
         // 90 percent: the share is 1.6 GiB, the 2 GiB floor dominates.
         let reserve = dartq_toolchain::ledger::RESERVE_FLOOR;
-        assert!(!low_memory(total, Some(reserve), 90, false), "boundary equal");
-        assert!(low_memory(total, Some(reserve - 1), 90, false), "one byte under");
+        assert!(!low_memory(total, Some(reserve), 90), "boundary equal");
+        assert!(low_memory(total, Some(reserve - 1), 90), "one byte under");
         // 50 percent: the 8 GiB share dominates the floor.
         let share = 8 * gib;
-        assert!(!low_memory(total, Some(share), 50, false));
-        assert!(low_memory(total, Some(share - 1), 50, false));
-        assert!(low_memory(total, Some(u64::MAX), 90, true), "the kernel's own warn");
-        assert!(!low_memory(total, None, 90, false), "unreadable is never low");
-        assert!(!low_memory(0, Some(0), 90, false));
+        assert!(!low_memory(total, Some(share), 50));
+        assert!(low_memory(total, Some(share - 1), 50));
+        assert!(!low_memory(total, None, 90), "unreadable is never low");
+        assert!(!low_memory(0, Some(0), 90));
+    }
+
+    /// The standby sheds on a real shortfall or critical pressure, never
+    /// on warn alone: the kernel's level-2 fires at 40-50% free during
+    /// spawn bursts and must not evict a warm standby that would have
+    /// been reused (#4266, #4269). Level-4 critical and available-under-
+    /// reserve remain valid shed signals.
+    #[test]
+    fn the_standby_sheds_only_on_shortfall_or_critical() {
+        let gib = 1 << 30;
+        let total = 32 * gib;
+        let sheds = |available: Option<u64>, level: Option<u32>| {
+            low_memory(total, available, 90) || critical(total, available, level)
+        };
+        // Plenty of available memory: warn (level 2) alone never sheds.
+        assert!(
+            !sheds(Some(32 * gib * 43 / 100), Some(2)),
+            "warn at 43% free is not a shortfall"
+        );
+        // Under the reserve is the one shortfall signal.
+        let reserve = dartq_toolchain::ledger::RESERVE_FLOOR.max(32 * gib / 10);
+        assert!(
+            sheds(Some(reserve - 1), Some(1)),
+            "available under the reserve sheds"
+        );
+        // Critical: available under the critical floor, or kernel level 4.
+        let floor = dartq_toolchain::ledger::critical_floor(total);
+        assert!(
+            sheds(Some(floor - 1), Some(1)),
+            "available under the critical floor sheds"
+        );
+        assert!(
+            sheds(Some(20 * gib), Some(4)),
+            "kernel level 4 sheds even with plenty available"
+        );
+        // Level 3 (between warn and critical) never sheds on its own.
+        assert!(
+            !sheds(Some(20 * gib), Some(3)),
+            "level 3 is not critical"
+        );
     }
 }
