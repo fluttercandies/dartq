@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Resident analysis now pools by default: every `dartq analyze` request —
+  file, directory, package, and workspace aims alike — joins the shared
+  SDK-keyed pool daemon instead of spawning one daemon and one
+  `analysis_server` per roots set. A multi-aim run over N file or
+  package roots previously paid N daemons/N servers (~6.5 GB peak for five
+  file aims on a 49k-file corpus); the pool holds one daemon and one
+  server serving all aim roots through `set_roots` (~1.7 GB) with
+  byte-identical answers (#4267). Set `DARTQ_POOL=0` (or `false`/`no`/`off`)
+  to force the per-roots daemon, or `analyzer.pool.enabled: false` in
+  `dartq.yaml` for a config-level opt-out; `DARTQ_POOL=1` overrides the
+  config back on. The pool capacity defaults to 16 aim roots per server
+  (`DARTQ_POOL_MAX_ROOTS` or `analyzer.pool.max_roots` to tune, clamped
+  1–64).
+
 ## [0.1.23] - 2026-11-13
 
 This section consolidates everything unreleased since 1.0.0: the 0.1.18

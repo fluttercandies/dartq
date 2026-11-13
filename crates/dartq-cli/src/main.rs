@@ -1963,20 +1963,63 @@ pub(crate) fn memory_max_percent(config: Option<&DartqConfig>) -> u8 {
     )
 }
 
-/// The shared-analyzer pool posture: `DARTQ_POOL=1` opts the run in
-/// (with `DARTQ_POOL_MAX_ROOTS`, 1–64, overriding the cap), else
-/// `analyzer.pool` in `dartq.yaml` decides. `None` is the one-daemon-per-
-/// worktree posture.
+/// The shared-analyzer pool posture: pooling is the DEFAULT for every
+/// resident request — one pooled daemon and one analysis server per SDK
+/// serves every aim root through `set_roots`, instead of one daemon and
+/// one server per aim root (the multiplication a multi-aim script
+/// otherwise pays: measured 5 file aims → 5 daemons/5 servers ≈ 6.5 GB
+/// peak where the pool holds 1/1 ≈ 1.7 GB with byte-identical answers).
+/// `None` is the one-daemon-per-roots-set posture.
+///
+/// Off switches, in precedence order: `DARTQ_POOL=0` (also `false`/`no`/
+/// `off`) forces the per-roots daemon — the env kill-switch; else
+/// `analyzer.pool.enabled: false` in `dartq.yaml` opts out the same way;
+/// `DARTQ_POOL=1` (also `true`/`yes`/`on`) forces the pool on over the
+/// config. With neither set, the pool is on.
+///
+/// The cap — the most roots one pooled server hosts before a join is
+/// refused to the worktree's own daemon — is `DARTQ_POOL_MAX_ROOTS`, else
+/// `analyzer.pool.max_roots`, else 16 (aim roots are cheaper than the
+/// worktree roots the pool was born for — files in one folder share one
+/// analyzer context — and a refusal recreates the multiplication this
+/// default exists to remove), clamped 1–64.
 fn pool_posture(config: Option<&DartqConfig>) -> Option<u32> {
-    let (enabled, max_roots) = config.map_or((false, 3), DartqConfig::pool);
-    let env_on = std::env::var("DARTQ_POOL").is_ok_and(|value| value == "1");
-    if !env_on && !enabled {
+    let pool = config
+        .and_then(|config| config.analyzer)
+        .and_then(|analyzer| analyzer.pool);
+    pool_decision(
+        std::env::var("DARTQ_POOL").ok().as_deref(),
+        pool.and_then(|pool| pool.enabled),
+        pool.and_then(|pool| pool.max_roots),
+        std::env::var("DARTQ_POOL_MAX_ROOTS").ok().as_deref(),
+    )
+}
+
+/// [`pool_posture`]'s decision, pure: `env` is `DARTQ_POOL`'s raw value,
+/// `config_enabled`/`config_cap` the `dartq.yaml` `analyzer.pool` knobs,
+/// `env_cap` `DARTQ_POOL_MAX_ROOTS`'s raw value. `Some(cap)` pools, `None`
+/// keeps the per-roots daemon.
+fn pool_decision(
+    env: Option<&str>,
+    config_enabled: Option<bool>,
+    config_cap: Option<u64>,
+    env_cap: Option<&str>,
+) -> Option<u32> {
+    const POOL_OFF: [&str; 4] = ["0", "false", "no", "off"];
+    const POOL_ON: [&str; 4] = ["1", "true", "yes", "on"];
+    let env = env.map(|value| value.trim().to_ascii_lowercase());
+    let env = env.as_deref();
+    if POOL_OFF.contains(&env.unwrap_or_default()) {
         return None;
     }
-    let cap = std::env::var("DARTQ_POOL_MAX_ROOTS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(max_roots)
+    let enabled = config_enabled.unwrap_or(true);
+    if !POOL_ON.contains(&env.unwrap_or_default()) && !enabled {
+        return None;
+    }
+    let cap = env_cap
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .or_else(|| config_cap.and_then(|cap| u32::try_from(cap).ok()))
+        .unwrap_or(16)
         .clamp(1, 64);
     Some(cap)
 }
@@ -6095,6 +6138,70 @@ mod tests {
             "a malformed dartq.yaml fails open to the default posture"
         );
         fs::remove_file(dir.path().join("dartq.yaml")).expect("remove");
+    }
+
+    /// The pool routing decision (see [`pool_posture`]): pooling is the
+    /// default — every arm below pins one branch of the
+    /// env → config → default precedence so a future edit cannot silently
+    /// re-narrow the default back to opt-in.
+    #[test]
+    fn pool_decision_matrix() {
+        // Default-on: neither env nor config → the pool at the 16-root cap.
+        assert_eq!(pool_decision(None, None, None, None), Some(16));
+        assert_eq!(
+            pool_decision(Some(""), None, None, None),
+            Some(16),
+            "an empty env value is not an off switch"
+        );
+        // The env kill-switch, all spellings and case variants.
+        for off in ["0", "false", "no", "off", "FALSE", " Off "] {
+            assert_eq!(
+                pool_decision(Some(off), None, None, None),
+                None,
+                "DARTQ_POOL={off:?} must force the per-roots daemon"
+            );
+        }
+        // `analyzer.pool.enabled: false` opts out when the env is silent.
+        assert_eq!(
+            pool_decision(None, Some(false), None, None),
+            None,
+            "the yaml opt-out holds without an env override"
+        );
+        // The env force-on beats the yaml opt-out.
+        for on in ["1", "true", "yes", "on", "ON"] {
+            assert_eq!(
+                pool_decision(Some(on), Some(false), None, None),
+                Some(16),
+                "DARTQ_POOL={on:?} must force the pool over the config"
+            );
+        }
+        // Unrecognized env values fall through to the config/default.
+        assert_eq!(
+            pool_decision(Some("maybe"), None, None, None),
+            Some(16),
+            "a non-boolean env value is ignored, not an off switch"
+        );
+        // Cap resolution: env cap beats the yaml cap beats the 16 default.
+        assert_eq!(
+            pool_decision(None, None, Some(8), Some("4")),
+            Some(4),
+            "DARTQ_POOL_MAX_ROOTS wins over analyzer.pool.max_roots"
+        );
+        assert_eq!(
+            pool_decision(None, None, Some(8), None),
+            Some(8),
+            "the yaml cap applies when the env cap is absent"
+        );
+        assert_eq!(
+            pool_decision(None, None, Some(8), Some("junk")),
+            Some(8),
+            "an unparseable env cap falls back to the yaml cap"
+        );
+        // Clamp bounds: below 1 and above 64 both clamp.
+        assert_eq!(pool_decision(None, None, None, Some("0")), Some(1));
+        assert_eq!(pool_decision(None, None, None, Some("999")), Some(64));
+        assert_eq!(pool_decision(None, None, Some(0), None), Some(1));
+        assert_eq!(pool_decision(None, None, Some(10_000), None), Some(64));
     }
 
     // -----------------------------------------------------------------------
