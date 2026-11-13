@@ -1584,10 +1584,6 @@ const PRESSURE_COOLDOWN: Duration = Duration::from_secs(10);
 /// An idle resident is evictable only after this much silence — an
 /// eviction must never cut a daemon whose next request is mid-flight.
 const PRESSURE_UNUSED: Duration = Duration::from_secs(10);
-/// A macOS pressure level that already counts as low regardless of the
-/// free figure: 2 = warn, 4 = critical.
-#[cfg(target_os = "macos")]
-const PRESSURE_LEVEL_LOW: u32 = 2;
 
 /// One resident's pressure-monitor state (per daemon, cheap to keep).
 #[derive(Default)]
@@ -1652,33 +1648,36 @@ impl Pressure {
     }
 }
 
-/// Whether the host is under the ledger's memory-pressure line: the free
-/// figure under the reserve (`available < reserve`) or, on macOS, the
-/// kernel's own pressure level at warn or worse — the compressor and cache
-/// state a free-bytes figure misses. An unreadable figure is never low.
+/// Whether the host is under the ledger's memory-pressure line: the
+/// available figure under the reserve. An unreadable figure is never low.
 fn memory_low(max_percent: u8) -> bool {
     let total = total_memory();
     if total == 0 {
         return false;
     }
-    let reserve = Figures {
+    short_of(Figures {
         total,
-        available: None,
+        available: available_memory(),
         max_percent,
-    }
-    .reserve();
-    if let Some(available) = available_memory() {
-        if available < reserve {
-            return true;
-        }
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(level) = pressure_level()
-        && level >= PRESSURE_LEVEL_LOW
-    {
-        return true;
-    }
-    false
+    })
+}
+
+/// Whether the ledger's figures show a real shortfall: the available figure
+/// under the reserve.
+///
+/// The macOS kernel's warn level is deliberately **not** part of it. The
+/// kernel reads warn (level 2) during any large spawn burst — a page cache
+/// it can reclaim — while gigabytes are still available; shedding a warm
+/// resident on that signal protects nothing and turns every following
+/// request for the same key into a cold start (#4266: five 1.3 GB residents,
+/// two released at 42-43 % free, four times the 3.2 GB reserve, and the
+/// next asks for those keys paid 39-53 s again). Level 4 stays the
+/// critical signal in [`critical`]: an idle resident that sees critical
+/// pressure and no other victim sheds itself.
+fn short_of(figures: Figures) -> bool {
+    figures
+        .available
+        .is_some_and(|available| available < figures.reserve())
 }
 
 /// Whether the host is at the pressure monitor's critical line: free
@@ -2013,6 +2012,25 @@ mod tests {
         assert_eq!(at(32 * GIB, 95).reserve(), RESERVE_FLOOR);
         // The budget still follows max_percent.
         assert_eq!(at(24 * GIB, 90).budget(), 24 * GIB * 9 / 10);
+    }
+
+    #[test]
+    fn a_resident_sheds_only_on_a_real_shortfall() {
+        let at = |total: u64, available: Option<u64>, max_percent: u8| Figures {
+            total,
+            available,
+            max_percent,
+        };
+        // #4266: 32 GB, 90% share → 3.2 GiB reserve. The kernel reported warn
+        // at 42-43% free (≈13.7 GiB available) and the monitor shed a 1.3 GB
+        // resident; that is four times the reserve, so nothing was short.
+        assert!(!short_of(at(32 * GIB, Some(32 * GIB * 43 / 100), 90)));
+        assert!(!short_of(at(32 * GIB, Some(5 * GIB), 90)));
+        // Under the reserve is the one shortfall signal.
+        assert!(short_of(at(32 * GIB, Some(3 * GIB), 90)));
+        assert!(short_of(at(32 * GIB, Some(1 * GIB), 90)));
+        // An unreadable figure is never low (the pre-existing posture).
+        assert!(!short_of(at(32 * GIB, None, 90)));
     }
 
     #[test]

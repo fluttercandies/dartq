@@ -287,7 +287,12 @@ pub fn serve(dir: &Path, renderer: FaceRenderer) -> u8 {
                     warm_lows = 0;
                 }
                 if let Some(victim) = pressure.tick(std::process::id(), spec.max_percent, true) {
-                    eprintln!("dartq analyze: released the idle {victim} under memory pressure");
+                    // The daemon's stderr is `/dev/null` (the client spawns
+                    // it detached): the events file is the only surface that
+                    // survives the eviction for the next forensic pass.
+                    files.event(&format!(
+                        "dartq analyze: released the idle {victim} under memory pressure"
+                    ));
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
