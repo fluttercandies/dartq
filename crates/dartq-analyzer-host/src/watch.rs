@@ -31,19 +31,29 @@
 //!
 //! * **Quiet turns — the health trust window.** The barrier is the
 //!   only multi-millisecond wait an otherwise idle daemon pays, and a
-//!   quiet tree pays it for nothing. After [`HEALTHY_FOR`] of
-//!   uninterrupted, punctual streaming — no strike pending, no
-//!   straggler under evaluation, the liveness proof fresh and the
-//!   journal drained empty — a request serves from the journal verdict
-//!   alone: it still writes the next cookies (their delivery, off the
-//!   request path, is what the following request's trust keys on) and
-//!   still re-stats the unwatched configs, but the fseventsd round
-//!   trip leaves the answer path. An edit whose event has delivered is
-//!   in the journal and the full path serves it; an edit still in
-//!   flight can defer exactly one ask, and the trusted serve's own
-//!   cookie guarantees the next ask sees it. A stream that silently
-//!   stops delivering loses trust inside [`TRUST_WINDOW`]: the barrier
-//!   returns, and its timeout and strike machinery with it.
+//!   quiet tree pays it for nothing. Trust is earned by one proven
+//!   round trip: the stream's first cookie delivery observed after the
+//!   last arm or stream restart (a young stream is an unproven stream
+//!   until it delivers — no age clock warms it up, because every ask
+//!   re-checks the conditions that matter). With that delivery on
+//!   record, no strike pending, no straggler under evaluation, the
+//!   liveness proof fresh and the journal drained empty, a request
+//!   serves from the journal verdict alone: it still writes the next
+//!   cookies (their delivery, off the request path, is what the
+//!   following request's trust keys on) and still re-stats the
+//!   unwatched configs, but the fseventsd round trip leaves the answer
+//!   path. A missed wait bound is latency, not doubt — the straggler
+//!   it leaves behind adjudicates liveness (delivery clears, expiry
+//!   strikes), and the window re-opens the ask after it delivers
+//!   rather than re-earning a punctuality streak. An edit whose event
+//!   has delivered is in the journal and the full path serves it; an
+//!   edit still in flight defers until a cookie created after it
+//!   delivers — at most one ask on a stream that keeps up with the ask
+//!   cadence, and never longer than [`TRUST_WINDOW`] machinery allows,
+//!   since sustained trust requires a delivery inside that window. A
+//!   stream that silently stops delivering loses trust inside
+//!   [`TRUST_WINDOW`]: the barrier returns, and its timeout and strike
+//!   machinery with it.
 //!
 //! * **Fallbacks, all to the same walk.** `walk_required` is raised on
 //!   the stream's rescan flags (FSEvents
@@ -122,7 +132,9 @@ const COOKIE_TIMEOUTS: u32 = 3;
 /// The cool-off after an abandon: `COOL_OFF * 2^strikes` capped at
 /// [`COOL_OFF_MAX`]; the strike count clears after [`HEALTHY_FOR`]
 /// without one. A transient error costs minutes of walking, never the
-/// daemon's life.
+/// daemon's life. (`HEALTHY_FOR` is a cool-off-domain constant: the
+/// health trust window no longer ages a stream through it — see
+/// [`Freshness::trust_ready`].)
 #[allow(dead_code)] // production-only; the tests use a shortened cool-off
 const COOL_OFF: Duration = Duration::from_secs(60);
 const COOL_OFF_MAX: Duration = Duration::from_secs(30 * 60);
@@ -748,10 +760,13 @@ pub(crate) struct Freshness {
     /// The instant the cool-off was entered — the healthy clock's
     /// baseline. `None` while armed.
     since: Option<Instant>,
-    /// The instant the stream's current health streak began — set at
-    /// every (re)arm and stream restart, restarted by a cookie that
-    /// missed its wait bound. [`HEALTHY_FOR`] of streak is the trust
-    /// window's age gate: a young stream is an unproven stream.
+    /// The instant of the last arm or stream restart — the doubt
+    /// boundary a liveness proof must postdate before the trust window
+    /// may open. A stream's first delivery observed after it proves
+    /// that (new) stream; a cookie that merely misses its wait bound
+    /// does NOT move it (lateness adjudicates through the straggler
+    /// set, and the straggler's delivery re-stamps the proof on the
+    /// far side of the unchanged boundary).
     health_since: Option<Instant>,
     /// The last trusted serve's cookie files — unlinked (and their
     /// pending registrations dropped) by the next request, whose own
@@ -1077,7 +1092,8 @@ impl Freshness {
             .map(|w| w.dir.clone())
             .collect();
         // A spawn (initial arm or a cool-off's re-arm) is an unproven
-        // stream: its health streak begins here.
+        // stream: its doubt boundary begins here — the trust window
+        // opens only after a delivery observed on the new stream.
         let spawned = self.watcher.is_none();
         let failed = match self.watcher.as_mut() {
             Some(watcher) => watcher.reconcile(&self.plan, &self.shared),
@@ -1100,8 +1116,9 @@ impl Freshness {
                 .collect();
             if after != before {
                 self.first_walk = true;
-                // The restarted stream is a new stream: its health
-                // streak — and with it the trust window — begins now.
+                // The restarted stream is a new stream: its doubt
+                // boundary — and with it the trust window's proof
+                // obligation — begins now.
                 self.health_since = Some(Instant::now());
             }
         }
@@ -1289,7 +1306,8 @@ impl Freshness {
         if !self.armed() {
             return self.walk_check(WalkReason::Unarmed);
         }
-        // The health trust window: with the streak aged, no doubt
+        // The health trust window: with the stream's first delivery
+        // proven after the last doubt boundary, nothing doubtable
         // pending, the liveness proof fresh and the journal drained
         // empty, the verdict needs no round trip. A cookie that cannot
         // be created falls through — the barrier below reports it
@@ -1534,12 +1552,14 @@ impl Freshness {
         // delete event inside the expiry still proves the stream
         // alive, and only expiring undelivered is a strike. Cookie
         // names are unique per sync, so a straggler can never resolve
-        // a later barrier. The missed bound also restarts the health
-        // streak: the trust window re-earns itself after
-        // [`HEALTHY_FOR`] of punctual delivery.
+        // a later barrier. The missed bound itself is latency, not
+        // doubt — the health boundary stays put, and the straggler's
+        // delivery re-stamps the liveness proof on its far side, so
+        // the trust window re-opens on the very next ask instead of
+        // re-earning a punctuality streak that loaded hosts never
+        // accumulate.
         journal.late.insert(name.clone());
         self.late.push((name, Instant::now() + late_expiry()));
-        self.health_since = Some(Instant::now());
         Sync::Timeout
     }
 
@@ -1550,33 +1570,41 @@ impl Freshness {
     ///   under evaluation (`late` empty);
     /// * no merged dir waits out its one-more-request re-coverage
     ///   (`carry_dirs` empty);
-    /// * the stream's health streak spans [`HEALTHY_FOR`] — armed
-    ///   continuously since the last arm, restart, or missed bound;
     /// * the stream proved liveness inside [`TRUST_WINDOW`] (a
-    ///   cookie's event observed delivered);
+    ///   cookie's event observed delivered) — and that proof POSTDATES
+    ///   the last arm or stream restart (`health_since`): one proven
+    ///   round trip on the current stream earns the window, and any
+    ///   restart, abandon or re-arm re-earns it the same way. No age
+    ///   clock gates this — every ask re-checks the proof's freshness,
+    ///   so a stream that goes silent loses the window inside
+    ///   [`TRUST_WINDOW`] plus one ask regardless of how long it had
+    ///   been trusted before;
     /// * the journal itself is drained empty with no walk flag.
     ///
     /// The staleness contract: an edit whose event has delivered is in
     /// the journal — the peek sees it and this returns `false`, the
-    /// full barrier path serves the edit. An edit still in flight can
-    /// defer exactly one ask, and the trusted serve's own cookie
-    /// guarantees the next ask sees it (per-stream ordering: the edit
-    /// precedes that cookie, and the window reopens only once the
-    /// cookie's delivery is observed). Any doubt takes today's path.
+    /// full barrier path serves the edit. An edit still in flight
+    /// defers until a cookie created after it delivers (per-stream
+    /// ordering) — at most one ask on a stream that delivers inside
+    /// the ask cadence, and never longer than the proof-freshness
+    /// machinery allows, since sustained trust requires a delivery
+    /// inside [`TRUST_WINDOW`]. A missed wait bound does not close
+    /// this window by itself: the straggler it registers adjudicates
+    /// (`late` non-empty holds the window shut while the verdict pends;
+    /// its delivery re-stamps the proof and the next ask re-opens;
+    /// its expiry is a strike and doubt). Any doubt takes today's path.
     fn trust_ready(&self) -> bool {
         self.timeouts == 0
             && self.late.is_empty()
             && self.carry_dirs.is_empty()
-            && self
-                .health_since
-                .is_some_and(|since| since.elapsed() >= HEALTHY_FOR)
             && {
                 let journal = self.shared.journal.lock();
                 !journal.walk
                     && journal.dirty.is_empty()
-                    && journal
-                        .proven
-                        .is_some_and(|proven| proven.elapsed() <= TRUST_WINDOW)
+                    && journal.proven.is_some_and(|proven| {
+                        proven.elapsed() <= TRUST_WINDOW
+                            && self.health_since.is_none_or(|since| proven > since)
+                    })
             }
     }
 
@@ -2728,8 +2756,12 @@ mod tests {
         let diff = freshness.check(&tree.roots());
         assert!(diff.is_empty(), "no edits, no diff");
 
-        // An edit between requests: the barrier must see it.
+        // An edit between requests must surface — its delivered event
+        // is the journal's to catch, so the check waits for the
+        // delivery (an in-flight event may defer exactly one ask
+        // under an open trust window; the delivery parks it first).
         fs::write(&file, "var a = 42;\n").expect("edit");
+        await_live_delivery(&freshness, &file);
         let diff = freshness.check(&tree.roots());
         assert_eq!(diff.changed, vec![file.clone()], "the edit surfaces");
         assert_eq!(*freshness.snapshot(), oracle(&tree), "journal == walk");
@@ -2737,12 +2769,14 @@ mod tests {
         // A creation is a rebuild, also through the journal.
         let extra = tree.app.join("lib/extra.dart");
         fs::write(&extra, "var e;\n").expect("create");
+        await_live_delivery(&freshness, &extra);
         let diff = freshness.check(&tree.roots());
         assert!(diff.rebuild, "an added Dart file rebuilds");
         assert_eq!(*freshness.snapshot(), oracle(&tree));
 
         // A removal too.
         fs::remove_file(&extra).expect("remove");
+        await_live_delivery(&freshness, &extra);
         let diff = freshness.check(&tree.roots());
         assert!(diff.rebuild, "a deleted Dart file rebuilds");
         assert_eq!(*freshness.snapshot(), oracle(&tree));
@@ -2752,11 +2786,12 @@ mod tests {
     }
 
     /// How long the live-delivery tests wait on the OS: generous next to
-    /// any delivery a loaded host makes (behind a saturated `fseventsd`
-    /// the raw FSEvents API itself was measured at 2.3–3.8 s per event),
-    /// and finite — a substrate that stops delivering live events fails
-    /// these loudly, every run.
-    const LIVE_BOUND: Duration = Duration::from_secs(30);
+    /// any delivery a loaded host makes — behind a saturated `fseventsd`
+    /// the raw FSEvents API was measured at 2.3–3.8 s per event, and a
+    /// host running a parallel benchmark lane's watchers was measured
+    /// delivering in 20–30 s — and finite, so a substrate that stops
+    /// delivering live events still fails these loudly, every run.
+    const LIVE_BOUND: Duration = Duration::from_secs(60);
 
     /// Creates `file` — a name the tree never held — and blocks until
     /// the stream delivers it into the journal's dirty set. A fresh name
@@ -2933,14 +2968,30 @@ mod tests {
 
         // The journal continues where the walk left off — a transient
         // cookie strike under parallel load can legitimately cool the
-        // watcher off, so retry for one pass the journal serves; a
-        // cooled-off pass still walks and still catches the edit, which
-        // counts — the flag itself never loses the event either way.
+        // watcher off, so the settle accepts a walk pass too. An
+        // engaged trust window defers the edit's in-flight event until
+        // the stream delivers it — park on the journal until the event
+        // lands (bounded by the live bound), then the next check must
+        // merge the new bytes: losing the event would be stale
+        // forever; deferring one delivery latency is the documented
+        // contract.
         fs::write(&file, "var changed2;\n").expect("edit2");
-        for _ in 0..8 {
-            let _ = freshness.check(&tree.roots());
-            if *freshness.snapshot() == oracle(&tree) {
-                break;
+        let settle = Instant::now() + LIVE_BOUND;
+        while *freshness.snapshot() != oracle(&tree) {
+            let mut journal = freshness.shared.journal.lock();
+            if journal.dirty.contains(&file) {
+                drop(journal);
+                let _ = freshness.check(&tree.roots());
+            } else {
+                let timed_out = freshness
+                    .shared
+                    .delivered
+                    .wait_until(&mut journal, settle)
+                    .timed_out();
+                assert!(
+                    !timed_out,
+                    "the edit's event never delivered — the journal lost it"
+                );
             }
         }
         assert_eq!(
@@ -3042,8 +3093,8 @@ mod tests {
         fs::remove_dir_all(&tree.base).ok();
     }
 
-    /// Opens the health trust window deterministically: the streak is
-    /// aged past [`HEALTHY_FOR`], the liveness proof refreshed, and the
+    /// Opens the health trust window deterministically: the liveness
+    /// proof stamped a beat after the last doubt boundary, and the
     /// straggler bookkeeping cleared — a barrier that missed its bound
     /// under parallel-suite load keeps listening from `late` (measured:
     /// cookie delivery in seconds against a 500 ms bound), and that
@@ -3051,7 +3102,8 @@ mod tests {
     /// The journal's catch of edits and the cookies' real writes and
     /// deliveries stay real.
     fn open_trust(freshness: &mut Freshness) {
-        freshness.health_since = Some(Instant::now() - HEALTHY_FOR - Duration::from_secs(1));
+        freshness.timeouts = 0;
+        freshness.health_since = Some(Instant::now() - Duration::from_secs(1));
         freshness.late.clear();
         let mut journal = freshness.shared.journal.lock();
         journal.late.clear();
@@ -3059,9 +3111,10 @@ mod tests {
     }
 
     /// The trust window narrows on every doubt: a pending strike, a
-    /// straggler under evaluation, a carried dir, a young stream, a
-    /// stale liveness proof, a non-empty journal, the walk flag — each
-    /// ALONE keeps the request on today's full barrier path. Driven by
+    /// straggler under evaluation, a carried dir, an unproven stream
+    /// (no delivery observed since the last arm or restart), a stale
+    /// liveness proof, a non-empty journal, the walk flag — each ALONE
+    /// keeps the request on today's full barrier path. Driven by
     /// injection: eligibility is the unit, the OS is not involved.
     #[test]
     fn the_trust_window_narrows_on_doubt() {
@@ -3084,8 +3137,11 @@ mod tests {
         freshness.carry_dirs.push(tree.app.join("lib"));
         assert!(!freshness.trust_ready(), "a carried dir closes it");
         freshness.carry_dirs.clear();
+        // A delivery predating the last arm/restart proves the OLD
+        // stream, not the current one — the window stays shut until
+        // the current stream delivers.
         freshness.health_since = Some(Instant::now());
-        assert!(!freshness.trust_ready(), "a young stream closes it");
+        assert!(!freshness.trust_ready(), "an unproven stream closes it");
         open_trust(&mut freshness);
         freshness.shared.journal.lock().proven =
             Some(Instant::now() - TRUST_WINDOW - Duration::from_secs(1));
@@ -3231,10 +3287,14 @@ mod tests {
 
     /// Adversarial (stream restart): a moved watch set restarts the
     /// macOS stream (the predecessor's in-flight events die with it)
-    /// and drops the trust window to zero immediately — the streak
-    /// restarts, and no ask after the restart serves from the verdict
-    /// alone until [`HEALTHY_FOR`] re-earns it. The real restart is
-    /// the mechanism; the barrier's OS wait is elided by injection.
+    /// and drops the trust window to zero immediately — the doubt
+    /// boundary moves to the restart, so a liveness proof from the
+    /// DEAD stream can never re-open the window; no ask after the
+    /// restart serves from the verdict alone until the CURRENT stream
+    /// delivers (a proof postdating the restart). The real restart is
+    /// the mechanism; the barrier's OS wait is elided by injection
+    /// (which also means nothing ever stamps a post-restart proof, so
+    /// trust stays shut for the whole test — the strongest form).
     #[cfg(target_os = "macos")]
     #[test]
     fn a_stream_restart_drops_the_trust_window() {
@@ -3255,11 +3315,12 @@ mod tests {
         assert_eq!(freshness.trusted, 1, "the window was open");
         // The restart shape: the root set moves (a pool join).
         let _ = freshness.check(&other.roots());
+        let proven = freshness.shared.journal.lock().proven;
         assert!(
             freshness
                 .health_since
-                .is_some_and(|since| since.elapsed() < HEALTHY_FOR),
-            "the restart restarted the streak — trust is zero"
+                .is_some_and(|since| proven.is_none_or(|proven| proven <= since)),
+            "the restart moved the doubt boundary past the old proof — trust is zero"
         );
         // Neither the covering walk's ask nor the quiet one after it
         // trusts.
@@ -3268,6 +3329,204 @@ mod tests {
         assert_eq!(freshness.trusted, 1, "no ask after the restart trusted");
         fs::remove_dir_all(&tree.base).ok();
         fs::remove_dir_all(&other.base).ok();
+    }
+
+    /// Adversarial (fresh daemon — one proven round trip earns initial
+    /// trust): before the stream's FIRST delivery is observed, no ask
+    /// trusts — the proof does not exist. After one delivery lands on
+    /// the current stream (a cookie event the drain really recorded,
+    /// the same stamp a held barrier's cookie makes), the very next
+    /// ask serves from the journal verdict alone — no HEALTHY_FOR-style
+    /// warm-up in between — and the window it opened still serves an
+    /// edit landing between turns. Deterministic: the barrier is
+    /// elided by injection (which also means no barrier ever writes a
+    /// cookie, so the ONLY thing that can stamp the liveness proof is
+    /// the marker's real delivery), while the journal's catch of edits
+    /// and the drain's recording stay real.
+    #[test]
+    fn a_first_delivery_earns_initial_trust() {
+        let _serial = serial();
+        let tree = Tree::build("trust-first");
+        let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
+        generous_wait(&mut freshness);
+        freshness.journal_by_injection();
+        assert!(freshness.armed());
+        // The install's stream move and its covering walk consume the
+        // first ask; whatever in-flight dot-path noise survived is
+        // dropped so the next ask's verdict is the gate's alone.
+        let _ = freshness.check(&tree.roots());
+        std::thread::sleep(Duration::from_millis(600));
+        let _ = freshness.check(&tree.roots());
+        freshness.shared.journal.lock().dirty.clear();
+        freshness.carry_dirs.clear();
+        assert_eq!(freshness.trusted, 0, "nothing proved the stream yet");
+        assert!(
+            !freshness.trust_ready(),
+            "no delivery observed — the window cannot be open"
+        );
+        // The proof: a cookie-named file inside the watched tree,
+        // delivered by the real stream and recorded by the real drain.
+        let marker = tree
+            .app
+            .join(".dart_tool/dartq")
+            .join(format!("{COOKIE_PREFIX}{}-proof", std::process::id()));
+        fs::write(&marker, b"").expect("proof cookie");
+        {
+            let shared = &freshness.shared;
+            let deadline = Instant::now() + LIVE_BOUND;
+            let mut journal = shared.journal.lock();
+            while journal.proven.is_none() {
+                let timed_out = shared.delivered.wait_until(&mut journal, deadline).timed_out();
+                assert!(
+                    !timed_out || journal.proven.is_some(),
+                    "the stream never delivered the proof cookie within {LIVE_BOUND:?}"
+                );
+            }
+        }
+        let _ = fs::remove_file(&marker);
+        // One proven round trip: the next ask trusts, with no age gate
+        // between the delivery and this ask. The wait window (seconds
+        // under load) can admit the arm's straggler redeliveries —
+        // FSEvents re-reports the watched roots as dir events with
+        // trailing slashes — so drain once more and retry past any
+        // that still race the ask; the proof itself stays valid.
+        std::thread::sleep(Duration::from_millis(600));
+        let _ = freshness.check(&tree.roots());
+        let mut diff = Diff::default();
+        for _ in 0..4 {
+            freshness.shared.journal.lock().dirty.clear();
+            freshness.carry_dirs.clear();
+            diff = freshness.check(&tree.roots());
+            if freshness.trusted > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            freshness.trusted, 1,
+            "the first delivery after the arm earned initial trust"
+        );
+        assert!(diff.is_empty(), "a quiet turn diffs nothing; {diff:?}");
+        assert_eq!(*freshness.snapshot(), oracle(&tree), "journal == walk");
+        // The window it opened still serves edits between turns — the
+        // staleness bar rides along (delivered edits never defer).
+        let file = tree.app.join("lib/a.dart");
+        fs::write(&file, "var first = 1;\n").expect("edit");
+        await_live_delivery(&freshness, &file);
+        let diff = freshness.check(&tree.roots());
+        assert_eq!(
+            diff.changed,
+            vec![file.clone()],
+            "the edit between trusted turns surfaces (trusted {})",
+            freshness.trusted
+        );
+        assert_eq!(*freshness.snapshot(), oracle(&tree), "never stale");
+        fs::remove_dir_all(&tree.base).ok();
+    }
+
+    /// Adversarial (missed bound — a bound miss the straggler proves
+    /// alive is liveness evidence, not doubt): a barrier that misses
+    /// its wait bound must NOT move the doubt boundary. The straggler
+    /// it registers holds the window shut while it pends, and the ask
+    /// after its delivery re-opens it — no streak to re-earn, however
+    /// young the boundary. The timeout arm runs for REAL (no
+    /// injection): a second watched entry whose dir the stream does
+    /// not cover forces the miss deterministically (its cookie can
+    /// never deliver, however calm the host), while the real stream
+    /// eventually delivers the genuine cookie, whose delete event then
+    /// resolves the straggler's name exactly the way a late delivery
+    /// does — and that delivery re-stamps the liveness proof on the
+    /// far side of the UNMOVED boundary. Initial engagement is opened
+    /// by the standard hand hook (`open_trust`); the miss, the pin and
+    /// the re-opening are the mechanism under test.
+    #[test]
+    fn a_missed_bound_then_delivery_reopens_trust() {
+        let _serial = serial();
+        let tree = Tree::build("trust-miss");
+        let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
+        generous_wait(&mut freshness);
+        assert!(freshness.armed());
+        // Settle the install's restart and its noise; under a loaded
+        // host the settle barriers may miss and leave stragglers — the
+        // hand hook clears that bookkeeping (its expiry is not the
+        // mechanism under test here).
+        let _ = freshness.check(&tree.roots());
+        std::thread::sleep(Duration::from_millis(600));
+        let _ = freshness.check(&tree.roots());
+        freshness.shared.journal.lock().dirty.clear();
+        freshness.carry_dirs.clear();
+        open_trust(&mut freshness);
+        let _ = freshness.check(&tree.roots());
+        assert_eq!(freshness.trusted, 1, "the window was open");
+        let trusted_before = freshness.trusted;
+        let boundary = freshness.health_since;
+        // The forced miss: a watched entry outside every streamed dir —
+        // its cookie file writes fine but never delivers, so the
+        // barrier cannot hold however calm the host is.
+        let outside = tree.base.join("outside");
+        fs::create_dir_all(&outside).expect("outside dir");
+        freshness.shared.watched.lock().push(Watch {
+            cookie_dir: outside.clone(),
+            dir: outside.clone(),
+            root: false,
+        });
+        let missed = freshness.sync();
+        freshness.shared.watched.lock().pop();
+        assert_eq!(
+            missed,
+            Sync::Timeout,
+            "the uncovered cookie missed the bound"
+        );
+        assert_eq!(
+            freshness.health_since, boundary,
+            "the missed bound did not move the doubt boundary"
+        );
+        assert_eq!(freshness.timeouts, 0, "a miss is not a strike");
+        // The pending straggler holds the window shut...
+        assert!(
+            !freshness.trust_ready(),
+            "the straggler under evaluation closes it"
+        );
+        // ...and its delivery — the real cookie's delete event
+        // resolving the shared name — re-opens it. Wait for the
+        // resolution, then poll the GATE itself (a check with the
+        // gate still shut would run a real barrier and register a
+        // fresh straggler, wedging the loop on a loaded host); stray
+        // redeliveries the wait admitted are drained each poll.
+        let names: Vec<String> = freshness.late.iter().map(|(name, _)| name.clone()).collect();
+        assert_eq!(names.len(), 1, "one straggler pends; {names:?}");
+        {
+            let shared = &freshness.shared;
+            let deadline = Instant::now() + LIVE_BOUND;
+            let mut journal = shared.journal.lock();
+            while names.iter().any(|name| journal.late.contains(name)) {
+                let timed_out = shared.delivered.wait_until(&mut journal, deadline).timed_out();
+                assert!(
+                    !timed_out,
+                    "the straggler never resolved within {LIVE_BOUND:?}"
+                );
+            }
+        }
+        let deadline = Instant::now() + LIVE_BOUND;
+        while !{
+            freshness.sweep_late();
+            freshness.shared.journal.lock().dirty.clear();
+            freshness.carry_dirs.clear();
+            freshness.trust_ready()
+        } {
+            assert!(
+                Instant::now() < deadline,
+                "the window never re-opened after the straggler's delivery"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let diff = freshness.check(&tree.roots());
+        assert!(
+            freshness.trusted > trusted_before,
+            "the ask after the straggler's delivery re-opened the window"
+        );
+        assert!(diff.is_empty(), "a quiet turn diffs nothing; {diff:?}");
+        assert_eq!(*freshness.snapshot(), oracle(&tree), "journal == walk");
+        fs::remove_dir_all(&tree.base).ok();
     }
 
     /// The adaptive wait bound: seeded by the first walk, moved by
@@ -4164,8 +4423,8 @@ mod tests {
                 edit.push(start.elapsed().as_micros());
             }
         }
-        // The trusted leg: the health window open — the streak aged
-        // past HEALTHY_FOR, the liveness proof stamped, the straggler
+        // The trusted leg: the health window open — the liveness proof
+        // stamped a beat past the last doubt boundary, the straggler
         // bookkeeping of a saturated host cleared (see `open_trust`) —
         // quiet turns serve from the verdict alone.
         let mut trusted = Vec::new();
