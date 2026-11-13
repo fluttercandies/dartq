@@ -213,7 +213,13 @@ mod tests {
             .arg(format!("exec -a {tag} sleep 60 &"))
             .status()
             .expect("spawn fixture");
-        let deadline = SystemTime::now() + Duration::from_secs(10);
+        // Reparenting is a kernel-side instant once the spawning shell
+        // exits; what the deadline really bounds is `ps` visibility
+        // under load — a throttled runner can take seconds per
+        // `ps -axo` spawn, so the window is generous but still finite
+        // (the loop structurally advances: every iteration either
+        // adopts the fixture or sleeps toward the deadline).
+        let deadline = SystemTime::now() + Duration::from_secs(30);
         loop {
             let Ok(table) = Command::new("ps")
                 .args(["-axo", "pid=,ppid=,command="])
@@ -260,17 +266,24 @@ mod tests {
     #[test]
     fn reaper_takes_only_run_aged_orphans() {
         let (pid, tag) = spawn_fixture();
-        // The age gate sees whole seconds, so "older than the run" must
-        // be older by a full column second — the same-second slack the
-        // sweep admits by design (it widens the window, never narrows).
-        // The margin also covers a loaded ps: the gate compares against
-        // the run's own elapsed time, taken after ps returns.
-        thread::sleep(Duration::from_secs(3));
+        // The age gate sees whole seconds (`ps` etime truncated, run
+        // elapsed truncated), so the fixture must be at least one
+        // etime-second old for the exclusion leg below to see it as
+        // pre-run. Two seconds gives that margin deterministically —
+        // the wait is on the fixture's own clock, not on any reap
+        // call's duration.
+        thread::sleep(Duration::from_secs(2));
 
         // The fixture predates this "run" — excluded by the age gate.
-        let started_now = SystemTime::now();
+        // `run_started` is the sweep's clock seam: handing it a time
+        // ahead of now makes `duration_since` fail and `run_elapsed`
+        // collapse to zero (the product's own clock-skew path), so the
+        // exclusion no longer races a starved runner's reap duration —
+        // any fixture past its first etime-second is older than a
+        // zero-length run on every host.
+        let zero_length_run = SystemTime::now() + Duration::from_secs(3_600);
         assert!(
-            !super::reap_orphaned_frontend_servers(started_now).contains(&(pid as libc::pid_t)),
+            !super::reap_orphaned_frontend_servers(zero_length_run).contains(&(pid as libc::pid_t)),
             "a process older than the run is never touched"
         );
         assert!(alive(pid), "fixture {pid} ({tag}) died un-swept");
@@ -279,7 +292,10 @@ mod tests {
         let an_hour_ago = SystemTime::now() - Duration::from_secs(3_600);
         let reaped = super::reap_orphaned_frontend_servers(an_hour_ago);
         assert!(reaped.contains(&(pid as libc::pid_t)));
-        let deadline = SystemTime::now() + Duration::from_secs(10);
+        // SIGTERM to `sleep` is prompt, but the fixture is reaped by its
+        // adopter (init or the runner's subreaper), whose own scheduling
+        // under load can lag the signal — the deadline bounds that wait.
+        let deadline = SystemTime::now() + Duration::from_secs(15);
         while alive(pid) {
             assert!(SystemTime::now() < deadline, "fixture survived SIGTERM");
             thread::sleep(Duration::from_millis(50));

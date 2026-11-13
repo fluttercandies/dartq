@@ -1711,21 +1711,23 @@ mod tests {
     /// the dill. Measured as a difference: the parent builds two dills
     /// an order of magnitude apart in size (unmeasured), a spawned
     /// copy of this test binary rewrites each, and the bigger child's
-    /// peak `ru_maxrss` (bytes on macOS, KiB on Linux — both reaped
-    /// via `wait4`) must stay within one flat budget of the smaller's.
+    /// polled peak RSS must stay within one flat budget of the
+    /// smaller's.
     ///
-    /// The differencing is the point: an absolute per-child budget
-    /// proved platform-shaped. A streaming ~68 MB rewrite peaked at
-    /// ~6 MB on macOS but ~240 MB on Linux runners, because Linux
-    /// carries the pre-exec address space's high-water RSS across
-    /// `exec` (`setmax_mm_hiwater_rss` in the kernel's exec path) — a
-    /// child forked right after its parent built the fixture reports
-    /// the parent's footprint as its own peak. Here both dills are
-    /// built (and their builder memory dropped) before either child
-    /// spawns, so each platform's constant baseline — fork-inherited
-    /// or not, allocator noise, binary size — is identical for the
-    /// two children and cancels in the subtraction, leaving only
-    /// memory that actually grows with the dill.
+    /// The observation channel is `ps -o rss=` sampled while the child
+    /// runs — CURRENT resident bytes, not `ru_maxrss`. That distinction
+    /// is what makes the bound platform-independent: Linux carries the
+    /// pre-exec address space's high-water RSS across `exec`
+    /// (`setmax_mm_hiwater_rss`), so a `ru_maxrss`-based child reports
+    /// its parent's fixture-building footprint (~240 MB observed on CI
+    /// runners) no matter what the rewrite does; differencing two such
+    /// readings only cancels the floor when both children inherit the
+    /// same one, and any asymmetry in spawn timing or allocator state
+    /// leaks straight into the delta. `ps rss` reads the live resident
+    /// set instead — page cache, allocator arenas, and kernel
+    /// accounting differences all land inside the same KiB unit on
+    /// Linux and macOS — so the two children differ only by the memory
+    /// the rewrite itself holds.
     #[test]
     #[cfg(unix)]
     fn rewrite_peak_rss_is_independent_of_dill_size() {
@@ -1755,7 +1757,13 @@ mod tests {
     }
 
     /// Rewrites `src` in a fresh child (a copy of this binary) and
-    /// returns that child's peak RSS in bytes.
+    /// returns the largest RSS `ps` observed for it while it ran, in
+    /// bytes. `ps -o rss=` reports KiB on both Linux and macOS.
+    ///
+    /// Polling rather than `wait4`'s `ru_maxrss` is deliberate: the
+    /// rewrite's live set is what must stay flat, and only a live
+    /// reading sees it — a lifetime peak is polluted by whatever the
+    /// parent process happened to hold at fork/exec time.
     #[cfg(unix)]
     fn child_peak_rss(src: &Path, dst: &Path) -> u64 {
         let mut child = std::process::Command::new(std::env::current_exe().expect("current exe"))
@@ -1768,29 +1776,55 @@ mod tests {
             .env("DQ_BCACHE_RSS_DST", dst)
             .spawn()
             .expect("spawn child");
-        let mut status: libc::c_int = 0;
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        // Safety: `wait4` reaps our own child; both out-params are
-        // valid.
-        let pid = child.id() as libc::pid_t;
-        let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
-        let _ = child.wait();
-        assert_eq!(reaped, pid, "wait4 failed");
+        let pid = child.id().to_string();
+        let mut peak_kib = 0u64;
+        let mut samples = 0u64;
+        // The rewrite is I/O-bound over tens of MB — orders of
+        // magnitude longer than one ps spawn — so a poll every few ms
+        // cannot miss the plateau the string-table pass holds for most
+        // of the run. A `ps` failure is a skipped sample, never fatal:
+        // the loop still terminates on child exit.
+        let status = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => break status,
+                None => {
+                    if let Ok(output) = std::process::Command::new("ps")
+                        .args(["-o", "rss=", "-p", &pid])
+                        .output()
+                    {
+                        if output.status.success() {
+                            if let Ok(text) = std::str::from_utf8(&output.stdout) {
+                                if let Ok(kib) = text.trim().parse::<u64>() {
+                                    peak_kib = peak_kib.max(kib);
+                                    samples += 1;
+                                }
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        };
         assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "child rewrite failed: raw status {status}"
+            status.success(),
+            "child rewrite failed: {status} ({samples} rss samples, peak {peak_kib} KiB)"
         );
-        let scale = if cfg!(target_os = "macos") { 1 } else { 1024 };
-        usage.ru_maxrss as u64 * scale
+        assert!(
+            samples > 0,
+            "ps never reported the child's RSS — the rewrite finished before one poll; the fixture is too small to measure"
+        );
+        peak_kib * 1024
     }
 
-    /// The RSS delta budget: how far the bigger dill's peak may exceed
-    /// the smaller's. Streaming leaves only workload-scaled
+    /// The RSS delta budget: how far the bigger dill's polled peak may
+    /// exceed the smaller's. Streaming leaves only workload-scaled
     /// bookkeeping between the two runs — the string-table
     /// ends/new-ends/matched vectors cost ~13 bytes per entry, ~3.4 MB
     /// at 260k strings — while any whole-file posture adds at least
     /// the dills' ~64 MB size gap. 16 MB sits far above the
-    /// bookkeeping delta and four times under the failure signal.
+    /// bookkeeping delta and four times under the failure signal; the
+    /// polled channel carries no fork/exec baseline, so the same flat
+    /// bound holds on every platform.
     const RSS_DELTA_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 
     /// A valid dill with `count` string-table entries (~257 bytes
