@@ -769,15 +769,18 @@ fn scoped_report(files: &FxHashMap<Arc<str>, FileErrors>, aims: &[crate::Aim]) -
     })))
 }
 
+/// The report line's face key — the compat arm of the answer cache, and
+/// the answered-turn record's tag for a face-less ask (#4278): one
+/// spelling, shared by the in-memory cache and the on-disk record family.
+pub(crate) const REPORT_FACE: &[u8] = b"report";
+
 impl State {
-    /// The report line's face key — the compat arm shares the one cache.
-    const REPORT_FACE: &'static [u8] = b"report";
 
     /// The render behind [`Server::render`]: cache check, per-file
     /// fragment rebuild, sort, splice — all under the one state lock.
     fn render(&mut self, aims: &[crate::Aim]) -> Option<std::sync::Arc<[u8]>> {
         self.served(aims)?;
-        let key = (aims_key(aims), Self::REPORT_FACE.to_vec());
+        let key = (aims_key(aims), REPORT_FACE.to_vec());
         if let Some(hit) = self.answers.get(&key)
             && hit.epoch == self.epoch
         {
@@ -937,8 +940,9 @@ impl State {
 
 /// The answer cache's key for one aims list: the canonical aims spelling
 /// (variant-tagged, path-sorted, deduped, serialized) — asks that name
-/// the same coverage in a different order reuse one line.
-fn aims_key(aims: &[crate::Aim]) -> Vec<u8> {
+/// the same coverage in a different order reuse one line, in the cache
+/// and in the answered-turn record's key (#4278) alike.
+pub(crate) fn aims_key(aims: &[crate::Aim]) -> Vec<u8> {
     fn leg(aim: &crate::Aim) -> (u8, &Path) {
         match aim {
             crate::Aim::Dir(path) => (0, path.as_path()),

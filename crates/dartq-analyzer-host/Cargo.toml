@@ -23,6 +23,9 @@ rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The answered-turn record kill switch's dartq.yaml leg (#4278): the
+# one `analyzer.official.answer_records` bool, read daemon-side.
+serde_yaml = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

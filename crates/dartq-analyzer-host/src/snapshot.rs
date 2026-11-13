@@ -38,13 +38,18 @@ use rustc_hash::FxHashSet;
 /// measurement table.
 pub(crate) static STAT_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// The state a freshness diff needs — (size, mtime) vs absent. A
-/// non-regular file or an unreadable path is `None`, identical to absent
-/// in `take` and to the walk's filtering.
+/// The state a freshness diff needs — (size, mtime) vs absent, plus the
+/// file's (dev, ino) identity for the answer record's tree pin (#4278):
+/// a path removed and recreated between two walks names a new inode, so
+/// the record's set-equality sees the swap even when size and mtime
+/// collide. A non-regular file or an unreadable path is `None`,
+/// identical to absent in `take` and to the walk's filtering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stat {
     size: u64,
     mtime_ns: u64,
+    dev: u64,
+    ino: u64,
 }
 
 /// One `fs::metadata` stat as the walk sees it. Errors and non-regular
@@ -66,9 +71,23 @@ impl Stat {
             .map_or(0, |since| {
                 u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
             });
+        // The identity legs ride the same `fs::Metadata` call the size
+        // and mtime legs already read — no second stat, no extra syscall
+        // (#4278's nil-overhead posture). A host without the extensions
+        // records zeros on both sides of every comparison, so equality
+        // there decides on (size, mtime) alone.
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt as _;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
         Self {
             size: metadata.len(),
             mtime_ns,
+            dev,
+            ino,
         }
     }
 
@@ -761,6 +780,27 @@ impl Snapshot {
             .sum()
     }
 
+    /// The walk's stamp set — every recorded path with its `(size,
+    /// mtime_ns, dev, ino)` facts, in the snapshot's path order: the
+    /// exact set an answered-turn record pins and its probe re-derives
+    /// (#4278). Both sides come from this one derivation, so the
+    /// set-equality comparison never spells the facts two ways.
+    #[must_use]
+    pub fn stamps(&self) -> Vec<(PathBuf, u64, u64, u64, u64)> {
+        self.0
+            .iter()
+            .map(|entry| {
+                (
+                    entry.path.to_path_buf(),
+                    entry.stat.size,
+                    entry.stat.mtime_ns,
+                    entry.stat.dev,
+                    entry.stat.ino,
+                )
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -1080,5 +1120,79 @@ mod tests {
         let before = take();
         fs::write(app.join("pubspec.yaml"), "name: app2").expect("write");
         assert!(before.diff(&take()).rebuild, "a pubspec change rebuilds");
+    }
+
+    /// The stamp set (#4278): the walk's recorded paths in path order
+    /// with their full four-leg facts, and the identity legs ride the
+    /// same metadata call — a file removed and recreated keeps its size
+    /// and mtime (when both are restored) yet names a new inode, the
+    /// exact swap the fourth and fifth legs exist to catch.
+    #[test]
+    fn stamps_pin_paths_and_identity_and_see_inode_swaps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonical");
+        let app = base.join("app");
+        fs::create_dir_all(app.join("lib").join("deep")).expect("mkdir");
+        fs::write(app.join("lib/a.dart"), "var a;").expect("write");
+        fs::write(app.join("lib/deep/b.dart"), "var b;").expect("write");
+        fs::write(app.join("pubspec.yaml"), "name: app").expect("write");
+        let sdk = base.join("sdk");
+        let stamps = || Snapshot::take(std::slice::from_ref(&app), None, &sdk).stamps();
+
+        let first = stamps();
+        let mut paths: Vec<&Path> = first.iter().map(|(path, ..)| path.as_path()).collect();
+        paths.sort_unstable();
+        let recorded: Vec<PathBuf> = first.iter().map(|(path, ..)| path.clone()).collect();
+        assert_eq!(recorded, {
+            let mut sorted = recorded.clone();
+            sorted.sort_unstable();
+            sorted
+        });
+        assert!(paths.contains(&app.join("lib/deep/b.dart").as_path()));
+        assert!(paths.contains(&app.join("pubspec.yaml").as_path()));
+        for (path, size, mtime, dev, ino) in &first {
+            assert!(*size > 0, "{}", path.display());
+            assert!(*mtime > 0);
+            #[cfg(unix)]
+            assert!(*dev > 0 && *ino > 0, "identity legs on {}", path.display());
+            let _ = (dev, ino);
+        }
+        assert_eq!(stamps(), first, "an unchanged tree stamps identically");
+
+        // The identity swap: same bytes written back after a remove, the
+        // mtime restored — size and mtime legs equal, the inode leg not.
+        let a = app.join("lib/a.dart");
+        let (size, mtime) = first
+            .iter()
+            .find(|(path, ..)| path == &a)
+            .map(|(_, size, mtime, ..)| (*size, *mtime))
+            .expect("a.dart stamped");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::remove_file(&a).expect("rm");
+        fs::write(&a, "var a;").expect("recreate");
+        std::fs::File::options()
+            .write(true)
+            .open(&a)
+            .and_then(|file| {
+                file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(mtime))
+            })
+            .expect("restore mtime");
+        let swapped = stamps();
+        let entry = swapped
+            .iter()
+            .find(|(path, ..)| path == &a)
+            .map(|(_, size, mtime, dev, ino)| (*size, *mtime, *dev, *ino))
+            .expect("a.dart re-stamped");
+        assert_eq!((entry.0, entry.1), (size, mtime), "the stat legs hold");
+        #[cfg(unix)]
+        assert_ne!(
+            (entry.2, entry.3),
+            first
+                .iter()
+                .find(|(path, ..)| path == &a)
+                .map(|(_, _, _, dev, ino)| (*dev, *ino))
+                .expect("a.dart stamped"),
+            "a recreated file names a new inode"
+        );
     }
 }

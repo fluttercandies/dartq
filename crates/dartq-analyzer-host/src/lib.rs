@@ -196,7 +196,9 @@ impl Spec {
     }
 }
 
-fn add(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+/// The length-prefixed hash leg the key derivations share ([`Spec`]'s
+/// daemon and cache keys, and the answered-turn record key #4278).
+pub(crate) fn add(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
 }
@@ -456,8 +458,11 @@ mod tests {
 }
 
 /// The running binary's identity: path, size and mtime. A rebuilt or
-/// upgraded dartq gets fresh daemons without hashing its bytes per run.
-fn binary_identity() -> String {
+/// upgraded dartq gets fresh daemons without hashing its bytes per run —
+/// and fresh answered-turn records (#4278): the face writer the render
+/// ships through is this binary's, so its stamp belongs in the record
+/// key.
+pub(crate) fn binary_identity() -> String {
     let exe = std::env::current_exe().unwrap_or_default();
     let meta = std::fs::metadata(&exe).ok();
     let mtime = meta

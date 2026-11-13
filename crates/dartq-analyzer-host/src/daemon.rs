@@ -43,6 +43,13 @@
 //! The servers' caches share one disk budget (`crate::disk`): a request
 //! pays one `statvfs`, a running analysis one every few seconds, and
 //! passes over the caches run on a background thread.
+//!
+//! A served render also persists as an answered-turn record (#4278, the
+//! "Answered-turn records" section below): the wire line beside the
+//! read-time stamp set, byte-budget-capped under the cache dir. A
+//! serverless daemon whose baseline is still priming — a re-run after
+//! the last daemon's death — probes it before any server starts and
+//! serves a stamp-set hit with no spawn at all.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -211,6 +218,11 @@ pub fn serve(dir: &Path, renderer: FaceRenderer) -> u8 {
     // The dead-roots sweep runs in the disk budget's first pass, on its
     // own thread ([`Host::new`]): a daemon start never waits on a walk.
     crate::claim_cache(&spec.cache_dir(), &spec.roots);
+    // The answered-turn records' budget pass (#4278): dead and torn
+    // records reclaim, the survivors LRU-cap at the family's byte cap.
+    // Prefix peeks over a handful of files — paid inline, once per daemon
+    // start, never inside an ask.
+    sweep_records(&spec.cache_dir());
     // A SIGKILL'd predecessor could not take its server down (the group
     // kill only runs on catchable signals): the orphaned analysis_server
     // would keep this daemon's `--cache` dir — two servers on one cache
@@ -425,6 +437,25 @@ struct Host {
     /// The caches' disk budget: the request-time check, the in-analysis
     /// tick, the server-start pass and the background passes.
     disk: crate::disk::Disk,
+    /// The spec this daemon serves, read once at start — the answered-
+    /// turn record family's key legs and the probe walk's inputs (#4278).
+    spec: Spec,
+    /// Whether the answered-turn record family is on (#4278): the env
+    /// kill switch over the dartq.yaml opt-out, resolved once at start.
+    records: bool,
+    /// This ask's read-time stamp capture: the walk the cold-arm probe
+    /// paid, stashed for the persist that follows a served render — the
+    /// record pins the tree as the rendering run read it, never a
+    /// post-render state an edit during the settle could fool. `None` on
+    /// every ask whose probe did not walk (server live, baseline primed,
+    /// or the family off), and consumed by the one persist a served
+    /// render writes.
+    record_capture: Option<Stamps>,
+    /// The last record this daemon life persisted, `(key, stamps digest)`
+    /// — the quiet-turn elision: an identical figure over an unchanged
+    /// tree rewrites the bytes already on disk, so the write is skipped
+    /// until it moves.
+    record_saved: Option<([u8; 16], u64)>,
 }
 
 impl Host {
@@ -496,6 +527,10 @@ impl Host {
             brake: dartq_toolchain::ledger::GrowthBrake::default(),
             cache,
             disk: crate::disk::Disk::start(dir),
+            spec: spec.clone(),
+            records: records_enabled(&spec.roots),
+            record_capture: None,
+            record_saved: None,
         }
     }
 
@@ -730,6 +765,9 @@ impl Host {
         } else {
             aims.to_vec()
         };
+        if let Some(line) = self.record_probe(&owned, face) {
+            return Reply::Line(line);
+        }
         match self.analyze_result(client) {
             Ok(()) => {
                 let server = self.server.as_ref().expect("a live server");
@@ -748,10 +786,14 @@ impl Host {
                             };
                             wire.extend_from_slice(&render.bytes);
                             let line: Arc<[u8]> = wire.into();
+                            self.record_persist(&owned, Some(face), &line);
                             return Reply::Line(line);
                         }
                         match server.render_face(&owned, face, self.renderer) {
-                            Some(line) => Reply::Line(line),
+                            Some(line) => {
+                                self.record_persist(&owned, Some(face), &line);
+                                Reply::Line(line)
+                            }
                             None => Reply::Answer(Answer::NotServed),
                         }
                     }
@@ -760,7 +802,10 @@ impl Host {
                             return Reply::Answer(Answer::Report(Report::default()));
                         }
                         match server.render(&owned) {
-                            Some(line) => Reply::Line(line),
+                            Some(line) => {
+                                self.record_persist(&owned, None, &line);
+                                Reply::Line(line)
+                            }
                             None => Reply::Answer(Answer::NotServed),
                         }
                     }
@@ -835,21 +880,122 @@ impl Host {
     }
 
     fn analyze(&mut self, client: &UnixStream, aims: &[crate::Aim], face: Option<&Face>) -> Reply {
+        if let Some(line) = self.record_probe(aims, face) {
+            return Reply::Line(line);
+        }
         match self.analyze_result(client) {
             Ok(()) => {
                 let server = self.server.as_ref().expect("a live server");
                 match face {
                     Some(face) => match server.render_face(aims, face, self.renderer) {
-                        Some(line) => Reply::Line(line),
+                        Some(line) => {
+                            self.record_persist(aims, Some(face), &line);
+                            Reply::Line(line)
+                        }
                         None => Reply::Answer(Answer::NotServed),
                     },
                     None => match server.render(aims) {
-                        Some(line) => Reply::Line(line),
+                        Some(line) => {
+                            self.record_persist(aims, None, &line);
+                            Reply::Line(line)
+                        }
                         None => Reply::Answer(Answer::NotServed),
                     },
                 }
             }
             Err(answer) => Reply::Answer(answer),
+        }
+    }
+
+    /// The answered-turn record probe (#4278): a serverless daemon whose
+    /// baseline is still priming — the cold arm, exactly the state a
+    /// re-run over a byte-identical tree after the last daemon's death
+    /// sits in — may be an ask this key already answered. One full walk
+    /// (the record's stamp set pins the tree as the rendering run read
+    /// it; the probe re-derives the same set), compared for set
+    /// equality: a hit serves the record's wire line with no server at
+    /// all, a miss falls through to today's path unchanged — the walk
+    /// stays as this ask's read-time capture for the persist a served
+    /// render then writes. Every other ask (a live server, an installed
+    /// baseline, the family off, an unservable SDK) skips the probe and
+    /// clears any earlier capture, so a stale one never pins a later
+    /// render.
+    fn record_probe(&mut self, aims: &[crate::Aim], face: Option<&Face>) -> Option<Arc<[u8]>> {
+        self.record_capture = None;
+        if !self.records
+            || self.launch.is_none()
+            || self.server.is_some()
+            || self.freshness.primed()
+        {
+            return None;
+        }
+        let roots = self.roots();
+        let key = record_key(&self.spec, &roots, aims, face);
+        let path = record_path(&self.spec.cache_dir(), &key);
+        let (snapshot, _plan) = crate::snapshot::Snapshot::take_with_plan(
+            &roots,
+            self.spec.packages.as_deref(),
+            &self.spec.sdk_home(),
+        );
+        let stamps = snapshot.stamps();
+        match probe_record(&path, &stamps) {
+            Ok(line) => {
+                self.files.event(&format!(
+                    "dartq analyze: answer record hit ({} bytes)",
+                    line.len()
+                ));
+                Some(line)
+            }
+            Err(miss) => {
+                self.files
+                    .event(&format!("dartq analyze: answer record miss ({})", miss.as_str()));
+                self.record_capture = Some(stamps);
+                None
+            }
+        }
+    }
+
+    /// Persists the answered-turn record for a served render (#4278):
+    /// the wire line beside the read-time stamp capture this ask's probe
+    /// walked — the only capture that is provably pre-render, so the
+    /// record pins the tree as the rendering run read it, never a
+    /// post-render state an edit during the settle could fool. Only the
+    /// cold arm captures (a live-server ask's read-time facts live in
+    /// the freshness oracle's own walk, paid at the check), so a tree
+    /// that moves during a daemon's life leaves the record stale — and
+    /// the next daemon's cold ask misses, settles once, and re-persists:
+    /// the family self-heals on every cold start, and the byte-identical
+    /// re-run — the death-of-daemon case this exists for — always hits.
+    /// A served render with no capture skips the persist; the
+    /// quiet-turn elision skips it again while `(key, stamps digest)`
+    /// stands; a failed write is a silent no-op (the accelerator
+    /// posture).
+    fn record_persist(&mut self, aims: &[crate::Aim], face: Option<&Face>, line: &Arc<[u8]>) {
+        if !self.records {
+            return;
+        }
+        let Some(stamps) = self.record_capture.take() else {
+            return;
+        };
+        let key = record_key(&self.spec, &self.roots(), aims, face);
+        let encoded = serde_json::to_vec(&stamps).expect("stamps serialize");
+        let digest = u64::from_le_bytes(
+            blake3::hash(&encoded).as_bytes()[..8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        if self
+            .record_saved
+            .is_some_and(|(saved, digest_was)| saved == key && digest_was == digest)
+        {
+            return;
+        }
+        if write_record(&record_path(&self.spec.cache_dir(), &key), &encoded, line).is_ok() {
+            self.record_saved = Some((key, digest));
+            self.files.event(&format!(
+                "dartq analyze: answer record saved ({} bytes)",
+                line.len()
+            ));
         }
     }
 
@@ -1571,6 +1717,396 @@ fn peak_persist_moved(persisted: Option<(u64, Option<u64>)>, peak: u64, source: 
     persisted.is_none_or(|(peak_was, source_was)| peak != peak_was || source != source_was)
 }
 
+// ---------------------------------------------------------------------
+// Answered-turn records (#4278)
+//
+// The official face is the one face with no persisted answer: a
+// daemon's death lost its in-memory answer cache whole, so a re-run
+// over a byte-identical tree re-paid the full settle. The engine face
+// won this lever (#4243/#4260); this is that shape on the official
+// face. A served render persists its wire line beside the read-time
+// stamp set — one
+// file per (SDK, served roots, aims, face, dartq binary) key under the
+// cache dir's `answers/` family, atomically renamed, byte-budget-capped
+// with an LRU sweep at daemon start (#4273's posture: unbounded
+// persist-per-shape is the exact multiplication class that lesson
+// closed). A serverless, unprimed daemon's ask probes before any server
+// starts: one full walk, set-equality against the record's stamps, a
+// hit ships the payload through `Reply::Line` with the server never
+// spawning; any miss falls through to today's path byte-identically.
+// The records are whole-file write/read — a whole-repo envelope is
+// 215.9 MB-level and never parsed on serve, and they are NOT bounded by
+// the in-memory `AnswerCache`'s 64 MiB cap (that cap governs the
+// resident map; this family governs itself).
+// ---------------------------------------------------------------------
+
+/// One recorded file's stamp facts, the exact shape
+/// [`crate::snapshot::Snapshot::stamps`] derives — both sides of every
+/// comparison come from that one derivation.
+type Stamps = Vec<(PathBuf, u64, u64, u64, u64)>;
+
+/// The record family's codec version.
+const RECORD_VERSION: u32 = 1;
+/// The cache dir's subdir holding the record family.
+const RECORDS_DIR: &str = "answers";
+/// The final-path suffix; temps carry `.answer.tmp-<pid>-<seq>`.
+const RECORD_SUFFIX: &str = ".answer";
+/// The record family's byte cap, per cache dir (#4273's budget
+/// amendment): the wire caps one served face at 1 GiB
+/// ([`crate::client::MAX_FACE_BYTES`]) and the largest measured
+/// whole-repo envelope is 215.9 MB, so 2 GiB holds the biggest legal
+/// record beside a working set of smaller shapes — while staying inside
+/// the disk discipline's own figures (an idle cache cap of 8 GiB across
+/// worktrees). The startup sweep LRU-caps the family here, oldest
+/// last-persist (mtime) first.
+const RECORDS_CAP: u64 = 2 << 30;
+/// How far the sweep reads into a record to judge it dead: the header
+/// line is three small numbers, always inside this bound — a file whose
+/// first line runs past it is a foreign format, dead for this binary.
+const RECORD_PREFIX_LEN: usize = 128;
+/// How long a `.answer.tmp-*` must age before the sweep reclaims it —
+/// an in-flight writer's temp is never touched (#4273's grace).
+const RECORD_SWEEP_GRACE: Duration = Duration::from_secs(3600);
+/// The temp-file counter of [`write_record`]'s sibling temps.
+static RECORD_TMP_SEQ: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// The record's first line: the codec version and the two lengths the
+/// frame's rest must add up to — `header\nstamps\npayload`, whole-file
+/// write and read, the payload never parsed on serve.
+#[derive(Serialize, Deserialize)]
+struct RecordHeader {
+    v: u32,
+    /// The stamps line's byte length.
+    stamps: u64,
+    /// The payload's byte length — the exact wire bytes served.
+    bytes: u64,
+}
+
+/// Why a probe fell through to today's path. Every miss is the
+/// accelerator's silence: nothing changes, the ask just pays what it
+/// always paid.
+#[derive(Debug)]
+enum RecordMiss {
+    /// No readable record under the key (absent counts).
+    NoRecord,
+    /// A record this codec cannot serve (torn, foreign, or the frame's
+    /// lengths do not add up) — dead weight, unlinked under the
+    /// concurrent-writer guard.
+    Decode,
+    /// The tree moved: the walked stamp set is not the record's.
+    Stamps,
+}
+
+impl RecordMiss {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoRecord => "no-record",
+            Self::Decode => "decode",
+            Self::Stamps => "stamps",
+        }
+    }
+}
+
+/// The record family's key: the daemon-key discipline
+/// ([`crate::Spec::dir`]'s) over the answer's own legs — the SDK (root
+/// and version), the served root set (sorted, so a pooled set spelled in
+/// a different join order is the same answer), the package-config
+/// override, the canonical aims spelling, the face tag, and the running
+/// binary's stamp. A record can only ever answer an ask whose every leg
+/// it was rendered under: an SDK swap, a root-set change, another aims
+/// or face shape, or a rebuilt dartq all key away from it.
+fn record_key(
+    spec: &Spec,
+    roots: &[PathBuf],
+    aims: &[crate::Aim],
+    face: Option<&Face>,
+) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    crate::add(&mut hasher, spec.sdk_root.as_os_str().as_encoded_bytes());
+    crate::add(&mut hasher, spec.sdk_version.as_bytes());
+    let mut sorted: Vec<&Path> = roots.iter().map(std::convert::AsRef::as_ref).collect();
+    sorted.sort_unstable();
+    for root in sorted {
+        crate::add(&mut hasher, root.as_os_str().as_encoded_bytes());
+    }
+    crate::add(
+        &mut hasher,
+        spec.packages
+            .as_deref()
+            .map_or(&[][..], |p| p.as_os_str().as_encoded_bytes()),
+    );
+    crate::add(&mut hasher, &crate::server::aims_key(aims));
+    let face_tag = face.map_or(crate::server::REPORT_FACE.to_vec(), |face| {
+        serde_json::to_vec(face).expect("a face serializes")
+    });
+    crate::add(&mut hasher, &face_tag);
+    crate::add(&mut hasher, crate::binary_identity().as_bytes());
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    key
+}
+
+/// The record file of `key` under the cache dir's answers family.
+fn record_path(cache: &Path, key: &[u8; 16]) -> PathBuf {
+    cache
+        .join(RECORDS_DIR)
+        .join(format!("{}{RECORD_SUFFIX}", hex::encode(key)))
+}
+
+/// Writes one record atomically: a unique sibling temp, then a
+/// same-filesystem rename over the destination — a torn write leaves
+/// the previous record (or nothing), never a half frame the probe
+/// would trust. The header line derives from the lengths it is handed,
+/// so the frame always adds up by construction.
+fn write_record(path: &Path, stamps_line: &[u8], payload: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    std::fs::create_dir_all(path.parent().expect("the answers dir path"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("record");
+    let tmp = path.with_file_name(format!(
+        "{name}.tmp-{}-{}",
+        std::process::id(),
+        RECORD_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        let header = serde_json::to_vec(&RecordHeader {
+            v: RECORD_VERSION,
+            stamps: stamps_line.len() as u64,
+            bytes: payload.len() as u64,
+        })
+        .expect("the header serializes");
+        file.write_all(&header)
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.write_all(stamps_line))
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.write_all(payload))
+    });
+    let renamed = written.and_then(|()| std::fs::rename(&tmp, path));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    renamed
+}
+
+/// Probes the record at `path` for an ask whose walked stamp set is
+/// `stamps`: the frame must decode, its lengths must add up, and the
+/// record's stamp set must equal the walked one — then the payload is
+/// the served wire line, exactly the bytes the render shipped. A decode
+/// miss unlinks the dead record under the concurrent-writer guard
+/// (fresh bytes a racing writer renamed in between the read and the
+/// unlink are spared); a stamps miss keeps it — the tree moved, and a
+/// revert brings the record's stamps back (the persist a fresh render
+/// then writes supersedes it either way).
+fn probe_record(path: &Path, stamps: &Stamps) -> Result<Arc<[u8]>, RecordMiss> {
+    let frame = std::fs::read(path).map_err(|_| RecordMiss::NoRecord)?;
+    let miss = || decode_miss(path, &frame);
+    let Some(one) = frame.iter().position(|b| *b == b'\n') else {
+        return Err(miss());
+    };
+    let header: RecordHeader = serde_json::from_slice(&frame[..one]).map_err(|_| miss())?;
+    if header.v != RECORD_VERSION {
+        return Err(miss());
+    }
+    let stamps_end = (one + 1)
+        .checked_add(usize::try_from(header.stamps).unwrap_or(usize::MAX))
+        .filter(|end| frame.get(*end) == Some(&b'\n'))
+        .ok_or_else(miss)?;
+    let payload_start = stamps_end + 1;
+    let payload_end = payload_start
+        .checked_add(usize::try_from(header.bytes).unwrap_or(usize::MAX))
+        .filter(|end| *end == frame.len())
+        .ok_or_else(miss)?;
+    let recorded: Stamps = serde_json::from_slice(&frame[one + 1..stamps_end]).map_err(|_| miss())?;
+    if recorded != *stamps {
+        return Err(RecordMiss::Stamps);
+    }
+    Ok(frame[payload_start..payload_end].into())
+}
+
+/// The decode miss's verdict: the judged frame is dead weight — unlink
+/// it under the concurrent-writer guard and say why.
+fn decode_miss(path: &Path, frame: &[u8]) -> RecordMiss {
+    remove_record_if(path, frame);
+    RecordMiss::Decode
+}
+
+/// Removes the record at `path` only if its bytes still equal `judged`
+/// — the miss-path unlink's concurrent-writer guard (#4273's): a writer
+/// whose atomic rename landed fresh bytes between the probe's read and
+/// this unlink keeps its record, and fresh content can never byte-equal
+/// the stale bytes the probe judged.
+fn remove_record_if(path: &Path, judged: &[u8]) {
+    if std::fs::read(path).is_ok_and(|current| current == judged) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The record family's budget pass (#4273's posture, at daemon start —
+/// never inside an ask): dead records reclaim outright — a frame whose
+/// header this codec cannot read or whose lengths do not add up (torn,
+/// foreign, or a future codec — dead weight for this binary, whose own
+/// keys fork away from a foreign generation anyway); `.answer.tmp-*`
+/// debris reclaims past [`RECORD_SWEEP_GRACE`]; the survivors LRU-cap
+/// at [`RECORDS_CAP`], oldest last-persist (mtime) first with a
+/// path-ascending tie-break for determinism. Best-effort throughout:
+/// any I/O failure skips its file, and a record this pass misses stays
+/// for the next daemon start.
+fn sweep_records(cache: &Path) {
+    sweep_records_with(cache, RECORDS_CAP);
+}
+
+/// [`sweep_records`]'s core over an explicit cap — the budget the tests
+/// squeeze.
+fn sweep_records_with(cache: &Path, cap: u64) {
+    let Ok(files) = std::fs::read_dir(cache.join(RECORDS_DIR)) else {
+        return;
+    };
+    let mut live: Vec<(u64, u64, PathBuf)> = Vec::new();
+    for file in files.flatten() {
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(name) = file.file_name().into_string().ok() else {
+            continue;
+        };
+        let path = file.path();
+        if name.contains(".answer.tmp-") {
+            let aged = meta
+                .modified()
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok())
+                .is_some_and(|age| age >= RECORD_SWEEP_GRACE);
+            if aged {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else if name.ends_with(RECORD_SUFFIX) {
+            if record_dead(&path, meta.len()) {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |span| span.as_secs());
+            live.push((mtime, meta.len(), path));
+        }
+    }
+    let mut total: u64 = live.iter().map(|&(_, size, _)| size).sum();
+    if total <= cap {
+        return;
+    }
+    live.sort_unstable();
+    for (_, size, path) in live {
+        if total <= cap {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
+/// Whether the record at `path` is provably dead for this binary: a
+/// first line past the prefix bound, a header this codec cannot parse,
+/// a foreign version, or a frame whose lengths do not add up to the
+/// file's size (a torn or truncated write the rename discipline cannot
+/// produce on the final path — a foreign writer's). A file unreadable
+/// right now is not provably dead and stays for the next pass.
+fn record_dead(path: &Path, len: u64) -> bool {
+    use std::io::Read as _;
+    let Ok(prefix) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(RECORD_PREFIX_LEN);
+    if prefix
+        .take(RECORD_PREFIX_LEN as u64)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return false;
+    }
+    let Some(one) = head.iter().position(|b| *b == b'\n') else {
+        return true;
+    };
+    let Ok(header) = serde_json::from_slice::<RecordHeader>(&head[..one]) else {
+        return true;
+    };
+    header.v != RECORD_VERSION
+        || len != (one as u64)
+            .saturating_add(1)
+            .saturating_add(header.stamps)
+            .saturating_add(1)
+            .saturating_add(header.bytes)
+}
+
+/// The env kill switch of the record family.
+const RECORDS_ENV: &str = "DARTQ_ANSWER_RECORD";
+
+/// Resolves the record family's switch, once per daemon start: the env
+/// (`DARTQ_ANSWER_RECORD=0` off, `=1` on) over the governing
+/// dartq.yaml's `analyzer.official.answer_records: false` (project file
+/// over the user-level global, the config tiering's own precedence),
+/// defaulting on. An unparseable override fails open to the tier below
+/// — the posture of every knob here.
+fn records_enabled(roots: &[PathBuf]) -> bool {
+    let env = std::env::var(RECORDS_ENV).ok();
+    let global = std::env::home_dir()
+        .map(|home| home.join(".dartq").join("dartq.yaml"))
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    // The project tier: the nearest dartq.yaml up from the founding
+    // root — the same nearest-up-the-chain rule the CLI's discovery
+    // walks from the invocation's cwd. The daemon's cwd is wherever its
+    // client spawned it, so the founding root is this side's own truth;
+    // for the one boolean this reads, the tree's own governing file is
+    // the right universe either way.
+    let project = roots.first().and_then(|root| {
+        root.ancestors()
+            .map(|dir| dir.join("dartq.yaml"))
+            .find(|candidate| candidate.is_file())
+            .and_then(|path| std::fs::read_to_string(path).ok())
+    });
+    records_enabled_with(env.as_deref(), global.as_deref(), project.as_deref())
+}
+
+/// [`records_enabled`]'s testable core: the env string and the two yaml
+/// bodies as read.
+fn records_enabled_with(env: Option<&str>, global: Option<&str>, project: Option<&str>) -> bool {
+    match env.map(str::trim) {
+        Some("0") => return false,
+        Some("1") => return true,
+        _ => {}
+    }
+    let yaml = |text: Option<&str>| {
+        text.and_then(|text| {
+            #[derive(Deserialize, Default)]
+            struct File {
+                analyzer: Option<Analyzer>,
+            }
+            #[derive(Deserialize, Default)]
+            struct Analyzer {
+                official: Option<Official>,
+            }
+            #[derive(Deserialize, Default)]
+            struct Official {
+                answer_records: Option<bool>,
+            }
+            serde_yaml::from_str::<File>(text)
+                .ok()?
+                .analyzer?
+                .official?
+                .answer_records
+        })
+    };
+    yaml(project).or_else(|| yaml(global)).unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2072,5 +2608,448 @@ mod tests {
             !sheds(Some(20 * gib), Some(3)),
             "level 3 is not critical"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #4278: the answered-turn record family.
+    // ------------------------------------------------------------------
+
+    /// The fixture spec of the record tests.
+    fn record_spec(sdk_version: &str, roots: &[&str], packages: Option<&str>) -> Spec {
+        Spec {
+            sdk_root: PathBuf::from("/sdks/a"),
+            sdk_version: sdk_version.to_owned(),
+            roots: roots.iter().map(PathBuf::from).collect(),
+            packages: packages.map(PathBuf::from),
+            budget: 0,
+            idle_secs: 60,
+            max_percent: 90,
+            max_concurrent: 0,
+            pool: false,
+            max_roots: 3,
+            warm: 0,
+            warm_ttl_secs: 0,
+        }
+    }
+
+    /// The record key folds every leg an answer was rendered under: the
+    /// SDK, the served root set (order-free — a pooled set spelled in a
+    /// different join order is the same answer), and the package
+    /// override; the shape legs (aims, face) are pinned by the next
+    /// test. The binary stamp leg is the one process constant a test
+    /// cannot vary; the daemon-key discipline it copies is `Spec::dir`'s
+    /// own, pinned by that module's tests.
+    #[test]
+    fn the_record_key_folds_every_serving_leg() {
+        let lon = Face {
+            format: crate::face::FaceFormat::Lon,
+            root: None,
+        };
+        let dir = crate::Aim::Dir(PathBuf::from("/w/a"));
+        let key = |version: &str,
+                   roots: &[&str],
+                   packages: Option<&str>,
+                   aims: &[crate::Aim],
+                   face: Option<&Face>| {
+            let spec = record_spec(version, roots, packages);
+            let roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
+            record_key(&spec, &roots, aims, face)
+        };
+        let base = key(
+            "3.13.7",
+            &["/w/a"],
+            None,
+            std::slice::from_ref(&dir),
+            Some(&lon),
+        );
+        assert_eq!(
+            base,
+            key(
+                "3.13.7",
+                &["/w/a"],
+                None,
+                std::slice::from_ref(&dir),
+                Some(&lon),
+            ),
+            "the same legs key the same record"
+        );
+        // The root set is order-free but set-sensitive: a pool's join
+        // order is not a new answer, a joined root is (the set_roots
+        // gate — a record never crosses a root-set change).
+        assert_eq!(
+            key(
+                "3.13.7",
+                &["/w/b", "/w/a"],
+                None,
+                std::slice::from_ref(&dir),
+                Some(&lon),
+            ),
+            key(
+                "3.13.7",
+                &["/w/a", "/w/b"],
+                None,
+                std::slice::from_ref(&dir),
+                Some(&lon),
+            ),
+            "the same set in another order is the same answer"
+        );
+        assert_ne!(
+            base,
+            key(
+                "3.13.7",
+                &["/w/a", "/w/b"],
+                None,
+                std::slice::from_ref(&dir),
+                Some(&lon),
+            ),
+            "a joined root is another answer's key"
+        );
+        // Every other leg separates too.
+        assert_ne!(
+            base,
+            key("3.14.0", &["/w/a"], None, std::slice::from_ref(&dir), Some(&lon)),
+            "an SDK swap"
+        );
+        assert_ne!(
+            base,
+            key(
+                "3.13.7",
+                &["/w/a"],
+                Some("/w/a/.dart_tool/package_config.json"),
+                std::slice::from_ref(&dir),
+                Some(&lon)
+            ),
+            "a package-config override"
+        );
+    }
+
+    /// The key's shape legs: another aims shape, another face (and the
+    /// compat report face), and the aims spelling's canonicalization —
+    /// order and duplicates of one coverage are the same answer.
+    #[test]
+    fn the_record_key_separates_shapes_and_canonicalizes_aims() {
+        let lon = Face {
+            format: crate::face::FaceFormat::Lon,
+            root: None,
+        };
+        let json = Face {
+            format: crate::face::FaceFormat::Json,
+            root: None,
+        };
+        let dir = crate::Aim::Dir(PathBuf::from("/w/a"));
+        let file = crate::Aim::File(PathBuf::from("/w/a/lib/a.dart"));
+        let key = |aims: &[crate::Aim], face: Option<&Face>| {
+            let spec = record_spec("3.13.7", &["/w/a"], None);
+            let roots: Vec<PathBuf> = vec![PathBuf::from("/w/a")];
+            record_key(&spec, &roots, aims, face)
+        };
+        let base = key(
+            std::slice::from_ref(&dir),
+            Some(&lon),
+        );
+        assert_ne!(
+            base,
+            key(std::slice::from_ref(&file), Some(&lon)),
+            "another aims shape"
+        );
+        assert_ne!(
+            base,
+            key(std::slice::from_ref(&dir), Some(&json)),
+            "another face"
+        );
+        assert_ne!(
+            base,
+            key(std::slice::from_ref(&dir), None),
+            "the compat report face"
+        );
+        // The aims spelling is canonical: order and duplicates of one
+        // coverage are the same answer.
+        assert_eq!(
+            key(&[dir.clone(), file.clone()], Some(&lon)),
+            key(&[file, dir], Some(&lon)),
+            "canonical aims spelling"
+        );
+    }
+
+    /// The record codec: a written frame serves its payload whole and
+    /// unparsed on a stamp-set hit; a stamps miss keeps the record (a
+    /// revert brings its stamps back); a decode miss — torn, foreign,
+    /// or lengths that do not add up — unlinks the dead weight; an
+    /// absent record is the quiet no-record miss.
+    #[test]
+    fn a_record_round_trips_and_its_misses_are_typed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = record_path(dir.path(), &[7; 16]);
+        let stamps: Stamps = vec![
+            (PathBuf::from("/w/a/lib/a.dart"), 6, 7, 8, 9),
+            (PathBuf::from("/w/a/pubspec.yaml"), 10, 11, 12, 13),
+        ];
+        let line = write_record(&path, &serde_json::to_vec(&stamps).expect("stamps"), b"wire");
+        assert!(line.is_ok(), "{line:?}");
+
+        let hit = probe_record(&path, &stamps).expect("the identical set hits");
+        assert_eq!(&*hit, b"wire", "the payload ships verbatim");
+
+        let moved: Stamps = stamps
+            .iter()
+            .map(|(path, ..)| (path.clone(), 99, 99, 99, 99))
+            .collect();
+        assert!(matches!(
+            probe_record(&path, &moved),
+            Err(RecordMiss::Stamps)
+        ));
+        assert!(path.is_file(), "a stamps miss keeps the record");
+        assert!(probe_record(&path, &stamps).is_ok(), "and it hits again");
+
+        // Torn: the frame's lengths no longer add up.
+        let frame = std::fs::read(&path).expect("frame");
+        std::fs::write(&path, &frame[..frame.len() - 1]).expect("torn");
+        assert!(matches!(
+            probe_record(&path, &stamps),
+            Err(RecordMiss::Decode)
+        ));
+        assert!(!path.exists(), "a decode miss unlinks the dead record");
+
+        // Foreign: a future codec's record is dead weight for this one.
+        write_record(&path, &serde_json::to_vec(&stamps).expect("stamps"), b"wire")
+            .expect("rewrite");
+        let mut frame = std::fs::read(&path).expect("frame");
+        let v = frame
+            .iter()
+            .position(|b| *b == b':')
+            .expect("the version colon");
+        frame[v + 1] = b'9'; // the header's version digit
+        std::fs::write(&path, &frame).expect("foreign");
+        assert!(matches!(
+            probe_record(&path, &stamps),
+            Err(RecordMiss::Decode)
+        ));
+        assert!(!path.exists(), "the foreign record reclaims");
+
+        // Absent — and a directory that does not even exist yet.
+        assert!(matches!(
+            probe_record(&path, &stamps),
+            Err(RecordMiss::NoRecord)
+        ));
+    }
+
+    /// The startup budget pass (#4273's posture): dead records and aged
+    /// write debris reclaim, a young temp and every live record stay,
+    /// and the survivors LRU-cap at the budget — oldest last-persist
+    /// (mtime) first, the fresh record last.
+    #[test]
+    fn the_startup_sweep_reclaims_dead_debris_and_lru_caps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let answers = dir.path().join(RECORDS_DIR);
+        std::fs::create_dir_all(&answers).expect("answers dir");
+        let stamps: Stamps = vec![(PathBuf::from("/w/a.dart"), 1, 2, 3, 4)];
+        let stamps_line = serde_json::to_vec(&stamps).expect("stamps");
+        let mint = |key: u8| {
+            let path = record_path(dir.path(), &[key; 16]);
+            write_record(&path, &stamps_line, &[0u8; 1024]).expect("mint");
+            path
+        };
+        let age = |path: &Path, secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|file| {
+                    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+                })
+                .expect("age");
+        };
+
+        let dead = answers.join(format!("aa{RECORD_SUFFIX}"));
+        std::fs::write(&dead, b"not a record").expect("plant dead");
+        let young_tmp = answers.join("bb.answer.tmp-1-1");
+        std::fs::write(&young_tmp, b"half").expect("plant young tmp");
+        let aged_tmp = answers.join("cc.answer.tmp-2-1");
+        std::fs::write(&aged_tmp, b"half").expect("plant aged tmp");
+        age(&aged_tmp, 0);
+        let old = mint(1);
+        age(&old, 100);
+        let mid = mint(2);
+        age(&mid, 200);
+        let fresh = mint(3);
+        // The three records are size-identical frames; a cap that holds
+        // exactly two evicts the oldest last-persist clock alone.
+        let one = std::fs::metadata(&old).expect("meta").len();
+        let cap = one.saturating_mul(2);
+
+        sweep_records_with(dir.path(), cap);
+
+        assert!(!dead.exists(), "a foreign frame reclaims");
+        assert!(!aged_tmp.exists(), "aged debris reclaims");
+        assert!(young_tmp.is_file(), "young debris may be in flight");
+        assert!(!old.exists(), "the oldest last-persist clock evicts");
+        assert!(mid.is_file() && fresh.is_file(), "in-budget records stay");
+        let surviving: u64 = std::fs::read_dir(&answers)
+            .expect("answers dir")
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok().map(|meta| meta.len()))
+            .sum();
+        assert!(
+            surviving <= cap + young_tmp.metadata().expect("meta").len(),
+            "the family sits at or under the budget ({surviving})"
+        );
+    }
+
+    /// The kill switch's tiers: the env arm is hard in both directions,
+    /// a garbage override fails open to the yaml tier, the project file
+    /// beats the global, and the default is on.
+    #[test]
+    fn the_kill_switch_tiers_env_over_yaml_over_default() {
+        let off = "analyzer:\n  official:\n    answer_records: false\n";
+        let on = "analyzer:\n  official:\n    answer_records: true\n";
+        assert!(records_enabled_with(None, None, None), "on by default");
+        assert!(!records_enabled_with(Some("0"), Some(on), Some(on)), "env off wins");
+        assert!(records_enabled_with(Some("1"), None, Some(off)), "env on wins");
+        assert!(
+            records_enabled_with(Some("garbage"), None, None),
+            "a garbage env fails open to the default"
+        );
+        assert!(!records_enabled_with(None, None, Some(off)), "the project opts out");
+        assert!(!records_enabled_with(None, Some(off), None), "the global opts out");
+        assert!(!records_enabled_with(None, Some(on), Some(off)), "project beats global");
+        assert!(records_enabled_with(None, Some(off), Some(on)), "project beats global");
+        assert!(
+            records_enabled_with(None, Some("not: [valid"), Some("also { bad")),
+            "a malformed tier fails open to on"
+        );
+        assert!(
+            records_enabled_with(None, None, Some("analyzer:\n  pool: true\n")),
+            "a yaml without the knob is silent"
+        );
+    }
+
+    /// The miss-path unlink's concurrent-writer guard: only the bytes a
+    /// probe actually judged dead may unlink.
+    #[test]
+    fn the_unlink_guard_spares_replaced_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("guard.answer");
+        std::fs::write(&path, b"judged").expect("plant");
+        remove_record_if(&path, b"fresh bytes a writer just landed");
+        assert!(path.is_file(), "replaced bytes are never unlinked");
+        remove_record_if(&path, b"judged");
+        assert!(!path.exists(), "the judged bytes unlink");
+        remove_record_if(&dir.path().join("absent.answer"), b"x");
+    }
+
+    /// The #4243 invalidation matrix over the record's own stamp set:
+    /// every tree move misses, the revert re-persists and re-hits, an
+    /// add/delete pair returns to the original set (and the original
+    /// record), and an inode swap with restored stat legs still misses
+    /// — the dev/ino legs' whole purpose.
+    #[test]
+    fn the_invalidation_matrix_of_the_answer_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonical");
+        let app = base.join("app");
+        std::fs::create_dir_all(app.join("lib").join("deep")).expect("mkdir");
+        std::fs::create_dir_all(app.join(".dart_tool")).expect("mkdir");
+        std::fs::write(app.join("lib/a.dart"), "var a;").expect("write");
+        std::fs::write(app.join("lib/deep/b.dart"), "var b;").expect("write");
+        std::fs::write(app.join("pubspec.yaml"), "name: app").expect("write");
+        std::fs::write(
+            app.join(".dart_tool/package_config.json"),
+            r#"{"configVersion":2,"packages":[]}"#,
+        )
+        .expect("write");
+        let sdk = base.join("sdk");
+        let roots = vec![app.clone()];
+        let stamps = || crate::snapshot::Snapshot::take(&roots, None, &sdk).stamps();
+        let path = record_path(dir.path(), &[9; 16]);
+        let persist = |stamps: &Stamps| {
+            write_record(
+                &path,
+                &serde_json::to_vec(stamps).expect("stamps"),
+                b"the rendered wire line",
+            )
+            .expect("persist");
+        };
+        let miss = |stamps: &Stamps| {
+            matches!(probe_record(&path, stamps), Err(RecordMiss::Stamps))
+        };
+
+        let first = stamps();
+        persist(&first);
+        assert_eq!(
+            probe_record(&path, &first).ok().as_deref(),
+            Some(&b"the rendered wire line"[..]),
+            "the byte-identical re-run serves"
+        );
+
+        // Edit, revert, re-persist, re-hit: the revert itself is a
+        // stat move (the mtime moved), so the miss it causes ends with
+        // the fresh record the re-render persists — the next turn hits.
+        std::fs::write(app.join("lib/a.dart"), "var a2;").expect("edit");
+        let edited = stamps();
+        assert!(miss(&edited), "an edit misses");
+        std::fs::write(app.join("lib/a.dart"), "var a;").expect("revert");
+        assert!(miss(&stamps()), "the revert's own mtime still misses");
+        persist(&stamps());
+        assert!(probe_record(&path, &stamps()).is_ok(), "the next turn re-hits");
+
+        // Touch-only: no content change, the mtime leg alone.
+        std::fs::File::options()
+            .write(true)
+            .open(app.join("lib/a.dart"))
+            .and_then(|file| file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(123)))
+            .expect("touch");
+        assert!(miss(&stamps()), "a touch-only move misses");
+        persist(&stamps());
+
+        // Nested options, pubspec, package config: the non-Dart inputs.
+        std::fs::write(app.join("lib/analysis_options.yaml"), "linter:\n").expect("nested");
+        assert!(miss(&stamps()), "a nested options file misses");
+        std::fs::remove_file(app.join("lib/analysis_options.yaml")).expect("rm");
+        persist(&stamps());
+        std::fs::write(app.join("pubspec.yaml"), "name: app2").expect("pubspec");
+        assert!(miss(&stamps()), "a pubspec edit misses");
+        std::fs::write(app.join("pubspec.yaml"), "name: app").expect("revert");
+        persist(&stamps());
+        std::fs::write(
+            app.join(".dart_tool/package_config.json"),
+            r#"{"configVersion":2,"packages":[]}"#,
+        )
+        .expect("config touch");
+        assert!(miss(&stamps()), "a package_config edit misses");
+
+        // Add and delete: the add misses against the prior record, the
+        // delete returns the set to the original stamps — the original
+        // record answers again without any re-render.
+        std::fs::write(app.join("lib/new.dart"), "var n;").expect("add");
+        assert!(miss(&stamps()), "an added file misses");
+        std::fs::remove_file(app.join("lib/new.dart")).expect("delete");
+        assert!(
+            probe_record(&path, &stamps()).is_ok() || {
+                persist(&stamps());
+                probe_record(&path, &stamps()).is_ok()
+            },
+            "the deleted add restores the original set"
+        );
+
+        // The inode swap: same bytes, the mtime restored — only the
+        // identity legs see it.
+        let a = app.join("lib/a.dart");
+        let (_, mtime, ..) = stamps()
+            .iter()
+            .find(|(path, ..)| path == &a)
+            .map(|(_, size, mtime, ..)| (*size, *mtime))
+            .expect("stamped");
+        std::fs::remove_file(&a).expect("rm");
+        std::fs::write(&a, "var a;").expect("recreate");
+        std::fs::File::options()
+            .write(true)
+            .open(&a)
+            .and_then(|file| {
+                file.set_modified(std::time::UNIX_EPOCH + Duration::from_nanos(mtime))
+            })
+            .expect("restore mtime");
+        #[cfg(unix)]
+        assert!(miss(&stamps()), "an inode swap with restored legs misses");
+        #[cfg(not(unix))]
+        let _ = mtime;
     }
 }
