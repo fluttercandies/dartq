@@ -49,6 +49,23 @@
 //! ([`ContentStore::read`], [`ContentStore::total_bytes`]) stays truthful
 //! about what actually landed.
 //!
+//! # Answer-record sidecars (#4273)
+//!
+//! `<root>/answers/<key>.answer` — the answered-turn records the analyze
+//! faces persist (#4243) — fold into the store's byte budget: every
+//! [`ContentStore::open`] (the cold path; an ask never pays for it) sweeps
+//! the dir, unlinking sidecars whose blob is gone from the store (already
+//! the probe's `blob_missing` miss — the record can never hit again),
+//! foreign or torn records, and aged write debris, then LRU-capping the
+//! survivors' bytes under the same [`StoreConfig::size_limit`] the books
+//! enforce — each face, blobs and sidecars, independently at or under the
+//! flag. The LRU axis is the sidecar's mtime: the atomic rename each
+//! persist lands makes it the last-persist clock, the same field the
+//! books' crash rebuild reads, and choosing it costs no record schema
+//! change (existing sidecars keep serving). Probe-time misses unlink
+//! their dead record too, under the concurrent-writer guard — see
+//! [`remove_answer_record_if`].
+//!
 //! # Debris sweep (#4053)
 //!
 //! Two crash classes leave files eviction can never see back: a blob whose
@@ -270,6 +287,31 @@ pub fn answer_blob_path(root: &Path, id: &ContentId) -> PathBuf {
 /// The temp-file counter for [`write_answer_record`]'s sibling temps.
 static ANSWER_TMP_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// How many prefix bytes [`answer_prefix_blob`] reads per sidecar: the
+/// `version` field's varint (1), the `blob` string's varint length (1),
+/// and the 32-hex [`ContentId`] spelling (32). The sweep pays this, not a
+/// whole-record read — a monorepo stamp set makes one sidecar megabytes,
+/// and a 10 GiB dir of those must not move at open.
+const ANSWER_PREFIX_LEN: usize = 34;
+
+/// The blob id peeked from an answer sidecar's first
+/// [`ANSWER_PREFIX_LEN`] bytes: the record's leading `version` varint,
+/// the `blob` string's varint length, and the hex id itself — the
+/// positional-bincode layout under the varint standard config
+/// (`AnsweredRecord { version, blob, .. }`), pinned by a codec pin test
+/// so a schema change that moves the prefix fails the pin, not
+/// production. `None` for anything else (a foreign version, a torn or
+/// short prefix, a non-hex blob spelling) — the sweep's verdict that the
+/// record is dead weight.
+fn answer_prefix_blob(prefix: &[u8]) -> Option<ContentId> {
+    let version = crate::state::persist::ANSWER_RECORD_VERSION;
+    if prefix.first() != Some(&(version as u8)) || prefix.get(1) != Some(&32) {
+        return None;
+    }
+    let hex = std::str::from_utf8(prefix.get(2..ANSWER_PREFIX_LEN)?).ok()?;
+    ContentId::parse_hex(hex).ok()
+}
+
 /// Writes one answer-record sidecar atomically (#4243): a unique sibling
 /// temp file, then a same-filesystem rename over the destination — the
 /// snapshot store's save discipline (a torn write leaves the previous
@@ -308,6 +350,23 @@ pub fn write_answer_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Any [`std::io::Error`] from the read (absent, unreadable, torn).
 pub fn read_answer_record(path: &Path) -> std::io::Result<Vec<u8>> {
     fs::read(path)
+}
+
+/// Removes the answer record at `path` only if its bytes still equal
+/// `judged` — the miss-path unlink's concurrent-writer guard (#4273): a
+/// probe that judged a sidecar dead (decode, stamps, or blob miss — a
+/// verdict that can never hit again without a re-persist) re-reads before
+/// unlinking, so a writer whose atomic rename landed fresh bytes between
+/// the two reads keeps its record: fresh content cannot byte-equal the
+/// stale bytes the probe judged (the stamp sets differ by construction).
+/// A completed hit is immune by construction — its bytes are already in
+/// memory, and unlinking never disturbs an open file. Best-effort, like
+/// every sidecar write: a failed read or unlink leaves the record for the
+/// next open's sweep.
+pub fn remove_answer_record_if(path: &Path, judged: &[u8]) {
+    if fs::read(path).is_ok_and(|current| current == judged) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// The open-time knobs: where the store lives and how many bytes it may
@@ -433,6 +492,10 @@ impl ContentStore {
         let _books = store.lock_books();
         store.load_books();
         store.evict();
+        // The answers fold (#4273) runs after the open-time eviction, so
+        // records stranded by this very eviction reclaim in the same open;
+        // the cold path pays it, never an ask.
+        store.sweep_answers();
         // Unconditional compaction at open (the full manifest write open
         // has always paid): it normalizes rebuilt books into a fresh base
         // and absorbs any journal the previous session left.
@@ -658,6 +721,100 @@ impl ContentStore {
             }
         }
         report
+    }
+
+    /// The answers fold (#4273): the open-time sweep of
+    /// `<root>/answers` — the answered-turn sidecars' bounded lifecycle,
+    /// paid once per open (the cold path) and never inside an ask. Three
+    /// cuts, in walk order:
+    ///
+    /// * dead records unlink outright — a blob gone from the store (the
+    ///   probe's `blob_missing` miss, permanent until a re-persist whose
+    ///   put-then-sidecar ordering means any sidecar on disk references a
+    ///   blob whose rename already landed, so a present sidecar with an
+    ///   absent blob was killed by eviction, not by an in-flight writer),
+    ///   or a prefix that no longer names a version-and-blob record
+    ///   (torn, foreign, or a future codec — dead weight for this
+    ///   binary, whose own keys fork away from a foreign generation
+    ///   anyway);
+    /// * `<key>.answer.tmp-*` write debris unlinks past [`SWEEP_GRACE`]
+    ///   — the same in-flight protection [`Self::sweep_debris`] gives
+    ///   the store's own temps, while a final-path record is never
+    ///   in-flight (the atomic rename discipline) and needs no grace;
+    /// * the survivors LRU-cap at [`Self::limit`] — the same byte budget
+    ///   and the same posture the books just enforced, evicting
+    ///   oldest-mtime first (the last-persist clock) with a
+    ///   path-ascending tie-break for determinism.
+    ///
+    /// Best-effort throughout (the accelerator posture): any I/O failure
+    /// skips its file, and a record this pass misses stays for the next
+    /// open. A concurrent writer's fresh record is the mtime-newest, so
+    /// LRU pressure reaches it last — the same documented degradation as
+    /// the books' own eviction under a pathologically small cap.
+    fn sweep_answers(&self) {
+        let Ok(files) = fs::read_dir(self.root.join("answers")) else {
+            return;
+        };
+        let mut live: Vec<(u64, u64, PathBuf)> = Vec::new();
+        for file in files.flatten() {
+            let Ok(meta) = file.metadata() else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let file_name = file.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let path = file.path();
+            if name.contains(".answer.tmp-") {
+                // Write debris: reclaimed only past the grace, so a
+                // concurrent writer's in-flight temp is never touched —
+                // `sweep_debris`'s guard, same constant, same reason.
+                let aged = meta
+                    .modified()
+                    .ok()
+                    .and_then(|mtime| mtime.elapsed().ok())
+                    .is_some_and(|age| age >= SWEEP_GRACE);
+                if aged {
+                    let _ = fs::remove_file(&path);
+                }
+            } else if name.ends_with(".answer") {
+                // A final-path record is never in-flight (atomic rename),
+                // so the dead-record cuts need no grace.
+                let dead = match read_prefix(&path) {
+                    None => false, // unreadable right now: not provably dead
+                    Some(prefix) => match answer_prefix_blob(&prefix) {
+                        None => true,
+                        Some(blob) => !answer_blob_path(&self.root, &blob).is_file(),
+                    },
+                };
+                if dead {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |span| span.as_secs());
+                live.push((mtime, meta.len(), path));
+            }
+        }
+        let mut total: u64 = live.iter().map(|&(_, size, _)| size).sum();
+        if total <= self.limit {
+            return;
+        }
+        live.sort_unstable();
+        for (_, size, path) in live {
+            if total <= self.limit {
+                break;
+            }
+            if fs::remove_file(&path).is_ok() {
+                total = total.saturating_sub(size);
+            }
+        }
     }
 
     /// Appends one journal row per moved id (ascending id — the `BTreeSet`
@@ -998,6 +1155,22 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |age| age.as_secs())
+}
+
+/// The first [`ANSWER_PREFIX_LEN`] bytes of the file at `path` — fewer
+/// when the file is shorter, which is itself a verdict (a record too
+/// small to carry version-and-blob is dead; [`answer_prefix_blob`] reads
+/// a short slice as `None`). `None` only on an I/O failure, where the
+/// file is not provably dead and stays for the next open.
+fn read_prefix(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut prefix = Vec::with_capacity(ANSWER_PREFIX_LEN);
+    fs::File::open(path)
+        .ok()?
+        .take(ANSWER_PREFIX_LEN as u64)
+        .read_to_end(&mut prefix)
+        .ok()?;
+    Some(prefix)
 }
 
 /// The manifest's on-disk shape: a version header plus one row per booked
@@ -1427,6 +1600,196 @@ mod tests {
         assert!(
             !reopened.contains(&fresh),
             "young debris stays off the books"
+        );
+    }
+
+    /// One sidecar record for the answers fixtures: the persist side's
+    /// shape over a caller-chosen blob id (#4273).
+    fn answer_record(blob: &ContentId) -> crate::state::persist::AnsweredRecord {
+        crate::state::persist::AnsweredRecord {
+            version: crate::state::persist::ANSWER_RECORD_VERSION,
+            blob: blob.to_string(),
+            stamps: vec![(
+                PathBuf::from("/fixture/target.dart"),
+                crate::state::persist::AnswerStamp {
+                    dev: 0,
+                    ino: 0,
+                    mtime_ns: 0,
+                    size: 0,
+                },
+            )],
+            summary: crate::state::persist::AnswerSummary::default(),
+        }
+    }
+
+    /// Plants a blob file at the store's content-addressed path without
+    /// booking it — the sweep reads blob existence off the disk path, the
+    /// probe's own truth, so the books never enter these fixtures.
+    fn plant_blob(root: &Path, payload: &[u8]) -> ContentId {
+        let id = content_hash(payload);
+        let path = answer_blob_path(root, &id);
+        fs::create_dir_all(path.parent().expect("shard")).expect("blob shard");
+        fs::write(&path, payload).expect("plant blob");
+        id
+    }
+
+    /// Mints one sidecar the way the persist side mints it (#4273
+    /// fixtures): encoded record under `key`, beside its (planted) blob.
+    fn mint_answer(root: &Path, key: &[u8; 16], blob: &ContentId) -> (PathBuf, Vec<u8>) {
+        let bytes =
+            crate::state::persist::encode_answer(&answer_record(blob)).expect("encodes");
+        let path = answer_record_path(root, key);
+        write_answer_record(&path, &bytes).expect("mint sidecar");
+        (path, bytes)
+    }
+
+    /// The answers fold at open (#4273): a sidecar whose blob is gone —
+    /// the probe's permanent `blob_missing` miss — a future-codec record,
+    /// and aged write debris all reclaim; a live record, a young
+    /// in-flight temp, and a file unreadable right now stay for the next
+    /// open.
+    #[test]
+    fn answers_open_sweep_reclaims_dead_records_and_spares_live() {
+        let scratch = Scratch::new("answers-sweep");
+        drop(ContentStore::open(&scratch.config(u64::MAX)).expect("open"));
+        let live = plant_blob(&scratch.0, b"live answer bytes");
+        let (live_path, _) = mint_answer(&scratch.0, &[1; 16], &live);
+
+        // Dead: the blob never landed on disk (evicted between the
+        // sidecar writes of two sessions, or a stranded record).
+        let ghost = content_hash(b"never stored");
+        let (ghost_path, _) = mint_answer(&scratch.0, &[2; 16], &ghost);
+
+        // Dead: a future codec's record — foreign bytes for this binary.
+        let mut future = answer_record(&live);
+        future.version += 1;
+        let future_bytes = crate::state::persist::encode_answer(&future).expect("encodes");
+        let future_path = answer_record_path(&scratch.0, &[3; 16]);
+        write_answer_record(&future_path, &future_bytes).expect("mint future");
+
+        // Dead: a prefix too short to carry version-and-blob at all.
+        let torn_path = answer_record_path(&scratch.0, &[4; 16]);
+        fs::write(&torn_path, b"\x01\x20ab").expect("mint torn");
+
+        // Write debris: young survives the grace, aged reclaims.
+        let answers = scratch.0.join("answers");
+        let young_tmp = answers.join("0000.answer.tmp-1-1");
+        fs::write(&young_tmp, b"half-written").expect("young tmp");
+        let aged_tmp = answers.join("ffff.answer.tmp-2-1");
+        fs::write(&aged_tmp, b"half-written").expect("aged tmp");
+        set_file_mtime(&aged_tmp, FileTime::from_unix_time(0, 0)).expect("age tmp");
+
+        drop(ContentStore::open(&scratch.config(u64::MAX)).expect("reopen"));
+
+        assert!(live_path.is_file(), "an in-budget live record survives open");
+        assert!(
+            !ghost_path.exists() && !future_path.exists() && !torn_path.exists(),
+            "stale-blob, foreign-codec, and torn records are dead weight, reclaimed"
+        );
+        assert!(young_tmp.is_file(), "young debris may be in flight");
+        assert!(!aged_tmp.exists(), "aged debris reclaims");
+    }
+
+    /// The answers budget at open (#4273): over-limit sidecar bytes evict
+    /// oldest-mtime first — the last-persist clock — down to the cap, the
+    /// books' own posture on the sidecar face; a record a concurrent
+    /// writer just landed is the mtime-newest, so LRU pressure reaches it
+    /// last.
+    #[test]
+    fn answers_open_sweep_lru_caps_to_the_budget() {
+        let scratch = Scratch::new("answers-lru");
+        drop(ContentStore::open(&scratch.config(u64::MAX)).expect("open"));
+        let mut aged_sizes = Vec::new();
+        for (index, key) in [[1u8; 16], [2; 16], [3; 16]].into_iter().enumerate() {
+            let blob = plant_blob(&scratch.0, format!("aged payload {index}").as_bytes());
+            let (path, _) = mint_answer(&scratch.0, &key, &blob);
+            set_file_mtime(&path, FileTime::from_unix_time(1000 + index as i64, 0))
+                .expect("age record");
+            aged_sizes.push(fs::metadata(&path).expect("meta").len());
+        }
+        let fresh_blob = plant_blob(&scratch.0, b"fresh payload");
+        let (fresh_path, _) = mint_answer(&scratch.0, &[9; 16], &fresh_blob);
+        let fresh_size = fs::metadata(&fresh_path).expect("meta").len();
+
+        // The budget holds all but the oldest aged record.
+        let limit = aged_sizes[1] + aged_sizes[2] + fresh_size;
+        drop(ContentStore::open(&scratch.config(limit)).expect("reopen"));
+
+        assert!(
+            !answer_record_path(&scratch.0, &[1; 16]).exists(),
+            "the oldest last-persist clock evicts first"
+        );
+        assert!(
+            answer_record_path(&scratch.0, &[2; 16]).is_file()
+                && answer_record_path(&scratch.0, &[3; 16]).is_file()
+                && fresh_path.is_file(),
+            "in-budget records and the mtime-newest survive"
+        );
+        let surviving: u64 = fs::read_dir(scratch.0.join("answers"))
+            .expect("answers dir")
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|meta| meta.len())
+            .sum();
+        assert!(
+            surviving <= limit,
+            "the sidecar face sits at or under the flag's budget ({surviving} <= {limit})"
+        );
+    }
+
+    /// The miss-path unlink's concurrent-writer guard (#4273): only the
+    /// bytes a probe actually judged dead may unlink — a re-persist
+    /// landing fresh bytes between the probe's read and its unlink spares
+    /// the record — and a missing path is a quiet no-op.
+    #[test]
+    fn answer_unlink_guard_spares_replaced_bytes() {
+        let scratch = Scratch::new("answers-guard");
+        drop(ContentStore::open(&scratch.config(u64::MAX)).expect("open"));
+        let blob = plant_blob(&scratch.0, b"guard payload");
+        let (path, judged) = mint_answer(&scratch.0, &[7; 16], &blob);
+
+        remove_answer_record_if(&path, b"fresh bytes a writer just landed");
+        assert!(path.is_file(), "replaced bytes are never unlinked");
+
+        remove_answer_record_if(&path, &judged);
+        assert!(!path.exists(), "the judged-stale bytes unlink");
+
+        remove_answer_record_if(&scratch.0.join("answers").join("absent.answer"), b"x");
+    }
+
+    /// The sweep's prefix peek against the record codec (#4273): the
+    /// varint-standard positional layout puts `version` at byte 0 and the
+    /// 32-hex blob spelling at bytes 2..34, whatever the stamps payload
+    /// behind them — the pin every record schema change must re-run. A
+    /// foreign version and a short prefix read as dead.
+    #[test]
+    fn answer_prefix_blob_pins_the_codec_layout() {
+        let blob = content_hash(b"pin target");
+        let bytes =
+            crate::state::persist::encode_answer(&answer_record(&blob)).expect("encodes");
+        assert!(
+            bytes.len() > ANSWER_PREFIX_LEN,
+            "the fixture record carries a stamps payload past the prefix"
+        );
+        assert_eq!(
+            answer_prefix_blob(&bytes),
+            Some(blob),
+            "version varint, string-length varint, then the hex id"
+        );
+
+        let mut foreign = answer_record(&blob);
+        foreign.version += 1;
+        let foreign_bytes =
+            crate::state::persist::encode_answer(&foreign).expect("encodes");
+        assert_eq!(
+            answer_prefix_blob(&foreign_bytes),
+            None,
+            "a foreign version is dead weight for this binary"
+        );
+        assert_eq!(
+            answer_prefix_blob(&bytes[..ANSWER_PREFIX_LEN - 1]),
+            None,
+            "a prefix too short for version-and-blob is torn"
         );
     }
 

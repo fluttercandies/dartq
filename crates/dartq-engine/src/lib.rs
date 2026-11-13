@@ -1759,17 +1759,27 @@ fn probe_answer_at(
     let Some(sidecar) = store::read_answer_record(&path).ok() else {
         return state::persist::AnswerProbe::Miss(state::persist::AnswerMiss::NoRecord);
     };
+    // The miss-path unlink (#4273): a sidecar read past this point is dead
+    // once judged — decode, stamp, and blob misses can never hit again
+    // without a re-persist — so each miss unlinks it under the
+    // concurrent-writer guard (a re-persist that landed fresh bytes
+    // between the read and the unlink is spared; hits pay nothing — the
+    // warm path's zero-extra-syscall contract).
+    let unlink_dead = |reason: state::persist::AnswerMiss| {
+        store::remove_answer_record_if(&path, &sidecar);
+        state::persist::AnswerProbe::Miss(reason)
+    };
     let Some(record) = state::persist::decode_answer(&sidecar) else {
-        return state::persist::AnswerProbe::Miss(state::persist::AnswerMiss::Decode);
+        return unlink_dead(state::persist::AnswerMiss::Decode);
     };
     if record.stamps.as_slice() != stamps {
-        return state::persist::AnswerProbe::Miss(state::persist::AnswerMiss::Stamps);
+        return unlink_dead(state::persist::AnswerMiss::Stamps);
     }
     let Some(blob) = dartq_source::ContentId::parse_hex(&record.blob).ok() else {
-        return state::persist::AnswerProbe::Miss(state::persist::AnswerMiss::Decode);
+        return unlink_dead(state::persist::AnswerMiss::Decode);
     };
     let Some(bytes) = std::fs::read(store::answer_blob_path(root, &blob)).ok() else {
-        return state::persist::AnswerProbe::Miss(state::persist::AnswerMiss::Blob);
+        return unlink_dead(state::persist::AnswerMiss::Blob);
     };
     state::persist::AnswerProbe::Hit {
         bytes,
