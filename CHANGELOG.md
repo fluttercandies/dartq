@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-11-13
+
+### Added
+
+- Persisted answer records for the resident official face: a successfully
+  served analysis now persists its exact rendered bytes plus a read-only
+  stamp set of the tree (dev/ino/mtime_ns/size), and a later run over a
+  byte-identical tree — even after the daemon died — serves the record
+  with no `analysis_server` spawn at all. Whole-repo re-run cold on a
+  452k-LOC corpus: 10.24 s → 0.10 s (~100×), output md5-equal across
+  cold, record-served, and kill-switch runs. Records live under the cache
+  dir with a 2 GiB per-dir cap and a startup LRU sweep; disable with
+  `DARTQ_ANSWER_RECORD=0` or `analyzer.official.answer_records: false`
+  (#4278).
+
 ### Changed
 
 - Resident analysis now pools by default: every `dartq analyze` request —
@@ -22,6 +37,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config back on. The pool capacity defaults to 16 aim roots per server
   (`DARTQ_POOL_MAX_ROOTS` or `analyzer.pool.max_roots` to tune, clamped
   1–64).
+
+### Performance
+
+- The watch trust window engages on the first proven event-stream round
+  trip instead of requiring a 10-minute punctual streaming streak: a
+  fresh daemon skips the per-ask fseventsd cookie barrier (the 23–31 ms
+  dominant leg of a 30–50 ms warm turn) as soon as its first barrier
+  succeeds, and a missed bound that a straggler delivery then proves
+  alive no longer restarts doubt. Stream restarts, stale proofs, and
+  doubt conditions still drop trust to zero immediately (#4262, #4264).
+
+### Fixed
+
+- Resident shedding fires only on a real memory shortfall: the ledger
+  and standby-server eviction arms no longer treat a macOS kernel
+  memory-pressure warning at 43–53% free memory as an emergency, so five
+  coexisting analysis servers no longer trigger an eviction storm that
+  cold-restarts daemons mid-benchmark (the real-box 89–105 s "incremental"
+  steps that should have been 0.06 s), while a genuine critical-pressure
+  reading now bypasses the debounce and evicts on the first sample
+  (#4266, #4267, #4272, #4274).
+- Resident frame bodies are capped at the face-class 1 GiB limit before
+  allocation: an oversized length prefix fails as a malformed frame
+  instead of attempting the allocation (#4272).
+- The engine answers sidecar directory counts against the store byte
+  budget and is swept with it — dead records, tmp debris, and
+  oldest-mtime LRU — so a long-lived cache cannot grow past its budget
+  through record churn (#4272, #4273).
+- The engine face's 0.1.21→0.1.23 row drift on a 1,332-file corpus was
+  decomposed row-by-row with oracle arbitration at 3.13.7: 103 removed
+  rows confirmed as correctly eliminated false positives, and 57 added
+  regressions root-caused and fixed — composite-initializer starvation
+  (`final x = c ? a : b` binding inferred locals at the parse-time LUB),
+  the written-arg creation face declining drift-codegen type args,
+  junction-operand promotion misses, and a synthetic `FutureOr` scope
+  gate. The non-record pattern dispatch was re-pinned to the oracle's own
+  `Object?` leaf answer; the degraded record element face
+  (`List<(int, int)>` splitting into leaf reads) remains a tracked gap
+  (#4265, #4279).
 
 ## [0.1.23] - 2026-11-13
 
