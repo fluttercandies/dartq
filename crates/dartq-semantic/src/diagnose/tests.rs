@@ -24293,3 +24293,19 @@ mod ticket_4132_tests;
 #[cfg(test)]
 #[path = "ticket_4265_tests.rs"]
 mod ticket_4265_tests;
+
+// —— #4036 (the typed literal's written `<...>` group is read by its own
+// —— balance, so any trivia between the group and the literal's bracket keeps
+// —— the parse; the spread-only brace ambiguity reads the same can-be/must-be
+// —— fold the kind dispatch does) ——
+#[cfg(test)]
+#[path = "ticket_4036_tests.rs"]
+mod ticket_4036_tests;
+
+// —— #4128 (the initializer face's twin of the direct collection-operand
+// —— lattice: the diverse leaf joins answer the exact upper bound — Null and
+// —— nullable legs, function and record forms, the per-slot map folds — and
+// —— an `if`-led map entry splits at its branch entries before the colon) ——
+#[cfg(test)]
+#[path = "ticket_4128_tests.rs"]
+mod ticket_4128_tests;

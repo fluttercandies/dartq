@@ -4387,20 +4387,11 @@ impl<'a> Engine<'a> {
     /// its element, a nested `if` joins its own), so the join never
     /// duplicates the lattice. `s` is the trimmed segment start.
     fn init_element_leaf_ty(&self, bytes: &[u8], s: usize, e: usize) -> Option<Ty> {
-        // `if` is a reserved word: the prefix is the element, never an
-        // identifier's head, and the parenthesized condition follows.
-        let after_if = trim_value_ws(bytes, s + 2, e);
-        if bytes.get(s..).is_some_and(|rest| rest.starts_with(b"if"))
-            && !bytes.get(s + 2).is_some_and(|b| ident_byte(*b))
-            && bytes.get(after_if) == Some(&b'(')
-            && let Some(close) = matching_bracket_fwd(bytes, after_if)
-        {
-            let then_start = trim_value_ws(bytes, close + 1, e);
-            return match value_top_level_else(bytes, close + 1, e) {
-                Some(else_at) => {
-                    let else_start = trim_value_ws(bytes, else_at + 4, e);
-                    let then_ty = self.init_element_leaf_ty(bytes, then_start, else_at);
-                    let else_ty = self.init_element_leaf_ty(bytes, else_start, e);
+        if let Some((then_span, else_span)) = self.init_if_element_spans(bytes, s, e) {
+            return match else_span {
+                Some(else_span) => {
+                    let then_ty = self.init_element_leaf_ty(bytes, then_span.0, then_span.1);
+                    let else_ty = self.init_element_leaf_ty(bytes, else_span.0, else_span.1);
                     match (then_ty, else_ty) {
                         (Some(then_ty), Some(else_ty)) => {
                             Some(self.init_leaf_least_from(vec![then_ty, else_ty]))
@@ -4412,10 +4403,43 @@ impl<'a> Engine<'a> {
                         _ => None,
                     }
                 }
-                None => self.init_element_leaf_ty(bytes, then_start, e),
+                None => self.init_element_leaf_ty(bytes, then_span.0, then_span.1),
             };
         }
         self.leaf_row_ty_in(bytes, s, e)
+    }
+
+    /// The `if`-led element's branch spans — `(then span, else span?)`,
+    /// `None` for every other segment. The keyword's word boundary and
+    /// the parenthesized condition detect the element and the first
+    /// top-level depth-aware `else` splits it; a branchless `if` answers
+    /// its then span alone. Both the element fold and the map-entry fold
+    /// split their control-flow element through this one reader, so the
+    /// branch shape is spelled once. `s` is the trimmed segment start.
+    fn init_if_element_spans(
+        &self,
+        bytes: &[u8],
+        s: usize,
+        e: usize,
+    ) -> Option<((usize, usize), Option<(usize, usize)>)> {
+        // `if` is a reserved word: the prefix is the element, never an
+        // identifier's head, and the parenthesized condition follows.
+        let after_if = trim_value_ws(bytes, s + 2, e);
+        if !bytes.get(s..).is_some_and(|rest| rest.starts_with(b"if"))
+            || bytes.get(s + 2).is_some_and(|b| ident_byte(*b))
+            || bytes.get(after_if) != Some(&b'(')
+        {
+            return None;
+        }
+        let close = matching_bracket_fwd(bytes, after_if)?;
+        let then_start = trim_value_ws(bytes, close + 1, e);
+        Some(match value_top_level_else(bytes, close + 1, e) {
+            Some(else_at) => (
+                (then_start, else_at),
+                Some((trim_value_ws(bytes, else_at + 4, e), e)),
+            ),
+            None => ((then_start, e), None),
+        })
     }
 
     /// The spread element's contribution to the leaf join
@@ -4490,38 +4514,21 @@ impl<'a> Engine<'a> {
     }
 
     /// The map entry leaves' key/value least types: each segment's
-    /// top-level colon splits the sides, a colonless map spread donates
-    /// its `Map<K, V>` arguments to the per-slot folds, and any other
-    /// colonless leaf (a control-flow element, a non-map spread) keeps
-    /// both sides `dynamic`.
+    /// top-level colon splits the sides, an `if`-led control-flow element
+    /// splits its BRANCH entries first
+    /// (`typed_literal_resolver.dart` `_computeElementType`'s
+    /// IfElementImpl arm — each branch is a full map entry, so
+    /// `{if (c) 1: 'a' else 'k': 'b'}` joins the two keys), a colonless
+    /// map spread donates its `Map<K, V>` arguments to the per-slot
+    /// folds, and any other colonless leaf (a non-map spread, a malformed
+    /// entry) keeps both sides `dynamic`. Both slot folds ride
+    /// [`Self::init_leaf_least_from`], the same exact join the element
+    /// face runs.
     fn init_entry_leaf_tys(&self, bytes: &[u8], start: usize, end: usize) -> (Ty, Ty) {
         let mut keys = Vec::new();
         let mut values = Vec::new();
         for (s, e) in value_comma_segments(bytes, start, end) {
-            match value_top_level_colon(bytes, s, e) {
-                Some(colon) => {
-                    keys.push(self.leaf_row_ty_in(bytes, s, colon));
-                    values.push(self.leaf_row_ty_in(bytes, colon + 1, e));
-                }
-                None => {
-                    let s = trim_value_ws(bytes, s, e);
-                    if bytes.get(s..).is_some_and(|rest| rest.starts_with(b"...")) {
-                        match self.init_spread_map_entry_tys(bytes, s, e) {
-                            Some((k, v)) => {
-                                keys.push(Some(k));
-                                values.push(Some(v));
-                            }
-                            None => {
-                                keys.push(None);
-                                values.push(None);
-                            }
-                        }
-                    } else {
-                        keys.push(None);
-                        values.push(None);
-                    }
-                }
-            }
+            self.init_entry_segment_tys(bytes, s, e, &mut keys, &mut values);
         }
         let fold = |tys: Vec<Option<Ty>>| -> Ty {
             if tys.iter().any(|ty| ty.is_none()) {
@@ -4530,6 +4537,55 @@ impl<'a> Engine<'a> {
             self.init_leaf_least_from(tys.into_iter().flatten().collect())
         };
         (fold(keys), fold(values))
+    }
+
+    /// One map-entry segment's per-slot donation: an `if`-led element
+    /// splits at its top-level `else` and recurses per branch (each
+    /// branch is a full entry; an `else if` chain nests the same way), a
+    /// branchless `if` keeps its then entry, and every other segment
+    /// splits at its top-level colon (`key: value`) — the key's own
+    /// control-flow leaves split through [`Self::init_element_leaf_ty`].
+    /// A colonless map spread donates its `Map<K, V>` arguments; a
+    /// segment that yields no entry pushes `None` on both slots (the
+    /// fold's `dynamic`).
+    fn init_entry_segment_tys(
+        &self,
+        bytes: &[u8],
+        s: usize,
+        e: usize,
+        keys: &mut Vec<Option<Ty>>,
+        values: &mut Vec<Option<Ty>>,
+    ) {
+        let s = trim_value_ws(bytes, s, e);
+        if let Some((then_span, else_span)) = self.init_if_element_spans(bytes, s, e) {
+            self.init_entry_segment_tys(bytes, then_span.0, then_span.1, keys, values);
+            if let Some((else_start, else_end)) = else_span {
+                self.init_entry_segment_tys(bytes, else_start, else_end, keys, values);
+            }
+            return;
+        }
+        match value_top_level_colon(bytes, s, e) {
+            Some(colon) => {
+                keys.push(self.init_element_leaf_ty(bytes, s, colon));
+                values.push(self.init_element_leaf_ty(bytes, colon + 1, e));
+            }
+            None if bytes.get(s..).is_some_and(|rest| rest.starts_with(b"...")) => {
+                match self.init_spread_map_entry_tys(bytes, s, e) {
+                    Some((k, v)) => {
+                        keys.push(Some(k));
+                        values.push(Some(v));
+                    }
+                    None => {
+                        keys.push(None);
+                        values.push(None);
+                    }
+                }
+            }
+            None => {
+                keys.push(None);
+                values.push(None);
+            }
+        }
     }
 
     /// The map spread's per-slot donation (`{...m}` inside a map-decided
@@ -4605,47 +4661,105 @@ impl<'a> Engine<'a> {
         (ty != Ty::UNKNOWN && ty != Ty::Dynamic).then_some(ty)
     }
 
-    /// The collected leaf types' least face (`least_leaf_ty_from`'s
-    /// convention): one exact type keeps itself, an `int`/`double`/`num`
-    /// mix lifts to `num`, distinct non-nullable class faces lift to
-    /// their nearest shared supertype below `Object` (upstream
-    /// `least_upper_bound.dart`), and every other known-leaf mix — a
-    /// `Null` leg, parameterized leaves, an `Object`-only intersection,
-    /// unrelated finals (`int` + `bool`) — joins at `Object` (upstream
-    /// `TypeSystem.leastUpperBound`'s top rung for known leaves: never
-    /// the `dynamic` stand-in, whose subtype verdicts diverge from
-    /// `Object`'s on every `is` ask).
+    /// The collected leaf types' least upper bound — the exact join the
+    /// direct collection-operand face folds (`collection_operand_ty`'s
+    /// `exact_leaf_lub`), one lattice for both spellings of the same
+    /// inference rather than a name-level collapse:
+    ///
+    /// * a `dynamic` leaf absorbs the join (the literal's `dynamic`
+    ///   argument — the no-context arm);
+    /// * a `Null` leaf and every `?`-suffixed leaf re-arm the suffix on
+    ///   the join of the non-null forms (upstream `least_upper_bound.dart`
+    ///   `UP(int, Null)` = `int?`), so a nullable leg no longer collapses
+    ///   to bare `Object`;
+    /// * one form keeps itself, an `Object` form absorbs every other, the
+    ///   `int`/`double`/`num` mix lifts to `num`, and the remaining
+    ///   `dart:core` finals (`int`, `double`, `num`, `bool`, `String`,
+    ///   `Type`) join at `Object` (upstream `TypeSystem.leastUpperBound`'s
+    ///   top rung for known leaves — never the `dynamic` stand-in, whose
+    ///   subtype verdicts diverge from `Object`'s on every `is` ask);
+    /// * distinct written class heads lift to their nearest shared
+    ///   supertype ([`Self::shared_leaf_supertype`] — `String`/`RegExp`
+    ///   → `Pattern`, unrelated finals falling back to `Object`).
+    ///
+    /// A shape the lattice cannot spell — distinct function forms,
+    /// distinct record forms, a parameterized head beside a bare one,
+    /// `void`/`Never`, an unknown leaf — answers `dynamic`: the same
+    /// under-report the direct face's `exact_leaf_lub` answers `None`
+    /// for, never a guessed `Object` the oracle's join would not print.
     fn init_leaf_least_from(&self, tys: Vec<Ty>) -> Ty {
-        let int = Ty::named(self.members.primitive_ids[0]);
-        let double = Ty::named(self.members.primitive_ids[1]);
-        let num = Ty::named(self.members.primitive_ids[2]);
-        let mut first: Option<Ty> = None;
-        let mut diverse = false;
-        let mut other_face = false;
-        for ty in tys.iter().copied() {
-            if ty == Ty::Dynamic {
-                return Ty::Dynamic;
-            }
-            if ty != int && ty != double && ty != num {
-                other_face = true;
-            }
-            match first {
-                None => first = Some(ty),
-                Some(prev) if prev != ty => diverse = true,
-                Some(_) => {}
+        if tys.is_empty() || tys.contains(&Ty::Dynamic) {
+            return Ty::Dynamic;
+        }
+        let object = Ty::named(self.intern("Object"));
+        let mut nullable = false;
+        let mut forms: Vec<Ty> = Vec::with_capacity(tys.len());
+        for leaf in tys.iter().copied() {
+            match leaf {
+                Ty::Null => nullable = true,
+                Ty::Named {
+                    nullable: leaf_nullable,
+                    ..
+                }
+                | Ty::Record {
+                    nullable: leaf_nullable,
+                    ..
+                }
+                | Ty::Function {
+                    nullable: leaf_nullable,
+                    ..
+                } => {
+                    nullable |= leaf_nullable;
+                    let form = Self::non_null_form(leaf);
+                    if !forms.contains(&form) {
+                        forms.push(form);
+                    }
+                }
+                Ty::Unknown | Ty::Never | Ty::Void | Ty::Dynamic => return Ty::Dynamic,
             }
         }
-        match first {
-            None => Ty::Dynamic,
-            Some(ty) if !diverse => ty,
-            // The int/double/num mix is the one diverse fold the lattice
-            // can name (`num`); a mixed class fold asks the
-            // shared-supertype walk, and everything else joins at
-            // `Object` — the top rung for known leaves.
-            Some(_) if !other_face => num,
-            Some(_) => self
-                .shared_leaf_supertype(&tys)
-                .unwrap_or_else(|| Ty::named(self.intern("Object"))),
+        let join = match forms.as_slice() {
+            // Every leaf was `null`: the literal's argument is `Null`.
+            [] => return Ty::Null,
+            [one] => *one,
+            _ if forms.contains(&object) => object,
+            _ => {
+                // The shared-supertype walk and the primitive rungs read
+                // written heads only: a function or record form, or a
+                // parameterized head beside them, is no head this lattice
+                // can join (the direct face's `None`).
+                let heads = forms
+                    .iter()
+                    .map(|form| match *form {
+                        Ty::Named {
+                            name,
+                            args: ArgListId::EMPTY,
+                            ..
+                        } => Some(name),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let Some(heads) = heads else {
+                    return Ty::Dynamic;
+                };
+                let ids = &self.members.primitive_ids;
+                let type_head = self.intern("Type");
+                if heads.iter().all(|head| ids[..3].contains(head)) {
+                    Ty::named(ids[2])
+                } else if heads
+                    .iter()
+                    .all(|head| ids.contains(head) || *head == type_head)
+                {
+                    object
+                } else {
+                    self.shared_leaf_supertype(&forms).unwrap_or(object)
+                }
+            }
+        };
+        if nullable {
+            Self::nullable_form(join)
+        } else {
+            join
         }
     }
 
