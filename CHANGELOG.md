@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Record types are first-class in the engine's annotation capture: a
+  record type inside a generic annotation (`List<(int, int)>`) no longer
+  loses its written arguments to a poisoned capture sink, so for-in
+  record destructuring and pattern dispatch read the real field types
+  instead of degraded leaf reads. A sibling fix stops the spread-element
+  face from typing a send by its first argument's nullability (a call's
+  argument-list parens are no longer mistaken for an expression group).
+  On the 1,332-file corpus this removes 130 dartq-only false positives
+  (0 added rows, every removal oracle-arbitrated) (#4279).
+
+### Performance
+
+- The engine's cold analyze at monorepo scale is 2.3–2.6× faster: the
+  supertype-closure fixpoint used to re-scan every registered file in
+  every round, per library (rounds × reach × libraries — the super-linear
+  term behind 2,940–3,275 s at a 107k-file monorepo). Scans are now
+  once-per-(file, owner) with a shared, parallel-precomputed ClosureEdges
+  table replayed per library (built only for dirty batches ≥ 64, so
+  incremental daemon turns never pay O(workspace)). Full-107k
+  2,940–3,275 s → 1,279 s; the 500 MB output envelope stays
+  byte-identical (md5-equal to the pre-fix manifest) (#4283).
+
 ## [0.1.24] - 2026-11-13
 
 ### Added
