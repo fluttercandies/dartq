@@ -692,16 +692,19 @@ type ViewGroup = (Option<String>, Vec<(RequestId, Request)>);
 type AnswerKey = (ContextId, Vec<u8>, commands::RenderFormat);
 
 /// The key for one request, `None` when the request is not a cacheable
-/// rendered base-view analyze (another face, a `None` format, an agent
+/// rendered base-view analyze (another face, a `None` format, or an agent
 /// view — the agent's wear makes its answers a per-overlay function the
-/// base epoch does not observe — or the serve-early opt-in, whose marked
-/// answer must never be served to a settled caller, #4268).
+/// base epoch does not observe). The serve-early opt-in needs no key leg
+/// (#4297): the marked answer never reaches the cache — the early group
+/// returns before the cache is consulted, and the only path that stores is
+/// the full one, whose answers are unmarked (the marker rides the drain,
+/// not the request) — so a flagged ask that took the full turn keys
+/// exactly like a plain one and shares its cached bytes.
 fn answer_key(context: ContextId, request: &Request) -> Option<AnswerKey> {
     let Request::Analyze {
         targets,
         format: Some(format),
         agent: None,
-        serve_early: false,
         ..
     } = request
     else {
@@ -1160,6 +1163,17 @@ pub struct Session {
     /// plain answer is the correct (and cheapest) one, so the opt-in
     /// degrades to the default face with no marker.
     settled: FxHashSet<ContextId>,
+    /// The settle a serve-early turn owes (#4297): a context whose early
+    /// answer skipped the full turn. The next read on that context runs the
+    /// owed full turn — the requests that landed on the read answer from it,
+    /// unmarked, and the context settles — regardless of the context's
+    /// publish duty (a declared fork owes its settle exactly like the
+    /// default context). The debt is state, not a queued read's shape:
+    /// continuous intake attaches asks to the queued read, so a
+    /// request-carrying read can no longer announce "this is the settle
+    /// turn" on its own. Only the early path inserts; [`Session::read_turn`]
+    /// drains it.
+    settle_owed: FxHashSet<ContextId>,
     /// Whether any context has walked its workspace yet (#2591's lazy
     /// boot): the walk runs on the first drain staging engine work, not
     /// at startup — see [`Session::refresh_workspace_state`].
@@ -1661,6 +1675,7 @@ impl Session {
             answers: AnswerCache::default(),
             publishes_due: false,
             settled: FxHashSet::default(),
+            settle_owed: FxHashSet::default(),
             discovered: false,
             config_stamps,
             config_advisory: None,
@@ -2082,6 +2097,11 @@ impl Session {
                 if read.context == old {
                     read.context = fresh;
                 }
+            }
+            // The settle debt travels with the context id it was owed on: a
+            // fresh universe owes its full turn all the same (#4297).
+            if self.settle_owed.remove(&old) {
+                self.settle_owed.insert(fresh);
             }
             if self.runtime.close_context(old).is_err() {
                 // Invariant: the id came from assembly and was never
@@ -3524,8 +3544,26 @@ impl Session {
     /// order), and each group materializes its view onto the task's context
     /// engine and analyzes once. When a base write applied but no default
     /// base request rides a default-context read, a zero-request base
-    /// analysis still runs so the publish diff drains.
-    fn read_turn(&mut self, pending: PendingRead, turn: &mut Turn) {
+    /// analysis still runs so the publish diff drains. A context whose
+    /// serve-early turn owes its settle ([`Session::settle_owed`]) runs the
+    /// owed full turn here — its attached asks answer from that turn,
+    /// unmarked — whatever the context's publish duty.
+    fn read_turn(&mut self, mut pending: PendingRead, turn: &mut Turn) {
+        // The settle a serve-early turn deferred (#4297): this read is its
+        // drain point. The owed full turn answers the requests that landed
+        // on it (the wire flag is a latency opt-in best-effort, never a
+        // semantic fork), so the early gate is not offered them — stripping
+        // the flag routes them through the ordinary full path, whose
+        // answers are unmarked and whose analysis settles. The debt leaves
+        // the set here and is restored below if the turn cannot deliver.
+        let settle_owed = self.settle_owed.remove(&pending.context);
+        if settle_owed {
+            for (_, request) in &mut pending.requests {
+                if let Request::Analyze { serve_early, .. } = request {
+                    *serve_early = false;
+                }
+            }
+        }
         let mut groups: Vec<ViewGroup> = Vec::new();
         for (id, request) in pending.requests {
             let agent = request.agent().map(str::to_owned);
@@ -3548,9 +3586,17 @@ impl Session {
         // Set when a containment below left this context's due publish diff
         // undrained — the #1310 fallback's scheduling condition.
         let mut publish_panicked = false;
-        if publishes_here && (groups.is_empty() || (self.publishes_due && !has_base)) {
+        // The zero-request base analysis runs for three reasons: the read
+        // exists for the publish diff alone, a due diff needs the analysis a
+        // request-carrying read will not provide, or the context owes the
+        // settle a serve-early turn deferred (#4297) and no base request
+        // rides the read to carry it. The publish reasons are the default
+        // context's alone; the settle debt is any context's.
+        let base_due = publishes_here && (groups.is_empty() || (self.publishes_due && !has_base));
+        if base_due || (settle_owed && !has_base) {
+            let context = pending.context;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.run_group(self.default_context, None, Vec::new(), turn);
+                self.run_group(context, None, Vec::new(), turn);
             }));
             if let Ok(()) = outcome {
                 // `Ok` covers two cases. A completed drain cleared
@@ -3562,20 +3608,17 @@ impl Session {
                 // ends the session anyway, and keeping the diff honest
                 // is what a future non-quit cancel source needs for the
                 // #1310 retry to fire.
-                if !self.quit.is_cancelled() {
+                if publishes_here && !self.quit.is_cancelled() {
                     self.publishes_due = false;
                     self.publish_retry = None;
                 }
             } else {
-                eprintln!(
-                    "dartq-daemon: base analysis panicked; the publish diff retries on \
-                     the next intake"
-                );
-                self.note_plugin_path_panic(pending.context, None);
+                eprintln!("dartq-daemon: base analysis panicked; the next intake retries it");
+                self.note_plugin_path_panic(context, None);
                 self.restore_base_view_contained();
                 // Still due ⇔ the plan never ran: the diff is genuinely
                 // deferred (a panic after it would not be).
-                publish_panicked = self.publishes_due;
+                publish_panicked = publishes_here && self.publishes_due;
             }
         }
 
@@ -3603,6 +3646,13 @@ impl Session {
                     publish_panicked = true;
                 }
             }
+        }
+
+        // A settle owed but not delivered — a contained panic or a
+        // cancelled analysis left the context unsettled — stays owed: the
+        // next read on the context retries it (#4297).
+        if settle_owed && !self.settled.contains(&pending.context) {
+            self.settle_owed.insert(pending.context);
         }
 
         // The contained-panic fallback (#1310): a containment that deferred
@@ -3744,14 +3794,17 @@ impl Session {
         if let Some(aims) = self.serve_early_aims(context, agent, &requests) {
             self.run_serve_early_group(context, aims, requests, turn);
             // The early turn never settles the context, so the full turn
-            // this ask deferred is always owed: re-queue the read so the
-            // next drain runs the settle — publish plan included — exactly
-            // as if this ask had never arrived. A due publish diff is one
-            // reason the settle is owed; an unsettled workspace is the
-            // other.
-            if !self.settled.contains(&context) {
-                self.ensure_read(context, Tier::Normal);
-            }
+            // this ask deferred is always owed — publish plan included. The
+            // debt is recorded as state: the old re-queue guard ("only
+            // while unsettled") was vacuous here (an early-group context is
+            // never settled), and a request-carrying read cannot announce
+            // "this is the settle turn" on its own — under continuous
+            // intake the attached asks re-entered the early gate forever.
+            // Re-queueing the read keeps the settle's cadence: the next
+            // drain — a warm tick's or the next intake's — runs the owed
+            // full turn via [`Self::read_turn`]'s debt arm.
+            self.settle_owed.insert(context);
+            self.ensure_read(context, Tier::Normal);
             return;
         }
 
@@ -3893,10 +3946,19 @@ impl Session {
     /// Each aim resolves through the same table the engine's file-aim turn
     /// reads, and an unresolvable target (a skipped, excluded, or unseen
     /// path) falls back to the full turn rather than answering without it:
-    /// the opt-in buys latency, never a different row set. A non-`.dart`
-    /// file target cannot move the answer (the shared `covered` rule emits
-    /// no row for it) and therefore neither joins nor blocks the aim — the
-    /// same rule the cold CLI's file-aim derivation applies.
+    /// the opt-in buys latency, never a different row set. The same rule
+    /// covers a path-less ask (the whole workspace by the shared
+    /// `default_target` rule — a session-flag intake can hand one a
+    /// `serve_early` the parse-level guard never saw, #4297) and a path
+    /// with no standing library: a refused batch's ceiling anchor (an id,
+    /// never content or residency), or a context that has not analyzed its
+    /// workspace yet — the aim the engine's slice would honor cannot be
+    /// promised before formation, and a first ask has nothing settled to
+    /// beat, so the group takes the full turn itself, unmarked and
+    /// settling. A non-`.dart` file target cannot move the answer (the
+    /// shared `covered` rule emits no row for it) and therefore neither
+    /// joins nor blocks the aim — the same rule the cold CLI's file-aim
+    /// derivation applies.
     fn serve_early_aims(
         &self,
         context: ContextId,
@@ -3906,7 +3968,8 @@ impl Session {
         if agent.is_some() || self.settled.contains(&context) {
             return None;
         }
-        let files = self.engine(context).file_table();
+        let engine = self.engine(context);
+        let files = engine.file_table();
         let mut aims = Vec::new();
         for (_, request) in requests {
             let Request::Analyze {
@@ -3917,6 +3980,9 @@ impl Session {
             else {
                 return None;
             };
+            if targets.is_empty() {
+                return None;
+            }
             for target in targets {
                 match target {
                     // A directory aim's covered set spans whole libraries:
@@ -3926,7 +3992,9 @@ impl Session {
                     dartq_commands::analyze::Target::File(path)
                         if !path.extension().is_some_and(|ext| ext == "dart") => {}
                     dartq_commands::analyze::Target::File(path) => {
-                        aims.push(files.try_file_id(path)?);
+                        let file = files.try_file_id(path)?;
+                        engine.library_of(file)?;
+                        aims.push(file);
                     }
                 }
             }
@@ -3941,11 +4009,12 @@ impl Session {
     /// nothing else. No publish plan drains (no diff was due; a partial
     /// row set must never enter the baseline), the plugin weave never runs
     /// (its rows are workspace-wide observables a settled turn owns), and
-    /// the warm-turn answer cache neither serves nor stores this group
-    /// ([`answer_key`] refuses the opt-in, so a marked answer can never be
-    /// re-served to a settled caller). The context stays unsettled: the
-    /// libraries outside the aim remain dirty for the next full turn —
-    /// exactly what the marker announces to the client.
+    /// the warm-turn answer cache neither serves nor stores this group:
+    /// the early path returns before the cache is consulted, so the marked
+    /// bytes structurally never enter it (#4297). The context stays
+    /// unsettled: the libraries outside the aim remain dirty for the full
+    /// turn the settle debt owes — exactly what the marker announces to
+    /// the client.
     fn run_serve_early_group(
         &mut self,
         context: ContextId,
@@ -11318,6 +11387,18 @@ mod tests {
         targets: Vec<dartq_commands::analyze::Target>,
         serve_early: bool,
     ) -> serde_json::Value {
+        analyze_answer_in(session, id, None, targets, serve_early)
+    }
+
+    /// [`analyze_answer`] with a context tag: the declared-context pins
+    /// route their asks explicitly.
+    fn analyze_answer_in(
+        session: &mut Session,
+        id: i64,
+        context: Option<&str>,
+        targets: Vec<dartq_commands::analyze::Target>,
+        serve_early: bool,
+    ) -> serde_json::Value {
         session.queue_command(
             RequestId::Num(id),
             Request::Analyze {
@@ -11325,7 +11406,7 @@ mod tests {
                 format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
-                context: None,
+                context: context.map(str::to_owned),
                 serve_early,
             },
         );
@@ -11337,6 +11418,17 @@ mod tests {
             .expect("the analyze request answers")
             .as_value()
             .into_owned()
+    }
+
+    /// The answer payload one serviced request produced — the value/wire
+    /// distinction the cache pins read.
+    fn answered_payload(turn: &Turn, id: i64) -> AnswerPayload {
+        turn.answers
+            .iter()
+            .find(|(rid, _)| *rid == RequestId::Num(id))
+            .and_then(|(_, answer)| answer.as_ref().ok())
+            .expect("the request answers")
+            .clone()
     }
 
     /// A `lib/a.dart` + `lib/b.dart` workspace: `a.dart` declares `Foo` and
@@ -11581,9 +11673,10 @@ mod tests {
         );
     }
 
-    /// The deferred settle: after a serve-early turn the context re-queues
-    /// its read, so the NEXT drain runs the full turn — publishes flow and
-    /// the context settles — with no further client input.
+    /// The deferred settle: after a serve-early turn the context records
+    /// the settle debt (`settle_owed`) and re-queues its read, so the NEXT
+    /// drain runs the full turn — publishes flow and the context settles —
+    /// with no further client input.
     #[test]
     fn serve_early_requeues_the_deferred_settle() {
         let workspace = two_library_workspace("serve-early-unit-requeue");
@@ -11624,6 +11717,10 @@ mod tests {
             "still unsettled after the early turn"
         );
         assert!(
+            session.settle_owed.contains(&session.default_context),
+            "the early turn recorded the settle debt"
+        );
+        assert!(
             !session.reads.is_empty(),
             "the deferred settle re-queued a read"
         );
@@ -11636,14 +11733,19 @@ mod tests {
             "the deferred settle ran and settled the context"
         );
         assert!(
+            session.settle_owed.is_empty(),
+            "the settle debt drained with the full turn"
+        );
+        assert!(
             turn.answers.is_empty(),
             "the settle turn carries no answers"
         );
     }
 
-    /// The warm-turn answer cache never serves a marked answer: a
-    /// serve-early ask's rendered answer is not stored, and a later plain
-    /// ask on the same file answers the settled bytes (no marker).
+    /// The warm-turn answer cache never serves a marked answer: the early
+    /// group returns before the cache is consulted (the marked bytes
+    /// structurally never enter it, #4297), and a later plain ask on the
+    /// same file answers the settled bytes (no marker).
     #[test]
     fn serve_early_answers_never_enter_the_warm_cache() {
         let workspace = two_library_workspace("serve-early-unit-cache");
@@ -11721,6 +11823,423 @@ mod tests {
         assert!(
             plain["stdout"].as_str().is_some_and(|s| !s.is_empty()),
             "the rendered answer carries stdout: {plain}"
+        );
+    }
+
+    // ---- serve-early repairs (#4297) ----
+
+    /// #4297 (P1): the session-wide flag ORs `serve_early` into every
+    /// analyze ask AFTER parsing, so a path-less ask — which the
+    /// parse-level guard refuses — arrives flagged. It used to contribute
+    /// no aim and never block the early path: one sibling file ask pulled
+    /// the whole group onto it, and the path-less answer covered the whole
+    /// default target while carrying only the aim libraries' rows, marked.
+    /// The path-less ask now forces the group's full turn, unmarked.
+    #[test]
+    fn serve_early_session_flag_pathless_batch_takes_the_full_turn() {
+        let workspace = two_library_workspace("serve-early-unit-pathless");
+        let mut session = Session::with_runtime(
+            workspace.engine_config(),
+            Vec::new(),
+            Some(store_at(store_root("serve-early-unit-pathless"))),
+            None,
+            SessionRuntime {
+                serve_early: true,
+                ..SessionRuntime::default()
+            },
+        )
+        .expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Reopen the unsettled window with a NEW diagnostic in b.dart, so
+        // a partial (a.dart-only) answer is observably short.
+        let b = workspace.path("lib/b.dart");
+        fs::write(&b, "import 'a.dart';\nvoid main() { doesNotExist(); }\n")
+            .expect("rewrite b.dart");
+        session
+            .queue_disk_changes(std::slice::from_ref(&b))
+            .expect("disk changes queue");
+        let a = workspace.path("lib/a.dart");
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                targets: vec![dartq_commands::analyze::Target::File(a)],
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: false,
+            },
+        );
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                targets: Vec::new(),
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: false,
+            },
+        );
+        let turn = session.service();
+        let eager = answered_payload(&turn, 2).as_value().into_owned();
+        let pathless = answered_payload(&turn, 3).as_value().into_owned();
+        assert!(
+            pathless.get("settle").is_none(),
+            "the path-less ask answers unmarked: {pathless}"
+        );
+        assert!(
+            eager.get("settle").is_none(),
+            "the sibling ask answered by the same full turn is unmarked: {eager}"
+        );
+        let files: Vec<&str> = pathless["diags"]
+            .as_array()
+            .expect("diags array")
+            .iter()
+            .filter_map(|row| row["file"].as_str())
+            .collect();
+        assert!(
+            files.iter().any(|file| file.ends_with("lib/b.dart")),
+            "the full turn's b.dart row rides the path-less answer: {files:?}"
+        );
+        assert!(
+            session.settled.contains(&session.default_context),
+            "the fallback full turn settles the context"
+        );
+
+        // The path-less answer equals a settled full turn's rows.
+        let settled = analyze_answer(&mut session, 4, Vec::new(), false);
+        assert!(settled.get("settle").is_none(), "settled ask unmarked");
+        assert_eq!(
+            pathless["diags"], settled["diags"],
+            "the path-less answer is the full-turn rows"
+        );
+    }
+
+    /// #4297 (P2): a serve-early turn on a declared context owes its
+    /// settle — the old re-queue drained a zero-request read there, which
+    /// no-opped (no publish duty, no requests), so the fork never settled
+    /// and every later ask stayed on the early path. The debt runs the
+    /// owed full turn on whatever context owes it.
+    #[test]
+    fn serve_early_settle_debt_runs_on_a_declared_context() {
+        let workspace = two_library_workspace("serve-early-unit-debt-fork");
+        let pool = dartq_engine::ContentPool::new();
+        let mut base = workspace.engine_config();
+        base.store = dartq_engine::pooled_memory_store(&pool);
+        let mut session = Session::with_contexts(
+            base,
+            [fork_config(&workspace, &pool)],
+            Some(store_at(store_root("serve-early-unit-debt-fork"))),
+            None,
+        )
+        .expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        let fork = session.route(Some("t"));
+
+        // The fork's first ask forms its libraries (a full turn: no
+        // standing library exists to aim at yet), so the fork starts
+        // settled and a later edit is the only thing reopening it.
+        let a = workspace.path("lib/a.dart");
+        let warm = analyze_answer_in(
+            &mut session,
+            1,
+            Some("t"),
+            vec![dartq_commands::analyze::Target::File(a.clone())],
+            false,
+        );
+        assert!(
+            warm.get("settle").is_none(),
+            "the fork's first ask answers unmarked: {warm}"
+        );
+        assert!(
+            session.settled.contains(&fork),
+            "the first ask settled the fork"
+        );
+
+        // A write reopens every context's settle (content is not a fork
+        // dimension); the default context's publish read then drains its
+        // own full turn, leaving the fork unsettled.
+        let b = workspace.path("lib/b.dart");
+        fs::write(
+            &b,
+            "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n",
+        )
+        .expect("rewrite b.dart");
+        session
+            .queue_disk_changes(std::slice::from_ref(&b))
+            .expect("disk changes queue");
+        let _ = session.service();
+        assert!(
+            !session.settled.contains(&fork),
+            "the write reopened the fork's settle"
+        );
+
+        // The fork's serve-early ask answers early, marked, on its formed
+        // libraries.
+        let early = analyze_answer_in(
+            &mut session,
+            2,
+            Some("t"),
+            vec![dartq_commands::analyze::Target::File(a.clone())],
+            true,
+        );
+        assert_eq!(
+            early["settle"],
+            serde_json::json!("may-precede-settle"),
+            "the fork's early answer is marked: {early}"
+        );
+        assert!(
+            session.settle_owed.contains(&fork),
+            "the fork owes the settle the early turn deferred"
+        );
+
+        // The next drain — the re-queued read alone — runs the owed full
+        // turn on the fork.
+        let turn = session.service();
+        assert!(turn.answers.is_empty(), "the settle turn answers nothing");
+        assert!(
+            session.settled.contains(&fork),
+            "the fork's full turn ran and settled the context"
+        );
+        assert!(session.settle_owed.is_empty(), "the debt drained");
+
+        // Visible proof: the fork's next serve-early ask answers unmarked.
+        let again = analyze_answer_in(
+            &mut session,
+            3,
+            Some("t"),
+            vec![dartq_commands::analyze::Target::File(a)],
+            true,
+        );
+        assert!(
+            again.get("settle").is_none(),
+            "the settled fork degrades to the plain face: {again}"
+        );
+    }
+
+    /// #4297 (P2): under continuous sync+ask intake the settle read used
+    /// to attach the next ask and re-enter the early gate forever —
+    /// `publishes_due` never drained. The debt makes the next read the
+    /// settle turn: the full analysis runs between intakes, the publish
+    /// diff goes out, and the attached ask answers unmarked.
+    #[test]
+    fn serve_early_settle_debt_drains_between_interleaved_intakes() {
+        let workspace = two_library_workspace("serve-early-unit-debt-starve");
+        let mut session = Session::with_store(
+            workspace.engine_config(),
+            store_at(store_root("serve-early-unit-debt-starve")),
+            None,
+        )
+        .expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        assert!(session.settled.contains(&session.default_context));
+
+        // Round A: a sync + a serve-early ask share one drain. The early
+        // turn answers, the settle stays owed, the diff stays due.
+        let b = workspace.path("lib/b.dart");
+        fs::write(&b, "import 'a.dart';\nvoid main() { doesNotExist(); }\n")
+            .expect("rewrite b.dart");
+        session
+            .queue_disk_changes(std::slice::from_ref(&b))
+            .expect("disk changes queue");
+        let a = workspace.path("lib/a.dart");
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                targets: vec![dartq_commands::analyze::Target::File(a.clone())],
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: true,
+            },
+        );
+        let turn = session.service();
+        let early = answered_payload(&turn, 2).as_value().into_owned();
+        assert_eq!(
+            early["settle"],
+            serde_json::json!("may-precede-settle"),
+            "the early turn answers marked: {early}"
+        );
+        assert!(session.publishes_due, "the early turn left the diff due");
+        assert!(
+            session.settle_owed.contains(&session.default_context),
+            "the settle is owed"
+        );
+
+        // Round B: another sync + another serve-early ask, one drain — the
+        // shape that used to starve the settle forever.
+        fs::write(
+            &b,
+            "import 'a.dart';\nvoid main() { doesNotExist(); doesNotExist(); }\n",
+        )
+        .expect("rewrite b.dart again");
+        session
+            .queue_disk_changes(std::slice::from_ref(&b))
+            .expect("disk changes queue");
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                targets: vec![dartq_commands::analyze::Target::File(a)],
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: true,
+            },
+        );
+        let turn = session.service();
+        let second = answered_payload(&turn, 3).as_value().into_owned();
+        assert!(
+            second.get("settle").is_none(),
+            "the settle turn answered the attached ask unmarked: {second}"
+        );
+        assert!(
+            !session.publishes_due,
+            "the settle turn drained the due publish diff"
+        );
+        assert!(
+            turn.publishes
+                .iter()
+                .any(|publish| publish.uri.contains("lib/b.dart")),
+            "the diff's push went out: {:?}",
+            turn.publishes
+                .iter()
+                .map(|publish| publish.uri.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            session.settled.contains(&session.default_context),
+            "the settle turn settled the context"
+        );
+        assert!(session.settle_owed.is_empty(), "the debt drained");
+    }
+
+    /// #4297 (P2): the session flag used to make every ask non-cacheable
+    /// for the session's life (the `answer_key` `serve_early: false` leg),
+    /// settled contexts included — exactly where the plain full answer is
+    /// the cheapest correct one. Cacheability follows the answering path:
+    /// the early group bypasses the cache, the full path serves/stores.
+    #[test]
+    fn serve_early_flagged_session_serves_the_cache_when_settled() {
+        let workspace = two_library_workspace("serve-early-unit-flag-cache");
+        let mut session = Session::with_runtime(
+            workspace.engine_config(),
+            Vec::new(),
+            Some(store_at(store_root("serve-early-unit-flag-cache"))),
+            None,
+            SessionRuntime {
+                serve_early: true,
+                ..SessionRuntime::default()
+            },
+        )
+        .expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        assert!(session.settled.contains(&session.default_context));
+
+        let a = workspace.path("lib/a.dart");
+        let ask = || Request::Analyze {
+            targets: vec![dartq_commands::analyze::Target::File(a.clone())],
+            format: Some(crate::commands::RenderFormat::Lon),
+            verbosity: Verbosity::Compact,
+            agent: None,
+            context: None,
+            serve_early: false,
+        };
+        session.queue_command(RequestId::Num(2), ask());
+        let turn = session.service();
+        let first = answered_payload(&turn, 2);
+
+        session.queue_command(RequestId::Num(3), ask());
+        let turn = session.service();
+        let second = answered_payload(&turn, 3);
+        assert!(
+            matches!(&second, AnswerPayload::Wire(_)),
+            "the flagged session's settled context answers from the cache"
+        );
+        assert_eq!(
+            first.as_bytes().as_ref(),
+            second.as_bytes().as_ref(),
+            "the cached answer is byte-identical"
+        );
+        assert!(
+            second.as_value().get("settle").is_none(),
+            "the cached answer is unmarked"
+        );
+    }
+
+    /// #4297 (P3): an interned path with no owning library (a refused
+    /// batch's ceiling anchor — an id, never content or residency) is not
+    /// an aim: the engine would widen that turn to the whole workspace, so
+    /// the daemon takes the full turn itself — unmarked, settling —
+    /// instead of marking it pre-settle and skipping the settle.
+    #[test]
+    fn serve_early_aim_without_a_library_takes_the_full_turn() {
+        let workspace = two_library_workspace("serve-early-unit-aimless");
+        let mut session = Session::with_store(
+            workspace.engine_config(),
+            store_at(store_root("serve-early-unit-aimless")),
+            None,
+        )
+        .expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        assert!(session.settled.contains(&session.default_context));
+
+        // Trip the live-path ceiling: the batch's first path is interned
+        // for the degrade row only — an id with no content and no library.
+        let live = session.engine(session.default_context).file_table().len();
+        session.set_live_path_cap(live + 1);
+        let churn = workspace.path("lib/churn_0.dart");
+        fs::write(&churn, CLEAN_MAIN).expect("write churn");
+        let roomie = workspace.path("lib/churn_1.dart");
+        fs::write(&roomie, CLEAN_MAIN).expect("write roomie");
+        session
+            .queue_disk_changes(&[churn.clone(), roomie])
+            .expect_err("the over-ceiling batch is refused");
+        let anchor = session
+            .engine(session.default_context)
+            .file_table()
+            .try_file_id(&churn)
+            .expect("the refusal interns its anchor");
+        assert!(
+            session
+                .engine(session.default_context)
+                .library_of(anchor)
+                .is_none(),
+            "the ceiling anchor has no library"
+        );
+
+        // Reopen the unsettled window, then ask the library-less aim.
+        let b = workspace.path("lib/b.dart");
+        fs::write(&b, "import 'a.dart';\nvoid main() { doesNotExist(); }\n")
+            .expect("rewrite b.dart");
+        session
+            .queue_disk_changes(std::slice::from_ref(&b))
+            .expect("the sync admits under the ceiling");
+        let answer = analyze_answer(
+            &mut session,
+            2,
+            vec![dartq_commands::analyze::Target::File(churn)],
+            true,
+        );
+        assert!(
+            answer.get("settle").is_none(),
+            "the library-less aim takes the full turn unmarked: {answer}"
+        );
+        assert!(
+            session.settled.contains(&session.default_context),
+            "the full turn settles the context"
+        );
+        assert!(
+            session.settle_owed.is_empty(),
+            "no settle debt is owed after a full turn"
         );
     }
 }

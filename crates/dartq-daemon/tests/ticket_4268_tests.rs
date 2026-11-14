@@ -301,10 +301,10 @@ fn serve_early_rejects_directory_and_agent_shapes() {
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
-/// The warm-turn answer cache never serves a marked answer: a
-/// serve-early ask's rendered answer is not stored, and a later plain
-/// ask on the same file answers the settled bytes (no marker) — the
-/// cache's `serve_early: false` key leg keeps the two faces disjoint.
+/// The warm-turn answer cache never serves a marked answer: the early
+/// group returns before the cache is consulted (a marked answer can never
+/// enter it, #4297), and a later plain ask on the same file answers the
+/// settled bytes (no marker).
 #[test]
 fn serve_early_answers_never_enter_the_warm_cache() {
     let _guard = workspace_lock();
