@@ -5147,7 +5147,14 @@ impl<'a> Engine<'a> {
         names: Vec<StringId>,
     ) -> Option<(usize, Box<[Ty]>, Box<[(StringId, Ty)]>)> {
         let (mark, open) = self.record_marks.pop()?;
-        if count == 0 || mark > self.rows.len() {
+        if count == 0 {
+            // `()` — the empty record literal: no field windows exist, so
+            // the shape is the reserved empty record outright (the
+            // element/assignability faces read `()` exactly like any other
+            // record spelling — #4288's arity-zero case).
+            return Some((mark, Box::default(), Box::default()));
+        }
+        if mark > self.rows.len() {
             return None;
         }
         let rows = &self.rows[mark..];

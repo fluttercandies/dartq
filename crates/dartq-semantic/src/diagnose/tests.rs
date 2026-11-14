@@ -24302,6 +24302,14 @@ mod ticket_4265_tests;
 #[path = "ticket_4036_tests.rs"]
 mod ticket_4036_tests;
 
+// —— #4288 (the record-vs-record assignability verdict inside the typed
+// —— list literal's element check: the record literal's `( … )` is no
+// —— transparent group — the peel declines it and the record arm of
+// —— `assignable` decides arity, named set, slots and nullability) ——
+#[cfg(test)]
+#[path = "ticket_4288_tests.rs"]
+mod ticket_4288_tests;
+
 // —— #4128 (the initializer face's twin of the direct collection-operand
 // —— lattice: the diverse leaf joins answer the exact upper bound — Null and
 // —— nullable legs, function and record forms, the per-slot map folds — and

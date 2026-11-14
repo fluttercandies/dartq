@@ -69,10 +69,10 @@ fn spaced_nested_list_element_face_keeps_the_written_argument() {
 
 /// A record-shaped argument rides the same capture (`<(int, int)>[...]`):
 /// the literal's RESULT face is `List<(int, int)>`, so the return and
-/// call-argument positions name the written record type. (The element
-/// check's own `list_element_type_not_assignable` row against a record
-/// element type is a separate assignability-family gap — the record-vs-
-/// record verdict — outside this ticket's capture scope.)
+/// call-argument positions name the written record type — and the element
+/// check's own `list_element_type_not_assignable` row fires against a
+/// record element of the wrong shape (#4288 closed the record-vs-record
+/// verdict the narrowed assertion used to defer).
 #[test]
 fn spaced_record_argument_is_the_element_face() {
     let report = report_ops(
@@ -80,7 +80,17 @@ fn spaced_record_argument_is_the_element_face() {
          void takes(Set<(int, int)> x) {}\n\
          void main() {\n\
          \x20 takes(<(int, int)> [(1, 2)]);\n\
+         \x20 final bad = <(int, int)> [(3, 'z')];\n\
          }\n",
+    );
+    assert_eq!(
+        texts(&report, "list_element_type_not_assignable"),
+        vec![
+            "The element type '(int, String)' can't be assigned to the \
+             list type '(int, int)'."
+                .to_string()
+        ],
+        "the record element's own check asks the record-vs-record verdict"
     );
     assert_eq!(
         texts(&report, "return_of_invalid_type"),

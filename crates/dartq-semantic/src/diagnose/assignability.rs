@@ -600,6 +600,13 @@ impl<'a> Engine<'a> {
                     continue;
                 }
             }
+            // The element node's own span — the trimmed segment with its
+            // transparent wrappers still on — saved before the peel loop
+            // narrows `we`. A record literal's row anchors at its `)`
+            // alone, so its assignability report re-anchors on this whole
+            // element extent, the oracle's `.at(element)`
+            // (`literal_element_verifier.dart`'s element node).
+            let elem_span = (ws, we);
             // A nested collection literal owns the element position when
             // the trimmed segment IS the literal — the `[`/`{` opens it
             // and the matching `]`/`}` closes it. Transparent wrappers
@@ -627,7 +634,13 @@ impl<'a> Engine<'a> {
                 }
                 // A `( e )` group peels when its own close is the
                 // segment's last byte — otherwise the paren groups only
-                // a prefix (`(a).b`) and the element is the whole.
+                // a prefix (`(a).b`) and the element is the whole. A
+                // RECORD literal is no transparent group: `(a, b)` IS the
+                // element, its row sits at the `)` alone
+                // ([`RowShape::Record`] — the parenthesized face pushes
+                // `RowShape::Bare` instead), and peeling would strand the
+                // row search on the fields' drained residue, leaving the
+                // record-vs-record assignability ask unanswered (#4288).
                 if lw < we && bytes[lw] == b'(' {
                     let mut d = 0usize;
                     let mut close = None;
@@ -645,6 +658,12 @@ impl<'a> Engine<'a> {
                         }
                     }
                     if close == Some(we - 1) {
+                        if self.rows.iter().any(|row| {
+                            matches!(row.shape, RowShape::Record(_))
+                                && row.range.offset == self.utf16_of(we - 1)
+                        }) {
+                            break;
+                        }
                         lw += 1;
                         let mut nwe = we - 1;
                         while nwe > lw && bytes[nwe - 1].is_ascii_whitespace() {
@@ -694,8 +713,12 @@ impl<'a> Engine<'a> {
             // The third member: whether the element's own row is an INT
             // LITERAL (`is_int_literal_row`'s shape) — the verdict's
             // literal flag, never a variable's `int` (the conversion keys
-            // on the literal, not the value).
-            let (mut element_ty, row_range, int_literal) = if let Some((kind, key)) = literal {
+            // on the literal, not the value). The fourth: whether the
+            // answering row IS the record literal's own
+            // ([`RowShape::Record`] — its range covers the `)` alone, so
+            // the report re-anchors on `elem_span`).
+            let (mut element_ty, row_range, int_literal, record_row) =
+                if let Some((kind, key)) = literal {
                 // A nested collection literal is the element: its static
                 // type adopts the context when the declared face's head
                 // matches (`['x']` under `List<int>` resolves `List<int>`
@@ -735,6 +758,7 @@ impl<'a> Engine<'a> {
                 (
                     ty,
                     self.untyped_literal_span(&operand).unwrap_or(operand.range),
+                    false,
                     false,
                 )
             } else {
@@ -780,7 +804,12 @@ impl<'a> Engine<'a> {
                         if ty == Ty::UNKNOWN {
                             continue;
                         }
-                        (ty, row.range, self.is_int_literal_row(&row))
+                        (
+                            ty,
+                            row.range,
+                            self.is_int_literal_row(&row),
+                            matches!(row.shape, RowShape::Record(_)),
+                        )
                     }
                     None => {
                         // No single row spans the window (a composite
@@ -793,7 +822,7 @@ impl<'a> Engine<'a> {
                             continue;
                         }
                         let stop16 = e16;
-                        let Some((row_ty, row_range, row_lit)) = self
+                        let Some((row_ty, row_range, row_lit, row_record)) = self
                             .rows
                             .iter()
                             .rev()
@@ -802,11 +831,18 @@ impl<'a> Engine<'a> {
                                     && row.range.offset >= s16
                                     && row.range.end() <= stop16
                             })
-                            .map(|row| (row.ty, row.range, self.is_int_literal_row(row)))
+                            .map(|row| {
+                                (
+                                    row.ty,
+                                    row.range,
+                                    self.is_int_literal_row(row),
+                                    matches!(row.shape, RowShape::Record(_)),
+                                )
+                            })
                         else {
                             continue;
                         };
-                        (row_ty, row_range, row_lit)
+                        (row_ty, row_range, row_lit, row_record)
                     }
                 }
             };
@@ -847,11 +883,19 @@ impl<'a> Engine<'a> {
                 let (a0, a1) = (self.ty_display(element_ty), self.ty_display(declared));
                 // A null-aware element's row covers `?` + operand — the
                 // `?` marker's own offset through the operand's end, never
-                // the operand row's bare span.
+                // the operand row's bare span. A record literal's row
+                // covers its `)` alone — the report anchors the whole
+                // element extent (`elem_span`, wrappers included) like the
+                // oracle's `.at(element)`.
                 let row_range = if let Some((q, q_end)) = q_span {
                     SourceRange {
                         offset: self.utf16_of(q),
                         length: self.utf16_of(q_end) - self.utf16_of(q),
+                    }
+                } else if record_row {
+                    SourceRange {
+                        offset: self.utf16_of(elem_span.0),
+                        length: self.utf16_of(elem_span.1) - self.utf16_of(elem_span.0),
                     }
                 } else {
                     row_range
