@@ -24340,6 +24340,17 @@ mod ticket_4128_tests;
 #[path = "ticket_4289_tests.rs"]
 mod ticket_4289_tests;
 
+// —— #4293 (the deferred promotion-aware literal-element re-decision: the
+// —— set/list/map element emitters record every potentially-nullable leaf
+// —— their parse-time verdict cannot decide, and the post-flow pass re-asks
+// —— the assignability question against the leaf's flow-aware static type —
+// —— promoted-and-assignable stays silent, un-promoted reports the declared
+// —— face, a promotion to a non-assignable subtype reports the promoted
+// —— face; the #4289 parse-time guard retires) ——
+#[cfg(test)]
+#[path = "ticket_4293_tests.rs"]
+mod ticket_4293_tests;
+
 // —— #4294 (the `is!`-guard + early-return continuation promotes when the
 // —— tested head is a bare name two reachable files declare: the registry
 // —— slot is registration order's, so the promotion gate answers name-level

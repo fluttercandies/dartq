@@ -2259,6 +2259,13 @@ pub fn fold_unit_with_ops<'t>(
     // `report.usage` — the tail is taken and source-ordered below, so the
     // rows merge with the verifier-family diagnostics.
     engine.deferred_type_checks(&promotions);
+    // The #4293 promotion-aware literal-element re-decision rides the same
+    // seam: the set/list/map element emitters recorded every
+    // potentially-nullable leaf their parse-time verdict could not decide,
+    // and the pass re-asks each assignability question against the leaf's
+    // flow-aware static type (the promoted or declared face) once the
+    // `PromotedRead`/`ReadType` rows stand.
+    engine.deferred_literal_element_checks(&promotions);
     // The discarded-value folds (`checkConstructorInvocation`) and the
     // `unless` parameter co-row (`_findUndefinedUseResultParameter`) run
     // after the resolve arms: the folds read the final used set, the co-row

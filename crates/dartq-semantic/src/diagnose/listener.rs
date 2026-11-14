@@ -15395,6 +15395,23 @@ impl Engine<'_> {
                 if ty == Ty::Void || ty == Ty::UNKNOWN {
                     continue;
                 }
+                // Promotion-blindness deferral (#4293): a potentially
+                // nullable key/value face may be flow-promoted by a
+                // surrounding condition; the deferred pass re-asks the
+                // assignability question against the flow type (the same
+                // shared mechanism the set/list element faces ride).
+                // `?`-marked sides keep their parse-time verdict.
+                if peeled.q_span.is_none() && self.potentially_nullable(ty) {
+                    self.pending_element_redections.push(ElementRedecision {
+                        span: range,
+                        anchor: range,
+                        expected,
+                        code,
+                        declared: ty,
+                        int_literal: false,
+                    });
+                    continue;
+                }
                 if self.assignable(ty, expected, false) == Some(false) {
                     let (a0, a1) = (self.ty_display(ty), self.ty_display(expected));
                     self.emit(code, range, &a0, &a1);
@@ -15449,20 +15466,32 @@ impl Engine<'_> {
                 }
                 (ty, range, false)
             };
-            // Promotion-blindness guard (parse time): a leaf whose static
+            // Promotion-blindness deferral (#4293): a leaf whose static
             // face is a nullable-suffixed type (`int?`, `C?`) may be
             // flow-promoted to its non-null bound by a surrounding
             // condition (`x == null ? ... : {x}`) — a verdict the pass-2
             // `read_types`/`promotions` tables decide but the parse-time
             // row cannot see. Emitting on the un-promoted face would
             // fabricate `set_element_type_not_assignable` the oracle never
-            // reports, so a nullable face with no explicit `?`-promotion
-            // marker declines to the under-report direction. A bare `null`
+            // reports; declining every nullable face would miss the row a
+            // genuinely un-promoted face owes (`<int>{x}` over `int?`
+            // reports `'int?'`). The candidate defers to
+            // [`Self::deferred_literal_element_checks`], which re-asks the
+            // assignability question against the flow type. A bare `null`
             // literal reads `Ty::Null` (never `nullable: true`) and a
             // `?`-marked leaf already answered its own nullability ask —
-            // both keep their verdict. A nested literal's collection face
-            // is never nullable-suffixed, so the arm is untouched.
+            // both keep their parse-time verdict. A nested literal's
+            // collection face is never nullable-suffixed, so the arm is
+            // untouched.
             if peeled.q_span.is_none() && self.potentially_nullable(ty) {
+                self.pending_element_redections.push(ElementRedecision {
+                    span: range,
+                    anchor: range,
+                    expected: element,
+                    code: SemanticCode::SetElementTypeNotAssignable,
+                    declared: ty,
+                    int_literal,
+                });
                 continue;
             }
             let ty = if peeled.q_span.is_some() {

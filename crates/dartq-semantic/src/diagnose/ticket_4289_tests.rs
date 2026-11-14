@@ -174,22 +174,23 @@ fn set_elements_check_typed_untyped_and_nested() {
     );
 }
 
-/// The promotion-blindness guard on the set-element face: a leaf whose
-/// parse-time static face is nullable-suffixed (`int?`) may be flow-promoted
-/// to its non-null bound by a surrounding condition — a verdict only the
-/// pass-2 `read_types`/`promotions` tables can decide. The emitter declines
-/// that shape to the under-report direction rather than fabricate a row the
-/// oracle never reports. A bare `null` literal reads `Ty::Null` (never
-/// `nullable: true`) and a non-nullable face keep their verdict, and the
-/// `?`-marked leaf already answered its own nullability ask.
+/// The set-element face's promotion-aware re-decision (#4293, retiring the
+/// #4289 parse-time guard): the emitter records every potentially-nullable
+/// leaf its parse-time verdict cannot decide, and
+/// [`Engine::deferred_literal_element_checks`] re-asks the assignability
+/// question against the leaf's flow-aware static type. A leaf promoted by a
+/// surrounding condition reads its promoted non-null face and stays silent;
+/// a genuinely un-promoted leaf reports the declared face (`'int?'`). A
+/// bare `null` literal reads `Ty::Null` (never `nullable: true`) and keeps
+/// its row, a non-nullable face (`'x'`) keeps its verdict, and a `?`-less
+/// nullable element type (`<int?>`) admits the declared face silently.
 ///
-/// Oracle provenance (`dart analyze` 3.13.7): `<int>{null}` reports `'Null'`,
-/// `<int>{1,'x',null}` reports `'String'`+`'Null'`, the `== null ? :` and
-/// `!= null ? :` conditionals are silent (promotion narrows `int?`→`int`),
-/// and the un-promoted `<int>{maybe}`/`{unpromoted}` report `'int?'` — the
-/// last two are the guard's accepted under-report debt.
+/// Oracle provenance (`dart analyze` 3.13.7, the exact fixture rows): five
+/// rows — `'Null'` (a), `'int?'` (b), `'int?'` (e), `'String'`+`'Null'` (f)
+/// — with both promoted conditionals (c, g) and the `<int?>` literal (d)
+/// silent.
 #[test]
-fn set_element_declines_nullable_face_but_keeps_null_and_nonnull() {
+fn set_element_flow_aware_face_reports_unpromoted_and_keeps_null_and_nonnull() {
     let report = report_ops(
         "void takes(int? maybe, int? unpromoted) {\n\
          \x20 final a = <int>{null};\n\
@@ -207,6 +208,12 @@ fn set_element_declines_nullable_face_but_keeps_null_and_nonnull() {
             "The element type 'Null' can't be assigned to the set type \
              'int'."
                 .to_string(),
+            "The element type 'int?' can't be assigned to the set type \
+             'int'."
+                .to_string(),
+            "The element type 'int?' can't be assigned to the set type \
+             'int'."
+                .to_string(),
             "The element type 'String' can't be assigned to the set type \
              'int'."
                 .to_string(),
@@ -214,10 +221,9 @@ fn set_element_declines_nullable_face_but_keeps_null_and_nonnull() {
              'int'."
                 .to_string(),
         ],
-        "the `null` literal and the non-nullable `'x'` element keep their \
-         rows; the nullable `int?` faces — promoted or not — decline to the \
-         under-report direction (the `b`/`e` un-promoted rows are the \
-         accepted debt)"
+        "the promoted conditionals (c, g) stay silent, the un-promoted \
+         leaves (b, e) report 'int?', and the null/non-nullable faces keep \
+         their rows"
     );
 }
 

@@ -4008,6 +4008,12 @@ pub(crate) struct Engine<'a> {
     /// question the teardown join asks — `x.m` on a promoted private
     /// final field never was an unchecked use.
     pub(crate) prop_promotion_rows: PropPromotionStaging,
+    /// The promotion-blind literal-element candidates (#4293): set/list/map
+    /// element, key, and value leaves whose parse-time static face is
+    /// potentially nullable, recorded by the element emitters instead of
+    /// decided on the declared face. [`Self::deferred_literal_element_checks`]
+    /// re-decides them once the flow promotion/read-type rows stand.
+    pub(crate) pending_element_redections: Vec<ElementRedecision>,
     /// One record per `receiver.member` fold (#1409/B5): the merged row's
     /// name, receiver classification, and the receiver read's span,
     /// offset-keyed. The staged-join re-decides against it after pass 2 —
@@ -5312,6 +5318,37 @@ impl PromotionStaging {
     }
 }
 
+/// One promotion-blind literal-element candidate (#4293): a set/list/map
+/// element (or map key/value) whose parse-time static face is potentially
+/// nullable — a face a surrounding `if (x is T)`/`x != null` may
+/// flow-promote to a type the parse-time pass cannot see (the promotion
+/// rows fill only after `parse_unit`). The element emitters record the
+/// candidate instead of deciding on the declared face;
+/// [`Engine::deferred_literal_element_checks`] re-decides once the flow
+/// rows stand.
+#[derive(Clone, Copy)]
+pub(crate) struct ElementRedecision {
+    /// The leaf's answering row span — the join key
+    /// [`PromotionStaging::promoted`]/[`Engine::read_type_at`] read.
+    /// Identical spans only: a composite expression's row never matches a
+    /// bare read's promotion row.
+    pub(crate) span: SourceRange,
+    /// The report anchor — the row model's own node span (the same extent
+    /// the parse-time emitter reports at).
+    pub(crate) anchor: SourceRange,
+    /// The expected element / map-key / map-value type the assignability
+    /// ask reads.
+    pub(crate) expected: Ty,
+    /// The row family (`set_element_type_not_assignable` and friends).
+    pub(crate) code: SemanticCode,
+    /// The parse-time static face — the fallback verdict when no flow row
+    /// stands at `span` (a leaf the flow never types).
+    pub(crate) declared: Ty,
+    /// The int-literal conversion flag (`analyzeIntLiteral`'s
+    /// `convertToDouble`).
+    pub(crate) int_literal: bool,
+}
+
 /// The invalid-type name set (#2193): the names a `TypeUse` row's
 /// push-time verdict snapshotted `Missing` or `NonType` — the oracle's
 /// `InvalidType` positions. A promoted/read type spelling whose
@@ -6364,6 +6401,57 @@ impl<'a> Engine<'a> {
             let saved = self.armed_ty.replace(checked);
             self.check_type_check(at, Some((operand_ty, span)), negated);
             self.armed_ty = saved;
+        }
+    }
+
+    /// The deferred promotion-aware literal-element re-decision (#4293):
+    /// the literal element checks run during `parse_unit`, before the flow
+    /// replay fills [`PromotionStaging`]/[`Engine::read_types`], so a leaf
+    /// a surrounding `if (x is T)`/`x != null` promotes reads as its
+    /// un-promoted declared face at check time. The emitters record the
+    /// potentially-nullable leaves they cannot decide
+    /// ([`Self::pending_element_redections`]); this pass re-asks each
+    /// assignability question against the leaf's flow-aware static type —
+    /// the promoted type when a promotion stands, the declared face
+    /// otherwise — and stages the row the oracle reports. A
+    /// promoted-and-assignable leaf stays silent (the false row the
+    /// declared face would fabricate); an un-promoted leaf keeps the
+    /// oracle's row (`<int>{x}` over `x: int?` reports `'int?'`, and a
+    /// promotion to a non-assignable subtype reports the promoted face —
+    /// `if (x is String)` over `Object?` reports `'String'`).
+    pub(crate) fn deferred_literal_element_checks(&mut self, promotions: &PromotionStaging) {
+        for candidate in std::mem::take(&mut self.pending_element_redections) {
+            // The leaf's flow-aware static type: a `PromotedRead` fact at
+            // the leaf's own span substitutes outright, otherwise the
+            // `ReadType` row answers (the promoted or declared flow type).
+            // The property-promotion substitution covers the member reads
+            // the variable tables cannot key.
+            let flow = match promotions.promoted(candidate.span) {
+                Some(ty) if ty != Ty::Unknown => Some(ty),
+                _ => self.read_type_at(candidate.span),
+            };
+            let flow = flow
+                .map(|ty| self.boundary.canonical_dotted_ty(ty))
+                .filter(|ty| *ty != Ty::Unknown && !self.is_invalid_ty(*ty));
+            let ty = match flow {
+                Some(ty) => ty,
+                // No flow row: the leaf was never a promotable read — the
+                // parse-time face decides, exactly as the emitter would
+                // have judged it.
+                None => self
+                    .promotable_field_substitution(
+                        &self.prop_promotion_rows,
+                        candidate.span,
+                        candidate.declared,
+                    )
+                    .filter(|ty| *ty != Ty::Unknown)
+                    .unwrap_or(candidate.declared),
+            };
+            if self.assignable(ty, candidate.expected, candidate.int_literal) != Some(false) {
+                continue;
+            }
+            let (a0, a1) = (self.ty_display(ty), self.ty_display(candidate.expected));
+            self.stage_typed(candidate.code, candidate.anchor, &a0, &a1);
         }
     }
 

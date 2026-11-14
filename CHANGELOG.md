@@ -65,6 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `return_of_invalid_type` FPs. Member lookup elsewhere stays strict.
   On the 1,338-file corpus this removes 8 dartq-only rows (0 added,
   every removal oracle-arbitrated) (#4294).
+- Literal-element assignability is now promotion-aware: set, list, and
+  map-entry emitters no longer judge a potentially-nullable leaf on its
+  parse-time declared face — the candidate defers to a post-parse pass
+  that re-asks the question against the leaf's flow type (promotion
+  fact, else the flow read, else the declared face; undecidable
+  abstains). A promoted leaf stays silent, a genuinely un-promoted
+  nullable leaf reports exactly the oracle's row, and `null` literals
+  and `?`-marked leaves keep their verdicts. On the 1,338-file corpus
+  this removes 45 dartq-only false positives (0 added, every removal
+  oracle-arbitrated) (#4293).
 
 ## [0.1.25] - 2026-11-14
 

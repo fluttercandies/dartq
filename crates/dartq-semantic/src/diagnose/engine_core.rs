@@ -534,6 +534,7 @@ impl<'a> Engine<'a> {
             unresolved_member_rows: Vec::new(),
             extension_nullable_resolved: FxHashSet::default(),
             prop_promotion_rows: PropPromotionStaging::default(),
+            pending_element_redections: Vec::new(),
             member_reads: Vec::new(),
             member_read_ends: FxHashMap::default(),
             recv_memo: RefCell::new(FxHashMap::default()),

@@ -932,6 +932,31 @@ impl<'a> Engine<'a> {
             if q_span.is_some() {
                 element_ty = Self::non_null_form(element_ty);
             }
+            // Promotion-blindness deferral (#4293): a potentially nullable
+            // element face may be flow-promoted by a surrounding
+            // condition — the parse-time row cannot see the promotion, so
+            // the verdict defers to
+            // [`Self::deferred_literal_element_checks`], which re-asks the
+            // assignability question against the leaf's flow type. Spread
+            // operands and nested literals ask a different question (their
+            // element/literal face, not the leaf read's own static type)
+            // and keep their parse-time verdicts, as does a `?`-marked
+            // element.
+            if q_span.is_none()
+                && !spread
+                && literal.is_none()
+                && self.potentially_nullable(element_ty)
+            {
+                self.pending_element_redections.push(ElementRedecision {
+                    span: row_range,
+                    anchor: row_range,
+                    expected: declared,
+                    code: SemanticCode::ListElementTypeNotAssignable,
+                    declared: element_ty,
+                    int_literal,
+                });
+                continue;
+            }
             // `analyzeIntLiteral`'s `convertToDouble` (upstream
             // `visitIntegerLiteral`): an INT LITERAL element under a
             // context `int` fails but `double` satisfies is typed
