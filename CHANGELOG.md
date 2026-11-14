@@ -48,6 +48,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ambiguity the way upstream's empty-info fold does (`{...t}` with
   unbounded `T` → `Map<dynamic, dynamic>`-shaped ambiguity verdicts)
   (#4036).
+- Nested collection literals descend through typed contexts: when an
+  outer check (map value, list/set element) meets an inner literal, the
+  inner literal now receives the inner context type and the existing
+  checks recurse (`<List<int>, Map<String, int>>{[1]: {'k': 'c'}}`
+  answers the inner entry's wrong value). A new set-element face is
+  promotion-aware about its blindness: nullable declared leaves that a
+  flow promotion could narrow decline the check instead of
+  under-reporting (null literals, non-nullable and `?`-marked leaves
+  still answer) (#4289).
+- Promotions on unattributable heads no longer refuse under legacy
+  folding: when a name slot is genuinely ambiguous (dart:ui `Image` vs
+  flutter `Image` captured by registration order, prefixed heads, SDK
+  face-only names), `is_subtype_typed` cannot prove the join — the
+  promotion gate alone now takes an optimistic name-level step, so the
+  guarded branch's member reads stop emitting `undefined_getter` /
+  `return_of_invalid_type` FPs. Member lookup elsewhere stays strict.
+  On the 1,338-file corpus this removes 8 dartq-only rows (0 added,
+  every removal oracle-arbitrated) (#4294).
 
 ## [0.1.25] - 2026-11-14
 
