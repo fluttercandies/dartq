@@ -113,16 +113,17 @@ fn spaced_record_argument_is_the_element_face() {
 
 /// The set and map literals read their written arguments the same way: a
 /// set's element and a map's value both keep the written nested argument
-/// across the whitespace, and the narrower side refuses. (A map whose
-/// VALUE type is itself generic — `<K, Map<A, B>>{k: {...}}` — has a
-/// separate nested-value-descent gap in the map-entry check, outside this
-/// ticket's capture scope.)
+/// across the whitespace, and the narrower side refuses. A map whose VALUE
+/// type is itself generic descends the same way (#4289): the inner literal
+/// adopts the donated `Map<String, int>` and its own entry check reports
+/// `map_value_type_not_assignable` at the failing value.
 #[test]
 fn spaced_set_and_map_element_faces_keep_the_written_arguments() {
     let report = report_ops(
         "void main() {\n\
          \x20 final s = <List<int>> {[1], ['a']};\n\
          \x20 final m = <String, List<int>> {'k': ['b']};\n\
+         \x20 final n = <List<int>, Map<String, int>> {[1]: {'k': 'c'}};\n\
          }\n",
     );
     assert_eq!(
@@ -137,6 +138,16 @@ fn spaced_set_and_map_element_faces_keep_the_written_arguments() {
         ],
         "the set's element and the map's value both read their written \
          nested argument"
+    );
+    assert_eq!(
+        texts(&report, "map_value_type_not_assignable"),
+        vec![
+            "The element type 'String' can't be assigned to the map value \
+             type 'int'."
+                .to_string()
+        ],
+        "the nested map literal's own entry check fires under the donated \
+         value type"
     );
 }
 

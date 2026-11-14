@@ -24329,3 +24329,13 @@ mod ticket_4288_tests;
 #[cfg(test)]
 #[path = "ticket_4128_tests.rs"]
 mod ticket_4128_tests;
+
+// —— #4289 (the nested collection literal's descent: an outer map-value /
+// —— list-element / set-element check hands the inner `[`/`{` literal its
+// —— donated context type through `literal_ctx_ty`'s enclosing walk, and
+// —— the inner literal's own verifier fires the inner rows; non-adopting
+// —— literals whole-compare at their own span — plus the typed `<E>{`
+// —— set literal's own element face) ——
+#[cfg(test)]
+#[path = "ticket_4289_tests.rs"]
+mod ticket_4289_tests;

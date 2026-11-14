@@ -11591,9 +11591,13 @@ impl ParserListener for DiagnoseListener<'_> {
             let ty = engine.boundary.args.borrow_mut().named(head, false, &args);
             // The typed map's own entry face
             // (`_verifyMapLiteralEntry`): each key/value against the
-            // written type arguments.
-            if let [k, v] = args.as_slice() {
-                engine.check_map_literal_entries(left, right, *k, *v);
+            // written type arguments. A one-argument group is the typed
+            // SET — its element face runs the same per-leaf ask
+            // (`_checkForSetElementTypeNotAssignable3`).
+            match args.as_slice() {
+                [k, v] => engine.check_map_literal_entries(left, right, *k, *v),
+                [element] => engine.check_set_literal_elements(left, right, *element),
+                _ => {}
             }
             // The spread-element verifier (`_verifySpreadForListOrSet` /
             // `_verifySpreadForMap`) and the `expression_in_map` face run
@@ -11674,6 +11678,16 @@ impl ParserListener for DiagnoseListener<'_> {
         // dispatch runs NEITHER verifier, so both faces abstain here.
         match resolved_kind {
             Some(SpreadLiteralKind::Set) => {
+                // The untyped set's element face: a `Set<E>`/`Iterable<E>`
+                // context donates `E` as the expected element type
+                // (`_checkForSetElementTypeNotAssignable3` reads the
+                // resolved type's argument — the context-inferred one
+                // here); a leaf-inferred literal's own LUB makes every
+                // element assignable by construction, so no context means
+                // no ask.
+                if let Some(element) = engine.set_literal_ctx_element(left) {
+                    engine.check_set_literal_elements(left, right, element);
+                }
                 engine.check_spread_elements(left, right, SpreadLiteralKind::Set);
             }
             Some(SpreadLiteralKind::Map) => {
@@ -14882,27 +14896,6 @@ fn find_word(bytes: &[u8], start: usize, end: usize, needle: &[u8]) -> Option<us
     None
 }
 
-/// Whether the byte before position `eq` makes the `=` a compound
-/// (`==`, `??=`, `+=`, `<=`, ...) rather than the plain assignment.
-fn compound_assignment(bytes: &[u8], eq: usize) -> bool {
-    eq >= 2
-        && matches!(
-            bytes[eq - 2],
-            b'=' | b'!'
-                | b'<'
-                | b'>'
-                | b'+'
-                | b'-'
-                | b'*'
-                | b'/'
-                | b'%'
-                | b'&'
-                | b'|'
-                | b'^'
-                | b'?'
-        )
-}
-
 /// The spread operand's leading bare identifier: its name when the span
 /// opens with an identifier token (`l`, `a.b`, `a(1)` — the resolution
 /// channels answer the head name), `None` for operands opening with any
@@ -14927,7 +14920,7 @@ fn leading_ident_name(engine: &Engine<'_>, start: usize, end: usize) -> Option<S
 /// The written group's span for the typed literal opening at `left`: the
 /// gate (the byte before the bracket closes a written `<>` group, never an
 /// expression arrow) plus the balanced walk to the group's `<` head.
-fn typed_group_head(engine: &Engine<'_>, left: Token) -> Option<usize> {
+pub(crate) fn typed_group_head(engine: &Engine<'_>, left: Token) -> Option<usize> {
     let bytes = engine.source.as_bytes();
     let mut cursor = engine.byte_of(left.range.offset);
     while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
@@ -15346,16 +15339,51 @@ impl Engine<'_> {
     /// entry's key and value rows ask their assignability question of the
     /// literal's resolved type arguments, reporting
     /// `map_key_type_not_assignable` / `map_value_type_not_assignable` at
-    /// the failing side. Leaves without a top-level colon (spreads,
-    /// expression elements), the conditional shape, and the null-aware
-    /// entry (its promotion asks a different question) stay silent.
+    /// the failing side. A side that IS a nested collection literal
+    /// resolves under the donated type first: an adopting literal stays
+    /// silent here (its own element/entry verifier owns the inner rows —
+    /// the context reaches it through [`Self::literal_ctx_ty`]'s enclosing
+    /// walk), a non-adopting one upward-infers and whole-compares against
+    /// the expected type at the literal's own span. Leaves without a
+    /// top-level colon (spreads, expression elements), the conditional
+    /// shape, and the null-aware entry (its promotion asks a different
+    /// question) stay silent.
     pub(crate) fn check_map_literal_entries(&mut self, left: Token, right: Token, k: Ty, v: Ty) {
         for (key, value) in self.entry_spans(left, right) {
             for ((start, end), expected, code) in [
                 (key, k, SemanticCode::MapKeyTypeNotAssignable),
                 (value, v, SemanticCode::MapValueTypeNotAssignable),
             ] {
-                let Some((ty, range)) = self.leaf_completion_row(start, end) else {
+                let bytes = self.source.as_bytes();
+                let mut we = end;
+                while we > start && bytes[we - 1].is_ascii_whitespace() {
+                    we -= 1;
+                }
+                let ws = trim_ws(bytes, start, we);
+                if ws >= we {
+                    continue;
+                }
+                let peeled = self.peel_element(ws, we);
+                if let Some(elem) = peeled.literal.as_ref() {
+                    // The nested literal answers its own element/entry
+                    // checks through the context channel; the outer ask is
+                    // only the whole-type compare of a literal that could
+                    // not adopt the donated face.
+                    let (ty, range) = self.nested_literal_ty(elem, expected);
+                    let ty = if peeled.q_span.is_some() {
+                        Self::non_null_form(ty)
+                    } else {
+                        ty
+                    };
+                    if self.assignable(ty, expected, false) == Some(false) {
+                        let (a0, a1) = (self.ty_display(ty), self.ty_display(expected));
+                        self.emit(code, range, &a0, &a1);
+                    }
+                    continue;
+                }
+                let start16 = self.utf16_of(start);
+                let end16 = self.utf16_of(end);
+                let Some((ty, range)) = self.leaf_completion_row(start16, end16) else {
                     continue;
                 };
                 // A `void` key/value already reported through
@@ -15371,6 +15399,80 @@ impl Engine<'_> {
                     let (a0, a1) = (self.ty_display(ty), self.ty_display(expected));
                     self.emit(code, range, &a0, &a1);
                 }
+            }
+        }
+    }
+
+    /// The set literal's element face (`error_verifier.dart`
+    /// `_checkForSetElementTypeNotAssignable3` +
+    /// `literal_element_verifier.dart` `_checkAssignableToElementType`):
+    /// each leaf element's static type must be assignable to the literal's
+    /// resolved element type — `set_element_type_not_assignable` at the
+    /// failing element. A nested collection literal resolves under the
+    /// donated element type first (adopting literals stay silent — their
+    /// own verifier owns the inner rows); a non-adopting one whole-compares
+    /// at its own span. `...` spreads answer through
+    /// [`Self::check_spread_elements`]; entry-shaped leaves carry no
+    /// element type upstream (`map_entry_not_in_map` is a separate face)
+    /// and stay silent here, as do leaves with no spellable row.
+    pub(crate) fn check_set_literal_elements(&mut self, left: Token, right: Token, element: Ty) {
+        let bytes = self.source.as_bytes();
+        for (s, e) in self.literal_leaves(left, right) {
+            let s = trim_ws(bytes, s, e);
+            if s >= e || bytes[s..].starts_with(b"...") {
+                continue;
+            }
+            // An entry-shaped leaf inside a set literal is
+            // `map_entry_not_in_map`'s row, not an element-assignability
+            // ask — the spread/expression faces own it.
+            if entry_colon(bytes, s, e).is_some() {
+                continue;
+            }
+            let mut we = e;
+            while we > s && bytes[we - 1].is_ascii_whitespace() {
+                we -= 1;
+            }
+            let peeled = self.peel_element(s, we);
+            if peeled.q_span.is_some() && peeled.bounds.0 >= peeled.bounds.1 {
+                continue;
+            }
+            let (ty, range, int_literal) = if let Some(elem) = peeled.literal.as_ref() {
+                let (ty, range) = self.nested_literal_ty(elem, element);
+                (ty, range, false)
+            } else {
+                let (s16, e16) = (self.utf16_of(s), self.utf16_of(we));
+                let Some((ty, range)) = self.leaf_completion_row(s16, e16) else {
+                    continue;
+                };
+                if ty == Ty::Void || ty == Ty::UNKNOWN {
+                    continue;
+                }
+                (ty, range, false)
+            };
+            // Promotion-blindness guard (parse time): a leaf whose static
+            // face is a nullable-suffixed type (`int?`, `C?`) may be
+            // flow-promoted to its non-null bound by a surrounding
+            // condition (`x == null ? ... : {x}`) — a verdict the pass-2
+            // `read_types`/`promotions` tables decide but the parse-time
+            // row cannot see. Emitting on the un-promoted face would
+            // fabricate `set_element_type_not_assignable` the oracle never
+            // reports, so a nullable face with no explicit `?`-promotion
+            // marker declines to the under-report direction. A bare `null`
+            // literal reads `Ty::Null` (never `nullable: true`) and a
+            // `?`-marked leaf already answered its own nullability ask —
+            // both keep their verdict. A nested literal's collection face
+            // is never nullable-suffixed, so the arm is untouched.
+            if peeled.q_span.is_none() && self.potentially_nullable(ty) {
+                continue;
+            }
+            let ty = if peeled.q_span.is_some() {
+                Self::non_null_form(ty)
+            } else {
+                ty
+            };
+            if self.assignable(ty, element, int_literal) == Some(false) {
+                let (a0, a1) = (self.ty_display(ty), self.ty_display(element));
+                self.emit(SemanticCode::SetElementTypeNotAssignable, range, &a0, &a1);
             }
         }
     }
@@ -15457,9 +15559,12 @@ impl Engine<'_> {
         }
     }
 
-    /// The entry key/value spans (UTF-16) of a map-shaped literal's
-    /// leaves.
-    fn entry_spans(&self, left: Token, right: Token) -> Vec<((u32, u32), (u32, u32))> {
+    /// The entry key/value spans (byte offsets) of a map-shaped literal's
+    /// leaves — the key runs to the entry colon, the value from just past
+    /// it to the leaf's end. Byte spans let the assignability face peel
+    /// `?` markers and detect nested literals before the UTF-16 row
+    /// searches convert.
+    fn entry_spans(&self, left: Token, right: Token) -> Vec<((usize, usize), (usize, usize))> {
         let bytes = self.source.as_bytes();
         let mut out = Vec::new();
         for (s, e) in self.literal_leaves(left, right) {
@@ -15473,8 +15578,8 @@ impl Engine<'_> {
             if top_level_question(bytes, s, colon).is_some() {
                 continue;
             }
-            let key = (self.utf16_of(s), self.utf16_of(colon));
-            let value = (self.utf16_of(colon + 1), self.utf16_of(e));
+            let key = (s, colon);
+            let value = (colon + 1, e);
             out.push((key, value));
         }
         out
@@ -15845,13 +15950,16 @@ impl Engine<'_> {
     }
 
     /// The context side the literal's direct position donates (`Some(true)`
-    /// = map, `Some(false)` = set): the declaration group's armed
-    /// annotation at the direct `=` position, or the host's declared
-    /// return at the direct `=>`-body / `return` position — the two
-    /// channels the name-level model carries
-    /// (`typed_literal_resolver.dart` `_fromContextType`).
-    pub(crate) fn literal_context_side(&self, left: Token) -> Option<bool> {
-        let Ty::Named { name, .. } = self.literal_context_ty(left)? else {
+    /// = map, `Some(false)` = set): the full channel walk
+    /// [`Engine::literal_ctx_ty`] answers — declaration/`=`/`=>`/`return`
+    /// spellings, formal defaults, for-in heads, spread operands, and the
+    /// enclosing literal's own element/map-side donation — of which a
+    /// `Map` head is the map side and the other collection heads the set
+    /// side (`typed_literal_resolver.dart` `_fromContextType`).
+    pub(crate) fn literal_context_side(&mut self, left: Token) -> Option<bool> {
+        let ctx = self.literal_ctx_ty(left.range.offset, 0)?;
+        let ctx = self.fold_alias_ty(ctx);
+        let Ty::Named { name, .. } = ctx else {
             return None;
         };
         if name == self.collection_heads[2] {
@@ -15867,10 +15975,13 @@ impl Engine<'_> {
     }
 
     /// The written 2-argument `Map<K, V>` context at the literal's
-    /// direct position, split into its type arguments — the entry face's
-    /// expected key/value pair.
-    pub(crate) fn map_entry_context(&self, left: Token) -> Option<(Ty, Ty)> {
-        let Ty::Named { name, args, .. } = self.literal_context_ty(left)? else {
+    /// position, split into its type arguments — the entry face's expected
+    /// key/value pair. The same [`Engine::literal_ctx_ty`] walk
+    /// [`Self::literal_context_side`] reads.
+    pub(crate) fn map_entry_context(&mut self, left: Token) -> Option<(Ty, Ty)> {
+        let ctx = self.literal_ctx_ty(left.range.offset, 0)?;
+        let ctx = self.fold_alias_ty(ctx);
+        let Ty::Named { name, args, .. } = ctx else {
             return None;
         };
         if name != self.collection_heads[2] {
@@ -15881,49 +15992,6 @@ impl Engine<'_> {
             [k, v] => Some((*k, *v)),
             _ => None,
         }
-    }
-
-    fn literal_context_ty(&self, left: Token) -> Option<Ty> {
-        let bytes = self.source.as_bytes();
-        let cursor = preceding_position(bytes, self.byte_of(left.range.offset))?;
-        match bytes[cursor - 1] {
-            // The declaration's own initializer: the group is open and no
-            // nested executable sits between (`init_frame_depth` latched
-            // the initializer world's frame count — a closure body's
-            // `=` inside is its own business).
-            b'=' if !compound_assignment(bytes, cursor) => {
-                if self.in_initializer && self.frames.len() == self.init_frame_depth {
-                    self.pending_decl_ty
-                } else {
-                    None
-                }
-            }
-            // The arrow-body expression.
-            b'>' if cursor >= 2 && bytes[cursor - 2] == b'=' => self.host_return_ty(),
-            // The bare `return e;` expression.
-            b'n' if cursor >= 6
-                && bytes[cursor - 6..cursor] == *b"return"
-                && (cursor == 6 || !ident_byte(bytes[cursor - 7])) =>
-            {
-                self.host_return_ty()
-            }
-            _ => None,
-        }
-    }
-
-    /// The innermost executable's declared return — a closure frame's
-    /// uninferred return never delegates outward (`check_return`'s
-    /// `firstDepleted` posture).
-    fn host_return_ty(&self) -> Option<Ty> {
-        let frame = self
-            .frames
-            .iter()
-            .rev()
-            .find(|f| matches!(f.kind, FrameKind::Executable { .. }))?;
-        let FrameKind::Executable { ret, .. } = &frame.kind else {
-            return None;
-        };
-        ret.as_ref().map(|r| r.ty)
     }
 
     /// The spread-element verifier's ladder over a literal's `...`-led
@@ -16181,8 +16249,9 @@ impl Engine<'_> {
 
     /// The literal's inferred or declared element type for the
     /// set-element assignability ask: a typed `<E>{...}` reads `E` from
-    /// its own written group; an untyped `{...}` in a `Set<E>` context
-    /// reads `E` from `literal_context_ty`.
+    /// its own written group; an untyped `{...}` reads the element
+    /// argument of the [`Engine::literal_ctx_ty`] context — `Set<E>` and
+    /// `Iterable<E>` donate `E`, the same heads the set literal adopts.
     fn literal_set_or_map_element(&mut self, left: Token, right: Token) -> Option<Ty> {
         let _ = right;
         if let Some((_, Ty::Named { args, .. })) = self.typed_set_or_map_literal_ty(left)
@@ -16190,19 +16259,21 @@ impl Engine<'_> {
         {
             return Some(elem);
         }
-        if let Ty::Named { name, args, .. } = self.literal_context_ty(left)?
-            && name == self.collection_heads[1]
-            && let Some(elem) = self.boundary.pool().get(args).first().copied()
-        {
-            return Some(elem);
+        let ctx = self.literal_ctx_ty(left.range.offset, 0)?;
+        let ctx = self.fold_alias_ty(ctx);
+        let Ty::Named { name, args, .. } = ctx else {
+            return None;
+        };
+        if name != self.collection_heads[1] && name != self.collection_heads[3] {
+            return None;
         }
-        None
+        self.boundary.pool().get(args).first().copied()
     }
 
     /// The literal's declared or context-inferred map key/value pair for
     /// the spread map-side assignability asks: a typed `<K, V>{...}` reads
-    /// its own written arguments; an untyped `{...}` in a `Map<K, V>`
-    /// context reads the context's arguments.
+    /// its own written arguments; an untyped `{...}` reads the
+    /// [`Engine::literal_ctx_ty`] context's arguments.
     fn literal_map_key_value(&mut self, left: Token, right: Token) -> (Option<Ty>, Option<Ty>) {
         let _ = right;
         if let Some((_, Ty::Named { args, .. })) = self.typed_set_or_map_literal_ty(left) {
@@ -16211,7 +16282,10 @@ impl Engine<'_> {
                 return (Some(*k), Some(*v));
             }
         }
-        if let Some(Ty::Named { name, args, .. }) = self.literal_context_ty(left)
+        let ctx = self
+            .literal_ctx_ty(left.range.offset, 0)
+            .map(|ty| self.fold_alias_ty(ty));
+        if let Some(Ty::Named { name, args, .. }) = ctx
             && name == self.collection_heads[2]
         {
             let args = self.boundary.pool().get(args).to_vec();

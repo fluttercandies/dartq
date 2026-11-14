@@ -89,6 +89,32 @@ enum AnnotationVerdict {
     NoCtorArgs,
 }
 
+/// A collection element's face after the transparent wrappers peel —
+/// shared by the list/set element checks and the map-entry key/value
+/// check so every position asks the same adopt-or-infer question of the
+/// same literal node (`literal_element_verifier.dart`'s per-element
+/// descent).
+pub(crate) struct PeeledElement {
+    /// The post-peel byte bounds: after a leading `?` null-aware marker
+    /// and the `const`/`await`/`!`/grouping-paren wrappers.
+    pub(crate) bounds: (usize, usize),
+    /// The `?`-through-operand byte span, when a `?` led — the operand
+    /// answers the promote-to-non-null face and the emit re-anchors on
+    /// this whole span.
+    pub(crate) q_span: Option<(usize, usize)>,
+    /// The nested-literal face when the peeled element IS a `[`/`{`
+    /// collection literal.
+    pub(crate) literal: Option<NestedLiteralElem>,
+}
+
+/// The nested-literal half of [`PeeledElement`]: the `untyped_literals`
+/// kind and row key (the close bracket's UTF-16 offset — the empty `[]`
+/// keys its `[` itself).
+pub(crate) struct NestedLiteralElem {
+    pub(crate) kind: UntypedLiteral,
+    pub(crate) key: u32,
+}
+
 impl<'a> Engine<'a> {
     /// A literal `<…>` group's argument leaf as a [`Ty`]: `dynamic`/`Null`
     /// intern their dedicated faces — the same mapping the type
@@ -338,6 +364,165 @@ impl<'a> Engine<'a> {
             )
     }
 
+    /// The element expression `[ws, we)` (byte offsets, already
+    /// outer-trimmed) after the transparent wrappers peel: a leading `?`
+    /// null-aware marker first (its operand answers the same
+    /// assignability ask), then `const`/`await`/`!` prefixes and
+    /// grouping parens whose own close is the segment's last byte. A
+    /// RECORD literal is no transparent group: `(a, b)` IS the element
+    /// and peeling would strand the row search on the fields' drained
+    /// residue (#4288). The row model anchors the literal's value row at
+    /// its CLOSE bracket (the empty `[]` at its `[` itself), so the key
+    /// is the bracket's own offset. `literal` is `Some` only when the
+    /// peeled element IS a `[`/`{` collection literal — every other
+    /// shape answers through the row faces.
+    pub(crate) fn peel_element(&self, ws: usize, we: usize) -> PeeledElement {
+        let bytes = self.source.as_bytes();
+        let (mut lw, mut we) = (ws, we);
+        let mut q_span = None;
+        if lw < we && bytes[lw] == b'?' {
+            q_span = Some((lw, we));
+            lw += 1;
+            while lw < we && bytes[lw].is_ascii_whitespace() {
+                lw += 1;
+            }
+        }
+        loop {
+            while lw < we && bytes[lw].is_ascii_whitespace() {
+                lw += 1;
+            }
+            while we > lw && bytes[we - 1].is_ascii_whitespace() {
+                we -= 1;
+            }
+            if lw >= we {
+                break;
+            }
+            let rest = &self.source[lw..we];
+            let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+            if (rest.starts_with("const") || rest.starts_with("await"))
+                && lw + 5 < we
+                && !ident(bytes[lw + 5])
+            {
+                lw += 5;
+                continue;
+            }
+            if bytes[lw] == b'!' {
+                lw += 1;
+                continue;
+            }
+            // A `( e )` group peels when its own close is the segment's
+            // last byte — otherwise the paren groups only a prefix
+            // (`(a).b`) and the element is the whole.
+            if bytes[lw] == b'(' {
+                let mut d = 0usize;
+                let mut close = None;
+                for (j, &b) in bytes.iter().enumerate().take(we).skip(lw) {
+                    match b {
+                        b'(' | b'[' | b'{' => d += 1,
+                        b')' | b']' | b'}' => {
+                            d = d.saturating_sub(1);
+                            if d == 0 {
+                                close = Some(j);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if close == Some(we - 1) {
+                    if self.rows.iter().any(|row| {
+                        matches!(row.shape, RowShape::Record(_))
+                            && row.range.offset == self.utf16_of(we - 1)
+                    }) {
+                        break;
+                    }
+                    lw += 1;
+                    let mut nwe = we - 1;
+                    while nwe > lw && bytes[nwe - 1].is_ascii_whitespace() {
+                        nwe -= 1;
+                    }
+                    if nwe > lw {
+                        we = nwe;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+        let literal = if lw < we {
+            match (bytes[lw], bytes[we - 1]) {
+                (b'[', b']') | (b'{', b'}') => self
+                    .untyped_literals
+                    .get(&self.utf16_of(we - 1))
+                    .map(|kind| NestedLiteralElem {
+                        kind: *kind,
+                        key: self.utf16_of(we - 1),
+                    })
+                    .or_else(|| {
+                        self.untyped_literals
+                            .get(&self.utf16_of(lw))
+                            .map(|kind| NestedLiteralElem {
+                                kind: *kind,
+                                key: self.utf16_of(lw),
+                            })
+                    }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        PeeledElement {
+            bounds: (lw, we),
+            q_span,
+            literal,
+        }
+    }
+
+    /// The nested literal's static type under the expected face
+    /// `declared` plus its report anchor: it adopts the context when the
+    /// declared head matches the literal's family (`['x']` under
+    /// `List<int>` resolves `List<int>` and coerces), else the leaves'
+    /// upward inference (`['x']` under `int` reads `List<String>`; `{k:
+    /// v}` under `Map<K2, V2>` adopts and the entry face owns the
+    /// key/value verdicts). The range is the literal's own bracket span
+    /// — the whole-compare anchor the oracle's `.at(element)` writes.
+    pub(crate) fn nested_literal_ty(
+        &self,
+        elem: &NestedLiteralElem,
+        declared: Ty,
+    ) -> (Ty, SourceRange) {
+        let operand = Row {
+            name: self.intern(""),
+            range: SourceRange {
+                offset: elem.key,
+                length: 1,
+            },
+            qualified: false,
+            shape: RowShape::Value,
+            intent: Intent::Read,
+            write_op: None,
+            ty: Ty::UNKNOWN,
+        };
+        let ty = if self.literal_adopts_context(elem.kind, declared) {
+            declared
+        } else {
+            let family = match elem.kind {
+                UntypedLiteral::List => self.collection_heads[0],
+                UntypedLiteral::SetElements => self.collection_heads[1],
+                UntypedLiteral::MapEntries | UntypedLiteral::EmptyBraces => {
+                    match self.empty_literal_is_set(declared) {
+                        Some(true) => self.collection_heads[1],
+                        _ => self.collection_heads[2],
+                    }
+                }
+            };
+            self.collection_literal_ty(&operand, family)
+                .unwrap_or_else(|| self.literal_return_ty(elem.kind, declared))
+        };
+        let range = self.untyped_literal_span(&operand).unwrap_or(operand.range);
+        (ty, range)
+    }
+
     /// The typed list literal's element check (`listLiteral`'s resolution,
     /// type_analyzer.dart's element loop): each element's static type must
     /// be assignable to the written element type —
@@ -581,25 +766,6 @@ impl<'a> Engine<'a> {
             if ws >= we {
                 continue;
             }
-            // A null-aware element `?e` asks the same assignability question
-            // of its operand `e` — the `?` only widens the admitted face
-            // (type_analyzer.dart's null-aware element resolution), it does
-            // not skip the check. Peel the marker before the wrapper peel so
-            // `?(x)`/`? [..]` reach the literal/row faces; `q_span` keeps the
-            // `?`-through-operand-end span for the emit (saved before the
-            // wrapper peel narrows `we`).
-            let mut q_span = None;
-            let mut lw = ws;
-            if bytes[lw] == b'?' {
-                q_span = Some((lw, we));
-                lw += 1;
-                while lw < we && bytes[lw].is_ascii_whitespace() {
-                    lw += 1;
-                }
-                if lw >= we {
-                    continue;
-                }
-            }
             // The element node's own span — the trimmed segment with its
             // transparent wrappers still on — saved before the peel loop
             // narrows `we`. A record literal's row anchors at its `)`
@@ -607,76 +773,18 @@ impl<'a> Engine<'a> {
             // element extent, the oracle's `.at(element)`
             // (`literal_element_verifier.dart`'s element node).
             let elem_span = (ws, we);
-            // A nested collection literal owns the element position when
-            // the trimmed segment IS the literal — the `[`/`{` opens it
-            // and the matching `]`/`}` closes it. Transparent wrappers
-            // peel first: parens group without changing the face, and a
-            // `const`/`await`/`!` prefix sits before the bracket. The row
-            // model anchors the literal's value row at its CLOSE bracket
-            // (the empty `[]` at its `[` itself), so the key is the
-            // bracket's own offset, never a whole-span row.
-            loop {
-                while lw < we && bytes[lw].is_ascii_whitespace() {
-                    lw += 1;
-                }
-                let rest = &seg_text[lw - start..];
-                let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-                if (rest.starts_with("const") || rest.starts_with("await"))
-                    && lw + 5 < we
-                    && !ident(bytes[lw + 5])
-                {
-                    lw += 5;
-                    continue;
-                }
-                if lw < we && bytes[lw] == b'!' {
-                    lw += 1;
-                    continue;
-                }
-                // A `( e )` group peels when its own close is the
-                // segment's last byte — otherwise the paren groups only
-                // a prefix (`(a).b`) and the element is the whole. A
-                // RECORD literal is no transparent group: `(a, b)` IS the
-                // element, its row sits at the `)` alone
-                // ([`RowShape::Record`] — the parenthesized face pushes
-                // `RowShape::Bare` instead), and peeling would strand the
-                // row search on the fields' drained residue, leaving the
-                // record-vs-record assignability ask unanswered (#4288).
-                if lw < we && bytes[lw] == b'(' {
-                    let mut d = 0usize;
-                    let mut close = None;
-                    for (j, &b) in bytes.iter().enumerate().take(we).skip(lw) {
-                        match b {
-                            b'(' | b'[' | b'{' => d += 1,
-                            b')' | b']' | b'}' => {
-                                d = d.saturating_sub(1);
-                                if d == 0 {
-                                    close = Some(j);
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if close == Some(we - 1) {
-                        if self.rows.iter().any(|row| {
-                            matches!(row.shape, RowShape::Record(_))
-                                && row.range.offset == self.utf16_of(we - 1)
-                        }) {
-                            break;
-                        }
-                        lw += 1;
-                        let mut nwe = we - 1;
-                        while nwe > lw && bytes[nwe - 1].is_ascii_whitespace() {
-                            nwe -= 1;
-                        }
-                        if nwe > lw {
-                            we = nwe;
-                            continue;
-                        }
-                    }
-                }
-                break;
+            // A null-aware element `?e` asks the same assignability question
+            // of its operand `e` — the `?` only widens the admitted face
+            // (type_analyzer.dart's null-aware element resolution), it does
+            // not skip the check. `peel_element` peels the marker and the
+            // transparent wrappers; `q_span` keeps the `?`-through-operand
+            // span for the emit.
+            let peeled = self.peel_element(ws, we);
+            if peeled.q_span.is_some() && peeled.bounds.0 >= peeled.bounds.1 {
+                continue;
             }
+            let q_span = peeled.q_span;
+            let (lw, we) = peeled.bounds;
             // The element marker rides the element expression's own face,
             // never the segment start: a control element's header (`if
             // (…) e` / `for (…) e`) shadows it, so `if (x != null) ...x`
@@ -690,25 +798,7 @@ impl<'a> Engine<'a> {
             // spread-element resolution), never the iterable whole.
             let body = &self.source[lw..we];
             let spread = body.starts_with("...");
-            let literal = if lw < we {
-                match (bytes[lw], bytes[we - 1]) {
-                    (b'[', b']') | (b'{', b'}') => self
-                        .untyped_literals
-                        .get(&self.utf16_of(we - 1))
-                        .map(|kind| (*kind, self.utf16_of(we - 1)))
-                        .or_else(|| {
-                            // The empty `[]`'s row key rides its `[` — the
-                            // parser hands the empty list's right as its
-                            // own open bracket.
-                            self.untyped_literals
-                                .get(&self.utf16_of(lw))
-                                .map(|kind| (*kind, self.utf16_of(lw)))
-                        }),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            let literal = peeled.literal.as_ref();
             // Row ranges are UTF-16; the window/segment bounds are bytes.
             // The third member: whether the element's own row is an INT
             // LITERAL (`is_int_literal_row`'s shape) — the verdict's
@@ -718,7 +808,7 @@ impl<'a> Engine<'a> {
             // ([`RowShape::Record`] — its range covers the `)` alone, so
             // the report re-anchors on `elem_span`).
             let (mut element_ty, row_range, int_literal, record_row) =
-                if let Some((kind, key)) = literal {
+                if let Some(elem) = literal {
                     // A nested collection literal is the element: its static
                     // type adopts the context when the declared face's head
                     // matches (`['x']` under `List<int>` resolves `List<int>`
@@ -726,41 +816,8 @@ impl<'a> Engine<'a> {
                     // (`['x']` under `int` reads `List<String>`; `{k: v}`
                     // under `Map<K2, V2>` adopts and the entry face owns the
                     // key/value verdicts).
-                    let operand = Row {
-                        name: self.intern(""),
-                        range: SourceRange {
-                            offset: key,
-                            length: 1,
-                        },
-                        qualified: false,
-                        shape: RowShape::Value,
-                        intent: Intent::Read,
-                        write_op: None,
-                        ty: Ty::UNKNOWN,
-                    };
-                    let adopt = self.literal_adopts_context(kind, declared);
-                    let ty = if adopt {
-                        declared
-                    } else {
-                        let family = match kind {
-                            UntypedLiteral::List => self.collection_heads[0],
-                            UntypedLiteral::SetElements => self.collection_heads[1],
-                            UntypedLiteral::MapEntries | UntypedLiteral::EmptyBraces => {
-                                match self.empty_literal_is_set(declared) {
-                                    Some(true) => self.collection_heads[1],
-                                    _ => self.collection_heads[2],
-                                }
-                            }
-                        };
-                        self.collection_literal_ty(&operand, family)
-                            .unwrap_or_else(|| self.literal_return_ty(kind, declared))
-                    };
-                    (
-                        ty,
-                        self.untyped_literal_span(&operand).unwrap_or(operand.range),
-                        false,
-                        false,
-                    )
+                    let (ty, range) = self.nested_literal_ty(elem, declared);
+                    (ty, range, false, false)
                 } else {
                     // The element expression's own row: the outermost row
                     // spanning the trimmed window exactly — an inner row
@@ -971,7 +1028,32 @@ impl<'a> Engine<'a> {
             return None;
         };
         let heads = &self.collection_heads;
-        if !(name == heads[0] || name == heads[1] || name == heads[3]) {
+        // The same supertype rule [`Self::literal_adopts_context`] applies:
+        // only a `List`/`Iterable` context donates an element argument to a
+        // `[` literal — a `Set` context leaves the literal's element type
+        // to upward inference.
+        if !(name == heads[0] || name == heads[3]) {
+            return None;
+        }
+        self.boundary.args.borrow().get(args).first().copied()
+    }
+
+    /// The untyped `{…}`'s context element type for the set-element ask:
+    /// [`Self::literal_ctx_ty`]'s channel walk donates the `Set`/`Iterable`
+    /// head's single argument — the same heads
+    /// [`Self::literal_adopts_context`] lets a set literal adopt. A `List`
+    /// context deliberately donates nothing: `_fromContextType` resolves
+    /// the literal set-side but `Set<E>` downward-infers no argument
+    /// against `List<X>` (`{1, 'x'}` under `List<int>` reads
+    /// `Set<Object>` upstream), so the element check stays silent there.
+    pub(crate) fn set_literal_ctx_element(&mut self, left: Token) -> Option<Ty> {
+        let ctx = self.literal_ctx_ty(left.range.offset, 0)?;
+        let ctx = self.fold_alias_ty(ctx);
+        let Ty::Named { name, args, .. } = ctx else {
+            return None;
+        };
+        let heads = &self.collection_heads;
+        if !(name == heads[1] || name == heads[3]) {
             return None;
         }
         self.boundary.args.borrow().get(args).first().copied()
@@ -988,29 +1070,31 @@ impl<'a> Engine<'a> {
     /// tokens (`await`, `const`, `new`, `throw`, the unary heads) walk
     /// through to the channel. `depth` bounds the enclosing-literal
     /// recursion.
-    fn literal_ctx_ty(&mut self, left: u32, depth: u8) -> Option<Ty> {
+    pub(crate) fn literal_ctx_ty(&mut self, left: u32, depth: u8) -> Option<Ty> {
         if depth > 6 {
             return None;
         }
-        // A `{` literal carrying its own written `<K, V>`/`<E>` group IS its
-        // context: `var m = <String, List<Folder>>{…}` resolves the map's
-        // `Map<String, List<Folder>>` face without ever asking the `=`
-        // channel (which a `var` initializer leaves empty). The group must
-        // be the literal's own type arguments — a class/mixin body's brace
-        // can sit behind the same `on T<U>` `>` shape, so the `<` must not
-        // be a named generic's parameter list (no identifier/type head
-        // before it). The argument list re-parses through
-        // [`Self::literal_group_args`] — the flat segment scan inside
-        // `typed_set_or_map_literal_ty_at` collapses a nested generic
-        // (`List<int>` → `int`), which would donate `Map<String, int>`
-        // where the oracle reads `Map<String, List<int>>`.
-        if self.byte_at(left) == Some(b'{')
-            && let Some((head, _)) = self.typed_set_or_map_literal_ty_at(left)
-            && self.group_is_literal_args(head)
+        // A typed literal carrying its own written `<E>`/`<K, V>` group IS
+        // its context: `var m = <String, List<Folder>>{…}` resolves the
+        // map's `Map<String, List<Folder>>` face, `<List<int>>[…]` the
+        // list's `List<List<int>>`, without ever asking the `=` channel
+        // (which a `var` initializer leaves empty). The group must be the
+        // literal's own type arguments — a class/mixin body's brace can
+        // sit behind the same `on T<U>` `>` shape, so the `<` must not be
+        // a named generic's parameter list (no identifier/type head
+        // before it). The head comes from the balance walk alone — the
+        // flat [`Self::typed_set_or_map_literal_ty_at`] reader declines
+        // nested groups, and the argument list re-parses through
+        // [`Self::literal_group_args`] — the flat segment scan collapses a
+        // nested generic (`List<int>` → `int`), which would donate
+        // `Map<String, int>` where the oracle reads `Map<String,
+        // List<int>>`.
+        if let Some(bracket) = self.byte_at(left)
+            && (bracket == b'{' || bracket == b'[')
         {
-            // `literal_group_args` reads only the span's offset — the
-            // `{` bracket's own position rebuilds the handle the channel
-            // walk carries as a bare offset.
+            // `literal_group_args`/`typed_group_head` read only the span's
+            // offset — the bracket's own position rebuilds the handle the
+            // channel walk carries as a bare offset.
             let token = Token {
                 id: 0,
                 range: SourceRange {
@@ -1018,11 +1102,31 @@ impl<'a> Engine<'a> {
                     length: 1,
                 },
             };
-            if let Some(args) = self.literal_group_args(token) {
-                let (set, map) = (self.collection_heads[1], self.collection_heads[2]);
-                let ty = match args.len() {
-                    1 => self.boundary.args.borrow_mut().named(set, false, &args),
-                    2 => self.boundary.args.borrow_mut().named(map, false, &args),
+            if let Some(head) = super::listener::typed_group_head(self, token)
+                && self.group_is_literal_args(head as u32)
+                && let Some(args) = self.literal_group_args(token)
+            {
+                let ty = match (bracket, args.len()) {
+                    // `<E>{…}` is a set, `<K, V>{…}` a map — the brace
+                    // literal's own arity decides (`_fromTypeArguments`).
+                    (b'{', 1) => self.boundary.args.borrow_mut().named(
+                        self.collection_heads[1],
+                        false,
+                        &args,
+                    ),
+                    (b'{', 2) => self.boundary.args.borrow_mut().named(
+                        self.collection_heads[2],
+                        false,
+                        &args,
+                    ),
+                    // `<E>[…]` is a list — a single written argument is
+                    // its element type; any other arity is a recovery
+                    // shape the literal's own inference owns.
+                    (b'[', 1) => self.boundary.args.borrow_mut().named(
+                        self.collection_heads[0],
+                        false,
+                        &args,
+                    ),
                     _ => return None,
                 };
                 return Some(ty);
@@ -1358,14 +1462,17 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The `List`/`Set`/`Iterable` head's single argument — the context
-    /// element type an enclosing list-shaped position donates.
+    /// The `List`/`Iterable` head's single argument — the context element
+    /// type an enclosing `[` donates to a nested literal. A `Set` head is
+    /// excluded on purpose: a `[` literal's downward inference never
+    /// constrains against a `Set` context (`typed_literal_resolver.dart`
+    /// `_inferListTypeDownwards`), so the element type stays upward-inferred.
     fn iterable_element_arg(&self, ctx: Ty) -> Option<Ty> {
         let Ty::Named { name, args, .. } = self.fold_alias_ty(ctx) else {
             return None;
         };
         let heads = &self.collection_heads;
-        if !(name == heads[0] || name == heads[1] || name == heads[3]) {
+        if !(name == heads[0] || name == heads[3]) {
             return None;
         }
         self.boundary.args.borrow().get(args).first().copied()
@@ -1384,7 +1491,12 @@ impl<'a> Engine<'a> {
         let heads = &self.collection_heads;
         let (list, set, map, iterable) = (heads[0], heads[1], heads[2], heads[3]);
         match kind {
-            UntypedLiteral::List => name == list || name == set || name == iterable,
+            // A `[` literal's downward inference constrains `List<E>` only
+            // against a context `List<E>` itself is a subtype of — `List`
+            // and `Iterable` donate their argument; a `Set` context leaves
+            // `E` free (`<Set<int>>{[1]}` reads the element `List<int>`
+            // upward and the set-element check whole-compares it).
+            UntypedLiteral::List => name == list || name == iterable,
             UntypedLiteral::SetElements => name == set || name == iterable,
             UntypedLiteral::MapEntries => name == map,
             UntypedLiteral::EmptyBraces => name == map || name == set || name == iterable,
@@ -7176,7 +7288,10 @@ impl<'a> Engine<'a> {
             let heads = &self.collection_heads;
             let (list, set, map, iterable) = (heads[0], heads[1], heads[2], heads[3]);
             let adopts = match kind {
-                UntypedLiteral::List => name == list || name == set || name == iterable,
+                // The `[` literal's downward inference constrains `List<E>`
+                // only against `List`/`Iterable` contexts — a `Set`
+                // context leaves the element type upward-inferred.
+                UntypedLiteral::List => name == list || name == iterable,
                 UntypedLiteral::SetElements => name == set || name == iterable,
                 UntypedLiteral::MapEntries => name == map,
                 // An empty `{}` resolves to the context's shape whichever
