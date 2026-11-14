@@ -172,6 +172,6 @@ pub use model::{
     Container, ContainerKind, DuplicateDecl, FileElements, FnSig, MemberEntry, MemberKind,
     MicroKind, TopDecl,
 };
-pub use resolved_ops::{ClauseTrees, LibraryTypes, ResolvedTypeOps};
+pub use resolved_ops::{ClauseTrees, ClosureEdges, LibraryTypes, ResolvedTypeOps};
 pub use signature::{ApiSignature, SIGNATURE_VERSION};
 pub use use_face::{ExportUseFace, ImportUseFace, LibraryUsages, LibraryUseSet, UnitUseFace};

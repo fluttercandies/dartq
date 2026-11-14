@@ -71,7 +71,7 @@ use dartq_types::{
 use crate::bounds::TypeTree;
 use crate::library::ElementIndex;
 use crate::model::{
-    ArgListId, ArgPool, ContainerKind, FnShapeId, FnSig, MemberKind, MicroKind, Ty,
+    ArgListId, ArgPool, ContainerKind, FileElements, FnShapeId, FnSig, MemberKind, MicroKind, Ty,
 };
 
 /// Core-declaration raw ids (the hierarchy requires `Object`, `Future`,
@@ -573,6 +573,36 @@ impl LibraryTypes {
         lib: LibraryId,
         clauses: &ClauseTrees,
     ) -> Self {
+        Self::build_impl(graph, namespaces, index, strings, lib, clauses, None)
+    }
+
+    /// The shared-closure variant (#4283): `edges` carries the per-analyze
+    /// `ClosureEdges` table built once before the fan-out, and the
+    /// supertype closure replays its precomputed scan decisions instead
+    /// of re-collecting heads and re-running lookups per library. Pairs
+    /// the table does not hold keep the inline scan — outcomes are
+    /// identical either way.
+    pub fn build_with_edges(
+        graph: &LibraryGraph,
+        namespaces: &Namespaces,
+        index: &ElementIndex,
+        strings: &StringTable,
+        lib: LibraryId,
+        clauses: &ClauseTrees,
+        edges: &ClosureEdges,
+    ) -> Self {
+        Self::build_impl(graph, namespaces, index, strings, lib, clauses, Some(edges))
+    }
+
+    fn build_impl(
+        graph: &LibraryGraph,
+        namespaces: &Namespaces,
+        index: &ElementIndex,
+        strings: &StringTable,
+        lib: LibraryId,
+        clauses: &ClauseTrees,
+        closure_edges: Option<&ClosureEdges>,
+    ) -> Self {
         let table = TypeTable::new();
         let object = TypeDeclId::from_raw(OBJECT_RAW);
         let future = TypeDeclId::from_raw(FUTURE_RAW);
@@ -839,66 +869,60 @@ impl LibraryTypes {
         // -wins keeps the visible spelling's declaration authoritative:
         // a closure entry only ever fills an absent slot, never retypes
         // a name the unit itself resolves.
+        //
+        // Each file scans at most once across all rounds: a file's
+        // clause-head scan is pure (`namespaces.lookup` runs in the
+        // declaring file's scope and the registry membership checks only
+        // short-circuit it), so a later round's rescan of an
+        // already-scanned file registers nothing its first scan did not —
+        // every head it resolved landed in the registry then, and every
+        // head that failed lookup fails identically forever. Rescanning
+        // the whole registry per fixpoint round made the per-library cost
+        // scale with rounds × registered files (the super-linear
+        // engine-cold term, #4283). Keeping the round structure but
+        // filtering each round's scan list down to never-scanned files
+        // preserves the original visit order exactly — a round's rescans
+        // were state-neutral — so first-writer-wins outcomes are
+        // unchanged while each file pays the head walk once.
+        let mut scanned: FxHashSet<(FileId, LibraryId)> = FxHashSet::default();
         loop {
             let mut grew = false;
             let mut scan: Vec<(FileId, LibraryId)> = Vec::new();
-            let mut scanned: FxHashSet<(FileId, LibraryId)> = FxHashSet::default();
             for &(file, owner) in registry.decl_owner.values() {
                 if scanned.insert((file, owner)) {
                     scan.push((file, owner));
                 }
             }
             for (file, owner) in scan {
+                // The shared-table replay: this pair's scan decisions are
+                // pure, so the per-analyze `ClosureEdges` table already
+                // holds them — only the per-library membership filters and
+                // the registrations run here. A miss keeps the inline scan
+                // below (an owner the table never listed).
+                if let Some(edges) = closure_edges.and_then(|table| table.get(file, owner)) {
+                    for &(head, target_file) in edges {
+                        if registry.registry.contains_key(&head)
+                            || registry.non_containers.contains(&head)
+                            || registry.type_params.contains_key(&head)
+                        {
+                            continue;
+                        }
+                        let target_lib = graph.library_of_file(target_file).unwrap_or(owner);
+                        registry.register_file(index, target_file, target_lib, &mut actions);
+                        for action in actions.drain(..) {
+                            builder = action.apply(builder, &table, core_enum);
+                        }
+                        grew = true;
+                    }
+                    continue;
+                }
                 let Some(elements) = index.get(file) else {
                     continue;
                 };
-                // The clause spellings of every container in the file:
-                // the written trees' heads (recursively — a written
-                // argument's head rides the same edge) beside the
-                // element model's name-level clause lists. A member's
-                // declared type head rides the same closure: the
-                // recorder spells a member-typed variable's type bare,
-                // and the oracle resolves that spelling in the
-                // DECLARING file's context — a name the reading unit
-                // never imports (`InternalVariableElement`, spelled by
-                // src/dart/ast/ast.dart's property while the reader
-                // imports no element-model src file) still answers
-                // through its real declaration instead of collapsing
-                // to `Invalid`'s vacuous arms.
+                // The clause spellings of every container in the file —
+                // [`collect_clause_heads`] documents the shape.
                 let mut heads: Vec<StringId> = Vec::new();
-                for &name in elements.container_order() {
-                    if let Some(capture) = clauses.get(file, name) {
-                        for tree in &capture.supers {
-                            collect_tree_heads(tree, &mut heads);
-                        }
-                    }
-                    if let Some(container) = elements.container(name) {
-                        heads.extend(
-                            container
-                                .superclass
-                                .iter()
-                                .chain(container.with_clause.iter())
-                                .chain(container.implements_clause.iter())
-                                .chain(
-                                    (container.kind == ContainerKind::Mixin)
-                                        .then(|| container.on_clause.iter())
-                                        .into_iter()
-                                        .flatten(),
-                                )
-                                .copied(),
-                        );
-                        for entry in container.members.values() {
-                            let ty = match entry.kind {
-                                MemberKind::Field => entry.var_ty,
-                                MemberKind::Getter | MemberKind::Method => entry.return_ty,
-                                MemberKind::Setter => continue,
-                            };
-                            if let Ty::Named { name: head, .. } = ty {
-                                heads.push(head);
-                            }
-                        }
-                    }
-                }
+                collect_clause_heads(clauses, elements, file, &mut heads);
                 for head in heads {
                     if registry.registry.contains_key(&head)
                         || registry.non_containers.contains(&head)
@@ -1418,6 +1442,150 @@ impl LibraryTypes {
             invalid_property_tys,
             extension_erasures,
         }
+    }
+}
+
+/// The clause-head scan of one file: the written supertype trees' heads
+/// (recursively — a written argument's head rides the same edge) beside
+/// the element model's name-level clause lists, then every member's
+/// declared type head. A member-typed variable's head rides the closure
+/// because the oracle resolves that spelling in the DECLARING file's
+/// context — a name the reading unit never imports still answers through
+/// its real declaration instead of collapsing to `Invalid`'s vacuous
+/// arms.
+fn collect_clause_heads(
+    clauses: &ClauseTrees,
+    elements: &FileElements,
+    file: FileId,
+    heads: &mut Vec<StringId>,
+) {
+    for &name in elements.container_order() {
+        if let Some(capture) = clauses.get(file, name) {
+            for tree in &capture.supers {
+                collect_tree_heads(tree, heads);
+            }
+        }
+        if let Some(container) = elements.container(name) {
+            heads.extend(
+                container
+                    .superclass
+                    .iter()
+                    .chain(container.with_clause.iter())
+                    .chain(container.implements_clause.iter())
+                    .chain(
+                        (container.kind == ContainerKind::Mixin)
+                            .then(|| container.on_clause.iter())
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .copied(),
+            );
+            for entry in container.members.values() {
+                let ty = match entry.kind {
+                    MemberKind::Field => entry.var_ty,
+                    MemberKind::Getter | MemberKind::Method => entry.return_ty,
+                    MemberKind::Setter => continue,
+                };
+                if let Ty::Named { name: head, .. } = ty {
+                    heads.push(head);
+                }
+            }
+        }
+    }
+}
+
+/// Per-analyze closure edge table (#4283): for every `(file, owner)` pair
+/// the supertype-closure scan can meet, the ordered `(head, target-file)`
+/// registrations the scan would issue — a pure function of the
+/// graph/namespaces/index/clauses triple, computed once and shared by
+/// every library's closure replay. Pairs enter `decl_owner` with
+/// `owner = library_of_file(file)` (own units, import targets, closure
+/// registrations) or `owner = T` for a file re-exported through library
+/// `T`'s scope; [`Self::pairs`] enumerates both families. A replay-time
+/// miss (an owner the table never listed, e.g. the `library_of_file`
+/// fallback arm) keeps the inline scan — correct, just unshared.
+#[derive(Default)]
+pub struct ClosureEdges(FxHashMap<(FileId, LibraryId), Box<[(StringId, FileId)]>>);
+
+impl ClosureEdges {
+    /// The sequential one-shot build (tests and single-library callers);
+    /// the engine builds the same table in parallel over [`Self::pairs`]
+    /// and [`Self::compute`].
+    pub fn build(
+        graph: &LibraryGraph,
+        namespaces: &Namespaces,
+        index: &ElementIndex,
+        clauses: &ClauseTrees,
+    ) -> Self {
+        let table = Self::pairs(graph)
+            .into_iter()
+            .map(|(file, owner)| {
+                (
+                    (file, owner),
+                    Self::compute(graph, namespaces, index, clauses, file, owner),
+                )
+            })
+            .collect();
+        Self::from_map(table)
+    }
+
+    /// Every `(file, owner)` pair a closure scan can meet for the given
+    /// graph: each library's own units (the `library_of_file` identity)
+    /// plus each library's export scope (a re-exported file registers
+    /// under the exporting library).
+    pub fn pairs(graph: &LibraryGraph) -> Vec<(FileId, LibraryId)> {
+        let mut pairs: FxHashSet<(FileId, LibraryId)> = FxHashSet::default();
+        for lib in graph.libraries() {
+            for &file in graph.unit_files(lib) {
+                pairs.insert((file, lib));
+            }
+            for (_, entry) in graph.export_scope(lib) {
+                pairs.insert((entry.file, lib));
+            }
+        }
+        pairs.into_iter().collect()
+    }
+
+    /// The ordered edge list for one pair: every clause head whose
+    /// declaring-scope lookup finds a container-bearing declaration, in
+    /// scan order (the membership filters stay per-library at replay
+    /// time — first-writer-wins outcomes are the scan's own).
+    pub fn compute(
+        graph: &LibraryGraph,
+        namespaces: &Namespaces,
+        index: &ElementIndex,
+        clauses: &ClauseTrees,
+        file: FileId,
+        owner: LibraryId,
+    ) -> Box<[(StringId, FileId)]> {
+        let Some(elements) = index.get(file) else {
+            return Box::default();
+        };
+        let mut heads = Vec::new();
+        collect_clause_heads(clauses, elements, file, &mut heads);
+        let mut out = Vec::new();
+        for head in heads {
+            if let Lookup::Found(NamespaceEntry::Decl(target)) = namespaces.lookup(graph, owner, head)
+                && index.get(target).is_some_and(|els| els.container(head).is_some())
+            {
+                out.push((head, target));
+            }
+        }
+        out.into()
+    }
+
+    /// Assembles a table from precomputed pairs ([`Self::compute`] per
+    /// entry of [`Self::pairs`]) — the engine builds this in parallel
+    /// before the fan-out.
+    pub fn from_map(
+        map: FxHashMap<(FileId, LibraryId), Box<[(StringId, FileId)]>>,
+    ) -> Self {
+        Self(map)
+    }
+
+    /// One pair's edge list, when the table holds it.
+    pub fn get(&self, file: FileId, owner: LibraryId) -> Option<&[(StringId, FileId)]> {
+        self.0.get(&(file, owner)).map(|boxed| &boxed[..])
     }
 }
 
