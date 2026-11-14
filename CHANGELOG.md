@@ -9,14 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Opt-in serve-early daemon mode (`dartq daemon --serve-early`): per-file
-  `dartq/analyze` answers while the workspace is still settling — the
-  asked files' rows come back ~7× sooner than the full settle (5.8 s vs
-  42.3 s first answer on a 1,338-file workspace, debug build), every
-  early answer carries a `settle: "may-precede-settle"` marker on the
-  envelope only, and a stamp-fresh answer-record hit short-circuits the
-  early path (records are settled bytes). Off by default; with the flag
-  unset the wire bytes are identical (#4268).
+- Opt-in serve-early daemon mode (`dartq daemon --serve-early`, stdio
+  daemon face): per-file `dartq/analyze` answers while the workspace is
+  still settling — the asked files' rows come back ~7× sooner than the
+  full settle (5.8 s vs 42.3 s first answer on a 1,338-file workspace
+  with persisted facts, debug build), and every early answer carries a
+  `settle: "may-precede-settle"` marker on the envelope only. Off by
+  default; with the flag unset the wire bytes are identical (#4268).
 
 ### Fixed
 
