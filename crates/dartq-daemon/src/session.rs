@@ -11388,7 +11388,9 @@ mod tests {
         );
         assert!(settled.get("settle").is_none(), "settled answers unmarked");
         assert!(
-            settled["diags"].as_array().is_some_and(|rows| !rows.is_empty()),
+            settled["diags"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
             "the fixture file carries a diagnostic: {settled}"
         );
 
@@ -11397,7 +11399,9 @@ mod tests {
         let b = workspace.path("lib/b.dart");
         fs::write(&b, "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n")
             .expect("rewrite b.dart");
-        session.queue_disk_changes(&[b]).expect("disk changes queue");
+        session
+            .queue_disk_changes(&[b])
+            .expect("disk changes queue");
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
@@ -11482,7 +11486,9 @@ mod tests {
         let b = workspace.path("lib/b.dart");
         fs::write(&b, "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n")
             .expect("rewrite b.dart");
-        session.queue_disk_changes(&[b]).expect("disk changes queue");
+        session
+            .queue_disk_changes(&[b])
+            .expect("disk changes queue");
 
         let a = workspace.path("lib/a.dart");
         session.queue_command(
@@ -11556,7 +11562,9 @@ mod tests {
         let b = workspace.path("lib/b.dart");
         fs::write(&b, "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n")
             .expect("rewrite b.dart");
-        session.queue_disk_changes(&[b]).expect("disk changes queue");
+        session
+            .queue_disk_changes(&[b])
+            .expect("disk changes queue");
 
         // No serve_early spelled — the session flag sets it.
         let a = workspace.path("lib/a.dart");
@@ -11594,7 +11602,9 @@ mod tests {
         let b = workspace.path("lib/b.dart");
         fs::write(&b, "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n")
             .expect("rewrite b.dart");
-        session.queue_disk_changes(&[b]).expect("disk changes queue");
+        session
+            .queue_disk_changes(&[b])
+            .expect("disk changes queue");
         let a = workspace.path("lib/a.dart");
         session.queue_command(
             RequestId::Num(2),
@@ -11652,7 +11662,9 @@ mod tests {
         let b = workspace.path("lib/b.dart");
         fs::write(&b, "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n")
             .expect("rewrite b.dart");
-        session.queue_disk_changes(&[b]).expect("disk changes queue");
+        session
+            .queue_disk_changes(&[b])
+            .expect("disk changes queue");
         let a = workspace.path("lib/a.dart");
         session.queue_command(
             RequestId::Num(2),
@@ -11674,10 +11686,7 @@ mod tests {
             .expect("the serve-early ask answers")
             .as_value()
             .into_owned();
-        assert_eq!(
-            early["settle"],
-            serde_json::json!("may-precede-settle")
-        );
+        assert_eq!(early["settle"], serde_json::json!("may-precede-settle"));
 
         // Drain the deferred settle so the context is settled again.
         let _ = session.service();

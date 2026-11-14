@@ -74,15 +74,11 @@ pub use codes::{
 pub use conditional::{Configuration, SelectedUri, resolve_conditional};
 pub use cycles::{StronglyConnected, cycle_through, dependency_cycle, strongly_connected};
 pub use doc_import::{CommentLexeme, DocComment, DocImportDirective, doc_imports};
-pub use export_graph::{
-    AmbiguousExportFinding, InternalExportFinding, is_internal_sdk_library,
-};
+pub use export_graph::{AmbiguousExportFinding, InternalExportFinding, is_internal_sdk_library};
 pub use file_role::{FileRole, PartOfRow, part_of_row};
-pub use uri::{SdkFileKind, SdkFileKinds, canonical_dart_uri};
 pub use library_graph::{
     CombinatorClause, Combinators, DuplicateCombinatorName, ExportEdge, ExportEntry, FaceKind,
-    ImportEdge, LibraryGraph, LibraryGraphBuilder, LibraryId, LocalLookup,
-    UndefinedCombinatorName,
+    ImportEdge, LibraryGraph, LibraryGraphBuilder, LibraryId, LocalLookup, UndefinedCombinatorName,
 };
 pub use modifiers::{
     ClassModifiers, DeclKind, DeclarationViolation, ExplicitBaseFinal, ImplementsStep,
@@ -98,3 +94,4 @@ pub use uri::{
     DirectiveKind, PackageTable, RawUri, ResolvedTarget, ResolvedUri, UnresolvedKind,
     UriResolution, UriResolver, compose_canonical_uri, parse_directive_uri,
 };
+pub use uri::{SdkFileKind, SdkFileKinds, canonical_dart_uri};

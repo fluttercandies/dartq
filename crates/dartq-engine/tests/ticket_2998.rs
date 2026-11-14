@@ -43,7 +43,12 @@ fn rows_of(
                         .to_owned()
                 })
                 .unwrap_or_default();
-            (tail, row.range.offset, row.range.length, row.message.to_string())
+            (
+                tail,
+                row.range.offset,
+                row.range.length,
+                row.message.to_string(),
+            )
         })
         .collect()
 }
@@ -205,8 +210,7 @@ fn export_of_an_sdk_part_reports_non_library() {
 fn name_form_sdk_part_attaches_by_library_name() {
     const ATTACHED: &str =
         "library dart.developer;\npart 'dart:developer/creation_tracking.dart';\n";
-    const MISMATCHED: &str =
-        "library other.lib;\npart 'dart:developer/creation_tracking.dart';\n";
+    const MISMATCHED: &str = "library other.lib;\npart 'dart:developer/creation_tracking.dart';\n";
     const UNNAMED: &str = "part 'dart:developer/creation_tracking.dart';\n";
 
     for (label, content, expected) in [
@@ -333,11 +337,7 @@ fn ambiguous_export_reports_the_second_directive() {
     const B: &str = "int Foo = 1;\n";
     const C: &str = "int Foo = 2;\n";
 
-    let fixture = Fixture::new(&[
-        ("lib/a.dart", A),
-        ("lib/b.dart", B),
-        ("lib/c.dart", C),
-    ]);
+    let fixture = Fixture::new(&[("lib/a.dart", A), ("lib/b.dart", B), ("lib/c.dart", C)]);
     let mut engine = fixture.engine();
     engine.set_content(&fixture.path("lib/a.dart"), A.as_bytes());
     engine.set_content(&fixture.path("lib/b.dart"), B.as_bytes());
@@ -368,7 +368,10 @@ fn export_internal_library_reports_the_written_uri() {
 
     let fixture = Fixture::new(&[
         ("lib/a.dart", A),
-        ("sdk/lib/internal/internal.dart", "library dart._internal;\n"),
+        (
+            "sdk/lib/internal/internal.dart",
+            "library dart._internal;\n",
+        ),
     ]);
     let mut engine = fixture.engine();
     engine.set_content(&fixture.path("lib/a.dart"), A.as_bytes());
@@ -419,16 +422,11 @@ fn deferred_import_of_extension_reports() {
 /// `import`, a library `part` target, and an eager extension import.
 #[test]
 fn clean_directives_stay_silent() {
-    const A: &str =
-        "library my.lib;\nimport 'ext.dart' as p;\npart 'p.dart';\nint f() => 1;\n";
+    const A: &str = "library my.lib;\nimport 'ext.dart' as p;\npart 'p.dart';\nint f() => 1;\n";
     const EXT: &str = "extension E on int {\n  int get doubled => this * 2;\n}\n";
     const P: &str = "part of my.lib;\nint g() => 1;\n";
 
-    let fixture = Fixture::new(&[
-        ("lib/a.dart", A),
-        ("lib/ext.dart", EXT),
-        ("lib/p.dart", P),
-    ]);
+    let fixture = Fixture::new(&[("lib/a.dart", A), ("lib/ext.dart", EXT), ("lib/p.dart", P)]);
     let mut engine = fixture.engine();
     engine.set_content(&fixture.path("lib/a.dart"), A.as_bytes());
     engine.set_content(&fixture.path("lib/ext.dart"), EXT.as_bytes());

@@ -401,9 +401,11 @@ impl Engine {
         let build = state::persist::analyzer_build();
         let grants = self.state.feature_grants.fingerprint();
         let packages = state::persist::package_graph_fingerprint(&self.state.packages);
-        keyed.iter()
+        keyed
+            .iter()
             .map(|&(content, fingerprint)| {
-                let key = state::persist::lint_rows_key(build, grants, packages, content, fingerprint);
+                let key =
+                    state::persist::lint_rows_key(build, grants, packages, content, fingerprint);
                 store.read(&key).ok()
             })
             .collect()
@@ -507,14 +509,12 @@ impl Engine {
         };
         let blob = store.put(rendered);
         store.flush();
-        let Some(sidecar) =
-            state::persist::encode_answer(&state::persist::AnsweredRecord {
-                version: state::persist::ANSWER_RECORD_VERSION,
-                blob: blob.to_string(),
-                stamps,
-                summary,
-            })
-        else {
+        let Some(sidecar) = state::persist::encode_answer(&state::persist::AnsweredRecord {
+            version: state::persist::ANSWER_RECORD_VERSION,
+            blob: blob.to_string(),
+            stamps,
+            summary,
+        }) else {
             return;
         };
         let path = store::answer_record_path(store.root(), &key);
@@ -747,9 +747,7 @@ impl Engine {
             self.state.merged = None;
         }
         self.state.persist_library_runs();
-        let mut diagnostics = analyzed?
-        .as_ref()
-        .clone();
+        let mut diagnostics = analyzed?.as_ref().clone();
         self.capture_nested_pubspecs();
         // The settle's arming point (#2739): a completed analyze arms the
         // `Tier::Background` warm lane — O(1), the plan's items
@@ -1653,7 +1651,11 @@ impl Engine {
     /// safe direction by construction.
     #[must_use]
     pub fn stat_workspace(&self) -> Vec<(PathBuf, state::persist::AnswerStamp)> {
-        workspace_stamps(&self.state.packages, &self.state.options, &self.context_root)
+        workspace_stamps(
+            &self.state.packages,
+            &self.state.options,
+            &self.context_root,
+        )
     }
 }
 
@@ -1668,7 +1670,10 @@ fn generation_header(
     context_root: &Path,
     declared_variables: &rustc_hash::FxHashMap<String, String>,
 ) -> GenerationHeader {
-    let mut roots: Vec<PathBuf> = packages.iter().map(|package| package.root.clone()).collect();
+    let mut roots: Vec<PathBuf> = packages
+        .iter()
+        .map(|package| package.root.clone())
+        .collect();
     roots.sort();
     roots.dedup();
     GenerationHeader {
@@ -1721,7 +1726,11 @@ fn workspace_stamps(
     // Every package-table pubspec (the raw-bytes face the pubspec
     // lint reads; the package-graph fingerprint pins identity
     // columns, never content) and the consumed package config.
-    paths.extend(packages.iter().map(|package| package.root.join("pubspec.yaml")));
+    paths.extend(
+        packages
+            .iter()
+            .map(|package| package.root.join("pubspec.yaml")),
+    );
     paths.push(context_root.join("package_config.json"));
     // One normalization pass (the discovery spelling — symlinked
     // parents canonicalize so two processes derive one set), then the
@@ -2337,17 +2346,15 @@ impl Engine {
         // exact over owned columns.
         rows.push((
             "packages_rows",
-            (self.state.packages.len()
-                * std::mem::size_of::<dartq_package::PackageIdentity>()) as u64,
+            (self.state.packages.len() * std::mem::size_of::<dartq_package::PackageIdentity>())
+                as u64,
             "est",
         ));
         rows.push((
             "options_entries",
             (self.state.options.capacity()
-                * (std::mem::size_of::<(
-                    PathBuf,
-                    Arc<crate::analysis_options::AnalysisOptions>,
-                )>() + 1)) as u64,
+                * (std::mem::size_of::<(PathBuf, Arc<crate::analysis_options::AnalysisOptions>)>()
+                    + 1)) as u64,
             "exact",
         ));
         rows
@@ -3380,9 +3387,7 @@ mod tests {
             .expect("store arms");
         engine.discover_workspace().expect("discover");
         let cancel = CancellationToken::default();
-        engine
-            .analyze(&[], &mut |_| {}, &cancel)
-            .expect("analyze");
+        engine.analyze(&[], &mut |_| {}, &cancel).expect("analyze");
 
         // The serving shape: the full-workspace ask, one face.
         let shape = AnswerShape::new(AnswerFace::AnalyzeLon, vec![]);
@@ -3402,7 +3407,10 @@ mod tests {
         let stamps = engine.stat_workspace();
         engine.persist_answer(&shape, stamps, b"rendered-v1", summary);
         match engine.probe_answer(&shape, &engine.stat_workspace()) {
-            AnswerProbe::Hit { bytes, summary: hit } => {
+            AnswerProbe::Hit {
+                bytes,
+                summary: hit,
+            } => {
                 assert_eq!(bytes, b"rendered-v1");
                 assert_eq!(hit, summary);
             }
@@ -3431,8 +3439,11 @@ mod tests {
         // so the next run — a fresh engine over the same tree, exactly
         // the one-shot CLI flow — locates it and probes under a key no
         // record holds.
-        std::fs::write(root.join("lib/analysis_options.yaml"), "linter:\n  rules: []\n")
-            .expect("options");
+        std::fs::write(
+            root.join("lib/analysis_options.yaml"),
+            "linter:\n  rules: []\n",
+        )
+        .expect("options");
         let mut reassembled = facade_engine_over(&root);
         reassembled
             .open_content_store(&store::StoreConfig {
@@ -3538,8 +3549,11 @@ mod tests {
 
         // Blob eviction: the sidecar stands, the store lost the bytes —
         // read-through failure is the miss, never a partial serve.
-        std::fs::write(root.join("lib/extra.dart"), "int extra() => 3;\nint more() => 4;\n")
-            .expect("restore");
+        std::fs::write(
+            root.join("lib/extra.dart"),
+            "int extra() => 3;\nint more() => 4;\n",
+        )
+        .expect("restore");
         let stamps = engine.stat_workspace();
         engine.persist_answer(&shape, stamps, b"rendered-v3", summary);
         let hex = dartq_source::content_hash(b"rendered-v3").to_string();

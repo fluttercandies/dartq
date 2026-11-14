@@ -44,7 +44,12 @@ fn rows_of(
                         .to_owned()
                 })
                 .unwrap_or_default();
-            (tail, row.range.offset, row.range.length, row.message.to_string())
+            (
+                tail,
+                row.range.offset,
+                row.range.length,
+                row.message.to_string(),
+            )
         })
         .collect()
 }

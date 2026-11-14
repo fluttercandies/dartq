@@ -2017,12 +2017,10 @@ impl<'a> Engine<'a> {
                         // folds the alias and answers the shape's own field
                         // getter (its `Named` leg re-asks this same declared
                         // face, so a genuine class head keeps `Unknown`).
-                        match self.record_field_ty(merged_receiver_ty, member.name, is_null_aware)
-                        {
+                        match self.record_field_ty(merged_receiver_ty, member.name, is_null_aware) {
                             Some(field) if is_null_aware => {
                                 if !Self::is_nullable_ty(field) {
-                                    self.record_short_fields
-                                        .insert(member.range.offset, field);
+                                    self.record_short_fields.insert(member.range.offset, field);
                                 }
                                 Self::nullable_form(field)
                             }
@@ -8764,7 +8762,8 @@ impl<'a> Engine<'a> {
                 K::CloseParen | K::CloseSquare | K::CloseCurly => depth = depth.saturating_sub(1),
                 K::QuestionQuestion | K::QuestionQuestionEq if depth == 0 => {
                     return self.if_null_results.iter().any(|(rhs, (_, ty))| {
-                        start <= *rhs && *rhs <= end
+                        start <= *rhs
+                            && *rhs <= end
                             && matches!(
                                 self.fold_alias_ty(*ty),
                                 Ty::Named { name, .. } if name == function
@@ -8793,11 +8792,7 @@ impl<'a> Engine<'a> {
         }
         let deferred = std::mem::take(&mut self.deferred_if_null_bounds);
         for (offset, args) in deferred {
-            let Some(callee) = self
-                .rows
-                .iter()
-                .position(|row| row.range.offset == offset)
-            else {
+            let Some(callee) = self.rows.iter().position(|row| row.range.offset == offset) else {
                 continue;
             };
             let Some(row) = self.rows.get(callee) else {
@@ -8894,8 +8889,7 @@ impl<'a> Engine<'a> {
                     // this stop the walk overshoots to the CALL's paren
                     // and the unbalanced extent reads as no composite at
                     // all).
-                    if depth == 0 && (i == 0 || !continues_primary_backward(tokens[i - 1].kind))
-                    {
+                    if depth == 0 && (i == 0 || !continues_primary_backward(tokens[i - 1].kind)) {
                         first = i;
                         break;
                     }
@@ -9914,8 +9908,7 @@ impl<'a> Engine<'a> {
             .own_exec_window(outer_name, false)
             .map(|window| &window.params)
             .filter(|params| !params.is_empty())
-        .inspect(|_| {
-        })
+            .inspect(|_| {})
         else {
             return;
         };
@@ -16972,9 +16965,10 @@ impl<'a> Engine<'a> {
         // `bare_invoke_ty_is_result` returns as-is.
         let skip_row_ty = send_result != Ty::UNKNOWN
             && !shorthand_callee
-            && self.rows.get(callee).is_some_and(|row| {
-                row.qualified && self.callable_result_of(send_result).is_some()
-            });
+            && self
+                .rows
+                .get(callee)
+                .is_some_and(|row| row.qualified && self.callable_result_of(send_result).is_some());
         if send_result != Ty::UNKNOWN
             && !shorthand_callee
             && let Some(row) = self.rows.get_mut(callee)

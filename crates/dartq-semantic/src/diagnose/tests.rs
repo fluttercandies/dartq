@@ -792,17 +792,19 @@ fn staged_promotion_drops_void_and_spells_never() {
         FileTable::new().intern(Path::new("test.dart")),
     );
     let flow = Flow::new(&scanned.tokens, "");
-    assert!(staged_promotion(
-        FlowTy {
-            base: FlowBase::Void,
-            nullable: false
-        },
-        dartq_flow::ty::EMPTY_ARGS,
-        &flow,
-        &strings,
-        &mut pool
-    )
-    .is_none());
+    assert!(
+        staged_promotion(
+            FlowTy {
+                base: FlowBase::Void,
+                nullable: false
+            },
+            dartq_flow::ty::EMPTY_ARGS,
+            &flow,
+            &strings,
+            &mut pool
+        )
+        .is_none()
+    );
     assert_eq!(
         staged_promotion(
             FlowTy {
@@ -978,7 +980,10 @@ fn missing_annotation_reports_over_the_at_sign() {
     // the two rows always pair here.
     assert_eq!(
         code_names(&report),
-        ["undefined_annotation", "non_constant_annotation_constructor"]
+        [
+            "undefined_annotation",
+            "non_constant_annotation_constructor"
+        ]
     );
     let d = &report.diagnostics[0];
     assert_eq!(d.message, "Undefined name 'gone' used as an annotation.");
@@ -2124,26 +2129,26 @@ fn primitive_receivers_report_the_member_trio() {
     let report = report(
         "void f() { int x = 1; x.noSuchGetter; x.noSuchMethodHere(); x.noSuchSetter = 2; x.isEven; x.toString; }",
     );
-        // The receiver type `int` resolves through dart:core's
-        // final-primitive lane in every rig, so no `undefined_class` row
-        // precedes the member trio — the live oracle's posture.
-        assert_eq!(
-            code_names(&report),
-            ["undefined_getter", "undefined_method", "undefined_setter"],
-            "{:?}",
-            code_names(&report)
-        );
-        assert_eq!(
-            report.diagnostics[0].message,
-            "The getter 'noSuchGetter' isn't defined for the type 'int'."
-        );
-        assert_eq!(
-            report.diagnostics[1].message,
-            "The method 'noSuchMethodHere' isn't defined for the type 'int'."
-        );
-        assert_eq!(
-            report.diagnostics[2].message,
-            "The setter 'noSuchSetter' isn't defined for the type 'int'."
+    // The receiver type `int` resolves through dart:core's
+    // final-primitive lane in every rig, so no `undefined_class` row
+    // precedes the member trio — the live oracle's posture.
+    assert_eq!(
+        code_names(&report),
+        ["undefined_getter", "undefined_method", "undefined_setter"],
+        "{:?}",
+        code_names(&report)
+    );
+    assert_eq!(
+        report.diagnostics[0].message,
+        "The getter 'noSuchGetter' isn't defined for the type 'int'."
+    );
+    assert_eq!(
+        report.diagnostics[1].message,
+        "The method 'noSuchMethodHere' isn't defined for the type 'int'."
+    );
+    assert_eq!(
+        report.diagnostics[2].message,
+        "The setter 'noSuchSetter' isn't defined for the type 'int'."
     );
 }
 
@@ -5223,28 +5228,28 @@ fn instance_member_family_reports_by_intent() {
         "class C { int get g => 1; set p(int v) {} } \
              void f(C c) { c.h; c.s = 1; c.g = 2; c.p; }",
     );
-        assert_eq!(
-            code_names(&report),
-            [
-                "undefined_getter",
-                "undefined_setter",
-                "assignment_to_final_no_setter",
-                "undefined_getter",
-            ],
-            "{:?}",
-            code_names(&report)
-        );
-        assert_eq!(
-            report.diagnostics[0].message,
-            "The getter 'h' isn't defined for the type 'C'."
-        );
-        assert_eq!(
-            report.diagnostics[1].message,
-            "The setter 's' isn't defined for the type 'C'."
-        );
-        assert_eq!(
-            report.diagnostics[2].message,
-            "There isn't a setter named 'g' in class 'C'."
+    assert_eq!(
+        code_names(&report),
+        [
+            "undefined_getter",
+            "undefined_setter",
+            "assignment_to_final_no_setter",
+            "undefined_getter",
+        ],
+        "{:?}",
+        code_names(&report)
+    );
+    assert_eq!(
+        report.diagnostics[0].message,
+        "The getter 'h' isn't defined for the type 'C'."
+    );
+    assert_eq!(
+        report.diagnostics[1].message,
+        "The setter 's' isn't defined for the type 'C'."
+    );
+    assert_eq!(
+        report.diagnostics[2].message,
+        "There isn't a setter named 'g' in class 'C'."
     );
     assert_eq!(
         report.diagnostics[0].range.offset,
@@ -5347,19 +5352,19 @@ fn super_member_family_reports_by_shape() {
         "class B { int get g => 1; void m() {} set s(int v) {} } \
              class C extends B { void f() { super.g; super.m(); super.s = 1; super.q; super.q2(); super.q3 = 2; } }",
     );
-        assert_eq!(
-            code_names(&report),
-            [
-                "undefined_super_member",
-                "undefined_super_member",
-                "undefined_super_member",
-            ],
-            "{:?}",
-            code_names(&report)
-        );
-        assert_eq!(
-            report.diagnostics[0].message,
-            "The getter 'q' isn't defined in a superclass of 'C'."
+    assert_eq!(
+        code_names(&report),
+        [
+            "undefined_super_member",
+            "undefined_super_member",
+            "undefined_super_member",
+        ],
+        "{:?}",
+        code_names(&report)
+    );
+    assert_eq!(
+        report.diagnostics[0].message,
+        "The getter 'q' isn't defined in a superclass of 'C'."
     );
     assert_eq!(
         report.diagnostics[1].message,
@@ -6794,7 +6799,14 @@ fn record_pattern_binds_fields_beside_the_never_row() {
     let rows: Vec<(&'static str, u32, u32, &str)> = report
         .diagnostics
         .iter()
-        .map(|d| (d.code.name, d.range.offset, d.range.length, d.message.as_ref()))
+        .map(|d| {
+            (
+                d.code.name,
+                d.range.offset,
+                d.range.length,
+                d.message.as_ref(),
+            )
+        })
         .collect();
     assert_eq!(
         rows,

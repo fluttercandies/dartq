@@ -452,7 +452,11 @@ fn enum_static_over_own_constant() {
         .iter()
         .map(|d| d.message.to_string())
         .collect();
-    assert_eq!(rows, Vec::<String>::new(), "no static/instance row: {rows:?}");
+    assert_eq!(
+        rows,
+        Vec::<String>::new(),
+        "no static/instance row: {rows:?}"
+    );
     assert_eq!(
         all,
         vec!["The name 'e1' is already defined.".to_string()],

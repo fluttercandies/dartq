@@ -2572,11 +2572,14 @@ impl<'a> Engine<'a> {
     /// here).
     fn extension_on_admits(&self, face: &ExtensionFace, ty: Ty) -> bool {
         match (face.on_ty, ty) {
-            (Ty::Named {
-                name: on_name,
-                args: on_args,
-                ..
-            }, Ty::Named { name, args, .. }) => {
+            (
+                Ty::Named {
+                    name: on_name,
+                    args: on_args,
+                    ..
+                },
+                Ty::Named { name, args, .. },
+            ) => {
                 if on_name == name {
                     // The written arguments gate the admission exactly when
                     // both sides spell them: `on List<A>` admits `List<C>`
@@ -2935,9 +2938,7 @@ impl<'a> Engine<'a> {
                         self.backward_type_text(decl_offset)
                             .and_then(|text| self.parse_annotation_ty(&text))
                             .map(|ty| self.fold_alias_ty(ty))
-                            .filter(|ty| {
-                                matches!(ty, Ty::Record { .. } | Ty::Function { .. })
-                            })
+                            .filter(|ty| matches!(ty, Ty::Record { .. } | Ty::Function { .. }))
                     }
                 }
             }

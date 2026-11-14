@@ -6273,8 +6273,7 @@ impl<'a> Engine<'a> {
             // reports `undefined_class` (#4247), while a prefix-only or
             // filtered edge hides the name the same way.
             ScopedHit::NotFound
-                if self.members.primitive_ids.contains(&name)
-                    && !self.has_core_import_edge() =>
+                if self.members.primitive_ids.contains(&name) && !self.has_core_import_edge() =>
             {
                 (TypeResolution::Type, None)
             }

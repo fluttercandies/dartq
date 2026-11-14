@@ -1565,8 +1565,11 @@ impl ClosureEdges {
         collect_clause_heads(clauses, elements, file, &mut heads);
         let mut out = Vec::new();
         for head in heads {
-            if let Lookup::Found(NamespaceEntry::Decl(target)) = namespaces.lookup(graph, owner, head)
-                && index.get(target).is_some_and(|els| els.container(head).is_some())
+            if let Lookup::Found(NamespaceEntry::Decl(target)) =
+                namespaces.lookup(graph, owner, head)
+                && index
+                    .get(target)
+                    .is_some_and(|els| els.container(head).is_some())
             {
                 out.push((head, target));
             }
@@ -1577,9 +1580,7 @@ impl ClosureEdges {
     /// Assembles a table from precomputed pairs ([`Self::compute`] per
     /// entry of [`Self::pairs`]) — the engine builds this in parallel
     /// before the fan-out.
-    pub fn from_map(
-        map: FxHashMap<(FileId, LibraryId), Box<[(StringId, FileId)]>>,
-    ) -> Self {
+    pub fn from_map(map: FxHashMap<(FileId, LibraryId), Box<[(StringId, FileId)]>>) -> Self {
         Self(map)
     }
 
@@ -4154,7 +4155,10 @@ impl<'a> ResolvedTypeOps<'a> {
                 .collect::<Option<_>>()?;
             Some(ops.opaque_ty(name, mapped, nullable))
         }
-        Some(self.system.is_subtype(map(self, sub, pool)?, map(self, sup, pool)?))
+        Some(
+            self.system
+                .is_subtype(map(self, sub, pool)?, map(self, sup, pool)?),
+        )
     }
 
     /// Whether `ty` mentions a `TypeParameter` leaf anywhere in its
@@ -5613,7 +5617,9 @@ impl TypeOps for ResolvedTypeOps<'_> {
         if to.base == Base::Function
             && from_args == EMPTY_ARGS
             && let Base::Name(from_id) = from.base
-            && names.get(from_id as usize).is_some_and(|n| &**n == "Function")
+            && names
+                .get(from_id as usize)
+                .is_some_and(|n| &**n == "Function")
         {
             return (from.nullable || !to.nullable).then_some(to);
         }

@@ -46,7 +46,6 @@ fn assignment_messages(report: &FileReport) -> Vec<&str> {
         .collect()
 }
 
-
 /// A `Null` leaf joins at the nullable leaf: `{1, null}` is `Set<int?>`
 /// (`least_upper_bound.dart`'s `UP(int, Null)`), not the bare `Object`
 /// the name-level fold answered.
@@ -138,7 +137,9 @@ fn function_leaf_joins_its_form_and_the_null_leg() {
     );
     assert_eq!(
         assignment_messages(&report),
-        vec!["A value of type 'Set<int Function(int)?>' can't be assigned to a variable of type 'List<String>'."],
+        vec![
+            "A value of type 'Set<int Function(int)?>' can't be assigned to a variable of type 'List<String>'."
+        ],
         "{:?}",
         super::test_rig::rows(&report)
     );
@@ -159,7 +160,9 @@ fn record_leaf_joins_its_shape_and_the_null_leg() {
     );
     assert_eq!(
         assignment_messages(&report),
-        vec!["A value of type 'Set<(int, String)?>' can't be assigned to a variable of type 'List<String>'."],
+        vec![
+            "A value of type 'Set<(int, String)?>' can't be assigned to a variable of type 'List<String>'."
+        ],
         "{:?}",
         super::test_rig::rows(&report)
     );
@@ -206,7 +209,9 @@ fn map_value_slot_rearms_the_null_leg() {
     );
     assert_eq!(
         assignment_messages(&report),
-        vec!["A value of type 'Map<int, String?>' can't be assigned to a variable of type 'List<String>'."],
+        vec![
+            "A value of type 'Map<int, String?>' can't be assigned to a variable of type 'List<String>'."
+        ],
         "{:?}",
         super::test_rig::rows(&report)
     );
@@ -259,7 +264,9 @@ fn map_entry_if_joins_divergent_keys() {
     );
     assert_eq!(
         assignment_messages(&report),
-        vec!["A value of type 'Map<Object, String>' can't be assigned to a variable of type 'List<String>'."],
+        vec![
+            "A value of type 'Map<Object, String>' can't be assigned to a variable of type 'List<String>'."
+        ],
         "{:?}",
         super::test_rig::rows(&report)
     );

@@ -156,7 +156,11 @@ fn unbounded_param_uses_object_bound() {
          void main() {}\n",
     );
     let unchecked = rows_named(&report, "unchecked_use_of_nullable_value");
-    assert_eq!(unchecked.len(), 1, "nullable-branch face reports: {unchecked:?}");
+    assert_eq!(
+        unchecked.len(),
+        1,
+        "nullable-branch face reports: {unchecked:?}"
+    );
     assert!(
         rows_named(&report, "undefined_getter").is_empty(),
         "the nullable branch owns the face: {:?}",

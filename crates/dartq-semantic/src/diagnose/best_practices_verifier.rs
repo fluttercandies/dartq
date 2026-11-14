@@ -308,11 +308,7 @@ impl<'a> Engine<'a> {
             // reads the usage bucket, so neither copy was suppressed
             // (#2777's duplicated row).
             let code = SemanticCode::InvalidUseOfVisibleForTemplateMember;
-            self.report_invalid_access(
-                code.code_info(),
-                anchor,
-                code.message(display, &uri),
-            );
+            self.report_invalid_access(code.code_info(), anchor, code.message(display, &uri));
         }
         if legs.testing {
             self.report_invalid_access(

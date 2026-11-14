@@ -3064,7 +3064,9 @@ impl ParserListener for DiagnoseListener<'_> {
                         .backward_type_text(name_tok.offset)
                         .and_then(|text| self.engine.parse_annotation_ty(&text))
                 });
-            if self.engine.is_void_spelling(self.engine.fold_alias_ty(sem_ty.clone()))
+            if self
+                .engine
+                .is_void_spelling(self.engine.fold_alias_ty(sem_ty.clone()))
                 && matches!(loop_var_ty, Some(var_ty)
                     if !self.engine.is_void_spelling(self.engine.fold_alias_ty(var_ty)))
             {
@@ -3082,7 +3084,8 @@ impl ParserListener for DiagnoseListener<'_> {
                             .unwrap_or(range)
                     });
                 if let Some(range) = range {
-                    self.engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
+                    self.engine
+                        .emit(SemanticCode::UseOfVoidResult, range, "", "");
                 }
             }
             match staged {
@@ -6926,8 +6929,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     // the operator and anchor `non_bool_operand` at the
                     // whole operand (the oracle's `.at(operand)`,
                     // binary_expression_resolver.dart:81-92).
-                    right.range =
-                        engine.operand_extent_after(operator.range.end(), right.range);
+                    right.range = engine.operand_extent_after(operator.range.end(), right.range);
                     // #3240: the fold below reports BOTH operands of the
                     // lazy boolean operators (`fold_binary` runs
                     // `checkForUseOfVoidResult` on the pair), so a `void`
@@ -11918,7 +11920,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // One expression node: the argument-window run split never treats
         // an interior field row as a sibling argument boundary.
         if open_offset != u32::MAX {
-            engine.literal_extents.push((open_offset, token.range.end()));
+            engine
+                .literal_extents
+                .push((open_offset, token.range.end()));
         }
         if let Some(fields) = engine.const_capture.record_literal(count, token.range) {
             let failed = engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
@@ -14370,7 +14374,8 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.ur_seal_used();
     }
 
-    fn end_switch_case_when_clause(&mut self, token: Token) {        self.flow().end_switch_case_when_clause(token);
+    fn end_switch_case_when_clause(&mut self, token: Token) {
+        self.flow().end_switch_case_when_clause(token);
         // `WhenClause` is in the official used set (the guard expression).
         self.engine.ur_seal_used();
     }
@@ -15320,9 +15325,7 @@ impl Engine<'_> {
     /// segment ends in anything else (or is the identifier alone).
     fn strip_trailing_identifier(&self, start: usize, end: usize) -> Option<(usize, usize)> {
         let bytes = self.source.as_bytes();
-        let is_ident = |b: u8| {
-            b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
-        };
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
         let mut e = end;
         while e > start && bytes[e - 1].is_ascii_whitespace() {
             e -= 1;
@@ -15524,9 +15527,7 @@ impl Engine<'_> {
         match self.fold_brace_literal(left, right) {
             BraceLiteralFold::Set => Some(SpreadLiteralKind::Set),
             BraceLiteralFold::Map => Some(SpreadLiteralKind::Map),
-            BraceLiteralFold::Both
-            | BraceLiteralFold::Either
-            | BraceLiteralFold::Undecided => None,
+            BraceLiteralFold::Both | BraceLiteralFold::Either | BraceLiteralFold::Undecided => None,
         }
     }
 

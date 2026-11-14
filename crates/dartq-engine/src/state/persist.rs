@@ -36,12 +36,12 @@ use serde::{Deserialize, Serialize};
 use dartq_diagnostics::{
     CodeInfo, CodeRegistry, ContextMessage, Diagnostic, DiagnosticType, Severity,
 };
+use dartq_index::{LibraryIndex, NameRow, RefKind, RefRow, SubtypeEdge, TargetRef};
 use dartq_package::{PackageIdentity, PackageTable, SourceCategory};
 use dartq_resolution::{
     CombinatorClause, Combinators, Configuration, ResolutionCode, ResolvedTarget,
 };
 use dartq_sdk::SdkSnapshot;
-use dartq_index::{LibraryIndex, NameRow, RefKind, RefRow, SubtypeEdge, TargetRef};
 use dartq_semantic::ApiSignature;
 use dartq_semantic::persisted::{PersistedElements, PersistedRange};
 use dartq_source::{ContentId, FileId, FileTable, LineIndex, SourceRange, StringId, StringTable};
@@ -966,7 +966,11 @@ impl AnswerShape {
 /// identical asks. The single derivation point: the daemon turn cache
 /// (#4240) and the CLI probe read one spelling, never their own.
 #[must_use]
-pub fn envelope_key(header: &dartq_snapshot::GenerationHeader, grants: u64, shape: &AnswerShape) -> [u8; 16] {
+pub fn envelope_key(
+    header: &dartq_snapshot::GenerationHeader,
+    grants: u64,
+    shape: &AnswerShape,
+) -> [u8; 16] {
     let mut bytes = Vec::with_capacity(96);
     bytes.extend_from_slice(&shape.face.tag().to_le_bytes());
     bytes.extend_from_slice(&header.format_version.to_le_bytes());
@@ -1075,9 +1079,11 @@ pub(crate) fn encode_answer(record: &AnsweredRecord) -> Option<Vec<u8>> {
 /// Decodes a stored answer record; `None` on any failure (foreign bytes,
 /// a torn sidecar, a future codec) — a miss, never an error.
 pub(crate) fn decode_answer(bytes: &[u8]) -> Option<AnsweredRecord> {
-    let (record, _) =
-        bincode_next::serde::decode_from_slice::<AnsweredRecord, _>(bytes, bincode_next::config::standard())
-            .ok()?;
+    let (record, _) = bincode_next::serde::decode_from_slice::<AnsweredRecord, _>(
+        bytes,
+        bincode_next::config::standard(),
+    )
+    .ok()?;
     (record.version == ANSWER_RECORD_VERSION).then_some(record)
 }
 
@@ -4212,8 +4218,7 @@ mod tests {
             .load::<PersistedFacts>(&header)
             .expect("generation");
         assert_eq!(edited.ingest_facts_snapshot(snapshot), 1);
-        let main_edited =
-            edited.set_content(&main_path, b"void main() { var x = 1; }\n");
+        let main_edited = edited.set_content(&main_path, b"void main() { var x = 1; }\n");
         let mut edited_hits = 0;
         let mut edited_recomputes = 0;
         let mut on_event = |event: EngineEvent| {
@@ -4371,7 +4376,10 @@ mod tests {
         // saved for the warm shape.
         let mut producer = bare_engine_over_sdk(&root, &sdk_root);
         producer.open_content_store(&config()).expect("open store");
-        assert_eq!(producer.discover_workspace().expect("discover").file_count, 3);
+        assert_eq!(
+            producer.discover_workspace().expect("discover").file_count,
+            3
+        );
         let cold_rows = producer
             .analyze(&[], &mut |_| {}, &cancel)
             .expect("cold analyze");
@@ -4399,7 +4407,9 @@ mod tests {
         // match for the aim, and the full set a later untargeted turn must
         // restore.
         let mut full_engine = bare_engine_over_sdk(&root, &sdk_root);
-        full_engine.open_content_store(&config()).expect("open store");
+        full_engine
+            .open_content_store(&config())
+            .expect("open store");
         let snapshot = snapshot_store
             .load::<PersistedFacts>(&header)
             .expect("generation");
@@ -4422,7 +4432,9 @@ mod tests {
         // The targeted turn: only a.dart's library replays; b.dart and
         // c.dart defer instead of decoding and merging.
         let mut aim_engine = bare_engine_over_sdk(&root, &sdk_root);
-        aim_engine.open_content_store(&config()).expect("open store");
+        aim_engine
+            .open_content_store(&config())
+            .expect("open store");
         let snapshot = snapshot_store
             .load::<PersistedFacts>(&header)
             .expect("generation");
@@ -4496,8 +4508,14 @@ mod tests {
         let root = bare_workspace_with(
             "part",
             &[
-                ("host.dart", "part 'piece.dart';\nvoid host() { var x = ; }\n"),
-                ("piece.dart", "part of 'host.dart';\nvoid piece() { var y = ; }\n"),
+                (
+                    "host.dart",
+                    "part 'piece.dart';\nvoid host() { var x = ; }\n",
+                ),
+                (
+                    "piece.dart",
+                    "part of 'host.dart';\nvoid piece() { var y = ; }\n",
+                ),
                 ("other.dart", "void other() { var z = ; }\n"),
             ],
         );
@@ -4534,7 +4552,9 @@ mod tests {
         drop(producer);
 
         let mut aim_engine = bare_engine_over_sdk(&root, &sdk_root);
-        aim_engine.open_content_store(&config()).expect("open store");
+        aim_engine
+            .open_content_store(&config())
+            .expect("open store");
         let snapshot = snapshot_store
             .load::<PersistedFacts>(&header)
             .expect("generation");
@@ -4578,7 +4598,11 @@ mod tests {
             1,
             "one library — the part's defining library — replayed"
         );
-        assert_eq!(aim_engine.state.slice_deferred.len(), 1, "other.dart deferred");
+        assert_eq!(
+            aim_engine.state.slice_deferred.len(),
+            1,
+            "other.dart deferred"
+        );
         let _ = std::fs::remove_dir_all(&snap_root);
         let _ = std::fs::remove_dir_all(&store_root);
         let _ = std::fs::remove_dir_all(&sdk_root);
@@ -4593,7 +4617,10 @@ mod tests {
     fn targeted_turn_falls_back_when_a_target_has_no_library() {
         let root = bare_workspace_with(
             "fallback",
-            &[("a.dart", "void a() { var x = ; }\n"), ("b.dart", "void b() { var y = ; }\n")],
+            &[
+                ("a.dart", "void a() { var x = ; }\n"),
+                ("b.dart", "void b() { var y = ; }\n"),
+            ],
         );
         let sdk_root = shared_sdk_root("fallback");
         let snap_root = snapshot_cache_dir();
@@ -4624,7 +4651,9 @@ mod tests {
         drop(producer);
 
         let mut aim_engine = bare_engine_over_sdk(&root, &sdk_root);
-        aim_engine.open_content_store(&config()).expect("open store");
+        aim_engine
+            .open_content_store(&config())
+            .expect("open store");
         let snapshot = snapshot_store
             .load::<PersistedFacts>(&header)
             .expect("generation");
@@ -4821,8 +4850,7 @@ mod tests {
             r#""strings":["greet","Missing","C","p"]},"#,
             r#""files":["/w/lib/main.dart","/w/lib/other.dart"]}"#,
         );
-        let payload: PersistedLibraryRun =
-            serde_json::from_str(json).expect("decode");
+        let payload: PersistedLibraryRun = serde_json::from_str(json).expect("decode");
         let fingerprint =
             ApiSignature::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
         let mut files = FileTable::new();
@@ -4883,7 +4911,8 @@ mod tests {
 
         // The embedded fingerprint check: a different expected face never
         // serves, even though the store key would have matched the fold.
-        let moved = ApiSignature::from_bytes([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+        let moved =
+            ApiSignature::from_bytes([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
         assert!(
             payload
                 .clone()
@@ -4897,8 +4926,7 @@ mod tests {
         // A file the loading engine never interned: the run cannot be
         // attributed faithfully, so nothing serves.
         let ghost_json = json.replace("/w/lib/other.dart", "/w/lib/ghost.dart");
-        let ghost: PersistedLibraryRun =
-            serde_json::from_str(&ghost_json).expect("decode");
+        let ghost: PersistedLibraryRun = serde_json::from_str(&ghost_json).expect("decode");
         assert!(
             ghost
                 .materialize(&fingerprint, &codes, &strings, &mut |path| {
@@ -4935,7 +4963,13 @@ mod tests {
         let key_packages = lint_rows_key(build, grants, [8u8; 16], content, fingerprint);
         assert_ne!(key1, key_packages, "packages move re-keys");
 
-        let key_content = lint_rows_key(build, grants, packages, content_hash(b"int y = 2;"), fingerprint);
+        let key_content = lint_rows_key(
+            build,
+            grants,
+            packages,
+            content_hash(b"int y = 2;"),
+            fingerprint,
+        );
         assert_ne!(key1, key_content, "content move re-keys");
 
         let key_fp = lint_rows_key(build, grants, packages, content, 100);

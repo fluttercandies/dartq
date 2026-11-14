@@ -4527,10 +4527,11 @@ fn scrutinee_head_is_invalid(
     // and the switch's exhaustiveness verdict runs over it (probed 3.13.7:
     // `T extends St` reports `non_exhaustive_switch_statement` naming the
     // missing enum constant).
-    if index
-        .get(file)
-        .is_some_and(|elements| elements.decl(name).is_some_and(|d| d.kind == MicroKind::TypeParam))
-    {
+    if index.get(file).is_some_and(|elements| {
+        elements
+            .decl(name)
+            .is_some_and(|d| d.kind == MicroKind::TypeParam)
+    }) {
         return false;
     }
     let Lookup::Found(NamespaceEntry::Decl(owner)) =
@@ -5297,7 +5298,9 @@ fn synthesize_unknown_scrutinee_dead_cases(
                         || (!statement
                             && !resolves_as_core_type(strings.resolve(name))))
                     && !*resolvable.entry(name).or_insert_with(|| {
-                        !scrutinee_head_is_invalid(graph, namespaces, index, strings, lib, file, name)
+                        !scrutinee_head_is_invalid(
+                            graph, namespaces, index, strings, lib, file, name,
+                        )
                     })
             }
             Ty::Named { name, .. } => {

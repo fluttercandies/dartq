@@ -66,8 +66,7 @@ where
     let mut path = vec![start];
     let mut on_path = FxHashSet::from_iter([start]);
     let mut exhausted: FxHashSet<N> = FxHashSet::default();
-    let mut frames: Vec<(N, std::vec::IntoIter<N>)> =
-        vec![(start, successors(start).into_iter())];
+    let mut frames: Vec<(N, std::vec::IntoIter<N>)> = vec![(start, successors(start).into_iter())];
     loop {
         let Some(frame) = frames.last_mut() else {
             return None;
@@ -126,8 +125,7 @@ where
     // 1 = gray (on the current path), 2 = black (walk exhausted).
     let mut color: FxHashMap<N, u8> = FxHashMap::default();
     let mut path: Vec<N> = Vec::new();
-    let mut frames: Vec<(N, std::vec::IntoIter<N>)> =
-        vec![(start, successors(start).into_iter())];
+    let mut frames: Vec<(N, std::vec::IntoIter<N>)> = vec![(start, successors(start).into_iter())];
     color.insert(start, 1);
     path.push(start);
     loop {
@@ -193,10 +191,7 @@ pub struct StronglyConnected<N> {
 /// and the pop-until-root component extraction mirror
 /// `dependency_walker.dart:51-122` so a component's member order is the
 /// oracle's `evaluateScc` order exactly.
-pub fn strongly_connected<N>(
-    nodes: &[N],
-    successors: impl Fn(N) -> Vec<N>,
-) -> StronglyConnected<N>
+pub fn strongly_connected<N>(nodes: &[N], successors: impl Fn(N) -> Vec<N>) -> StronglyConnected<N>
 where
     N: Copy + Eq + std::hash::Hash,
 {
@@ -240,9 +235,8 @@ where
                     if lowlink[&node] == index[&node] {
                         let mut component = Vec::new();
                         loop {
-                            let member = tarjan_stack
-                                .pop()
-                                .expect("the root is on the Tarjan stack");
+                            let member =
+                                tarjan_stack.pop().expect("the root is on the Tarjan stack");
                             on_tarjan_stack.remove(&member);
                             component.push(member);
                             if member == node {
@@ -441,10 +435,7 @@ mod tests {
             (4, &[1][..]),
         ];
         let sccs = strong_connected_sorted(&edges);
-        assert_eq!(
-            sccs.cyclic_component(1),
-            Some(&[3_u32, 4, 2, 1][..])
-        );
+        assert_eq!(sccs.cyclic_component(1), Some(&[3_u32, 4, 2, 1][..]));
     }
 
     /// Disjoint cycles index independently and every member answers its

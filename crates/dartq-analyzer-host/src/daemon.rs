@@ -505,11 +505,7 @@ impl Host {
             standby_lease: None,
             warm,
             warm_ttl,
-            freshness: Freshness::new(
-                &spec.roots,
-                spec.packages.as_deref(),
-                &spec.sdk_home(),
-            ),
+            freshness: Freshness::new(&spec.roots, spec.packages.as_deref(), &spec.sdk_home()),
             degrade_streak: 0,
             degrade_noted: false,
             files,
@@ -517,8 +513,7 @@ impl Host {
             lease: None,
             max_percent: spec.max_percent,
             max_concurrent: spec.max_concurrent,
-            peak_key: repo_key(&spec.roots)
-                .unwrap_or_else(|| cache.display().to_string()),
+            peak_key: repo_key(&spec.roots).unwrap_or_else(|| cache.display().to_string()),
             // The Dart source size derives from the priming walk's
             // snapshot once it lands (`analyze_result` refreshes it) —
             // a daemon start never pays a discovery walk of its own.
@@ -779,8 +774,7 @@ impl Host {
                         // rows.
                         if owned.is_empty() {
                             let render = (self.renderer)(&[], face);
-                            let Some(mut wire) =
-                                face_header(&render.meta, render.bytes.len())
+                            let Some(mut wire) = face_header(&render.meta, render.bytes.len())
                             else {
                                 return Reply::Answer(Answer::NotServed);
                             };
@@ -838,7 +832,9 @@ impl Host {
         self.disk.check();
         let reply = match serde_json::from_str::<Ask>(&line) {
             Ok(ask) if self.pooled => self.join(&stream, ask),
-            Ok(ask) if ask.roots == self.roots => self.analyze(&stream, &ask.aims, ask.face.as_ref()),
+            Ok(ask) if ask.roots == self.roots => {
+                self.analyze(&stream, &ask.aims, ask.face.as_ref())
+            }
             Ok(_) => Reply::Answer(Answer::Fault("the daemon serves other roots".into())),
             Err(error) => Reply::Answer(Answer::Fault(format!("unreadable request: {error}"))),
         };
@@ -947,8 +943,10 @@ impl Host {
                 Some(line)
             }
             Err(miss) => {
-                self.files
-                    .event(&format!("dartq analyze: answer record miss ({})", miss.as_str()));
+                self.files.event(&format!(
+                    "dartq analyze: answer record miss ({})",
+                    miss.as_str()
+                ));
                 self.record_capture = Some(stamps);
                 None
             }
@@ -1058,7 +1056,9 @@ impl Host {
             Ok(()) => Ok(()),
             Err(Fault::Budget { budget, measured }) => {
                 self.forget("budget");
-                return Err(Answer::Budget(Fault::Budget { budget, measured }.to_string()));
+                return Err(Answer::Budget(
+                    Fault::Budget { budget, measured }.to_string(),
+                ));
             }
             Err(Fault::Yield { peak }) => {
                 // The growth brake fired: the server is already dead.
@@ -1165,12 +1165,13 @@ impl Host {
     /// every joined worktree — so a join admitted while the server was
     /// down (or a restart after a fault) does not silently drop the
     /// joiners' roots.
-    fn start(&mut self, launch: &Launch, client: &UnixStream, why: &'static str) -> Result<(), Fault> {
-        match standby_admit(
-            self.warm,
-            self.standby.is_some(),
-            self.sdk_facts_current(),
-        ) {
+    fn start(
+        &mut self,
+        launch: &Launch,
+        client: &UnixStream,
+        why: &'static str,
+    ) -> Result<(), Fault> {
+        match standby_admit(self.warm, self.standby.is_some(), self.sdk_facts_current()) {
             None => self.start_fresh(launch, client, why),
             Some(Adopt::Adopt) => self.start_by_adoption(launch, client),
             Some(Adopt::Miss) => self.start_fresh(launch, client, "warm-miss"),
@@ -1231,11 +1232,7 @@ impl Host {
     /// the standby for the next ask; an adoption that faults kills the
     /// standby (`warm-fault`) and falls to a fresh spawn; a budget or
     /// yield surfaces as the fresh start's own fault would.
-    fn start_by_adoption(
-        &mut self,
-        launch: &Launch,
-        client: &UnixStream,
-    ) -> Result<(), Fault> {
+    fn start_by_adoption(&mut self, launch: &Launch, client: &UnixStream) -> Result<(), Fault> {
         let lease = match self.lease_slot(client) {
             Ok(lease) => lease,
             // The gate wait failed: the request yields as a fresh start's
@@ -1291,11 +1288,8 @@ impl Host {
         client: &UnixStream,
     ) -> Result<Option<dartq_toolchain::ledger::Lease>, Fault> {
         use dartq_toolchain::ledger::{self, Face, Releasable, Request};
-        let (bytes, sized) = ledger::sizing_with_source(
-            &self.peak_key,
-            Face::AnalysisServer,
-            self.source_bytes,
-        );
+        let (bytes, sized) =
+            ledger::sizing_with_source(&self.peak_key, Face::AnalysisServer, self.source_bytes);
         let request = Request {
             face: Face::AnalysisServer,
             label: self
@@ -1514,10 +1508,9 @@ fn low_memory(total: u64, available: Option<u64>, max_percent: u8) -> bool {
     if total == 0 {
         return false;
     }
-    let share = u64::try_from(
-        u128::from(total) * u128::from(100 - max_percent.clamp(1, 100)) / 100,
-    )
-    .unwrap_or(u64::MAX);
+    let share =
+        u64::try_from(u128::from(total) * u128::from(100 - max_percent.clamp(1, 100)) / 100)
+            .unwrap_or(u64::MAX);
     let reserve = share.max(dartq_toolchain::ledger::RESERVE_FLOOR);
     available.is_some_and(|available| available < reserve)
 }
@@ -1621,8 +1614,9 @@ fn degradation_note(
         // see above), a journal answer, or a by-design walk — the
         // covering walk after an arm or a stream restart, a pool
         // rebase: none count, the streak starts over.
-        Some(WalkReason::First | WalkReason::Rebase | WalkReason::CookieTimeout)
-        | None => return (0, None),
+        Some(WalkReason::First | WalkReason::Rebase | WalkReason::CookieTimeout) | None => {
+            return (0, None);
+        }
     };
     let streak = streak.saturating_add(1);
     (streak, (streak >= 2).then_some(why))
@@ -1713,7 +1707,11 @@ fn cold_freshness_skip(server_live: bool, primed: bool) -> bool {
 /// forgotten after the growth brake's floor record changed the store by
 /// another path) always lands, so a genuinely changed figure is never
 /// elided.
-fn peak_persist_moved(persisted: Option<(u64, Option<u64>)>, peak: u64, source: Option<u64>) -> bool {
+fn peak_persist_moved(
+    persisted: Option<(u64, Option<u64>)>,
+    peak: u64,
+    source: Option<u64>,
+) -> bool {
     persisted.is_none_or(|(peak_was, source_was)| peak != peak_was || source != source_was)
 }
 
@@ -1768,8 +1766,7 @@ const RECORD_PREFIX_LEN: usize = 128;
 /// an in-flight writer's temp is never touched (#4273's grace).
 const RECORD_SWEEP_GRACE: Duration = Duration::from_secs(3600);
 /// The temp-file counter of [`write_record`]'s sibling temps.
-static RECORD_TMP_SEQ: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static RECORD_TMP_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The record's first line: the codec version and the two lengths the
 /// frame's rest must add up to — `header\nstamps\npayload`, whole-file
@@ -1919,7 +1916,8 @@ fn probe_record(path: &Path, stamps: &Stamps) -> Result<Arc<[u8]>, RecordMiss> {
         .checked_add(usize::try_from(header.bytes).unwrap_or(usize::MAX))
         .filter(|end| *end == frame.len())
         .ok_or_else(miss)?;
-    let recorded: Stamps = serde_json::from_slice(&frame[one + 1..stamps_end]).map_err(|_| miss())?;
+    let recorded: Stamps =
+        serde_json::from_slice(&frame[one + 1..stamps_end]).map_err(|_| miss())?;
     if recorded != *stamps {
         return Err(RecordMiss::Stamps);
     }
@@ -2039,11 +2037,12 @@ fn record_dead(path: &Path, len: u64) -> bool {
         return true;
     };
     header.v != RECORD_VERSION
-        || len != (one as u64)
-            .saturating_add(1)
-            .saturating_add(header.stamps)
-            .saturating_add(1)
-            .saturating_add(header.bytes)
+        || len
+            != (one as u64)
+                .saturating_add(1)
+                .saturating_add(header.stamps)
+                .saturating_add(1)
+                .saturating_add(header.bytes)
 }
 
 /// The env kill switch of the record family.
@@ -2147,8 +2146,7 @@ mod tests {
         assert!(!served.contains(&Path::new("/w/a")));
         // The primary never leaves: two joins on a 2-cap pool refuse —
         // dropping the primary is not a join, it is another daemon.
-        let mut small: Vec<(PathBuf, Instant)> =
-            vec![(PathBuf::from("/w/primary"), at(1500))];
+        let mut small: Vec<(PathBuf, Instant)> = vec![(PathBuf::from("/w/primary"), at(1500))];
         assert_eq!(
             admit(&mut small, &roots(&["/w/x", "/w/y"]), 2, now),
             None,
@@ -2183,7 +2181,14 @@ mod tests {
         let evicted = admit(&mut active, &[PathBuf::from("/w/c")], 3, now).expect("admitted");
         assert_eq!(evicted, vec![PathBuf::from("/w/b")]);
         let served: Vec<&Path> = active.iter().map(|(root, _)| root.as_path()).collect();
-        assert_eq!(served, [Path::new("/w/primary"), Path::new("/w/a"), Path::new("/w/c")]);
+        assert_eq!(
+            served,
+            [
+                Path::new("/w/primary"),
+                Path::new("/w/a"),
+                Path::new("/w/c")
+            ]
+        );
 
         // Two joiners need two places; one cold root cannot give both.
         let mut mixed: Vec<(PathBuf, Instant)> = vec![
@@ -2193,7 +2198,12 @@ mod tests {
         ];
         let before = mixed.clone();
         assert_eq!(
-            admit(&mut mixed, &[PathBuf::from("/w/x"), PathBuf::from("/w/y")], 3, now),
+            admit(
+                &mut mixed,
+                &[PathBuf::from("/w/x"), PathBuf::from("/w/y")],
+                3,
+                now
+            ),
             None
         );
         assert_eq!(mixed, before, "a refused join evicts nothing");
@@ -2213,8 +2223,11 @@ mod tests {
         std::fs::create_dir_all(&gitdir).expect("worktree git dir");
         std::fs::write(gitdir.join("commondir"), "../..\n").expect("commondir");
         std::fs::create_dir_all(&linked).expect("linked worktree");
-        std::fs::write(linked.join(".git"), format!("gitdir: {}\n", gitdir.display()))
-            .expect("linked .git");
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect("linked .git");
         let common = main.join(".git").canonicalize().expect("common dir");
         let key = |roots: &[PathBuf]| repo_key(roots);
         assert_eq!(
@@ -2222,7 +2235,11 @@ mod tests {
             Some(format!("{}:", common.display())),
             "the main worktree's top"
         );
-        assert_eq!(key(&[linked.clone()]), key(&[main.clone()]), "a linked sibling");
+        assert_eq!(
+            key(&[linked.clone()]),
+            key(&[main.clone()]),
+            "a linked sibling"
+        );
         let sub = Path::new("pkgs").join("a");
         assert_eq!(
             key(&[linked.join(&sub)]),
@@ -2235,9 +2252,16 @@ mod tests {
         std::fs::create_dir_all(&module).expect("module git dir");
         let submodule = main.join("m");
         std::fs::create_dir_all(&submodule).expect("submodule");
-        std::fs::write(submodule.join(".git"), format!("gitdir: {}\n", module.display()))
-            .expect("submodule .git");
-        assert_ne!(key(&[submodule]), key(&[main.clone()]), "its own common dir");
+        std::fs::write(
+            submodule.join(".git"),
+            format!("gitdir: {}\n", module.display()),
+        )
+        .expect("submodule .git");
+        assert_ne!(
+            key(&[submodule]),
+            key(&[main.clone()]),
+            "its own common dir"
+        );
 
         let other = tmp.path().join("other");
         std::fs::create_dir_all(other.join(".git")).expect("other repo");
@@ -2336,9 +2360,7 @@ mod tests {
     #[test]
     fn the_face_header_refuses_over_cap_and_writes_in_cap() {
         let meta = crate::face::FaceMeta::default();
-        let over = usize::try_from(crate::client::MAX_FACE_BYTES)
-            .expect("cap fits usize")
-            + 1;
+        let over = usize::try_from(crate::client::MAX_FACE_BYTES).expect("cap fits usize") + 1;
         assert_eq!(face_header(&meta, over), None);
         assert_eq!(face_header(&meta, usize::MAX), None, "u32 overflow");
         let line = face_header(&meta, 42).expect("in-cap header");
@@ -2382,7 +2404,10 @@ mod tests {
     #[test]
     fn two_consecutive_degraded_checks_note_the_reason() {
         let shapes = [
-            (WalkReason::CookieBlocked, "its sync files cannot be written"),
+            (
+                WalkReason::CookieBlocked,
+                "its sync files cannot be written",
+            ),
             (WalkReason::StreamLost, "its event stream lost events"),
             (WalkReason::Unarmed, "its watcher is unavailable"),
         ];
@@ -2405,7 +2430,11 @@ mod tests {
     /// persistence, so an interrupted streak starts over.
     #[test]
     fn journal_and_by_design_answers_reset_the_streak() {
-        assert_eq!(degradation_note(1, None, false), (0, None), "a journal answer");
+        assert_eq!(
+            degradation_note(1, None, false),
+            (0, None),
+            "a journal answer"
+        );
         assert_eq!(
             degradation_note(1, Some(WalkReason::CookieTimeout), false),
             (0, None),
@@ -2527,7 +2556,10 @@ mod tests {
     /// ledger's cheapest victim.
     #[test]
     fn the_standby_lease_is_slotless_memory_only_and_releasable() {
-        let request = standby_request("warm standby 3.13.7".to_owned(), PathBuf::from("/d/busy.lock"));
+        let request = standby_request(
+            "warm standby 3.13.7".to_owned(),
+            PathBuf::from("/d/busy.lock"),
+        );
         assert!(!request.slot, "no job slot");
         assert_eq!(request.cap, 0);
         assert_eq!(request.bytes, STANDBY_LEASE);
@@ -2545,9 +2577,15 @@ mod tests {
     #[test]
     fn tier_two_needs_warm_a_servable_sdk_and_no_standby_yet() {
         assert!(enters_tier2(true, false, true), "the Tier-2 entry");
-        assert!(!enters_tier2(true, true, true), "Tier 3: the standby's own expiry");
+        assert!(
+            !enters_tier2(true, true, true),
+            "Tier 3: the standby's own expiry"
+        );
         assert!(!enters_tier2(false, false, true), "warm off exits as ever");
-        assert!(!enters_tier2(true, false, false), "a PerRun SDK never tiers");
+        assert!(
+            !enters_tier2(true, false, false),
+            "a PerRun SDK never tiers"
+        );
     }
 
     /// The standby's pressure line, mirroring the ledger monitor's own:
@@ -2604,10 +2642,7 @@ mod tests {
             "kernel level 4 sheds even with plenty available"
         );
         // Level 3 (between warn and critical) never sheds on its own.
-        assert!(
-            !sheds(Some(20 * gib), Some(3)),
-            "level 3 is not critical"
-        );
+        assert!(!sheds(Some(20 * gib), Some(3)), "level 3 is not critical");
     }
 
     // ------------------------------------------------------------------
@@ -2707,7 +2742,13 @@ mod tests {
         // Every other leg separates too.
         assert_ne!(
             base,
-            key("3.14.0", &["/w/a"], None, std::slice::from_ref(&dir), Some(&lon)),
+            key(
+                "3.14.0",
+                &["/w/a"],
+                None,
+                std::slice::from_ref(&dir),
+                Some(&lon)
+            ),
             "an SDK swap"
         );
         assert_ne!(
@@ -2743,10 +2784,7 @@ mod tests {
             let roots: Vec<PathBuf> = vec![PathBuf::from("/w/a")];
             record_key(&spec, &roots, aims, face)
         };
-        let base = key(
-            std::slice::from_ref(&dir),
-            Some(&lon),
-        );
+        let base = key(std::slice::from_ref(&dir), Some(&lon));
         assert_ne!(
             base,
             key(std::slice::from_ref(&file), Some(&lon)),
@@ -2784,7 +2822,11 @@ mod tests {
             (PathBuf::from("/w/a/lib/a.dart"), 6, 7, 8, 9),
             (PathBuf::from("/w/a/pubspec.yaml"), 10, 11, 12, 13),
         ];
-        let line = write_record(&path, &serde_json::to_vec(&stamps).expect("stamps"), b"wire");
+        let line = write_record(
+            &path,
+            &serde_json::to_vec(&stamps).expect("stamps"),
+            b"wire",
+        );
         assert!(line.is_ok(), "{line:?}");
 
         let hit = probe_record(&path, &stamps).expect("the identical set hits");
@@ -2811,8 +2853,12 @@ mod tests {
         assert!(!path.exists(), "a decode miss unlinks the dead record");
 
         // Foreign: a future codec's record is dead weight for this one.
-        write_record(&path, &serde_json::to_vec(&stamps).expect("stamps"), b"wire")
-            .expect("rewrite");
+        write_record(
+            &path,
+            &serde_json::to_vec(&stamps).expect("stamps"),
+            b"wire",
+        )
+        .expect("rewrite");
         let mut frame = std::fs::read(&path).expect("frame");
         let v = frame
             .iter()
@@ -2902,16 +2948,34 @@ mod tests {
         let off = "analyzer:\n  official:\n    answer_records: false\n";
         let on = "analyzer:\n  official:\n    answer_records: true\n";
         assert!(records_enabled_with(None, None, None), "on by default");
-        assert!(!records_enabled_with(Some("0"), Some(on), Some(on)), "env off wins");
-        assert!(records_enabled_with(Some("1"), None, Some(off)), "env on wins");
+        assert!(
+            !records_enabled_with(Some("0"), Some(on), Some(on)),
+            "env off wins"
+        );
+        assert!(
+            records_enabled_with(Some("1"), None, Some(off)),
+            "env on wins"
+        );
         assert!(
             records_enabled_with(Some("garbage"), None, None),
             "a garbage env fails open to the default"
         );
-        assert!(!records_enabled_with(None, None, Some(off)), "the project opts out");
-        assert!(!records_enabled_with(None, Some(off), None), "the global opts out");
-        assert!(!records_enabled_with(None, Some(on), Some(off)), "project beats global");
-        assert!(records_enabled_with(None, Some(off), Some(on)), "project beats global");
+        assert!(
+            !records_enabled_with(None, None, Some(off)),
+            "the project opts out"
+        );
+        assert!(
+            !records_enabled_with(None, Some(off), None),
+            "the global opts out"
+        );
+        assert!(
+            !records_enabled_with(None, Some(on), Some(off)),
+            "project beats global"
+        );
+        assert!(
+            records_enabled_with(None, Some(off), Some(on)),
+            "project beats global"
+        );
         assert!(
             records_enabled_with(None, Some("not: [valid"), Some("also { bad")),
             "a malformed tier fails open to on"
@@ -2968,9 +3032,7 @@ mod tests {
             )
             .expect("persist");
         };
-        let miss = |stamps: &Stamps| {
-            matches!(probe_record(&path, stamps), Err(RecordMiss::Stamps))
-        };
+        let miss = |stamps: &Stamps| matches!(probe_record(&path, stamps), Err(RecordMiss::Stamps));
 
         let first = stamps();
         persist(&first);
@@ -2989,7 +3051,10 @@ mod tests {
         std::fs::write(app.join("lib/a.dart"), "var a;").expect("revert");
         assert!(miss(&stamps()), "the revert's own mtime still misses");
         persist(&stamps());
-        assert!(probe_record(&path, &stamps()).is_ok(), "the next turn re-hits");
+        assert!(
+            probe_record(&path, &stamps()).is_ok(),
+            "the next turn re-hits"
+        );
 
         // Touch-only: no content change, the mtime leg alone.
         std::fs::File::options()
@@ -3043,9 +3108,7 @@ mod tests {
         std::fs::File::options()
             .write(true)
             .open(&a)
-            .and_then(|file| {
-                file.set_modified(std::time::UNIX_EPOCH + Duration::from_nanos(mtime))
-            })
+            .and_then(|file| file.set_modified(std::time::UNIX_EPOCH + Duration::from_nanos(mtime)))
             .expect("restore mtime");
         #[cfg(unix)]
         assert!(miss(&stamps()), "an inode swap with restored legs misses");

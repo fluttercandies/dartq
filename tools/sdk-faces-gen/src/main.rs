@@ -76,10 +76,8 @@ const FACES_OUT: &str = "crates/dartq-engine/src/sdk_faces_gen.rs";
 /// implicit core import, and so must the engine's face table. Each entry
 /// carries its clause kind: `Never` is the bottom type, not a class or
 /// mixin, so `implements Never` reports `implements_non_class` upstream.
-const SYNTHETIC_NAMES: &[(&str, &[(&str, FaceKind)])] = &[(
-    "core",
-    &[("Never", FaceKind::NonClass)],
-)];
+const SYNTHETIC_NAMES: &[(&str, &[(&str, FaceKind)])] =
+    &[("core", &[("Never", FaceKind::NonClass)])];
 
 /// Public top-level names that must be present in a library's face for the
 /// run to succeed — the pinned acceptance symbols of the facade census
@@ -719,7 +717,11 @@ fn emit_faces(tables: &Tables) -> String {
         out.push_str(name);
         out.push_str("\",\n        &[\n");
         for (decl_name, kind) in face {
-            let _ = writeln!(out, "            (\"{decl_name}\", FaceKind::{}),", kind.variant());
+            let _ = writeln!(
+                out,
+                "            (\"{decl_name}\", FaceKind::{}),",
+                kind.variant()
+            );
         }
         out.push_str("        ],\n    ),\n");
     }

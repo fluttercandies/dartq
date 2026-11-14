@@ -77,7 +77,12 @@ fn two_library_workspace() -> Workspace {
 /// the same batch as `messages` — the client's real change-report shape:
 /// the write applies at the drain, reopening the unsettled window before
 /// the coalesced read runs.
-fn dirty_and_send(h: &mut common::Harness, workspace: &Workspace, messages: &[Value], expect: usize) {
+fn dirty_and_send(
+    h: &mut common::Harness,
+    workspace: &Workspace,
+    messages: &[Value],
+    expect: usize,
+) {
     let b = workspace.path("lib/b.dart");
     fs::write(
         &b,
@@ -142,17 +147,15 @@ fn serve_early_on_answers_the_asked_file_with_the_marker() {
 
     // The settled baseline: a plain ask on the settled context.
     h.step(
-        &request(
-            2,
-            "dartq/analyze",
-            json!({ "targets": [a_target.clone()] }),
-        ),
+        &request(2, "dartq/analyze", json!({ "targets": [a_target.clone()] })),
         1,
     );
     let settled = answer_result(&h, 2);
     assert!(settled.get("settle").is_none());
     assert!(
-        settled["diags"].as_array().is_some_and(|rows| !rows.is_empty()),
+        settled["diags"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
         "the fixture file carries a diagnostic: {settled}"
     );
 
@@ -202,11 +205,7 @@ fn serve_early_mixed_group_falls_back_to_the_full_turn() {
                 "dartq/analyze",
                 json!({ "serve_early": true, "targets": [a_target.clone()] }),
             ),
-            request(
-                4,
-                "dartq/analyze",
-                json!({ "targets": [a_target.clone()] }),
-            ),
+            request(4, "dartq/analyze", json!({ "targets": [a_target.clone()] })),
         ],
         2,
     );

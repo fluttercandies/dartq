@@ -296,7 +296,11 @@ fn an_ambiguous_export_names_the_earlier_library_first() {
         .iter()
         .filter(|row| row.code.name == "ambiguous_export")
         .collect();
-    assert_eq!(rows.len(), 1, "one ambiguity at the repeat: {diagnostics:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "one ambiguity at the repeat: {diagnostics:?}"
+    );
     let row = rows[0];
     assert_eq!(
         (row.range.offset, row.range.length),
@@ -315,10 +319,12 @@ fn an_ambiguous_export_names_the_earlier_library_first() {
     let second = second.strip_suffix("'.").unwrap_or(second);
     assert!(
         first.ends_with("lib/a.dart"),
-        "first is the earlier export's library: {:?}", row.message
+        "first is the earlier export's library: {:?}",
+        row.message
     );
     assert!(
         second.ends_with("lib/b.dart"),
-        "second is the repeat's library: {:?}", row.message
+        "second is the repeat's library: {:?}",
+        row.message
     );
 }

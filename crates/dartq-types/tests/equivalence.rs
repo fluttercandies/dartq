@@ -42,9 +42,10 @@ fn never_question_is_its_own_null_equivalent_shape() {
     assert!(fx.system().is_null(never_question));
     assert!(!fx.system().is_bottom(never_question));
     assert!(!fx.system().is_structurally_equal(never_question, fx.null()));
-    assert!(fx
-        .system()
-        .is_structurally_equal(never_question, never_question));
+    assert!(
+        fx.system()
+            .is_structurally_equal(never_question, never_question)
+    );
 }
 
 #[test]

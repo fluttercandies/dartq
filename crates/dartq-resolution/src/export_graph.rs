@@ -724,10 +724,7 @@ mod tests {
             app,
             ExportEdge {
                 target: Some(x),
-                combinators: Combinators::new(
-                    [CombinatorClause::Show(names.into())],
-                    rig.strings,
-                ),
+                combinators: Combinators::new([CombinatorClause::Show(names.into())], rig.strings),
             },
         );
         // Same target, same names regrouped into two clauses.
@@ -808,11 +805,18 @@ mod tests {
         let graph = rig.builder.finish();
 
         // Out of the public API: nothing, whatever the facts.
-        assert!(graph
-            .invalid_internal_export_findings(app, 0, false, true, |_| true, |_| {
-                vec![alias]
-            })
-            .is_empty());
+        assert!(
+            graph
+                .invalid_internal_export_findings(
+                    app,
+                    0,
+                    false,
+                    true,
+                    |_| true,
+                    |_| { vec![alias] }
+                )
+                .is_empty()
+        );
 
         let findings = graph.invalid_internal_export_findings(
             app,
@@ -820,7 +824,11 @@ mod tests {
             true,
             true,
             |name| name == api,
-            |name| (name == wrapped).then(|| vec![alias, alias]).unwrap_or_default(),
+            |name| {
+                (name == wrapped)
+                    .then(|| vec![alias, alias])
+                    .unwrap_or_default()
+            },
         );
         assert_eq!(
             findings,
@@ -874,11 +882,11 @@ mod tests {
         let any = rig.name("A");
         let graph = rig.builder.finish();
 
-        assert!(graph
-            .invalid_internal_export_findings(app, 0, true, true, |_| true, |_| {
-                vec![any]
-            })
-            .is_empty());
+        assert!(
+            graph
+                .invalid_internal_export_findings(app, 0, true, true, |_| true, |_| { vec![any] })
+                .is_empty()
+        );
     }
 
     // ---- deferred_import_of_extension ----
@@ -919,10 +927,7 @@ mod tests {
         // Hidden by the combinators: no namespace face carries the
         // extension.
         let hidden = ImportEdge {
-            combinators: Combinators::new(
-                [CombinatorClause::Hide([on_int].into())],
-                rig.strings,
-            ),
+            combinators: Combinators::new([CombinatorClause::Hide([on_int].into())], rig.strings),
             ..hit.clone()
         };
         assert!(!graph.deferred_import_exports_extension(&hidden));

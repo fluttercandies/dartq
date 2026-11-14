@@ -2269,7 +2269,10 @@ impl<'a> Bounds<'a> {
                             })
                             .collect(),
                     );
-                    for bound in function.type_params_named.iter().filter_map(|(_, b)| b.as_ref())
+                    for bound in function
+                        .type_params_named
+                        .iter()
+                        .filter_map(|(_, b)| b.as_ref())
                     {
                         nested_windows(bound, out);
                     }

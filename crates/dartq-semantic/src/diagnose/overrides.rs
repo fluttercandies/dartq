@@ -8866,7 +8866,8 @@ impl<'a> Engine<'a> {
             let additive = !keyword_head
                 && matches!(
                     (kind, entry.tag),
-                    (ContainerKind::Mixin, SuperTag::On) | (ContainerKind::Mixin, SuperTag::Extends)
+                    (ContainerKind::Mixin, SuperTag::On)
+                        | (ContainerKind::Mixin, SuperTag::Extends)
                 );
             if additive {
                 self.remove_clause_miss(span.offset);

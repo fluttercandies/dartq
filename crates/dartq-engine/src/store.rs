@@ -1636,8 +1636,7 @@ mod tests {
     /// Mints one sidecar the way the persist side mints it (#4273
     /// fixtures): encoded record under `key`, beside its (planted) blob.
     fn mint_answer(root: &Path, key: &[u8; 16], blob: &ContentId) -> (PathBuf, Vec<u8>) {
-        let bytes =
-            crate::state::persist::encode_answer(&answer_record(blob)).expect("encodes");
+        let bytes = crate::state::persist::encode_answer(&answer_record(blob)).expect("encodes");
         let path = answer_record_path(root, key);
         write_answer_record(&path, &bytes).expect("mint sidecar");
         (path, bytes)
@@ -1681,7 +1680,10 @@ mod tests {
 
         drop(ContentStore::open(&scratch.config(u64::MAX)).expect("reopen"));
 
-        assert!(live_path.is_file(), "an in-budget live record survives open");
+        assert!(
+            live_path.is_file(),
+            "an in-budget live record survives open"
+        );
         assert!(
             !ghost_path.exists() && !future_path.exists() && !torn_path.exists(),
             "stale-blob, foreign-codec, and torn records are dead weight, reclaimed"
@@ -1765,8 +1767,7 @@ mod tests {
     #[test]
     fn answer_prefix_blob_pins_the_codec_layout() {
         let blob = content_hash(b"pin target");
-        let bytes =
-            crate::state::persist::encode_answer(&answer_record(&blob)).expect("encodes");
+        let bytes = crate::state::persist::encode_answer(&answer_record(&blob)).expect("encodes");
         assert!(
             bytes.len() > ANSWER_PREFIX_LEN,
             "the fixture record carries a stamps payload past the prefix"
@@ -1779,8 +1780,7 @@ mod tests {
 
         let mut foreign = answer_record(&blob);
         foreign.version += 1;
-        let foreign_bytes =
-            crate::state::persist::encode_answer(&foreign).expect("encodes");
+        let foreign_bytes = crate::state::persist::encode_answer(&foreign).expect("encodes");
         assert_eq!(
             answer_prefix_blob(&foreign_bytes),
             None,

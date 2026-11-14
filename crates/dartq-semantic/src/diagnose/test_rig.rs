@@ -177,10 +177,8 @@ fn scan_fixture(source: &str, file: dartq_source::FileId) -> dartq_scanner::Scan
     let scanned = dartq_scanner::scan(
         source,
         ScanConfig {
-            enable_triple_shift: FeatureSet::for_language_version(fixture_language_version(
-                source,
-            ))
-            .is_enabled(Feature::TripleShift),
+            enable_triple_shift: FeatureSet::for_language_version(fixture_language_version(source))
+                .is_enabled(Feature::TripleShift),
             enable_augmentations: true,
         },
         file,

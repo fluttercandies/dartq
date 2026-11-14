@@ -81,7 +81,10 @@ fn record_over_int_keeps_object_question_leaves() {
     );
     let rows = pattern_rows(&report);
     assert_eq!(rows.len(), 2, "{rows:?}");
-    assert!(rows.iter().any(|row| row.contains("'(Object?,)'")), "{rows:?}");
+    assert!(
+        rows.iter().any(|row| row.contains("'(Object?,)'")),
+        "{rows:?}"
+    );
     assert!(
         rows.iter()
             .any(|row| row.contains("'Object?' isn't assignable")),
@@ -236,11 +239,7 @@ fn typed_literal_record_element_face() {
            return samples;\n\
          }\n",
     );
-    let codes: Vec<&str> = report
-        .diagnostics
-        .iter()
-        .map(|d| d.code.name)
-        .collect();
+    let codes: Vec<&str> = report.diagnostics.iter().map(|d| d.code.name).collect();
     assert!(
         !codes.contains(&"return_of_invalid_type")
             && !codes.contains(&"invalid_assignment")
@@ -289,9 +288,7 @@ fn typed_map_literal_record_value_answers_getters() {
 /// own undefined-class row there).
 #[test]
 fn typed_literal_record_with_unresolved_field_head_stays_silent() {
-    let report = report_ops(
-        "final m = <({Element element, String? routeName}), int>{};\n",
-    );
+    let report = report_ops("final m = <({Element element, String? routeName}), int>{};\n");
     assert!(
         !report
             .diagnostics

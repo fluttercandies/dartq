@@ -1118,7 +1118,10 @@ pub(crate) enum ProxyError {
     /// A domain failure the daemon answered (constructed by the unix
     /// transport and the debug faces' tests; the standalone platforms
     /// only ever see the transport arm).
-    #[cfg_attr(not(unix), expect(dead_code, reason = "the unix socket transport constructs it"))]
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "the unix socket transport constructs it")
+    )]
     Daemon(i64, String),
     Transport(String),
 }

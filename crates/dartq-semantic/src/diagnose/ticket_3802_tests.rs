@@ -105,15 +105,13 @@ class B extends A {
         .collect();
     assert_eq!(
         rows,
-        vec![
-            (
-                "missing_assignable_selector",
-                dartq_diagnostics::Severity::Error,
-                at(fixture, "super!"),
-                6u32,
-                "Missing selector such as '.identifier' or '[0]'.".to_string()
-            ),
-        ],
+        vec![(
+            "missing_assignable_selector",
+            dartq_diagnostics::Severity::Error,
+            at(fixture, "super!"),
+            6u32,
+            "Missing selector such as '.identifier' or '[0]'.".to_string()
+        ),],
         "the resolver's selector row over `super!`, and nothing else; got: {:?}",
         report.diagnostics
     );

@@ -47,7 +47,12 @@ fn rows_of(
                         .to_owned()
                 })
                 .unwrap_or_default();
-            (tail, row.range.offset, row.range.length, row.message.to_string())
+            (
+                tail,
+                row.range.offset,
+                row.range.length,
+                row.message.to_string(),
+            )
         })
         .collect()
 }
@@ -229,11 +234,8 @@ fn import_of_a_part_from_inside_a_part_reports_on_the_part() {
     const B: &str = "part of 'a.dart';\nimport 'c.dart';\n";
     const C: &str = "part of 'a.dart';\nint h() => 1;\n";
 
-    let fixture = Fixture::with_enhanced_parts(&[
-        ("lib/a.dart", A),
-        ("lib/b.dart", B),
-        ("lib/c.dart", C),
-    ]);
+    let fixture =
+        Fixture::with_enhanced_parts(&[("lib/a.dart", A), ("lib/b.dart", B), ("lib/c.dart", C)]);
     let mut engine = fixture.engine();
     engine.set_content(&fixture.path("lib/a.dart"), A.as_bytes());
     engine.set_content(&fixture.path("lib/b.dart"), B.as_bytes());

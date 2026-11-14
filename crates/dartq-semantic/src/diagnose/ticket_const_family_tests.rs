@@ -206,7 +206,11 @@ fn nested_const_literal_elements_report_per_literal() {
 fn opaque_deferrals_stay_constant() {
     let rep = report("const a = [1 as int];");
     let as_rows = rows(&rep, "const a = [1 as int];");
-    assert_eq!(count(&as_rows, "non_constant_list_element"), 0, "{as_rows:?}");
+    assert_eq!(
+        count(&as_rows, "non_constant_list_element"),
+        0,
+        "{as_rows:?}"
+    );
     assert_eq!(
         count(&as_rows, "const_initialized_with_non_constant_value"),
         0,
@@ -220,10 +224,7 @@ fn opaque_deferrals_stay_constant() {
         "{index_rows:?}"
     );
     assert!(
-        index_rows.contains(&(
-            "const_initialized_with_non_constant_value",
-            "'ab'[0]"
-        )),
+        index_rows.contains(&("const_initialized_with_non_constant_value", "'ab'[0]")),
         "{index_rows:?}"
     );
 }

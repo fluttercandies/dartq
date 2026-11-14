@@ -2839,9 +2839,8 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(50)))
             .expect("timeout");
         let answer = read_frame_body(&mut theirs, &mut Vec::new());
-        let expected = format!(
-            "frame announces {announced} bytes, over the {MAX_FRAME_BODY_BYTES}-byte cap"
-        );
+        let expected =
+            format!("frame announces {announced} bytes, over the {MAX_FRAME_BODY_BYTES}-byte cap");
         assert!(
             matches!(
                 &answer,

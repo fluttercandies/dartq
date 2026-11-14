@@ -459,15 +459,15 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
             return exit::USAGE;
         }
     };
-    let (config, _dir, advisory) =
-        match crate::engine_config_with_advisory(&root, Some(&sdk_root)) {
-            Ok(faces) => faces,
-            Err(error) => {
-                eprintln!("dartq: session serve: {error}");
-                cleanup(&layout, &root);
-                return exit::USAGE;
-            }
-        };
+    let (config, _dir, advisory) = match crate::engine_config_with_advisory(&root, Some(&sdk_root))
+    {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("dartq: session serve: {error}");
+            cleanup(&layout, &root);
+            return exit::USAGE;
+        }
+    };
     // The engine trace — the cold-analysis progress substrate
     // (`dartq events progress` reads it; the file truncates per serve, so
     // each resident generation's sweep starts at zero).

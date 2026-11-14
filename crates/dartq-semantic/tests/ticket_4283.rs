@@ -28,9 +28,7 @@ use dartq_semantic::collector::collect;
 use dartq_semantic::diagnose::{StrictModes, fold_unit_with_ops};
 use dartq_semantic::library::ElementIndex;
 use dartq_semantic::model::MicroKind;
-use dartq_semantic::resolved_ops::{
-    ClauseTrees, ClosureEdges, LibraryTypes, ResolvedTypeOps,
-};
+use dartq_semantic::resolved_ops::{ClauseTrees, ClosureEdges, LibraryTypes, ResolvedTypeOps};
 use dartq_source::{FileId, FileTable, StringTable};
 
 /// The synthetic dart:core names the fragments consume.
@@ -117,7 +115,14 @@ fn workspace() -> Workspace {
                 builder.declare(lib, name, file);
             }
         }
-        capture_clause_trees(file, source, &scanned.tokens, features, &strings, &mut clauses);
+        capture_clause_trees(
+            file,
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            &mut clauses,
+        );
         builder.import(
             lib,
             ImportEdge {

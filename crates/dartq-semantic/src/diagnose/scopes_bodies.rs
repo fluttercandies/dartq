@@ -7834,11 +7834,11 @@ impl<'a> Engine<'a> {
             nullable: false,
             args: self.boundary.intern_list(&[arg]),
         };
-        let computation = self
-            .boundary
-            .args
-            .borrow_mut()
-            .function_generic(&[], future_or, &[], &[], false);
+        let computation =
+            self.boundary
+                .args
+                .borrow_mut()
+                .function_generic(&[], future_or, &[], &[], false);
         Some(Formals {
             positional: Box::from([Formal {
                 name: self.intern("computation"),
@@ -8395,9 +8395,9 @@ impl<'a> Engine<'a> {
                 // the written-group head's own lane answers below —
                 // `slot_creation_formals`' unindexed fallback reads the
                 // head's `<…>` group and only a `Future` head answers.
-                let bare_creation =
-                    (!callee.qualified && matches!(callee.shape, RowShape::Bare(_)))
-                        .then_some((callee.range, false));
+                let bare_creation = (!callee.qualified
+                    && matches!(callee.shape, RowShape::Bare(_)))
+                .then_some((callee.range, false));
                 (recv, callee.name, Some(callee_row), bare_creation)
             }
             None if enum_const => return None,
@@ -9435,8 +9435,7 @@ impl<'a> Engine<'a> {
         // `ctx_ret` can carry a synthetic `FutureOr` head
         // (`core_unindexed_future_formals`) that no written annotation
         // could produce — the scope gate must not apply to it (#4265).
-        let (staged, anchor, synthetic_ctx) = match (ret.as_ref(), ctx_ret.as_ref(), *body_brace)
-        {
+        let (staged, anchor, synthetic_ctx) = match (ret.as_ref(), ctx_ret.as_ref(), *body_brace) {
             (Some(exec), ..) => (exec.ty, exec.name_span, false),
             (None, Some(ctx), Some(brace)) => (*ctx, brace, true),
             _ => return,
@@ -9598,14 +9597,7 @@ impl<'a> Engine<'a> {
         } else {
             self.invalid_return_fold(declared)
         };
-        self.insert_body_completion(
-            end_range,
-            declared,
-            Some(brace),
-            is_async,
-            anchor,
-            false,
-        );
+        self.insert_body_completion(end_range, declared, Some(brace), is_async, anchor, false);
     }
 
     /// The name-level `_isLegalReturnType` for an `async` body: the top

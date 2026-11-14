@@ -2209,7 +2209,10 @@ fn run_grouped(
         target,
         wanted,
         crate::memory_max_percent(
-            dartq_commands::config::discover(root).ok().flatten().as_ref(),
+            dartq_commands::config::discover(root)
+                .ok()
+                .flatten()
+                .as_ref(),
         ),
         deadline,
     )?;
@@ -2346,7 +2349,10 @@ fn run_stock(
     let (lease, workers) = dartq_test::lease_run(
         plan.workers.min(indices.len()).max(1),
         crate::memory_max_percent(
-            dartq_commands::config::discover(root).ok().flatten().as_ref(),
+            dartq_commands::config::discover(root)
+                .ok()
+                .flatten()
+                .as_ref(),
         ),
         deadline,
     )?;

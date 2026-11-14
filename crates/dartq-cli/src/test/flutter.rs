@@ -1012,7 +1012,10 @@ fn run_shards(
         target,
         wanted,
         crate::memory_max_percent(
-            dartq_commands::config::discover(root).ok().flatten().as_ref(),
+            dartq_commands::config::discover(root)
+                .ok()
+                .flatten()
+                .as_ref(),
         ),
         deadline,
     )?;
@@ -1428,7 +1431,10 @@ fn grouped_pass(
         profile,
         target,
         crate::memory_max_percent(
-            dartq_commands::config::discover(&plan.root).ok().flatten().as_ref(),
+            dartq_commands::config::discover(&plan.root)
+                .ok()
+                .flatten()
+                .as_ref(),
         ),
         deadline,
     )?;

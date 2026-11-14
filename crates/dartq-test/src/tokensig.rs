@@ -180,6 +180,9 @@ mod tests {
     fn signatures_are_stable_and_recovery_aware() {
         let source = "void main() { print('hi'); }\n";
         assert_eq!(sig(source), sig(source));
-        assert_ne!(sig("var s = 'unterminated;\n"), sig("var s = 'unterminatedx';\n"));
+        assert_ne!(
+            sig("var s = 'unterminated;\n"),
+            sig("var s = 'unterminatedx';\n")
+        );
     }
 }

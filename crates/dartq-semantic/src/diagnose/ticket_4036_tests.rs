@@ -155,9 +155,7 @@ fn literal_result_face_reaches_is_call_and_return_positions() {
     );
     assert_eq!(
         texts(&report, "unnecessary_type_check"),
-        vec![
-            "Unnecessary type check; the result is always 'true'.".to_string()
-        ],
+        vec!["Unnecessary type check; the result is always 'true'.".to_string()],
         "the `is` operand reads the literal's written result face"
     );
     assert_eq!(

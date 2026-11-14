@@ -82,8 +82,8 @@ use clap::{Args, Parser as _, Subcommand, ValueEnum};
 use dartq_commands::analyze::Target;
 use dartq_commands::analyze::official::{self, OfficialRun};
 use dartq_commands::config::{
-    ConfigError, ContextConfig, ContextTarget, DartqConfig,
-    load as load_dartq_config, resolve_locator,
+    ConfigError, ContextConfig, ContextTarget, DartqConfig, load as load_dartq_config,
+    resolve_locator,
 };
 use dartq_commands::discover::{DiscoverError, discover};
 use dartq_commands::explain::ExplainError;
@@ -2714,14 +2714,14 @@ fn analyze_targets(
     // units included: the keys are path-free); a miss is the plain cold
     // build. The store opens here — past the probe seam (#4260), so a
     // served hit never pays it.
-    let facts_store = match dartq_snapshot::SnapshotStore::open(dartq_snapshot::SnapshotConfig::default())
-    {
-        Ok(store) => Some(store),
-        Err(error) => {
-            eprintln!("warning: facts snapshot store unavailable: {error}");
-            None
-        }
-    };
+    let facts_store =
+        match dartq_snapshot::SnapshotStore::open(dartq_snapshot::SnapshotConfig::default()) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                eprintln!("warning: facts snapshot store unavailable: {error}");
+                None
+            }
+        };
     for engine in &mut engines {
         if let Some(store) = &facts_store {
             let header = engine.snapshot_header();
@@ -5847,7 +5847,10 @@ mod tests {
         fs::write(package.join("lib/a.dart"), "").expect("write");
 
         let resolved = |paths: &[PathBuf]| {
-            analysis_root(&resolve_targets(paths).expect("targets"), &mut RootMemo::default())
+            analysis_root(
+                &resolve_targets(paths).expect("targets"),
+                &mut RootMemo::default(),
+            )
         };
         assert_eq!(
             resolved(&[package.join("lib/a.dart"), package.join("test")]),
@@ -5885,9 +5888,7 @@ mod tests {
         for (package, name) in [(&a, "a"), (&b, "b")] {
             fs::write(
                 package.join("pubspec.yaml"),
-                format!(
-                    "name: {name}\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n"
-                ),
+                format!("name: {name}\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n"),
             )
             .expect("member pubspec");
         }
@@ -6016,27 +6017,43 @@ mod tests {
         let resolved = |paths: &[PathBuf]| resolve_targets(paths).expect("targets");
         // The single-pubspec shape: the file tier.
         assert_eq!(
-            resolve_scope(None, &resolved(&[standalone.join("lib/x.dart")]), &mut RootMemo::default()),
+            resolve_scope(
+                None,
+                &resolved(&[standalone.join("lib/x.dart")]),
+                &mut RootMemo::default()
+            ),
             AnalyzeScope::File,
             "a single-pubspec file aim: package == workspace == the repo"
         );
         // The workspace root's own package is that shape too: its package
         // tier roots at the whole workspace.
         assert_eq!(
-            resolve_scope(None, &resolved(&[root.join("tool/main.dart")]), &mut RootMemo::default()),
+            resolve_scope(
+                None,
+                &resolved(&[root.join("tool/main.dart")]),
+                &mut RootMemo::default()
+            ),
             AnalyzeScope::File,
             "a workspace root's own file aim: the package tier is the whole repo"
         );
         // A no-pubspec bare file: the package tier floors at the parent
         // directory while the file tier is the oracle's own posture.
         assert_eq!(
-            resolve_scope(None, &resolved(&[bare.join("lib/x.dart")]), &mut RootMemo::default()),
+            resolve_scope(
+                None,
+                &resolved(&[bare.join("lib/x.dart")]),
+                &mut RootMemo::default()
+            ),
             AnalyzeScope::File
         );
         // A member's file keeps the package tier — it is genuinely
         // narrower than the workspace.
         assert_eq!(
-            resolve_scope(None, &resolved(&[a.join("lib/x.dart")]), &mut RootMemo::default()),
+            resolve_scope(
+                None,
+                &resolved(&[a.join("lib/x.dart")]),
+                &mut RootMemo::default()
+            ),
             AnalyzeScope::Package,
             "a member file aim keeps its narrower package tier"
         );
@@ -6044,13 +6061,21 @@ mod tests {
         // package tier would pay the whole repo for one module tree (the
         // aim directory is what `dart analyze <dir>` passes verbatim).
         assert_eq!(
-            resolve_scope(None, &resolved(&[standalone.clone()]), &mut RootMemo::default()),
+            resolve_scope(
+                None,
+                &resolved(&[standalone.clone()]),
+                &mut RootMemo::default()
+            ),
             AnalyzeScope::File,
             "a single-pubspec directory aim analyzes its own tree"
         );
         // A nested module dir inside it: the same shape one level down.
         assert_eq!(
-            resolve_scope(None, &resolved(&[standalone.join("lib")]), &mut RootMemo::default()),
+            resolve_scope(
+                None,
+                &resolved(&[standalone.join("lib")]),
+                &mut RootMemo::default()
+            ),
             AnalyzeScope::File,
             "a nested module dir takes the aims tier"
         );
@@ -6075,7 +6100,11 @@ mod tests {
         // A no-pubspec bare directory aim: both tiers floor at the aim
         // itself — firing is the oracle's own posture and changes nothing.
         assert_eq!(
-            resolve_scope(None, &resolved(&[bare.join("lib")]), &mut RootMemo::default()),
+            resolve_scope(
+                None,
+                &resolved(&[bare.join("lib")]),
+                &mut RootMemo::default()
+            ),
             AnalyzeScope::File
         );
         // The workspace root aimed as a directory: firing is harmless —
@@ -6096,13 +6125,17 @@ mod tests {
             "one member aim beside a whole-repo file aim keeps the package tier"
         );
         // An explicit scope passes verbatim on the firing shape.
-        for scope in [AnalyzeScope::Package, AnalyzeScope::Workspace, AnalyzeScope::File] {
+        for scope in [
+            AnalyzeScope::Package,
+            AnalyzeScope::Workspace,
+            AnalyzeScope::File,
+        ] {
             assert_eq!(
                 resolve_scope(
-                Some(scope),
-                &resolved(&[standalone.join("lib/x.dart")]),
-                &mut RootMemo::default(),
-            ),
+                    Some(scope),
+                    &resolved(&[standalone.join("lib/x.dart")]),
+                    &mut RootMemo::default(),
+                ),
                 scope,
                 "an explicit --scope never re-resolves"
             );
@@ -6121,18 +6154,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let at = |yaml: &str| {
             fs::write(dir.path().join("dartq.yaml"), yaml).expect("write");
-            let config = dartq_commands::config::discover(dir.path())
-                .ok()
-                .flatten();
+            let config = dartq_commands::config::discover(dir.path()).ok().flatten();
             warm_posture(config.as_ref())
         };
         assert_eq!(
-            at("version: 1\nanalyzer:\n  pool:\n    enabled: true\n    warm_servers: true\n    warm_ttl_secs: 120\n"),
+            at(
+                "version: 1\nanalyzer:\n  pool:\n    enabled: true\n    warm_servers: true\n    warm_ttl_secs: 120\n"
+            ),
             (1, 120),
             "warm on with the declared TTL"
         );
         assert_eq!(
-            at("version: 1\nanalyzer:\n  pool:\n    enabled: true\n    warm_servers: false\n    warm_ttl_secs: 900\n"),
+            at(
+                "version: 1\nanalyzer:\n  pool:\n    enabled: true\n    warm_servers: false\n    warm_ttl_secs: 900\n"
+            ),
             (0, 900),
             "the off arm carries not-declared — the env is the off switch"
         );
@@ -6329,16 +6364,14 @@ mod tests {
             &["analyze", "--scope", "workspace", "/pkg"][..],
             &["analyze", "--scope=workspace", "/pkg"][..],
         ] {
-            let parsed = parse_args_of(spelling)
-                .expect("parse")
-                .expect("subcommand");
+            let parsed = parse_args_of(spelling).expect("parse").expect("subcommand");
             let Command::Analyze(args) = parsed else {
                 panic!("expected analyze command")
             };
             assert_eq!(args.scope, Some(AnalyzeScope::Workspace), "{spelling:?}");
             assert!(
-                args.resident_request().is_some_and(|ask| ask.scope
-                    == Some(AnalyzeScope::Workspace)),
+                args.resident_request()
+                    .is_some_and(|ask| ask.scope == Some(AnalyzeScope::Workspace)),
                 "--scope plumbs into the resident request"
             );
         }
@@ -6350,9 +6383,7 @@ mod tests {
             &["analyze", "--scope=file", "/pkg/lib/a.dart"][..],
             &["analyze", "--scope", "dir", "/pkg/lib"][..],
         ] {
-            let parsed = parse_args_of(spelling)
-                .expect("parse")
-                .expect("subcommand");
+            let parsed = parse_args_of(spelling).expect("parse").expect("subcommand");
             let Command::Analyze(args) = parsed else {
                 panic!("expected analyze command")
             };
@@ -6886,11 +6917,7 @@ mod tests {
             "version: 1\nmemory:\n  max_percent: 0\n",
         )
         .expect("dartq.yaml");
-        assert_eq!(
-            percent(dir.path()),
-            90,
-            "a config error falls back"
-        );
+        assert_eq!(percent(dir.path()), 90, "a config error falls back");
     }
 
     /// The official settings resolve from `dartq.yaml`'s `analyzer.official`
@@ -7155,8 +7182,7 @@ mod tests {
         // Each posture flag declines with its own reason.
         let declines = |args: &AnalyzeArgs, reason: &str| {
             assert_eq!(
-                answer_envelope_shape(args, &no_aims, 1, &Default::default())
-                    .expect_err("gated"),
+                answer_envelope_shape(args, &no_aims, 1, &Default::default()).expect_err("gated"),
                 reason
             );
         };
@@ -7304,13 +7330,16 @@ mod tests {
         let answers_dir = dartq_engine::store::default_root()
             .expect("cache root")
             .join("answers");
-        let before = fs::read_dir(&answers_dir).map(|entries| entries.count()).unwrap_or(0);
+        let before = fs::read_dir(&answers_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
 
         let mut out1: Vec<u8> = Vec::new();
         let code1 = analyze_targets(&args, &targets, &mut out1, &mut RootMemo::default());
         assert_eq!(code1, exit::ERRORS, "the fixture's error tier");
-        let after =
-            fs::read_dir(&answers_dir).map(|entries| entries.count()).unwrap_or(0);
+        let after = fs::read_dir(&answers_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
         assert!(
             after > before,
             "the cold run persisted an answer record under {answers_dir:?}"
@@ -7326,16 +7355,18 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let unreadable = root.join("lib/clean.dart");
-            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
-                .expect("chmod");
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).expect("chmod");
         }
         let mut out2: Vec<u8> = Vec::new();
         let code2 = analyze_targets(&args, &targets, &mut out2, &mut RootMemo::default());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(root.join("lib/clean.dart"), fs::Permissions::from_mode(0o644))
-                .expect("restore chmod");
+            fs::set_permissions(
+                root.join("lib/clean.dart"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .expect("restore chmod");
         }
         assert_eq!(out2, out1, "the warm re-ask serves byte-identical stdout");
         assert_eq!(code2, code1, "the same exit tier");

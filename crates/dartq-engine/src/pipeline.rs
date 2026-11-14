@@ -45,7 +45,6 @@ use crate::state::{
 };
 use crate::{CsrGraph, LibraryView, SemanticDiagnoser};
 
-
 /// The resolution pipeline stage: the interned library graph
 /// (dartq-resolution) over the current library set and the engine-library →
 /// graph-library mapping. The semantic seam reads per-file element models
@@ -219,8 +218,7 @@ pub(crate) fn analyze(
     // the store, nothing recomputed — defers the build to the first turn
     // that does: a turn that changes nothing recomputes nothing (#4205).
     if structure_moved || (graph.is_none() && !order.is_empty()) {
-        *graph = (!state.residency.is_empty())
-            .then(|| build_library_graph(state));
+        *graph = (!state.residency.is_empty()).then(|| build_library_graph(state));
     }
 
     // Phase-boundary budget poll: the ladder's first chance to
@@ -446,37 +444,32 @@ pub(crate) fn analyze(
     // O(workspace) once, the inline scan costs O(closure reach) per
     // library, so small incremental turns keep the inline path and a
     // cold or bulk analyze shares the table.
-    let closure_edges: Option<dartq_semantic::ClosureEdges> =
-        if order.len() >= 64
-            && let (Some(graph), Some(namespaces), Some(index), Some(clauses)) = (
-                fold_graph,
-                seam,
-                index.as_ref(),
-                clauses.as_ref(),
-            )
-        {
-            let pairs = dartq_semantic::ClosureEdges::pairs(&graph.graph);
-            let table: FxHashMap<_, _> = pairs
-                .par_iter()
-                .map(|&(file, owner)| {
-                    (
-                        (file, owner),
-                        dartq_semantic::ClosureEdges::compute(
-                            &graph.graph,
-                            namespaces,
-                            index,
-                            clauses,
-                            file,
-                            owner,
-                        ),
-                    )
-                })
-                .collect();
-            let out = dartq_semantic::ClosureEdges::from_map(table);
-            Some(out)
-        } else {
-            None
-        };
+    let closure_edges: Option<dartq_semantic::ClosureEdges> = if order.len() >= 64
+        && let (Some(graph), Some(namespaces), Some(index), Some(clauses)) =
+            (fold_graph, seam, index.as_ref(), clauses.as_ref())
+    {
+        let pairs = dartq_semantic::ClosureEdges::pairs(&graph.graph);
+        let table: FxHashMap<_, _> = pairs
+            .par_iter()
+            .map(|&(file, owner)| {
+                (
+                    (file, owner),
+                    dartq_semantic::ClosureEdges::compute(
+                        &graph.graph,
+                        namespaces,
+                        index,
+                        clauses,
+                        file,
+                        owner,
+                    ),
+                )
+            })
+            .collect();
+        let out = dartq_semantic::ClosureEdges::from_map(table);
+        Some(out)
+    } else {
+        None
+    };
 
     // Each job also rebuilds its library's symbol-index surface: the build
     // reads only the member captures (fresh from the drain above) and the

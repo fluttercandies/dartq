@@ -569,9 +569,12 @@ impl<'a> Engine<'a> {
                             None
                         };
                         let answer = match (inferred, constraint_id) {
-                            (Some(face), Some(sup)) => Some(self.ops.is_some_and(|ops| ops.subtype_ids(face, sup))),
-                            _ => constraint_id
-                                .and_then(|sup| self.face_subtype(*prior, *prior_file, written, sup)),
+                            (Some(face), Some(sup)) => {
+                                Some(self.ops.is_some_and(|ops| ops.subtype_ids(face, sup)))
+                            }
+                            _ => constraint_id.and_then(|sup| {
+                                self.face_subtype(*prior, *prior_file, written, sup)
+                            }),
                         };
                         if answer.unwrap_or_else(|| {
                             self.supertype_reaches(

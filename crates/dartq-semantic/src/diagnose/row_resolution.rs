@@ -3173,21 +3173,19 @@ impl<'a> Engine<'a> {
                             // matrix directly (`Int` carries `unary-` and
                             // `~`, `Double` only `unary-`, `Bool` neither);
                             // every other operand walks the indexed tables.
-                            let const_state = match crate::const_eval::ConstLookup::ident(
-                                self,
-                                row.name,
-                            ) {
-                                crate::const_eval::IdentVerdict::Value(
-                                    crate::const_eval::ConstantValue::Int(_),
-                                ) => Some(true),
-                                crate::const_eval::IdentVerdict::Value(
-                                    crate::const_eval::ConstantValue::Double(_),
-                                ) => Some(op_text == "unary-"),
-                                crate::const_eval::IdentVerdict::Value(
-                                    crate::const_eval::ConstantValue::Bool(_),
-                                ) => Some(false),
-                                _ => None,
-                            };
+                            let const_state =
+                                match crate::const_eval::ConstLookup::ident(self, row.name) {
+                                    crate::const_eval::IdentVerdict::Value(
+                                        crate::const_eval::ConstantValue::Int(_),
+                                    ) => Some(true),
+                                    crate::const_eval::IdentVerdict::Value(
+                                        crate::const_eval::ConstantValue::Double(_),
+                                    ) => Some(op_text == "unary-"),
+                                    crate::const_eval::IdentVerdict::Value(
+                                        crate::const_eval::ConstantValue::Bool(_),
+                                    ) => Some(false),
+                                    _ => None,
+                                };
                             match const_state {
                                 Some(false) => {
                                     let type_text = match self.fold_alias_ty(ty) {
@@ -3232,7 +3230,12 @@ impl<'a> Engine<'a> {
                                         // dispatch dynamically — silent).
                                         let type_text = match self.fold_alias_ty(ty) {
                                             face @ (Ty::Record { .. } | Ty::Function { .. }) => {
-                                                Some(face.render(&self.strings, &self.boundary.pool()))
+                                                Some(
+                                                    face.render(
+                                                        &self.strings,
+                                                        &self.boundary.pool(),
+                                                    ),
+                                                )
                                             }
                                             face @ Ty::Named { .. } => Some(self.ty_display(face)),
                                             _ => None,
@@ -3246,7 +3249,7 @@ impl<'a> Engine<'a> {
                                             );
                                         }
                                     }
-                                }
+                                },
                             }
                         }
                     } else if row.intent == Intent::Invoke
@@ -4216,9 +4219,7 @@ impl<'a> Engine<'a> {
             // candidates — they are legal identifiers.
             let name_candidate = match token.kind {
                 TokenKind::Identifier => true,
-                TokenKind::Keyword(k) => {
-                    k.style() != dartq_scanner::KeywordStyle::Reserved
-                }
+                TokenKind::Keyword(k) => k.style() != dartq_scanner::KeywordStyle::Reserved,
                 _ => false,
             };
             if !name_candidate {
@@ -5892,10 +5893,7 @@ impl<'a> Engine<'a> {
                     )
                     .unwrap_or(u16::MAX),
                     positional: positional.into(),
-                    named: named
-                        .iter()
-                        .map(|(name, ty)| (*name, *ty, false))
-                        .collect(),
+                    named: named.iter().map(|(name, ty)| (*name, *ty, false)).collect(),
                     return_ty: self.fold_alias_ty(entry.return_ty),
                 };
                 Some(self.fn_sig_ty(&sig))
@@ -7728,12 +7726,8 @@ impl<'a> Engine<'a> {
             .map(|index| self.promoted_recv_reads[index].1);
         let read_span = read_span?;
         match promotions.promoted(read_span) {
-            Some(promoted @ Ty::Named { .. }) => {
-                Some(promoted)
-            }
-            other => {
-                None
-            }
+            Some(promoted @ Ty::Named { .. }) => Some(promoted),
+            other => None,
         }
     }
 
@@ -9782,8 +9776,8 @@ impl<'a> Engine<'a> {
             .iter()
             .find(|(name, _)| container_text == *name)
             .map(|(name, members)| (*name, *members));
-        let Some((_, members)) = core
-            .or_else(|| function_face.then_some(("", &FUNCTION_MEMBERS[..])))
+        let Some((_, members)) =
+            core.or_else(|| function_face.then_some(("", &FUNCTION_MEMBERS[..])))
         else {
             // Not a known primitive — an UNDECIDABLE receiver head (`Never`
             // through the names-only stub, a `?`-less type-parameter
@@ -11781,8 +11775,7 @@ impl<'a> Engine<'a> {
         target: Option<(FileId, StringId, StringId)>,
     ) {
         if let Some((target_file, target_name, target_container)) = target {
-            if row.range.offset == 0 && row.range.length == 0 {
-            }
+            if row.range.offset == 0 && row.range.length == 0 {}
             self.report.member_refs.push(MemberRef {
                 range: row.range,
                 kind,
@@ -13204,10 +13197,9 @@ impl<'a> Engine<'a> {
             if !setter_hit && let Some((landing, kind, is_final, name_range)) = named_hit {
                 if row.intent == Intent::ReadWrite && matches!(kind, MemberKind::Getter) {
                     let name_text = self.strings.resolve(row.name);
-                    let class_text =
-                        landing.map_or_else(String::new, |(_, origin)| {
-                            self.strings.resolve(origin).to_string()
-                        });
+                    let class_text = landing.map_or_else(String::new, |(_, origin)| {
+                        self.strings.resolve(origin).to_string()
+                    });
                     self.emit(
                         SemanticCode::UndefinedSetter,
                         row.range,
@@ -13259,8 +13251,7 @@ impl<'a> Engine<'a> {
                     self.check_member_callee_function_nullable(row);
                 }
             }
-            if matches!(walk, Walk::Missing) {
-            }
+            if matches!(walk, Walk::Missing) {}
             let core_claim = matches!(walk, Walk::Missing)
                 && crate::member_face::core_member_return(
                     self.strings.resolve(container),
@@ -13312,7 +13303,11 @@ impl<'a> Engine<'a> {
                     );
                     if !extension_wins {
                         let name_text = self.strings.resolve(row.name);
-                        self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
+                        self.emit_unchecked_nullable(
+                            row.range,
+                            name_text,
+                            access_kind(&row.intent),
+                        );
                     } else {
                         self.extension_nullable_resolved.insert(row.range.offset);
                     }
@@ -17714,7 +17709,11 @@ mod tests {
         );
         assert_eq!(
             code_names(&report),
-            ["unused_field", "undefined_named_parameter", "missing_required_argument"],
+            [
+                "unused_field",
+                "undefined_named_parameter",
+                "missing_required_argument"
+            ],
             "{:?}",
             code_names(&report)
         );

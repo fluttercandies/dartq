@@ -513,11 +513,7 @@ fn callee_own_solve_binds_class_feeding_assignability() {
     // 'nope' isn't defined for the type 'A'" at the selector; re-pinned
     // from the old `!undefined_method` expectation, which the pre-solve
     // engine only met by leaving `a` unresolved).
-    assert!(
-        has_code(&rep, "undefined_method"),
-        "{:?}",
-        code_names(&rep)
-    );
+    assert!(has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
 }
 
 /// The accessor static face instantiates a resolved getter's declared

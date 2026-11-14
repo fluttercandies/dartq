@@ -5298,9 +5298,7 @@ impl PromotionStaging {
     /// negation-operand rescue, not a general relaxation — one operand's
     /// extent only ever contains its own subexpression reads (#4265).
     pub(crate) fn promoted_within(&self, range: SourceRange) -> Option<Ty> {
-        let mut index = self
-            .rows
-            .partition_point(|(r, _)| r.offset < range.offset);
+        let mut index = self.rows.partition_point(|(r, _)| r.offset < range.offset);
         while let Some(&(staged, ty)) = self.rows.get(index) {
             if staged.offset >= range.end() {
                 break;

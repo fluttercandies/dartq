@@ -1200,13 +1200,7 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                     let new_ty = self.recompute_binary_result(
-                        op,
-                        &left,
-                        &right,
-                        left_ty,
-                        right_ty,
-                        &params,
-                        &rewrites,
+                        op, &left, &right, left_ty, right_ty, &params, &rewrites,
                     );
                     (node_range, new_ty, result)
                 }
@@ -2021,8 +2015,7 @@ impl<'a> Engine<'a> {
                 StagedKind::Assignment => self.assignment_verdict(from, check.to, literal),
                 _ => self.assignable(from, check.to, literal),
             };
-            if !probe_kind.is_empty() {
-            }
+            if !probe_kind.is_empty() {}
             if verdict != Some(false) {
                 // Cleaned by the promotion, or the promoted type left the
                 // question undecidable — suppress (under-report).
@@ -8077,9 +8070,7 @@ impl<'a> Engine<'a> {
     /// declines the whole recovery (under-report).
     pub(crate) fn parse_record_annotation(&self, text: &str) -> Option<Ty> {
         let text = text.trim();
-        let (text, nullable) = text
-            .strip_suffix('?')
-            .map_or((text, false), |t| (t, true));
+        let (text, nullable) = text.strip_suffix('?').map_or((text, false), |t| (t, true));
         let inner = text.strip_prefix('(')?.strip_suffix(')')?;
         let mut positional: Vec<Ty> = Vec::new();
         let mut named: Vec<(StringId, Ty)> = Vec::new();
@@ -12362,8 +12353,7 @@ impl<'a> Engine<'a> {
             PENDING_COMPOSITE_FOLDS.with(|queue| {
                 let mut queue = queue.borrow_mut();
                 if queue.len() < PENDING_COMPOSITE_FOLD_CAP {
-                    let mut params: Vec<StringId> =
-                        self.type_params.iter().copied().collect();
+                    let mut params: Vec<StringId> = self.type_params.iter().copied().collect();
                     params.extend(self.pending_type_params.iter().copied());
                     queue.push(PendingCompositeFold::Binary {
                         file: self.file,
@@ -12897,7 +12887,8 @@ impl<'a> Engine<'a> {
             if joined != parse_ty {
                 self.rewrite_if_null_consumers(rhs_offset, parse_ty, joined);
             }
-            self.if_null_results.insert(rhs_offset, (lhs_offset, joined));
+            self.if_null_results
+                .insert(rhs_offset, (lhs_offset, joined));
         }
     }
 
@@ -14473,7 +14464,8 @@ impl<'a> Engine<'a> {
                     match self.tokens.matching_end(idx) {
                         Some(close) => {
                             let closer = tokens[close];
-                            end = self.utf16_of(closer.byte_offset as usize + closer.byte_len as usize);
+                            end = self
+                                .utf16_of(closer.byte_offset as usize + closer.byte_len as usize);
                             idx = close + 1;
                             continue;
                         }

@@ -122,11 +122,7 @@ fn synthetic_futureor_closure_context_stays_silent() {
            });\n\
          }\n",
     );
-    assert!(
-        report.diagnostics.is_empty(),
-        "{:?}",
-        code_names(&report)
-    );
+    assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
 }
 
 /// (2) The written-unimported-FutureOr pin (ticket_3132): the existing

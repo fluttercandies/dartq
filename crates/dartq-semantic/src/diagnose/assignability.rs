@@ -719,133 +719,133 @@ impl<'a> Engine<'a> {
             // the report re-anchors on `elem_span`).
             let (mut element_ty, row_range, int_literal, record_row) =
                 if let Some((kind, key)) = literal {
-                // A nested collection literal is the element: its static
-                // type adopts the context when the declared face's head
-                // matches (`['x']` under `List<int>` resolves `List<int>`
-                // and coerces), else the leaves' upward inference
-                // (`['x']` under `int` reads `List<String>`; `{k: v}`
-                // under `Map<K2, V2>` adopts and the entry face owns the
-                // key/value verdicts).
-                let operand = Row {
-                    name: self.intern(""),
-                    range: SourceRange {
-                        offset: key,
-                        length: 1,
-                    },
-                    qualified: false,
-                    shape: RowShape::Value,
-                    intent: Intent::Read,
-                    write_op: None,
-                    ty: Ty::UNKNOWN,
-                };
-                let adopt = self.literal_adopts_context(kind, declared);
-                let ty = if adopt {
-                    declared
-                } else {
-                    let family = match kind {
-                        UntypedLiteral::List => self.collection_heads[0],
-                        UntypedLiteral::SetElements => self.collection_heads[1],
-                        UntypedLiteral::MapEntries | UntypedLiteral::EmptyBraces => {
-                            match self.empty_literal_is_set(declared) {
-                                Some(true) => self.collection_heads[1],
-                                _ => self.collection_heads[2],
-                            }
-                        }
+                    // A nested collection literal is the element: its static
+                    // type adopts the context when the declared face's head
+                    // matches (`['x']` under `List<int>` resolves `List<int>`
+                    // and coerces), else the leaves' upward inference
+                    // (`['x']` under `int` reads `List<String>`; `{k: v}`
+                    // under `Map<K2, V2>` adopts and the entry face owns the
+                    // key/value verdicts).
+                    let operand = Row {
+                        name: self.intern(""),
+                        range: SourceRange {
+                            offset: key,
+                            length: 1,
+                        },
+                        qualified: false,
+                        shape: RowShape::Value,
+                        intent: Intent::Read,
+                        write_op: None,
+                        ty: Ty::UNKNOWN,
                     };
-                    self.collection_literal_ty(&operand, family)
-                        .unwrap_or_else(|| self.literal_return_ty(kind, declared))
-                };
-                (
-                    ty,
-                    self.untyped_literal_span(&operand).unwrap_or(operand.range),
-                    false,
-                    false,
-                )
-            } else {
-                // The element expression's own row: the outermost row
-                // spanning the trimmed window exactly — an inner row
-                // (`{k: f()}`'s `f` leaf, `a + b`'s `b`) types its own
-                // operand, never the element. A nested literal's `]`/`}`
-                // row drains into the deferred queue at its own close,
-                // so both stacks scan.
-                let (s16, e16) = (self.utf16_of(ws), self.utf16_of(we));
-                let exact = |row: &&Row| {
-                    row.range.offset == s16
-                        && row.range.end() == e16
-                        && !matches!(row.shape, RowShape::TypeUse(..))
-                };
-                let row = self
-                    .rows
-                    .iter()
-                    .rev()
-                    .take_while(|row| row.range.offset >= s16)
-                    .find(|row| exact(row))
-                    .or_else(|| {
-                        self.deferred_miss_rows
-                            .iter()
-                            .rev()
-                            .take_while(|row| row.range.offset >= s16)
-                            .find(|row| exact(row))
-                    })
-                    .cloned();
-                match row {
-                    Some(row) => {
-                        let mut ty = self.operand_static_ty(&row);
-                        if ty == Ty::UNKNOWN {
-                            // A for-in body element whose loop variable's
-                            // element type only the pass-2 pre-pass derives
-                            // (`local_init_rows` — the iterable literal's
-                            // row was still opaque at `)` close): the
-                            // element check fires at parse time, before that
-                            // pass exists, so the literal channel answers
-                            // the same face itself.
-                            ty = self.for_in_literal_element_ty(&row).unwrap_or(Ty::UNKNOWN);
-                        }
-                        if ty == Ty::UNKNOWN {
-                            continue;
-                        }
-                        (
-                            ty,
-                            row.range,
-                            self.is_int_literal_row(&row),
-                            matches!(row.shape, RowShape::Record(_)),
-                        )
-                    }
-                    None => {
-                        // No single row spans the window (a composite
-                        // operand the row model leaves unfolded): keep the
-                        // legacy last-typed-row posture — the element's
-                        // inner row is the best face available. A control
-                        // segment's multi-arm body never folds to one row,
-                        // so the leaf grab stays off it entirely.
-                        if control {
-                            continue;
-                        }
-                        let stop16 = e16;
-                        let Some((row_ty, row_range, row_lit, row_record)) = self
-                            .rows
-                            .iter()
-                            .rev()
-                            .find(|row| {
-                                row.ty != Ty::UNKNOWN
-                                    && row.range.offset >= s16
-                                    && row.range.end() <= stop16
-                            })
-                            .map(|row| {
-                                (
-                                    row.ty,
-                                    row.range,
-                                    self.is_int_literal_row(row),
-                                    matches!(row.shape, RowShape::Record(_)),
-                                )
-                            })
-                        else {
-                            continue;
+                    let adopt = self.literal_adopts_context(kind, declared);
+                    let ty = if adopt {
+                        declared
+                    } else {
+                        let family = match kind {
+                            UntypedLiteral::List => self.collection_heads[0],
+                            UntypedLiteral::SetElements => self.collection_heads[1],
+                            UntypedLiteral::MapEntries | UntypedLiteral::EmptyBraces => {
+                                match self.empty_literal_is_set(declared) {
+                                    Some(true) => self.collection_heads[1],
+                                    _ => self.collection_heads[2],
+                                }
+                            }
                         };
-                        (row_ty, row_range, row_lit, row_record)
+                        self.collection_literal_ty(&operand, family)
+                            .unwrap_or_else(|| self.literal_return_ty(kind, declared))
+                    };
+                    (
+                        ty,
+                        self.untyped_literal_span(&operand).unwrap_or(operand.range),
+                        false,
+                        false,
+                    )
+                } else {
+                    // The element expression's own row: the outermost row
+                    // spanning the trimmed window exactly — an inner row
+                    // (`{k: f()}`'s `f` leaf, `a + b`'s `b`) types its own
+                    // operand, never the element. A nested literal's `]`/`}`
+                    // row drains into the deferred queue at its own close,
+                    // so both stacks scan.
+                    let (s16, e16) = (self.utf16_of(ws), self.utf16_of(we));
+                    let exact = |row: &&Row| {
+                        row.range.offset == s16
+                            && row.range.end() == e16
+                            && !matches!(row.shape, RowShape::TypeUse(..))
+                    };
+                    let row = self
+                        .rows
+                        .iter()
+                        .rev()
+                        .take_while(|row| row.range.offset >= s16)
+                        .find(|row| exact(row))
+                        .or_else(|| {
+                            self.deferred_miss_rows
+                                .iter()
+                                .rev()
+                                .take_while(|row| row.range.offset >= s16)
+                                .find(|row| exact(row))
+                        })
+                        .cloned();
+                    match row {
+                        Some(row) => {
+                            let mut ty = self.operand_static_ty(&row);
+                            if ty == Ty::UNKNOWN {
+                                // A for-in body element whose loop variable's
+                                // element type only the pass-2 pre-pass derives
+                                // (`local_init_rows` — the iterable literal's
+                                // row was still opaque at `)` close): the
+                                // element check fires at parse time, before that
+                                // pass exists, so the literal channel answers
+                                // the same face itself.
+                                ty = self.for_in_literal_element_ty(&row).unwrap_or(Ty::UNKNOWN);
+                            }
+                            if ty == Ty::UNKNOWN {
+                                continue;
+                            }
+                            (
+                                ty,
+                                row.range,
+                                self.is_int_literal_row(&row),
+                                matches!(row.shape, RowShape::Record(_)),
+                            )
+                        }
+                        None => {
+                            // No single row spans the window (a composite
+                            // operand the row model leaves unfolded): keep the
+                            // legacy last-typed-row posture — the element's
+                            // inner row is the best face available. A control
+                            // segment's multi-arm body never folds to one row,
+                            // so the leaf grab stays off it entirely.
+                            if control {
+                                continue;
+                            }
+                            let stop16 = e16;
+                            let Some((row_ty, row_range, row_lit, row_record)) = self
+                                .rows
+                                .iter()
+                                .rev()
+                                .find(|row| {
+                                    row.ty != Ty::UNKNOWN
+                                        && row.range.offset >= s16
+                                        && row.range.end() <= stop16
+                                })
+                                .map(|row| {
+                                    (
+                                        row.ty,
+                                        row.range,
+                                        self.is_int_literal_row(row),
+                                        matches!(row.shape, RowShape::Record(_)),
+                                    )
+                                })
+                            else {
+                                continue;
+                            };
+                            (row_ty, row_range, row_lit, row_record)
+                        }
                     }
-                }
-            };
+                };
             if spread {
                 // A spread element contributes its operand's ELEMENT type
                 // (type_analyzer.dart's spread-element resolution), never
@@ -2798,7 +2798,10 @@ impl<'a> Engine<'a> {
                                 (_, RefTarget::Member { container }) => {
                                     if let Ty::Named { name, .. } =
                                         self.member_declared_ty(container, receiver.name)
-                                        && matches!(self.walk_members(name, row.name), Walk::Found(_))
+                                        && matches!(
+                                            self.walk_members(name, row.name),
+                                            Walk::Found(_)
+                                        )
                                     {
                                         return (name, None);
                                     }
@@ -2816,7 +2819,10 @@ impl<'a> Engine<'a> {
                                 (_, RefTarget::Local) => {
                                     let ty = self.receiver_static_ty(receiver);
                                     if let named @ Ty::Named { name, .. } = self.fold_alias_ty(ty)
-                                        && matches!(self.walk_members(name, row.name), Walk::Found(_))
+                                        && matches!(
+                                            self.walk_members(name, row.name),
+                                            Walk::Found(_)
+                                        )
                                     {
                                         return (name, Some(named));
                                     }
@@ -3047,9 +3053,7 @@ impl<'a> Engine<'a> {
                             Ty::Named {
                                 name,
                                 nullable: false,
-                                args: self
-                                    .boundary
-                                    .intern_list(&vec![Ty::Unknown; arity]),
+                                args: self.boundary.intern_list(&vec![Ty::Unknown; arity]),
                             }
                         }
                     })
@@ -8244,9 +8248,11 @@ impl<'a> Engine<'a> {
         }
         let from_primitive = self.members.primitive_ids.contains(&from);
         if from_primitive
-            && crate::switch_tracker::CORE_SUPERTYPES.iter().any(|&(sub, sup)| {
-                self.strings.resolve(from) == sub && self.strings.resolve(to) == sup
-            })
+            && crate::switch_tracker::CORE_SUPERTYPES
+                .iter()
+                .any(|&(sub, sup)| {
+                    self.strings.resolve(from) == sub && self.strings.resolve(to) == sup
+                })
         {
             // The lattice's own accept (`int <: num`) — the caller's matrix
             // answers the positive; the negative never overturns it.
@@ -9024,7 +9030,11 @@ impl<'a> Engine<'a> {
             // `FutureOr<top> Function()` sibling (#3999).
             return Some(match sup {
                 Ty::Dynamic | Ty::Void => true,
-                Ty::Named { name, nullable: true, .. } if name == self.intern("Object") => true,
+                Ty::Named {
+                    name,
+                    nullable: true,
+                    ..
+                } if name == self.intern("Object") => true,
                 Ty::Named { name, .. } if name == self.intern("FutureOr") => {
                     self.slot_subtype(
                         Ty::Named {

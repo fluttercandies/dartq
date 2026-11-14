@@ -4265,9 +4265,7 @@ impl Interp<'_> {
                 let (branch, shadowed) = match frame {
                     Frame::Branch { branch, .. } => (branch, Vec::new()),
                     Frame::If {
-                        branch,
-                        shadowed,
-                        ..
+                        branch, shadowed, ..
                     } => (branch, shadowed),
                     // The element close only ever pairs with its own open:
                     // a mismatched frame is recovery bleed — treat it as a

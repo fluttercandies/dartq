@@ -919,10 +919,7 @@ impl FeatureGrants {
             // its subtree from the CLI base) and `Some([])` resolve
             // identically today — fold the distinction anyway so a future
             // semantic split cannot alias old keys.
-            field(
-                &mut bytes,
-                &[u8::from(flags.is_some())],
-            );
+            field(&mut bytes, &[u8::from(flags.is_some())]);
             for flag in flags.unwrap_or_default() {
                 field(&mut bytes, format!("{flag:?}").as_bytes());
             }
@@ -2429,12 +2426,10 @@ impl EngineState {
         let adopted: Vec<(LibraryId, [u8; 16], LibraryResult, LibraryIndex)> = decoded
             .into_par_iter()
             .filter_map(|(library, key, fingerprint, payload)| {
-                let (run, surface) = payload.materialize(
-                    &fingerprint,
-                    &codes,
-                    strings,
-                    &mut |path| minted.get(path).copied(),
-                )?;
+                let (run, surface) =
+                    payload.materialize(&fingerprint, &codes, strings, &mut |path| {
+                        minted.get(path).copied()
+                    })?;
                 Some((library, key, run, surface))
             })
             .collect();
@@ -2626,8 +2621,7 @@ impl EngineState {
             else {
                 continue;
             };
-            let Some(payload) =
-                persist::PersistedLibraryRun::of(result, surface, files, strings)
+            let Some(payload) = persist::PersistedLibraryRun::of(result, surface, files, strings)
             else {
                 continue;
             };
@@ -3131,7 +3125,11 @@ impl EngineState {
             ),
             ("scanned_cache_tokens", as_u64(scanned), "exact"),
             ("scanned_map_slots", as_u64(scanned_slots), "exact"),
-            ("scanned_cache_hits", self.scanned_hits.load(Ordering::Relaxed), "count"),
+            (
+                "scanned_cache_hits",
+                self.scanned_hits.load(Ordering::Relaxed),
+                "count",
+            ),
             (
                 "scanned_cache_misses",
                 self.scanned_misses.load(Ordering::Relaxed),
@@ -3500,7 +3498,8 @@ mod tests {
         let minted = mint_run_paths(&mut files, spellings.into_iter());
 
         assert_eq!(
-            minted[Path::new("/w/lib/main.dart")], existing,
+            minted[Path::new("/w/lib/main.dart")],
+            existing,
             "a pre-existing path keeps its id — the mint never re-allocates"
         );
         let sdk_id = minted[sdk];
