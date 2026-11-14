@@ -236,6 +236,10 @@ pub(crate) enum Request {
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
+        /// The serve-early opt-in (#4268): answer the aims before the
+        /// session's workspace settles (see [`Drain::serve_early`]). Off by
+        /// default; the plain face is byte-identical to the settled one.
+        serve_early: bool,
     },
     Check {
         paths: Vec<PathBuf>,
@@ -410,6 +414,7 @@ impl Request {
             Self::Rename { .. } => Verbosity::Compact,
         }
     }
+
 }
 
 /// Whether `method` is one of the `dartq/*` faces this module serves.
@@ -440,6 +445,8 @@ struct AnalyzeParams {
     format: Option<RenderFormat>,
     #[serde(default)]
     verbosity: Verbosity,
+    #[serde(default)]
+    serve_early: bool,
 }
 
 #[derive(Deserialize)]
@@ -749,12 +756,40 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
                     return Err("the rendered dartq/analyze face answers the base view".into());
                 }
             }
+            // The serve-early opt-in (#4268) is a per-file answer: the
+            // engine's file-aim turn answers exactly the targets' libraries
+            // (a directory target spans whole libraries, and a path-less ask
+            // is the whole workspace by definition). Refuse the shapes the
+            // mode cannot honor instead of silently answering a settled
+            // full turn the caller did not ask for.
+            if decoded.serve_early {
+                if agent.is_some() {
+                    return Err(
+                        "serve_early answers the base view; drop agent_id or the flag".into(),
+                    );
+                }
+                if targets.is_empty() {
+                    return Err(
+                        "serve_early answers per-file asks: name one or more file targets".into(),
+                    );
+                }
+                if let Some(dartq_commands::analyze::Target::Dir(dir)) = targets
+                    .iter()
+                    .find(|target| matches!(target, dartq_commands::analyze::Target::Dir(_)))
+                {
+                    return Err(format!(
+                        "serve_early answers per-file asks: {} is a directory; name files",
+                        dir.display()
+                    ));
+                }
+            }
             Ok(Request::Analyze {
                 targets,
                 format: decoded.format,
                 verbosity: decoded.verbosity,
                 agent,
                 context,
+                serve_early: decoded.serve_early,
             })
         }
         "dartq/check" | "dartq/fix" => parse_check_or_fix(method, params, root),
@@ -1530,6 +1565,14 @@ pub(crate) struct Drain<'a> {
     /// the read view crosses into the answer workers, and full-tier
     /// shortening — the only writer — runs on the session thread.
     pub symbols: &'a SymbolTable,
+    /// Whether this group's analysis was the serve-early turn (#4268):
+    /// the engine's file-aim pass ran from a context whose workspace has
+    /// not settled, so every `dartq/analyze` answer of the group carries
+    /// the may-precede-settle marker ([`SERVE_EARLY_MARKER`]). The
+    /// session sets this only for a base group whose every request opted
+    /// in; the default path always leaves it `false`, which keeps the
+    /// plain answer's bytes untouched.
+    pub serve_early: bool,
 }
 
 /// The package config one analysis universe was assembled from, with the
@@ -1813,6 +1856,14 @@ fn memory_answer(drain: &Drain<'_>) -> Value {
 /// the rendered stdout bytes of the same writer the cold CLI face prints
 /// through (`rendered_answer`), beside the severity counts and the
 /// workspace advisory.
+///
+/// A serve-early group's answers (#4268) carry one extra top-level field,
+/// `settle: "may-precede-settle"` ([`SERVE_EARLY_MARKER`]): the rows are
+/// the asked files' settled rows (the engine's file-aim contract), but
+/// the session's workspace had not been analyzed whole when they were
+/// computed, so a client must not read the answer as "the workspace is
+/// fully analyzed". The field is absent on every settled answer — the
+/// default path's bytes are untouched.
 pub(crate) fn analyze_answer(
     drain: &Drain<'_>,
     verbosity: Verbosity,
@@ -1843,7 +1894,13 @@ pub(crate) fn analyze_answer(
         files: &document,
     };
     if let Some(format) = format {
-        return rendered_answer(format, &output, drain.advisory, drain.package_stamp);
+        return rendered_answer(
+            format,
+            &output,
+            drain.advisory,
+            drain.package_stamp,
+            drain.serve_early,
+        );
     }
     let mut answer = dartq_commands::analyze::diags_document(&output);
     if verbosity == Verbosity::Minimal
@@ -1856,7 +1913,27 @@ pub(crate) fn analyze_answer(
             }
         }
     }
-    session_answer(answer, verbosity, None, drain, &[("diags", "file")])
+    let mut answer = session_answer(answer, verbosity, None, drain, &[("diags", "file")]);
+    mark_serve_early(&mut answer, drain.serve_early);
+    answer
+}
+
+/// The serve-early answer's marker value (#4268): the answer was computed
+/// from the aims' libraries while the session's workspace was still
+/// settling, so its rows may precede the settled run's — the client's
+/// signal to treat the workspace, not the asked files, as unanalyzed. The
+/// engine's file-aim contract keeps the asked files' rows equal to the
+/// settled run's; the marker is the one field that says which state
+/// produced them.
+pub(crate) const SERVE_EARLY_MARKER: &str = "may-precede-settle";
+
+/// Stamps the serve-early marker onto one answer value (#4268): absent on
+/// every settled answer, so the default path's bytes (and the answer
+/// cache's stored bytes) are exactly today's.
+fn mark_serve_early(answer: &mut Value, serve_early: bool) {
+    if serve_early {
+        answer["settle"] = json!(SERVE_EARLY_MARKER);
+    }
 }
 
 /// The routed one-shot answer (#2627): the rendered stdout bytes of the
@@ -1875,6 +1952,7 @@ fn rendered_answer(
     output: &AnalysisOutput<'_>,
     advisory: Option<&WorkspaceAdvisory>,
     package_stamp: Option<&PackageStamp>,
+    serve_early: bool,
 ) -> Value {
     let mut stdout = Vec::new();
     let rendered = match format {
@@ -1899,7 +1977,7 @@ fn rendered_answer(
                     dartq_diagnostics::Severity::Info => (e, w, i + 1),
                 }
             });
-    json!({
+    let mut answer = json!({
         "v": SCHEMA_VERSION,
         "stdout": String::from_utf8(stdout).expect("the writers emit UTF-8"),
         "counts": {"error": errors, "warning": warnings, "info": infos},
@@ -1908,7 +1986,14 @@ fn rendered_answer(
             "message": advisory.message(),
         })),
         "packages": package_stamp.map(PackageStamp::wire),
-    })
+    });
+    // The marker rides the envelope, never the rendered bytes: the stdout
+    // document is the cold face's own (the oracle envelope keeps its key
+    // set; the lon face keeps the CLI document's), so a serve-early answer
+    // stays byte-comparable with the settled one while the envelope — the
+    // machine face a routed caller reads — names the state.
+    mark_serve_early(&mut answer, serve_early);
+    answer
 }
 
 /// The routed one-shot answer over a value-shaped face (#2629): the
@@ -2032,7 +2117,7 @@ fn check_disk_view(
         // No advisory and no universe stamp: the M0 pipeline is scan+parse
         // over the disk — its bytes read no package universe, so there is
         // nothing for the caller to verify against the disk.
-        return Ok(rendered_answer(format, &output, None, None));
+        return Ok(rendered_answer(format, &output, None, None, false));
     }
     let diags: Vec<Value> = output
         .diagnostics

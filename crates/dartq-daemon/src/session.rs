@@ -291,6 +291,15 @@ pub struct SessionRuntime {
     /// caller-built stores as-is — the A/B posture for the store
     /// decomposition comparison.
     pub pooled_mapped_store: bool,
+    /// The serve-early opt-in at session scope (#4268): `dartq daemon
+    /// --serve-early` turns it on for the session. Every base-view
+    /// `dartq/analyze` then answers per-file asks before the workspace
+    /// settles, each answer carrying `settle: "may-precede-settle"`. The
+    /// per-request `serve_early` parameter still opts a single ask in on
+    /// an unflagged session; either source sets the request's flag — the
+    /// session flag has no per-request opt-out. `false` keeps the
+    /// per-request-only posture (the default).
+    pub serve_early: bool,
 }
 
 impl Default for SessionRuntime {
@@ -300,6 +309,7 @@ impl Default for SessionRuntime {
             trace: None,
             content_store_limit: None,
             pooled_mapped_store: true,
+            serve_early: false,
         }
     }
 }
@@ -682,14 +692,16 @@ type ViewGroup = (Option<String>, Vec<(RequestId, Request)>);
 type AnswerKey = (ContextId, Vec<u8>, commands::RenderFormat);
 
 /// The key for one request, `None` when the request is not a cacheable
-/// rendered base-view analyze (another face, a `None` format, or an agent
+/// rendered base-view analyze (another face, a `None` format, an agent
 /// view — the agent's wear makes its answers a per-overlay function the
-/// base epoch does not observe).
+/// base epoch does not observe — or the serve-early opt-in, whose marked
+/// answer must never be served to a settled caller, #4268).
 fn answer_key(context: ContextId, request: &Request) -> Option<AnswerKey> {
     let Request::Analyze {
         targets,
         format: Some(format),
         agent: None,
+        serve_early: false,
         ..
     } = request
     else {
@@ -1138,6 +1150,16 @@ pub struct Session {
     /// context-tagged or agent requests ride the read, so the diff still
     /// goes out.
     publishes_due: bool,
+    /// The contexts whose workspace has settled (#4268): a context enters
+    /// after one completed untargeted analysis — every live library's rows
+    /// are current — and the whole set empties whenever content moved
+    /// underneath the standing rows (an applied write, a refresh pass that
+    /// reloaded or removed a file, a universe rebuild, the startup walk),
+    /// the events one full turn is needed to absorb. A serve-early ask is
+    /// eligible only for a context that is absent here: once settled, the
+    /// plain answer is the correct (and cheapest) one, so the opt-in
+    /// degrades to the default face with no marker.
+    settled: FxHashSet<ContextId>,
     /// Whether any context has walked its workspace yet (#2591's lazy
     /// boot): the walk runs on the first drain staging engine work, not
     /// at startup — see [`Session::refresh_workspace_state`].
@@ -1167,6 +1189,11 @@ pub struct Session {
     context_memory_limit_mib: u64,
     context_content_store_limit: Option<u64>,
     context_traced: bool,
+    /// The session-wide serve-early opt-in (#4268), copied from
+    /// [`SessionRuntime::serve_early`] at assembly: `true` ORs into every
+    /// `dartq/analyze` request's `serve_early` flag at intake, so the
+    /// whole session answers per-file asks before the workspace settles.
+    serve_early: bool,
     /// Whether the refresh walk's live-path skip has been reported (#2596)
     /// — the once-per-session stderr line for paths the ceiling refused.
     refresh_skip_reported: bool,
@@ -1633,6 +1660,7 @@ impl Session {
             answer_epoch: 0,
             answers: AnswerCache::default(),
             publishes_due: false,
+            settled: FxHashSet::default(),
             discovered: false,
             config_stamps,
             config_advisory: None,
@@ -1640,6 +1668,7 @@ impl Session {
             context_memory_limit_mib,
             context_content_store_limit,
             context_traced,
+            serve_early: session_runtime.serve_early,
             refresh_skip_reported: false,
             symbols: commands::SymbolTable::default(),
             lint_memo: dartq_commands::lints::LintMemo::default(),
@@ -1713,6 +1742,9 @@ impl Session {
     /// Discovery I/O.
     pub fn sweep(&mut self) -> Result<(), SessionError> {
         self.discovered = true;
+        // Re-discovery re-enqueues the whole walk's content: every context
+        // reopens the settle (#4268).
+        self.settled.clear();
         for index in 0..self.context_ids.len() {
             self.engine_mut(self.context_ids[index])
                 .discover_workspace()?;
@@ -1802,6 +1834,8 @@ impl Session {
             }
             if moved {
                 self.invalidate_answers();
+                // Reloaded or removed content reopens the settle (#4268).
+                self.settled.clear();
             }
         }
         // The serve face's `dartq.yaml` advisory (#4106): ticked on this
@@ -2057,8 +2091,10 @@ impl Session {
             self.published.clear();
             self.publishes_due = true;
             // A fresh universe re-keys every file id and moves the answer's
-            // package stamp (#4240): no frozen answer survives it.
+            // package stamp (#4240): no frozen answer survives it, and no
+            // context stays settled (#4268).
             self.invalidate_answers();
+            self.settled.clear();
             self.pub_config = pub_config;
             self.config_dir = config_dir;
             let fresh_plugins =
@@ -2302,6 +2338,16 @@ impl Session {
     /// post-write state. Crate-internal: the wire face is
     /// [`crate::server`]'s method table.
     pub(crate) fn queue_command(&mut self, id: RequestId, request: Request) {
+        // The session-wide serve-early opt-in (#4268): a `dartq daemon
+        // --serve-early` session ORs its flag into every analyze ask at
+        // intake — the request-level parameter still opts a single ask in
+        // on an unflagged session, and there is no per-request opt-out.
+        let mut request = request;
+        if self.serve_early
+            && let Request::Analyze { serve_early, .. } = &mut request
+        {
+            *serve_early = true;
+        }
         let context = self.route(request.context());
         self.ensure_read(context, Tier::Interactive);
         if let Some(pending) = self
@@ -2982,8 +3028,10 @@ impl Session {
                     self.snapshot.note_apply();
                     self.cursor += 1;
                     // Content moved (#4240): no frozen answer survives a
-                    // landed write.
+                    // landed write, and the write's dirty libraries reopen
+                    // the settle (#4268).
                     self.invalidate_answers();
+                    self.settled.clear();
                     for change in &changes {
                         match change {
                             OverlayChange::Set { path, bytes } => {
@@ -3032,8 +3080,10 @@ impl Session {
                     // The containment says the write did not land, but a
                     // mid-fan-out panic may have applied some contexts
                     // (#4240): treat the content as moved — one full turn
-                    // is the cheap side of that uncertainty.
+                    // is the cheap side of that uncertainty — and reopen the
+                    // settle for the same reason (#4268).
                     self.invalidate_answers();
+                    self.settled.clear();
                     // Re-stage the taken changes (last-wins merge with
                     // anything a new edit stages) WITHOUT re-enqueueing
                     // the write task: the next real intake re-queues via
@@ -3678,6 +3728,33 @@ impl Session {
             self.restore_base_view();
         }
 
+        // The serve-early opt-in (#4268): a base group made entirely of
+        // serve-early file asks, on a context whose workspace has not
+        // settled, runs the engine's file-aim turn — the aims' libraries
+        // recompute while every other dirty library waits for the settle —
+        // and answers with the may-precede-settle marker. The turn is a
+        // pure read: it never runs the publish plan, so a due publish diff
+        // stays due and the baseline is untouched — the next full turn
+        // drains it exactly as if this ask had never arrived. A settled
+        // context takes the ordinary path below — the same answer, minus
+        // the marker — and every other shape (a directory aim, an
+        // unresolvable file, a mixed group) falls back to today's full
+        // turn, unmarked: the opt-in is best-effort latency, never a
+        // semantic fork.
+        if let Some(aims) = self.serve_early_aims(context, agent, &requests) {
+            self.run_serve_early_group(context, aims, requests, turn);
+            // The early turn never settles the context, so the full turn
+            // this ask deferred is always owed: re-queue the read so the
+            // next drain runs the settle — publish plan included — exactly
+            // as if this ask had never arrived. A due publish diff is one
+            // reason the settle is owed; an unsettled workspace is the
+            // other.
+            if !self.settled.contains(&context) {
+                self.ensure_read(context, Tier::Normal);
+            }
+            return;
+        }
+
         // The warm-turn answer cache (#4240): a base group whose every
         // request is a rendered analyze the cache holds under the current
         // epoch answers without the engine turn — the whole-library
@@ -3704,7 +3781,7 @@ impl Session {
             }
         }
 
-        let Ok(diagnostics) = self.analyze_with_lints(context) else {
+        let Ok(diagnostics) = self.analyze_with_lints(context, &[]) else {
             for (id, _) in requests {
                 turn.answers.push((id, Err(SessionError::Cancelled)));
             }
@@ -3773,6 +3850,7 @@ impl Session {
             package_stamp: self.package_stamp.as_ref(),
             overlay_paths: &overlay_paths,
             symbols: &self.symbols,
+            serve_early: false,
         };
         let answers_before = turn.answers.len();
         Self::answer_requests(&drain, requests, &mut turn.answers);
@@ -3800,14 +3878,132 @@ impl Session {
         }
     }
 
+    /// The serve-early turn's aim set (#4268): `Some` when this group may
+    /// answer before the workspace settles — the base view, the context
+    /// unsettled, and every request an opt-in ask whose `.dart` targets
+    /// are resident — `None` otherwise, which is today's full turn,
+    /// unmarked.
+    ///
+    /// A due publish diff does not block the early path: the serve-early
+    /// turn is a pure read — it never runs the publish plan, so the diff
+    /// stays due for the next full turn exactly as if this ask had never
+    /// arrived. The marker is the client's signal that the workspace,
+    /// not the asked files, is what remains unanalyzed.
+    ///
+    /// Each aim resolves through the same table the engine's file-aim turn
+    /// reads, and an unresolvable target (a skipped, excluded, or unseen
+    /// path) falls back to the full turn rather than answering without it:
+    /// the opt-in buys latency, never a different row set. A non-`.dart`
+    /// file target cannot move the answer (the shared `covered` rule emits
+    /// no row for it) and therefore neither joins nor blocks the aim — the
+    /// same rule the cold CLI's file-aim derivation applies.
+    fn serve_early_aims(
+        &self,
+        context: ContextId,
+        agent: Option<&str>,
+        requests: &[(RequestId, Request)],
+    ) -> Option<Vec<FileId>> {
+        if agent.is_some() || self.settled.contains(&context) {
+            return None;
+        }
+        let files = self.engine(context).file_table();
+        let mut aims = Vec::new();
+        for (_, request) in requests {
+            let Request::Analyze {
+                targets,
+                serve_early: true,
+                ..
+            } = request
+            else {
+                return None;
+            };
+            for target in targets {
+                match target {
+                    // A directory aim's covered set spans whole libraries:
+                    // no per-file slice exists, so the group takes the
+                    // full turn.
+                    dartq_commands::analyze::Target::Dir(_) => return None,
+                    dartq_commands::analyze::Target::File(path)
+                        if !path.extension().is_some_and(|ext| ext == "dart") => {}
+                    dartq_commands::analyze::Target::File(path) => {
+                        aims.push(files.try_file_id(path)?);
+                    }
+                }
+            }
+        }
+        aims.sort_unstable();
+        aims.dedup();
+        (!aims.is_empty()).then_some(aims)
+    }
+
+    /// One serve-early group's turn (#4268): the file-aim analysis, then
+    /// the group's answers from it — every one carrying the marker and
+    /// nothing else. No publish plan drains (no diff was due; a partial
+    /// row set must never enter the baseline), the plugin weave never runs
+    /// (its rows are workspace-wide observables a settled turn owns), and
+    /// the warm-turn answer cache neither serves nor stores this group
+    /// ([`answer_key`] refuses the opt-in, so a marked answer can never be
+    /// re-served to a settled caller). The context stays unsettled: the
+    /// libraries outside the aim remain dirty for the next full turn —
+    /// exactly what the marker announces to the client.
+    fn run_serve_early_group(
+        &mut self,
+        context: ContextId,
+        aims: Vec<FileId>,
+        requests: Vec<(RequestId, Request)>,
+        turn: &mut Turn,
+    ) {
+        let Ok(diagnostics) = self.analyze_with_lints(context, &aims) else {
+            for (id, _) in requests {
+                turn.answers.push((id, Err(SessionError::Cancelled)));
+            }
+            return;
+        };
+        let changes = commands::Changes::new(&self.changed, None);
+        // Disjoint field borrows: runtime (read), workspace_root/changed
+        // (read), symbols (read — the table is mutex-guarded).
+        // Invariant: the read task's context is session-lived, so the state lookup cannot miss.
+        let engine = self
+            .runtime
+            .context_state(context)
+            .expect("the read task's context lives for the session");
+        let drain = commands::Drain {
+            engine,
+            root: &self.workspace_root,
+            sdk_root: &self.sdk_root,
+            diagnostics: &diagnostics,
+            changes: &changes,
+            cursor: self.cursor,
+            advisory: self.workspace_advisory.as_ref(),
+            package_stamp: self.package_stamp.as_ref(),
+            overlay_paths: &[],
+            symbols: &self.symbols,
+            serve_early: true,
+        };
+        Self::answer_requests(&drain, requests, &mut turn.answers);
+    }
+
     /// The group's analysis: the engine turn plus the resident files' lint
     /// rows (#355) — memoized (#772), so a quiet turn parses only the
     /// turn's changed files — joined before the caller's severity-first
     /// sort so the answers keep the CLI analyze face's order. The context
     /// engine is borrowed mutably through `runtime` directly so the memo
     /// field borrows disjointly.
-    fn analyze_with_lints(&mut self, context: ContextId) -> Result<Vec<Diagnostic>, Cancelled> {
-        let mut diagnostics = self.analyze(context)?;
+    ///
+    /// `targets` slices the engine turn to the file-aim's libraries
+    /// (#4268's serve-early turn); the lint stage still walks every
+    /// resident library (memoized — a settled workspace's rows are cache
+    /// hits), and the caller's `covered` filter keeps only the aim files'
+    /// rows. The engine analysis is the expensive half and is scoped;
+    /// the lint pass is parallel and memo-hit dominated, so the targeted
+    /// turn's cost is the aim's libraries, not the workspace's. An empty
+    /// set is the full turn.
+    fn analyze_with_lints(
+        &mut self,
+        context: ContextId,
+        targets: &[FileId],
+    ) -> Result<Vec<Diagnostic>, Cancelled> {
+        let mut diagnostics = self.analyze_with_targets(context, targets)?;
         let lint_roots = [self.workspace_root().to_path_buf()];
         // Invariant: session contexts are opened at assembly and never closed, so the
         // state lookup cannot miss.
@@ -4585,17 +4781,43 @@ impl Session {
     /// stops the recompute inside the checkpoint stride, so the turn —
     /// and the shutdown ladder behind it — is no longer hostage to a
     /// slow analysis.
-    fn analyze(&mut self, context: ContextId) -> Result<Vec<Diagnostic>, Cancelled> {
+    ///
+    /// `targets` is the engine's file-aim set (#4234): non-empty runs the
+    /// targeted turn — only the libraries owning those files
+    /// recompute/replay, and the returned set is exactly their rows — so
+    /// the serve-early face (#4268) answers one file's libraries while
+    /// every other dirty library waits for the settle. An empty set is the
+    /// full turn and, when it completes, settles the context: the rows of
+    /// every live library are current from here until content or the
+    /// universe next moves.
+    fn analyze_with_targets(
+        &mut self,
+        context: ContextId,
+        targets: &[FileId],
+    ) -> Result<Vec<Diagnostic>, Cancelled> {
         let mut rejections = Vec::new();
         // A clone against the disjoint-field rule: the engine borrow is
         // `&mut self`, so the token travels by `Arc` — one refcount bump
         // per analysis, nothing on the checkpoint path.
         let quit = self.quit.clone();
-        let analyzed =
-            self.engine_mut(context)
-                .analyze(&[], &mut rejection_collector(&mut rejections), &quit);
+        let analyzed = self.engine_mut(context).analyze(
+            targets,
+            &mut rejection_collector(&mut rejections),
+            &quit,
+        );
         self.note_rejections(rejections);
-        analyzed
+        let rows = analyzed?;
+        if targets.is_empty() {
+            self.settled.insert(context);
+        }
+        Ok(rows)
+    }
+
+    /// The untargeted full-turn alias the tests drive directly; production
+    /// callers go through [`Self::analyze_with_lints`].
+    #[cfg(test)]
+    fn analyze(&mut self, context: ContextId) -> Result<Vec<Diagnostic>, Cancelled> {
+        self.analyze_with_targets(context, &[])
     }
 
     /// The one-shot plugin crash row's exact marker: the crash CODE under the
@@ -5019,6 +5241,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5123,6 +5346,7 @@ mod tests {
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
+                    serve_early: false,
                 },
             );
             let turn = session.service();
@@ -5317,6 +5541,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5358,6 +5583,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5395,6 +5621,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5457,6 +5684,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5506,6 +5734,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5599,6 +5828,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5672,6 +5902,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         fs::write(&main, CLEAN_MAIN).expect("rewrite on disk");
@@ -5686,6 +5917,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5734,6 +5966,7 @@ mod tests {
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
+                    serve_early: false,
                 },
             );
         }
@@ -5745,6 +5978,7 @@ mod tests {
                 verbosity: Verbosity::Full,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5816,6 +6050,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         fs::write(&main, CLEAN_MAIN).expect("rewrite on disk");
@@ -5851,6 +6086,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5911,6 +6147,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -5942,6 +6179,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         session.cancel_request(&RequestId::Num(1));
@@ -5994,6 +6232,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -6038,6 +6277,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -6181,6 +6421,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         session.cancel_request(&RequestId::Num(2));
@@ -6236,6 +6477,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         session.cancel_request(&RequestId::Num(3));
@@ -6367,6 +6609,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -6586,6 +6829,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -6651,6 +6895,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         session.queue_command(
@@ -6661,6 +6906,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         session.cancel_request(&RequestId::Num(2));
@@ -6714,6 +6960,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         session.cancel_request(&RequestId::Num(99));
@@ -6737,6 +6984,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -6806,6 +7054,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -6869,6 +7118,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -6898,6 +7148,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7019,6 +7270,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7111,6 +7363,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7157,6 +7410,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7205,6 +7459,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7239,6 +7494,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7475,6 +7731,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7627,6 +7884,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7641,6 +7899,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7661,6 +7920,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7727,6 +7987,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7935,6 +8196,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -7960,6 +8222,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -8008,6 +8271,7 @@ mod tests {
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
+                    serve_early: false,
                 },
             );
         }
@@ -8056,6 +8320,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -8173,6 +8438,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         crate::probe::arm_read_panic();
@@ -8323,6 +8589,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -8408,6 +8675,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         // Groups sort base first, so the armed trigger fires on the base
@@ -8443,6 +8711,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -8483,6 +8752,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         // The agent group is the turn's second (base sorts first): the
@@ -8736,6 +9006,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -8777,6 +9048,7 @@ mod tests {
                     verbosity: Verbosity::Compact,
                     agent: Some(agent),
                     context: None,
+                    serve_early: false,
                 },
             );
             let turn = session.service();
@@ -8803,6 +9075,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: Some(format!("agent-{}", count - 1)),
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -8850,6 +9123,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -9433,6 +9707,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         session.queue_command(
@@ -9443,6 +9718,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -9499,6 +9775,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -9561,6 +9838,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("a".into()),
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -9628,6 +9906,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         warm.queue_command(
@@ -9638,6 +9917,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
+                serve_early: false,
             },
         );
         let turn = warm.service();
@@ -9779,6 +10059,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -9976,6 +10257,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -10024,6 +10306,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -10056,6 +10339,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -10105,6 +10389,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -10129,6 +10414,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -10165,6 +10451,7 @@ mod tests {
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
+                    serve_early: false,
                 },
             );
             let turn = session.service();
@@ -10190,6 +10477,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let _ = session.service();
@@ -10203,6 +10491,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let _ = session.service();
@@ -10269,6 +10558,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -10448,6 +10738,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -10663,6 +10954,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -10706,6 +10998,7 @@ mod tests {
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
+                serve_early: false,
             },
         );
         let turn = session.service();
@@ -10857,6 +11150,7 @@ mod tests {
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
+                    serve_early: false,
                 },
             );
             crate::probe::reset_counters();
@@ -10958,6 +11252,7 @@ mod tests {
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
+                    serve_early: false,
                 },
             );
             crate::probe::reset_counters();
@@ -11009,5 +11304,414 @@ mod tests {
             served[0].len()
         );
         fs::remove_dir_all(&workspace.root).ok();
+    }
+
+    // ---- serve-early (#4268) ----
+
+    /// The analyzed-view answer payload for one queued analyze request:
+    /// the `as_value` view of whichever turn answered it. `format: None`
+    /// takes the structured `diags` document — the row-level face the
+    /// equivalence tests compare.
+    fn analyze_answer(
+        session: &mut Session,
+        id: i64,
+        targets: Vec<dartq_commands::analyze::Target>,
+        serve_early: bool,
+    ) -> serde_json::Value {
+        session.queue_command(
+            RequestId::Num(id),
+            Request::Analyze {
+                targets,
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early,
+            },
+        );
+        let turn = session.service();
+        turn.answers
+            .iter()
+            .find(|(rid, _)| *rid == RequestId::Num(id))
+            .and_then(|(_, answer)| answer.as_ref().ok())
+            .expect("the analyze request answers")
+            .as_value()
+            .into_owned()
+    }
+
+    /// A `lib/a.dart` + `lib/b.dart` workspace: `a.dart` declares `Foo` and
+    /// calls an undefined function (one engine row, always present), `b.dart`
+    /// uses `Foo` cleanly.
+    fn two_library_workspace(name: &str) -> Workspace {
+        let workspace = Workspace::new(CLEAN_MAIN);
+        fs::write(
+            workspace.path("lib/a.dart"),
+            "class Foo {\n  void meth() {}\n}\nvoid foo() {}\nvoid broken() { doesNotExist(); }\n",
+        )
+        .expect("write a.dart");
+        fs::write(
+            workspace.path("lib/b.dart"),
+            "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n}\n",
+        )
+        .expect("write b.dart");
+        let _ = name;
+        workspace
+    }
+
+    /// Opt-in on an unsettled context ⇒ the asked file's rows answer with
+    /// the marker; the rows equal the settled run's rows for that file.
+    #[test]
+    fn serve_early_answers_the_asked_file_with_the_marker() {
+        let workspace = two_library_workspace("serve-early-unit-on");
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("serve-early-unit-on")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
+
+        // The startup walk + first drain settle the context — the settled
+        // baseline for the same file.
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        assert!(
+            session.settled.contains(&session.default_context),
+            "the first full turn settles the context"
+        );
+        let a = workspace.path("lib/a.dart");
+        let settled = analyze_answer(
+            &mut session,
+            1,
+            vec![dartq_commands::analyze::Target::File(a.clone())],
+            false,
+        );
+        assert!(settled.get("settle").is_none(), "settled answers unmarked");
+        assert!(
+            settled["diags"].as_array().is_some_and(|rows| !rows.is_empty()),
+            "the fixture file carries a diagnostic: {settled}"
+        );
+
+        // Dirty the workspace: the write reopens the unsettled window, and
+        // the serve-early ask rides the same drain's read.
+        let b = workspace.path("lib/b.dart");
+        fs::write(&b, "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n")
+            .expect("rewrite b.dart");
+        session.queue_disk_changes(&[b]).expect("disk changes queue");
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                targets: vec![dartq_commands::analyze::Target::File(a.clone())],
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: true,
+            },
+        );
+        let turn = session.service();
+        let early = turn
+            .answers
+            .iter()
+            .find(|(rid, _)| *rid == RequestId::Num(2))
+            .and_then(|(_, answer)| answer.as_ref().ok())
+            .expect("the serve-early ask answers")
+            .as_value()
+            .into_owned();
+        assert_eq!(
+            early["settle"],
+            serde_json::json!("may-precede-settle"),
+            "the early answer carries the marker: {early}"
+        );
+        assert!(
+            !session.settled.contains(&session.default_context),
+            "the early turn never settles the context"
+        );
+        // The asked file's rows equal the settled run's rows.
+        assert_eq!(
+            early["diags"], settled["diags"],
+            "the asked file's rows equal the settled run's"
+        );
+    }
+
+    /// A settled context's serve-early ask degrades to the default face:
+    /// same rows, no marker.
+    #[test]
+    fn serve_early_on_a_settled_context_degrades_unmarked() {
+        let workspace = two_library_workspace("serve-early-unit-settled");
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("serve-early-unit-settled")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        assert!(session.settled.contains(&session.default_context));
+
+        let a = workspace.path("lib/a.dart");
+        let answer = analyze_answer(
+            &mut session,
+            1,
+            vec![dartq_commands::analyze::Target::File(a)],
+            true,
+        );
+        assert!(
+            answer.get("settle").is_none(),
+            "a settled context's serve-early ask answers unmarked: {answer}"
+        );
+    }
+
+    /// A mixed group (one serve-early ask, one plain ask) takes the full
+    /// turn: both answers unmarked and identical.
+    #[test]
+    fn serve_early_mixed_group_falls_back_to_the_full_turn() {
+        let workspace = two_library_workspace("serve-early-unit-mixed");
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("serve-early-unit-mixed")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Reopen the unsettled window.
+        let b = workspace.path("lib/b.dart");
+        fs::write(&b, "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n")
+            .expect("rewrite b.dart");
+        session.queue_disk_changes(&[b]).expect("disk changes queue");
+
+        let a = workspace.path("lib/a.dart");
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                targets: vec![dartq_commands::analyze::Target::File(a.clone())],
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: true,
+            },
+        );
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                targets: vec![dartq_commands::analyze::Target::File(a)],
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: false,
+            },
+        );
+        let turn = session.service();
+        let get = |id: i64| {
+            turn.answers
+                .iter()
+                .find(|(rid, _)| *rid == RequestId::Num(id))
+                .and_then(|(_, answer)| answer.as_ref().ok())
+                .expect("the ask answers")
+                .as_value()
+                .into_owned()
+        };
+        let early = get(2);
+        let plain = get(3);
+        assert!(early.get("settle").is_none(), "mixed group: {early}");
+        assert!(plain.get("settle").is_none(), "mixed group: {plain}");
+        assert_eq!(early, plain, "the full turn served both identically");
+        assert!(
+            session.settled.contains(&session.default_context),
+            "the fallback full turn settles the context"
+        );
+    }
+
+    /// The session-wide opt-in (`SessionRuntime::serve_early`, the
+    /// `--serve-early` flag's session seam): every analyze ask answers
+    /// early, marked — including one that spelled no `serve_early`.
+    #[test]
+    fn serve_early_session_flag_opts_every_analyze_in() {
+        let workspace = two_library_workspace("serve-early-unit-flag");
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("serve-early-unit-flag")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session = Session::with_runtime(
+            workspace.engine_config(),
+            Vec::new(),
+            Some(store),
+            None,
+            SessionRuntime {
+                serve_early: true,
+                ..SessionRuntime::default()
+            },
+        )
+        .expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        let b = workspace.path("lib/b.dart");
+        fs::write(&b, "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n")
+            .expect("rewrite b.dart");
+        session.queue_disk_changes(&[b]).expect("disk changes queue");
+
+        // No serve_early spelled — the session flag sets it.
+        let a = workspace.path("lib/a.dart");
+        let answer = analyze_answer(
+            &mut session,
+            1,
+            vec![dartq_commands::analyze::Target::File(a)],
+            false,
+        );
+        assert_eq!(
+            answer["settle"],
+            serde_json::json!("may-precede-settle"),
+            "the session flag marks the answer: {answer}"
+        );
+    }
+
+    /// The deferred settle: after a serve-early turn the context re-queues
+    /// its read, so the NEXT drain runs the full turn — publishes flow and
+    /// the context settles — with no further client input.
+    #[test]
+    fn serve_early_requeues_the_deferred_settle() {
+        let workspace = two_library_workspace("serve-early-unit-requeue");
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("serve-early-unit-requeue")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        assert!(session.settled.contains(&session.default_context));
+
+        // Dirty + ask early in the same drain.
+        let b = workspace.path("lib/b.dart");
+        fs::write(&b, "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n")
+            .expect("rewrite b.dart");
+        session.queue_disk_changes(&[b]).expect("disk changes queue");
+        let a = workspace.path("lib/a.dart");
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                targets: vec![dartq_commands::analyze::Target::File(a)],
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: true,
+            },
+        );
+        let turn = session.service();
+        assert_eq!(turn.answers.len(), 1, "only the ask answered");
+        assert!(
+            !session.settled.contains(&session.default_context),
+            "still unsettled after the early turn"
+        );
+        assert!(
+            !session.reads.is_empty(),
+            "the deferred settle re-queued a read"
+        );
+
+        // The next drain (no new input — the re-queued read alone) runs
+        // the settle: publishes flow, the context marks settled.
+        let turn = session.service();
+        assert!(
+            session.settled.contains(&session.default_context),
+            "the deferred settle ran and settled the context"
+        );
+        assert!(
+            turn.answers.is_empty(),
+            "the settle turn carries no answers"
+        );
+    }
+
+    /// The warm-turn answer cache never serves a marked answer: a
+    /// serve-early ask's rendered answer is not stored, and a later plain
+    /// ask on the same file answers the settled bytes (no marker).
+    #[test]
+    fn serve_early_answers_never_enter_the_warm_cache() {
+        let workspace = two_library_workspace("serve-early-unit-cache");
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("serve-early-unit-cache")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Reopen the unsettled window and ask early with a rendered format
+        // (the only cacheable shape).
+        let b = workspace.path("lib/b.dart");
+        fs::write(&b, "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n  f.meth();\n}\n")
+            .expect("rewrite b.dart");
+        session.queue_disk_changes(&[b]).expect("disk changes queue");
+        let a = workspace.path("lib/a.dart");
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                targets: vec![dartq_commands::analyze::Target::File(a.clone())],
+                format: Some(crate::commands::RenderFormat::Lon),
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: true,
+            },
+        );
+        let turn = session.service();
+        let early = turn
+            .answers
+            .iter()
+            .find(|(rid, _)| *rid == RequestId::Num(2))
+            .and_then(|(_, answer)| answer.as_ref().ok())
+            .expect("the serve-early ask answers")
+            .as_value()
+            .into_owned();
+        assert_eq!(
+            early["settle"],
+            serde_json::json!("may-precede-settle")
+        );
+
+        // Drain the deferred settle so the context is settled again.
+        let _ = session.service();
+        assert!(session.settled.contains(&session.default_context));
+
+        // A plain rendered ask on the same file: unmarked, and its bytes
+        // are the settled face — never the cached marked answer.
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                targets: vec![dartq_commands::analyze::Target::File(a)],
+                format: Some(crate::commands::RenderFormat::Lon),
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: false,
+            },
+        );
+        let turn = session.service();
+        let plain = turn
+            .answers
+            .iter()
+            .find(|(rid, _)| *rid == RequestId::Num(3))
+            .and_then(|(_, answer)| answer.as_ref().ok())
+            .expect("the plain ask answers")
+            .as_value()
+            .into_owned();
+        assert!(
+            plain.get("settle").is_none(),
+            "the plain ask answers unmarked: {plain}"
+        );
+        assert!(
+            plain["stdout"].as_str().is_some_and(|s| !s.is_empty()),
+            "the rendered answer carries stdout: {plain}"
+        );
     }
 }

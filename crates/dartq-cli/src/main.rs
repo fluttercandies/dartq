@@ -1073,6 +1073,14 @@ struct DaemonArgs {
     /// Unset = no sink and zero event work.
     #[arg(long, value_name = "PATH")]
     trace_events: Option<PathBuf>,
+    /// Serve-early opt-in (#4268): every `dartq/analyze` file-target ask
+    /// answers before the workspace settles, each answer carrying
+    /// `settle: "may-precede-settle"`. The settle turn still runs in the
+    /// background — the marked answer is the asked files' rows, which the
+    /// file-aim turn computes identically to the settled face. Never
+    /// default; per-request `serve_early` remains the single-ask opt-in.
+    #[arg(long)]
+    serve_early: bool,
 }
 
 #[derive(Args)]
@@ -3433,6 +3441,7 @@ fn daemon(args: &DaemonArgs) -> u8 {
             }
         };
     }
+    runtime.serve_early = args.serve_early;
     let assembled = if extras.is_empty() {
         dartq_daemon::Session::with_runtime(config, Vec::new(), None, stale_advisory, runtime)
     } else {
