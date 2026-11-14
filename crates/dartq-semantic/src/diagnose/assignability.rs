@@ -2766,39 +2766,71 @@ impl<'a> Engine<'a> {
         // unindexed-container dispatch below. A fully-contained receiver
         // row (`a.b.c`'s `.b`) yields no table hit and under-reports as
         // before.
-        let container = container.or_else(|| {
-            let index = self
-                .rows
-                .partition_point(|probe| probe.range.offset < row.range.offset);
-            let receiver = self.rows.get(index.checked_sub(1)?)?;
-            (receiver.range.end() <= row.range.offset).then(|| {
-                // An UNQUALIFIED implicit-this receiver (`_reader
-                // .readEnum(...)`, the callee row still the pre-merge
-                // selector at this send-close read): the bare scope
-                // resolves the receiver name to the enclosing
-                // container's member, whose WRITTEN declared type heads
-                // the container the member walk resolves on — and only
-                // when the walk finds the callee there (a foreign or
-                // stub head walks nowhere). Locals resolve to non-member
-                // targets and qualified receivers
-                // (`_sourceTable.$primaryKey`, a chain-computed face)
-                // keep the bare-name path (the SDK static head,
-                // `RangeError.checkValidRange`).
-                if !receiver.qualified {
-                    if let (_, RefTarget::Member { container }) = self.resolve_bare(receiver.name) {
-                        if let Ty::Named { name, .. } =
-                            self.member_declared_ty(container, receiver.name)
-                            && matches!(self.walk_members(name, row.name), Walk::Found(_))
-                        {
-                            return name;
+        // The fallback answers `(container head, receiver static type)`:
+        // the type rides only for a LOCAL receiver — the member's generic
+        // instantiation (`Map<K,V>.remove` answering `V?` → `Object?`
+        // under `Map<String, Object?>`) seeds the container's parameters
+        // from the receiver's written arguments downstream, and a bare
+        // container name alone would leave `V` free.
+        let (container, local_recv_ty) = match container {
+            Some(head) => (head, None),
+            None => {
+                let Some(found) = (|| {
+                    let index = self
+                        .rows
+                        .partition_point(|probe| probe.range.offset < row.range.offset);
+                    let receiver = self.rows.get(index.checked_sub(1)?)?;
+                    (receiver.range.end() <= row.range.offset).then(|| {
+                        // An UNQUALIFIED implicit-this receiver (`_reader
+                        // .readEnum(...)`, the callee row still the pre-merge
+                        // selector at this send-close read): the bare scope
+                        // resolves the receiver name to the enclosing
+                        // container's member, whose WRITTEN declared type heads
+                        // the container the member walk resolves on — and only
+                        // when the walk finds the callee there (a foreign or
+                        // stub head walks nowhere). Locals resolve to non-member
+                        // targets and qualified receivers
+                        // (`_sourceTable.$primaryKey`, a chain-computed face)
+                        // keep the bare-name path (the SDK static head,
+                        // `RangeError.checkValidRange`).
+                        if !receiver.qualified {
+                            match self.resolve_bare(receiver.name) {
+                                (_, RefTarget::Member { container }) => {
+                                    if let Ty::Named { name, .. } =
+                                        self.member_declared_ty(container, receiver.name)
+                                        && matches!(self.walk_members(name, row.name), Walk::Found(_))
+                                    {
+                                        return (name, None);
+                                    }
+                                }
+                                // A LOCAL receiver (`o.m()` where `o` is a parameter
+                                // or local typed `C`): the bare scope resolves the
+                                // name to the local, whose declared type heads the
+                                // container the member walk resolves on — the same
+                                // face the merged `Receiver::Typed` arm answers
+                                // post-merge, re-derived here for the pre-merge
+                                // callee selector row `consume_send` reads. The
+                                // full type (arguments included) rides along so
+                                // `instantiate_call_return` seeds the container's
+                                // parameters exactly like the merged arm.
+                                (_, RefTarget::Local) => {
+                                    let ty = self.receiver_static_ty(receiver);
+                                    if let named @ Ty::Named { name, .. } = self.fold_alias_ty(ty)
+                                        && matches!(self.walk_members(name, row.name), Walk::Found(_))
+                                    {
+                                        return (name, Some(named));
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
-                    }
-                }
-                receiver.name
-            })
-        });
-        let Some(container) = container else {
-            return Ty::UNKNOWN;
+                        (receiver.name, None)
+                    })
+                })() else {
+                    return Ty::UNKNOWN;
+                };
+                found
+            }
         };
 
         // `C.name(...)` on a class head: a named constructor outranks any
@@ -2866,11 +2898,23 @@ impl<'a> Engine<'a> {
                     // receiver, so the return instantiation reads the
                     // method's own parameters and the send-close
                     // solution (`_reader.readEnum(Tag.values)`'s `T`).
-                    _ => Receiver::This {
-                        container,
-                        kind: self
-                            .container_kind_of(container)
-                            .unwrap_or(ContainerKind::Class),
+                    // A LOCAL receiver's declared type rides as a
+                    // `Receiver::Typed` so `instantiate_call_return`
+                    // seeds the container's parameters from the written
+                    // arguments (`parameters.remove(name)` on
+                    // `Map<String, Object?>` answers `Object?`, not the
+                    // free `V?`).
+                    _ => match local_recv_ty {
+                        Some(ty) => Receiver::Typed {
+                            type_name: container,
+                            ty,
+                        },
+                        None => Receiver::This {
+                            container,
+                            kind: self
+                                .container_kind_of(container)
+                                .unwrap_or(ContainerKind::Class),
+                        },
                     },
                 };
                 self.instantiate_call_return(row, &recv, entry.return_ty)

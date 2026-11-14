@@ -16614,6 +16614,57 @@ impl<'a> Engine<'a> {
             .contains(&name)
     }
 
+    /// The `send_results` key for a completed send: the UTF-16 offset of
+    /// the token before the argument list's `(` — the teardown operand
+    /// scan's lookup key (`operand_expression_ty` step 3). For a generic
+    /// send `f<T>()`/`o.m<T>()` that token is the type-argument list's
+    /// `>`, not the callee name; for a plain send it is the callee name
+    /// itself. `None` when the token walk cannot reach the `(` (a
+    /// synthetic or unrecovered shape) — the caller falls back to the
+    /// callee row's own offset.
+    fn send_results_key(&self, end: Token) -> Option<u32> {
+        let tokens = self.tokens.as_slice();
+        // Locate `end` (`)`) by its UTF-16 offset, then walk backward to
+        // the matching `(` with the same depth-counting the teardown
+        // scan runs (nested `()`/`[]`/`{}` inside the argument list).
+        let mut last = tokens.partition_point(|t| t.utf16_offset < end.range.offset);
+        if last >= tokens.len() || tokens[last].utf16_offset != end.range.offset {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut at = last;
+        while at > 0 {
+            at -= 1;
+            match tokens[at].kind {
+                dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly => depth += 1,
+                dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::OpenCurly => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 || tokens[at].kind != dartq_scanner::TokenKind::OpenParen {
+            return None;
+        }
+        // The token before the `(`, skipping recovery synthetics — the
+        // same walk `operand_expression_ty` runs.
+        let mut callee = at;
+        while callee > 0 {
+            callee -= 1;
+            if !tokens[callee].is_synthetic() {
+                break;
+            }
+        }
+        Some(tokens[callee].utf16_offset)
+    }
+
     pub(crate) fn consume_send(&mut self, end: Token) -> Option<SendExit> {
         // Honor the armed link only for the send whose closing token is the
         // argument group's own `)` — a constructor invocation's `()` arms it
@@ -16910,18 +16961,38 @@ impl<'a> Engine<'a> {
         // reference's face must not outlive the invocation it fed. A
         // creation head keeps its own fold (the row is replaced below with
         // the instantiated/solved face).
+        // A callable send result on a QUALIFIED (member) row is the
+        // member's declared return — the send's own static type — not
+        // the callee's function face. Stamping it onto `row.ty` makes
+        // `operand_static_ty`'s `invoked_callee_result` unwrap it to
+        // the callable's result (`Object? Function()` → `Object?`,
+        // `Function` → `dynamic`), where the send result IS the
+        // callable type itself. Bare callees keep the write: their
+        // `row.ty` is the send's already-flattened result face
+        // `bare_invoke_ty_is_result` returns as-is.
+        let skip_row_ty = send_result != Ty::UNKNOWN
+            && !shorthand_callee
+            && self.rows.get(callee).is_some_and(|row| {
+                row.qualified && self.callable_result_of(send_result).is_some()
+            });
         if send_result != Ty::UNKNOWN
             && !shorthand_callee
             && let Some(row) = self.rows.get_mut(callee)
             && !matches!(row.shape, RowShape::Bare(BareInfo::Container { .. }))
         {
             let callee_offset = row.range.offset;
-            row.ty = send_result;
+            if !skip_row_ty {
+                row.ty = send_result;
+            }
             // The offset-keyed twin (#4282): the row stack is gone by the
             // teardown operand scan, so the invocation's static type must
             // survive beside its callee offset — a spread / for-in /
-            // yield-each operand spelling `f()` grounds there.
-            self.send_results.insert(callee_offset, send_result);
+            // yield-each operand spelling `f()` grounds there. The key is
+            // the token before `(` (the teardown scan's lookup key): for a
+            // generic send `f<T>()` that is `>`, not the callee name — the
+            // member row's own offset would miss the scan's `>` lookup.
+            let key = self.send_results_key(end).unwrap_or(callee_offset);
+            self.send_results.insert(key, send_result);
         }
         if matches!(
             self.rows.get(callee).map(|r| r.shape.clone()),

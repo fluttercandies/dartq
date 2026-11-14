@@ -7929,3 +7929,11 @@ mod ticket_4279_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_4282_tests.rs"]
 mod ticket_4282_tests;
+
+/// The #4287 pins: member-send result on locally-typed receivers —
+/// `C c = ...; ...c.m()` where `m` has a nullable declared return flows
+/// through `send_results` so the spread operand's callee-keyed leg
+/// answers the member's return type.
+#[cfg(test)]
+#[path = "diagnose/ticket_4287_tests.rs"]
+mod ticket_4287_tests;

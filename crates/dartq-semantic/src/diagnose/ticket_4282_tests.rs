@@ -120,13 +120,10 @@ fn bare_top_level_nullable_return_with_argument_reports() {
 }
 
 /// A method call's nullable return (oracle line 20: `o.m()`, length 5).
-/// Held: the member send's static type is `Unknown` at `consume_send`
-/// (the receiver face does not resolve the method's declared return in
-/// the current engine), so `send_results` records nothing and the
-/// operand ladder has no face to ground. The bare-callee and
-/// function-typed-variable arms below pin the faces this lane fixes.
+/// #4287 wires the receiver-local-declared-type → member signature →
+/// return type path so `consume_send` answers `List<int>?` and
+/// `send_results` records it for the operand ladder's callee-keyed leg.
 #[test]
-#[ignore = "held: member send result Unknown at consume_send — separate member-resolution gap"]
 fn method_call_nullable_return_in_spread_reports() {
     let fixture = "class C {\n\
                    List<int>? m() => null;\n\
