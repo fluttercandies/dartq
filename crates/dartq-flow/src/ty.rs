@@ -261,6 +261,19 @@ pub trait TypeOps {
     fn is_resolved_seam(&self) -> bool {
         false
     }
+    /// Whether one spelled head cannot be attributed to a single
+    /// declaration by this back-end: a lossy (prefixed-import) spelling, a
+    /// bare name several reachable files declare, or a names-only SDK face
+    /// standing beside a real declaration of the same spelling. The name
+    /// level answers `false` (it has no declarations to attribute); the
+    /// resolved seam lists them, and the promotion gates keep the
+    /// name-level optimistic answer over such heads — a wrong attribution
+    /// there manufactures a report (`Widget is Image` refusing the step
+    /// leaves the guard's continuation reading the declared type, #4294).
+    fn head_unattributable(&self, ty: Ty, names: &[Box<str>]) -> bool {
+        let _ = (ty, names);
+        false
+    }
     /// Whether `left` is a subtype of `right`.
     fn is_subtype(&self, left: Ty, right: Ty) -> bool;
     /// The "remainder" of `from` when `what` is removed by an instance

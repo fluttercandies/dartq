@@ -24339,3 +24339,13 @@ mod ticket_4128_tests;
 #[cfg(test)]
 #[path = "ticket_4289_tests.rs"]
 mod ticket_4289_tests;
+
+// —— #4294 (the `is!`-guard + early-return continuation promotes when the
+// —— tested head is a bare name two reachable files declare: the registry
+// —— slot is registration order's, so the promotion gate answers name-level
+// —— over the collision — the corpus's `dart:ui`-reachable `Image`
+// —— preempting `package:flutter`'s reported six oracle-proven
+// —— `undefined_getter` false positives) ——
+#[cfg(test)]
+#[path = "ticket_4294_tests.rs"]
+mod ticket_4294_tests;

@@ -174,6 +174,17 @@ pub struct LibraryTypes {
     /// so the adapter's verdict gates keep the name-level default's
     /// answer over them ([`ResolvedTypeOps::head_overloaded`]).
     lossy_overloads: FxHashSet<StringId>,
+    /// Bare spellings this build saw claimed by two DIFFERENT declarations
+    /// — two reachable files declare the name, and first-writer-wins
+    /// decided the registry slot by registration order. The flow layer's
+    /// bare-head question cannot attribute such a spelling either, so the
+    /// promotion gate keeps the name-level default's optimistic answer over
+    /// them ([`ResolvedTypeOps::head_ambiguous`]) — the same posture
+    /// [`Self::lossy_overloads`] takes for PREFIXED spellings, extended to
+    /// the collision registration order would otherwise settle
+    /// (#4294: a `dart:ui`-reachable `Image` preempting `package:flutter`'s
+    /// refused the oracle's `Widget is Image` promotion).
+    ambiguous_names: FxHashSet<StringId>,
     /// `typedef` name → the aliased head name plus its own `?` flag —
     /// captured only when the element model carried the RHS as a bare
     /// `Ty::Named` with no written arguments and the alias declares no
@@ -714,10 +725,14 @@ impl LibraryTypes {
         // rather than touching the move-only builder, then a single pass
         // applies them all — the same information, in build order.
         let mut registry = Registry {
+            graph,
+            namespaces,
+            lib,
             registry,
             decl_params,
             decl_owner,
             non_containers,
+            ambiguous_names: FxHashSet::default(),
             typedef_targets,
             typedef_shapes: FxHashMap::default(),
             aliases: Vec::new(),
@@ -773,6 +788,10 @@ impl LibraryTypes {
                 }
                 if registry.registry.contains_key(&name) || registry.non_containers.contains(&name)
                 {
+                    // The slot is taken — possibly by another file that
+                    // declares the same spelling (see the deviation the
+                    // verdict gates read, `LibraryTypes::ambiguous_names`).
+                    registry.note_claim(name, entry.file);
                     continue;
                 }
                 match index.get(entry.file).map(|els| els.container(name)) {
@@ -800,7 +819,7 @@ impl LibraryTypes {
                 }
             }
         }
-        for name in face_only {
+        for &name in &face_only {
             if !registry.registry.contains_key(&name) {
                 registry.non_containers.insert(name);
             }
@@ -843,6 +862,11 @@ impl LibraryTypes {
                             registry.non_containers.insert(name);
                         }
                     }
+                } else {
+                    // Prefixed-only names carry no bare claim, but a slot
+                    // another file filled makes the spelling ambiguous all
+                    // the same (`LibraryTypes::ambiguous_names`).
+                    registry.note_claim(name, entry.file);
                 }
                 let Some(&decl) = registry.registry.get(&name) else {
                     continue;
@@ -905,6 +929,11 @@ impl LibraryTypes {
                             || registry.non_containers.contains(&head)
                             || registry.type_params.contains_key(&head)
                         {
+                            // This foreign scope resolves the spelling to
+                            // another file than the registered slot's —
+                            // the bare name is unattributable in this
+                            // build (`LibraryTypes::ambiguous_names`).
+                            registry.note_claim(head, target_file);
                             continue;
                         }
                         let target_lib = graph.library_of_file(target_file).unwrap_or(owner);
@@ -928,6 +957,16 @@ impl LibraryTypes {
                         || registry.non_containers.contains(&head)
                         || registry.type_params.contains_key(&head)
                     {
+                        // The inline scan's own claim check (the replay
+                        // arm's `note_claim` above): the declaring
+                        // scope's resolution against the filled slot. The
+                        // replay table carries the target file already, so
+                        // this lookup runs on the fallback path only.
+                        if let Lookup::Found(NamespaceEntry::Decl(target_file)) =
+                            namespaces.lookup(graph, owner, head)
+                        {
+                            registry.note_claim(head, target_file);
+                        }
                         continue;
                     }
                     let Lookup::Found(NamespaceEntry::Decl(target_file)) =
@@ -951,6 +990,21 @@ impl LibraryTypes {
             }
             if !grew {
                 break;
+            }
+        }
+        // A names-only face entry standing beside a real declaration of the
+        // same spelling: the bare name is unattributable, so the promotion
+        // gate answers name-level over it
+        // ([`LibraryTypes::ambiguous_names`]). The SDK projection is the
+        // common carrier — `dart:ui`'s native `Image` is a face entry while
+        // `package:flutter/widgets.dart` re-exports a real widget class of
+        // the same name, and which one a fold consults must not depend on
+        // registration order (#4294: the six oracle-proven
+        // `undefined_getter` rows all came from the refused
+        // `Widget is Image` promotion).
+        for &name in &face_only {
+            if registry.registry.contains_key(&name) {
+                registry.ambiguous_names.insert(name);
             }
         }
         // —— the lossy-spelling overloads —————————————————————————————————
@@ -994,6 +1048,7 @@ impl LibraryTypes {
             decl_params,
             decl_owner,
             non_containers,
+            ambiguous_names,
             typedef_targets,
             mut typedef_shapes,
             aliases,
@@ -1428,6 +1483,7 @@ impl LibraryTypes {
             decl_params,
             non_containers,
             lossy_overloads,
+            ambiguous_names,
             typedef_targets,
             typedef_shapes,
             fn_shapes,
@@ -1640,11 +1696,22 @@ impl DeclAction {
 /// the parameter facts, and the fresh-id cursors. Struct-scoped so
 /// `register_file` can take `&mut self` without fighting the borrow
 /// checker.
-struct Registry {
+struct Registry<'g> {
+    /// The analyze-wide resolution pair the name claims consult: a spelling
+    /// several libraries declare is attributed by the ANALYZED library's own
+    /// scope, never by registration order
+    /// ([`LibraryTypes::ambiguous_names`]).
+    graph: &'g LibraryGraph,
+    namespaces: &'g Namespaces,
+    lib: LibraryId,
     registry: FxHashMap<StringId, TypeDeclId>,
     decl_params: FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     decl_owner: FxHashMap<TypeDeclId, (FileId, LibraryId)>,
     non_containers: FxHashSet<StringId>,
+    /// See [`LibraryTypes::ambiguous_names`]: filled by
+    /// [`Self::register_file`] whenever a container name a file declares is
+    /// already registered from a DIFFERENT file.
+    ambiguous_names: FxHashSet<StringId>,
     /// Bare `Ty::Named` typedef right-hand sides keyed on the alias's
     /// own spelling — the only alias shape the snapshot can resolve
     /// without the element model's `ArgPool` (see [`LibraryTypes::typedef_targets`]).
@@ -1765,7 +1832,26 @@ fn bound_head(bound: &Ty) -> Option<StringId> {
     }
 }
 
-impl Registry {
+impl Registry<'_> {
+    /// Records a bare-name claim that lost (or would lose) the registry
+    /// slot to a declaration in ANOTHER file: the spelling is
+    /// unattributable in this build, so the promotion gate keeps the
+    /// name-level answer over it (`LibraryTypes::ambiguous_names`). A claim
+    /// from the file that already owns the slot (a re-scan of the same
+    /// declaration) records nothing.
+    fn note_claim(&mut self, name: StringId, file: FileId) {
+        let Some(&existing) = self.registry.get(&name) else {
+            return;
+        };
+        if self
+            .decl_owner
+            .get(&existing)
+            .is_some_and(|&(owner_file, _)| owner_file != file)
+        {
+            self.ambiguous_names.insert(name);
+        }
+    }
+
     /// Declares every named container of one unit file into the snapshot
     /// (declaration order; first-wins on a shared name — a local shadows
     /// an import exactly like the scope chain), plus the unit's
@@ -1797,7 +1883,23 @@ impl Registry {
                 continue;
             };
             if self.registry.contains_key(&name) {
+                self.note_claim(name, file);
                 continue;
+            }
+            // A spelling several libraries declare is attributed by the
+            // ANALYZED library's own scope: when that scope resolves the
+            // name to a different file, this registration order's winner
+            // is not the declaration the unit sees — mark the spelling
+            // unattributable ([`LibraryTypes::ambiguous_names`]). The
+            // multi-declaration membership test is one hash probe, and
+            // only the (rare) multi-declared spellings pay the namespace
+            // lookup.
+            if self.graph.declaring_libraries(name).len() > 1
+                && let Lookup::Found(NamespaceEntry::Decl(visible)) =
+                    self.namespaces.lookup(self.graph, self.lib, name)
+                && visible != file
+            {
+                self.ambiguous_names.insert(name);
             }
             let decl = TypeDeclId::from_raw(self.next_decl);
             self.next_decl += 1;
@@ -5232,6 +5334,28 @@ impl TypeOps for ResolvedTypeOps<'_> {
         true
     }
 
+    /// [`TypeOps::head_unattributable`] over the resolved lattice: a lossy
+    /// (prefixed-import) spelling ([`Self::head_overloaded`]) or a bare
+    /// name this build could not attribute ([`LibraryTypes::ambiguous_names`]
+    /// — a cross-file registration collision or a names-only SDK face
+    /// beside a real declaration; #4294: a `dart:ui`-reachable `Image`
+    /// preempting `package:flutter`'s refused the oracle's `Widget is
+    /// Image` promotion, six oracle-proven `undefined_getter` rows).
+    fn head_unattributable(&self, ty: FlowTy, names: &[Box<str>]) -> bool {
+        if self.head_overloaded(ty, names) {
+            return true;
+        }
+        let Base::Name(id) = ty.base else {
+            return false;
+        };
+        let Some(lexeme) = names.get(id as usize) else {
+            return false;
+        };
+        self.snapshot
+            .ambiguous_names
+            .contains(&self.strings.intern(lexeme))
+    }
+
     /// `is_subtype` over the resolved world where both sides map; either
     /// side unmapped answers through [`NameTypeOps`] — today's name-level
     /// logic — so a `var`-inferred or unresolvable spelling keeps its
@@ -5533,6 +5657,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
             return NameTypeOps.is_subtype_typed(left, left_args, right, right_args, arena, names);
         }
         self.observe_names(names);
+        let mark = self.work_mark();
         // Two signature-less function spellings: the flow layer records
         // every function type as the bare `Base::Function` head (no
         // signature — ev.rs's `FunctionType` carries the nullability
@@ -5592,12 +5717,13 @@ impl TypeOps for ResolvedTypeOps<'_> {
         arena: &[Vec<ArgTy>],
         names: &[Box<str>],
     ) -> Option<FlowTy> {
-        // A lossy-overload head promotes name-level
-        // ([`Self::head_overloaded`]) — the resolved strict gate would
-        // consult the wrong class half the time, forcing or refusing
-        // steps the oracle decides otherwise; the name-level default's
-        // posture stands over the spelling.
-        if self.head_overloaded(to, names) || self.head_overloaded(from, names) {
+        // An unattributable head promotes name-level
+        // ([`Self::head_unattributable`]: a lossy overload or a bare name
+        // two reachable files declare) — the resolved strict gate would
+        // consult the wrong class half the time, forcing or refusing steps
+        // the oracle decides otherwise; the name-level default's posture
+        // stands over the spelling.
+        if self.head_unattributable(to, names) || self.head_unattributable(from, names) {
             return NameTypeOps.try_promote_to_typed(to, to_args, from, from_args, arena, names);
         }
         self.observe_names(names);

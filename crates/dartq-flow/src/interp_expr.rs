@@ -4867,6 +4867,17 @@ impl Interp<'_> {
                 self.names,
             );
         }
+        // The legacy (pre-sound-flow) arm's step gate is the resolved
+        // subtype question, which cannot decide a spelling no declaration
+        // owns — keep the optimistic step the name level would take over
+        // such a head (the under-report direction; refusing it reported
+        // the guard's continuation against the declared type, #4294).
+        if (tested, tested_args) != (previous, previous_args)
+            && (self.ops.head_unattributable(tested, self.names)
+                || self.ops.head_unattributable(previous, self.names))
+        {
+            return Some(tested);
+        }
         if self.ops.is_subtype_typed(
             tested,
             tested_args,
