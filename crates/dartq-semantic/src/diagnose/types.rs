@@ -2885,6 +2885,19 @@ pub(crate) struct Engine<'a> {
     /// (a switch over the call then answers the always-exhaustive
     /// verdict). Single slot, taken by the listener at the same event.
     pub(crate) send_return_staging: Option<(u32, Ty)>,
+    /// Every completed send's static type by CALLEE offset (#4282): the
+    /// send close writes the invocation node's type onto the callee row
+    /// (upstream `node.recordStaticType(returnType)`), but `resolve_rows`
+    /// takes the row stack before the teardown operand scan runs, so the
+    /// callee-keyed leg of [`Engine::operand_expression_ty`] cannot read
+    /// it there. The offset-keyed twin answers the shapes no read row
+    /// carries: a bare top-level function (the invoked callee stages no
+    /// `ReadType`), an invoked member (the chain record is a tear-off),
+    /// and a function-typed variable (the flow lattice spells no
+    /// signature). Populated at [`Engine::consume_send`]'s write-back
+    /// under the same gates (a decided, non-shorthand, non-creation
+    /// result).
+    pub(crate) send_results: FxHashMap<u32, Ty>,
     /// The last completed send's genuinely-unresolved bare head beside its
     /// callee row's range offset (#2860): `consume_send` records the pair
     /// when the send's return reads `Unknown` AND the head resolves nowhere

@@ -546,6 +546,7 @@ impl<'a> Engine<'a> {
             call_ends: Vec::new(),
             solved_call_params: FxHashMap::default(),
             send_return_staging: None,
+            send_results: FxHashMap::default(),
             send_invalid_staging: None,
             member_spellings: std::cell::OnceCell::new(),
             refined_call_returns: FxHashMap::default(),
@@ -2466,12 +2467,31 @@ impl<'a> Engine<'a> {
                         break;
                     }
                 }
-                if tokens[callee].utf16_offset >= start
-                    && let Some(ty) = self
+                if tokens[callee].utf16_offset >= start {
+                    // The completed send's recorded static type (#4282):
+                    // `consume_send` writes the invocation node's type onto
+                    // the callee row (upstream `recordStaticType`), but
+                    // `resolve_rows` drains the row stack before this
+                    // teardown scan — the offset-keyed `send_results` twin
+                    // survives. A bare callee (`...g()`), an invoked member
+                    // (`...o.m()`), and a function-typed local (`...t()`)
+                    // all land here: no flow read row carries their result
+                    // face, and the receiver walk's `callable_result_of`
+                    // declines the tear-off spellings.
+                    if let Some(ty) = self
+                        .send_results
+                        .get(&tokens[callee].utf16_offset)
+                        .copied()
+                        .filter(|ty| *ty != Ty::Unknown)
+                    {
+                        return Some((ty, anchor));
+                    }
+                    if let Some(ty) = self
                         .recv_expression_ty(self.token_utf16_span(callee)?)
                         .filter(|ty| *ty != Ty::Unknown)
-                {
-                    return Some((ty, anchor));
+                    {
+                        return Some((ty, anchor));
+                    }
                 }
             }
         }

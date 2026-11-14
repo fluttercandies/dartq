@@ -16915,7 +16915,13 @@ impl<'a> Engine<'a> {
             && let Some(row) = self.rows.get_mut(callee)
             && !matches!(row.shape, RowShape::Bare(BareInfo::Container { .. }))
         {
+            let callee_offset = row.range.offset;
             row.ty = send_result;
+            // The offset-keyed twin (#4282): the row stack is gone by the
+            // teardown operand scan, so the invocation's static type must
+            // survive beside its callee offset — a spread / for-in /
+            // yield-each operand spelling `f()` grounds there.
+            self.send_results.insert(callee_offset, send_result);
         }
         if matches!(
             self.rows.get(callee).map(|r| r.shape.clone()),

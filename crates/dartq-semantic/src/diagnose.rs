@@ -7921,3 +7921,11 @@ mod ticket_4202_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_4279_tests.rs"]
 mod ticket_4279_tests;
+
+/// The #4282 pins: the spread operand's callee-keyed leg answers a bare
+/// callee's call result (a top-level function's declared return, a
+/// function-typed variable's return) instead of the callee's tear-off
+/// face.
+#[cfg(test)]
+#[path = "diagnose/ticket_4282_tests.rs"]
+mod ticket_4282_tests;
