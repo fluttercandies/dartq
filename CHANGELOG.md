@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in serve-early daemon mode (`dartq daemon --serve-early`): per-file
+  `dartq/analyze` answers while the workspace is still settling — the
+  asked files' rows come back ~7× sooner than the full settle (5.8 s vs
+  42.3 s first answer on a 1,338-file workspace, debug build), every
+  early answer carries a `settle: "may-precede-settle"` marker on the
+  envelope only, and a stamp-fresh answer-record hit short-circuits the
+  early path (records are settled bytes). Off by default; with the flag
+  unset the wire bytes are identical (#4268).
+
+### Fixed
+
+- The initializer face's collection lattice no longer collapses diverse
+  leaf joins to `Object`: it mirrors the direct face's exact join
+  (`{1, null}` reads `Set<int?>`, `{p, true}` reads `Set<Object?>`,
+  function/record forms keep their shape), and an `if`-led map entry
+  splits at its branch entries before the per-slot colon
+  (`{if (c) 1: 'a' else 2: 3}` → `Map<int, Object>`) (#4128).
+- Spread, for-in, and `yield*` operands over bare top-level calls no
+  longer miss the oracle's rows: the send close's static type survives
+  the row-stack drain in a callee-offset-keyed side table that the
+  operand ladder consults first (#4282).
+- Typed-literal group capture no longer assumes the group closes right
+  before the bracket: the `<`'s own balance is walked, so spaced and
+  nested spellings (`<List<int>> [1]`) parse their written argument; and
+  a spread of a bare in-scope type parameter folds the set-or-map
+  ambiguity the way upstream's empty-info fold does (`{...t}` with
+  unbounded `T` → `Map<dynamic, dynamic>`-shaped ambiguity verdicts)
+  (#4036).
+
+## [0.1.25] - 2026-11-14
+
 ### Fixed
 
 - Record types are first-class in the engine's annotation capture: a
