@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The record element check is no longer peeled away: a record literal
+  `(a, b)` used as a typed list's element is the element itself, not
+  parenthesized trivia, so `list_element_type_not_assignable` now
+  answers record-vs-record shapes (arity, per-slot order and types,
+  named-field sets); `()` reads as the empty record (#4288).
+- Member sends on locally-typed receivers (`c.m()` where `c` is a
+  parameter or local with a declared type) now answer the member's
+  declared return type — the receiver's full written type seeds the
+  container's type parameters (`Map<String, Object?>.remove` answers
+  `Object?`), and spread/for-in/`yield*` operands over such calls stop
+  missing the oracle's rows (#4287).
 - The initializer face's collection lattice no longer collapses diverse
   leaf joins to `Object`: it mirrors the direct face's exact join
   (`{1, null}` reads `Set<int?>`, `{p, true}` reads `Set<Object?>`,
