@@ -14606,6 +14606,30 @@ fn angle_group_end(bytes: &[u8], lt: usize, end: usize) -> Option<usize> {
     None
 }
 
+/// The byte offset of the `>` closing the `<` at `head`, the group's own
+/// balance deciding: the byte ahead of the literal's bracket is never
+/// consulted, so any trivia between the group and the bracket keeps the
+/// pairing. `None` when `[head, limit)` leaves the group unbalanced.
+fn angle_group_close(bytes: &[u8], head: usize, limit: usize) -> Option<usize> {
+    if bytes.get(head) != Some(&b'<') || head >= limit {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, &b) in bytes[head..limit].iter().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(head + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Top-level comma segments between `start` and `end` for a literal's
 /// element list: bracket depth over `()[]{}`, string contents skipped, and
 /// a genuine `<...>` type-argument group folded into the depth so a typed
@@ -15052,9 +15076,14 @@ impl Engine<'_> {
 
     fn literal_group_args_with(&self, left: Token, allow_missing: bool) -> Option<Vec<Ty>> {
         let head = typed_group_head(self, left)?;
-        // The group's own closing `>` (gate-guaranteed the byte before the
-        // literal bracket) stays outside the segment scan.
-        let close = self.byte_of(left.range.offset) - 1;
+        // The group's own closing `>` stays outside the segment scan, and the
+        // group's BALANCE names it: the byte before the literal's bracket is
+        // the closer only when the two abut, so every whitespace spelling in
+        // between (a space, the indent of a wrapped initializer, a newline)
+        // left the former `- 1` short of the group — the last segment then ran
+        // past its closer and the whole parse declined (#4036).
+        let end = self.byte_of(left.range.offset);
+        let close = angle_group_close(self.source.as_bytes(), head, end)?;
         self.parse_group_args(head + 1, close, allow_missing)
     }
 
@@ -15450,21 +15479,13 @@ impl Engine<'_> {
 
     /// The brace literal's ambiguity decision
     /// (`typed_literal_resolver.dart` `_inferSetOrMapLiteralType`'s tail):
-    /// elements that must be map sides (entries, resolved map spreads) and
-    /// elements that must be set sides (expressions, resolved iterable
-    /// spreads) mixed together report
-    /// `ambiguous_set_or_map_literal_both`; no element forcing either side
-    /// while some element is positively undecided — a spread whose
-    /// expression row reads `dynamic`/non-collection, or an unresolvable
-    /// spread operand (the oracle's error-dynamic shape) — reports
-    /// `_either` (`_InferredCollectionElementTypeInformation`: a dynamic
-    /// spread fills all three slots, forcing neither must-be bit). One
-    /// side only decides silently, and the elementless form defaults to a
-    /// map. An operand with NO row resolves to a type the row model
-    /// cannot spell — its hidden side may already have decided the whole
-    /// literal in the oracle, so it suppresses the nothing-forces `_either`
-    /// tail (the under-report posture; a resolved collection spread is
-    /// this shape's common occupant).
+    /// the caller has already established an untyped, non-empty literal whose
+    /// position decides no side, so a fold that resolves nothing IS the
+    /// oracle's ambiguity — `_both` when different leaves force the two
+    /// sides, `_either` for every other unresolved fold (a spread whose
+    /// operand is `dynamic` or a decided non-collection fills both can-be
+    /// bits at most, and no must-be bit). One side only decides silently,
+    /// and the elementless form defaults to a map.
     pub(crate) fn check_set_or_map_ambiguity(
         &mut self,
         left: Token,
@@ -15475,27 +15496,12 @@ impl Engine<'_> {
         if count == 0 {
             return;
         }
-        let mut has_map = false;
-        let mut has_set = false;
-        let mut either_evidence = false;
-        let mut hidden_side = false;
-        for (start, end) in self.literal_leaves(left, right) {
-            match self.leaf_side(start, end) {
-                LeafSide::Map => has_map = true,
-                LeafSide::Set => has_set = true,
-                // `Either` forces nothing itself; `Neither` positively
-                // kills both can-be bits — both leave the literal
-                // unresolvable, so both are `_either` evidence.
-                LeafSide::Either | LeafSide::Neither => either_evidence = true,
-                LeafSide::Blind => hidden_side = true,
+        let code = match self.fold_brace_literal(left, right) {
+            BraceLiteralFold::Both => SemanticCode::AmbiguousSetOrMapLiteralBoth,
+            BraceLiteralFold::Either => SemanticCode::AmbiguousSetOrMapLiteralEither,
+            BraceLiteralFold::Set | BraceLiteralFold::Map | BraceLiteralFold::Undecided => {
+                return;
             }
-        }
-        let code = match (has_map, has_set) {
-            (true, true) => SemanticCode::AmbiguousSetOrMapLiteralBoth,
-            (false, false) if either_evidence && !hidden_side => {
-                SemanticCode::AmbiguousSetOrMapLiteralEither
-            }
-            _ => return,
         };
         let span_start = const_keyword
             .map(|token| token.range.offset)
@@ -15508,23 +15514,35 @@ impl Engine<'_> {
         self.emit_message_with_correction(code, range, message);
     }
 
-    /// The brace literal's resolved kind from its leaves
-    /// (`typed_literal_resolver.dart` `_inferSetOrMapLiteralType`'s
-    /// can-be/must-be combination): each leaf fills the can-be/must-be
-    /// slots through [`Self::leaf_side`], the walk folds them
-    /// (`canBeASet = canBeASet && element.canBeSet`,
-    /// `mustBeASet = mustBeASet || element.mustBeSet`), and the tail
-    /// decides — `canBeASet && mustBeASet` resolves a set, `canBeAMap &&
-    /// mustBeAMap` a map, every other shape is the ambiguous literal the
-    /// oracle leaves UNRESOLVED (its `typeOrThrow` is `dynamic`, so
-    /// `visitSetOrMapLiteral` runs neither element verifier — the
-    /// `None` answer suppresses the spread/expression faces instead of
-    /// fabricating the parser's map default).
+    /// The brace literal's resolved kind — the fold's resolving arms only.
+    /// Every other verdict is the ambiguous literal the oracle leaves
+    /// UNRESOLVED (its `typeOrThrow` is `dynamic`, so `visitSetOrMapLiteral`
+    /// runs neither element verifier — the `None` answer suppresses the
+    /// spread/expression faces instead of fabricating the parser's map
+    /// default).
     fn leaves_resolve_kind(&self, left: Token, right: Token) -> Option<SpreadLiteralKind> {
-        let mut can_set = true;
-        let mut must_set = false;
-        let mut can_map = true;
-        let mut must_map = false;
+        match self.fold_brace_literal(left, right) {
+            BraceLiteralFold::Set => Some(SpreadLiteralKind::Set),
+            BraceLiteralFold::Map => Some(SpreadLiteralKind::Map),
+            BraceLiteralFold::Both
+            | BraceLiteralFold::Either
+            | BraceLiteralFold::Undecided => None,
+        }
+    }
+
+    /// The brace literal's side verdict
+    /// (`typed_literal_resolver.dart` `_inferSetOrMapLiteralType`'s
+    /// can-be/must-be combination): each leaf fills the slots
+    /// [`Self::leaf_side`] names, the walk folds them
+    /// (`canBeASet = canBeASet && element.canBeSet`,
+    /// `mustBeASet = mustBeASet || element.mustBeSet`, and the map twins),
+    /// and the tail decides. The kind dispatch and the ambiguity row read
+    /// this ONE fold, so the literal's own verifier arm and its ambiguity
+    /// row can never disagree.
+    fn fold_brace_literal(&self, left: Token, right: Token) -> BraceLiteralFold {
+        let (mut can_set, mut can_map) = (true, true);
+        let (mut must_set, mut must_map) = (false, false);
+        let mut hidden = false;
         for (start, end) in self.literal_leaves(left, right) {
             match self.leaf_side(start, end) {
                 // `elementType` fills the element slot alone: a decided
@@ -15539,23 +15557,35 @@ impl Engine<'_> {
                     can_set = false;
                     must_map = true;
                 }
+                // A decided leaf that fills NO slot poisons both can-be
+                // bits without forcing either side.
                 LeafSide::Neither => {
                     can_set = false;
                     can_map = false;
                 }
                 // `Either` fills every can-be slot without forcing a
                 // must-be bit; `Blind` may hide a side the oracle already
-                // decided — both leave the fold untouched (the abstain
-                // posture).
-                LeafSide::Either | LeafSide::Blind => {}
+                // decided — both leave the can/must bits untouched (the
+                // abstain posture).
+                LeafSide::Either => {}
+                LeafSide::Blind => hidden = true,
             }
         }
+        // Two forced sides already poison both can-be bits (each forced
+        // leaf kills the other side's can-be bit), so the verdict is `_both`
+        // whatever a hidden leaf may hold.
+        if must_map && must_set {
+            return BraceLiteralFold::Both;
+        }
+        if hidden {
+            return BraceLiteralFold::Undecided;
+        }
         if can_set && must_set {
-            Some(SpreadLiteralKind::Set)
+            BraceLiteralFold::Set
         } else if can_map && must_map {
-            Some(SpreadLiteralKind::Map)
+            BraceLiteralFold::Map
         } else {
-            None
+            BraceLiteralFold::Either
         }
     }
 
@@ -15657,17 +15687,22 @@ impl Engine<'_> {
                             LeafSide::Neither
                         };
                     }
-                    // A type-parameter head reads its bound, matching
-                    // `asInstanceOf`'s bound resolution.
                     let ty = self.bound_face(ty);
                     let Ty::Named { name: head, .. } = ty else {
                         // A function/record/void operand fills no slot.
                         return LeafSide::Neither;
                     };
                     // A head the model cannot resolve (a callee-side
-                    // type parameter, an unmodeled spelling) is
-                    // undecidable — upstream's `typeOrThrow` reads it as
-                    // `dynamic`, which fills every can-be slot.
+                    // type parameter, an unmodeled spelling) splits two
+                    // ways upstream: a genuine type-parameter operand is
+                    // a `TypeParameterType`, whose `asInstanceOf` against
+                    // both `Iterable` and `Map` yields `null` — the
+                    // operand's `_InferredCollectionElementTypeInformation`
+                    // stays EMPTY, poisoning both can-be bits
+                    // (`Neither`). Any other unresolvable head is the
+                    // error-dynamic shape `typeOrThrow` produces, which
+                    // fills every can-be slot without forcing either
+                    // side (`Either`).
                     if crate::library::resolve_container(
                         self.graph,
                         self.namespaces,
@@ -15679,7 +15714,11 @@ impl Engine<'_> {
                     .is_none()
                         && !self.collection_heads.contains(&head)
                     {
-                        return LeafSide::Either;
+                        return if self.is_scope_param(head) {
+                            LeafSide::Neither
+                        } else {
+                            LeafSide::Either
+                        };
                     }
                     // `asInstanceOf(Iterable)` first, `asInstanceOf(Map)`
                     // second — upstream's order.
@@ -17481,6 +17520,20 @@ enum SpreadLiteralKind {
     List,
     Set,
     Map,
+}
+
+/// The brace literal's side verdict: `_inferSetOrMapLiteralType`'s
+/// can-be/must-be fold over the leaves. One side both possible and forced
+/// resolves the kind; two forced sides are `_both`; a fold that resolves
+/// nothing is `_either`; a leaf whose real side the row model cannot see
+/// leaves the verdict open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BraceLiteralFold {
+    Set,
+    Map,
+    Both,
+    Either,
+    Undecided,
 }
 
 /// A leaf element's must-be side for the ambiguity decision.
