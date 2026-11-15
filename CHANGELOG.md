@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-11-16
+
+### Added
+
+- Official-face `--metrics-json`: ten resident timing legs (server spawn,
+  roots, first pass, freshness, report, record persist, daemon total) on
+  `dartq analyze`; the metrics ride a separate answer that records never
+  store.
+- Engine-face execution of `analysis_server_plugin` plugins declared in
+  the top-level `plugins:` section: bootstrap mirrors the upstream
+  synthetic-package generator, findings weave into analyze answers under
+  the plugin's plain code name, and spawn failures surface as
+  `dartq/plugin_crashed` rows (#4312, #4319).
+- Daemon whole-root analyzed-set contract: package roots union discovered
+  nested self-resolved context roots, carved out of the enclosing walk —
+  the analyzed-set face whose oracle is analysis-server behavior on
+  identical `setAnalysisRoots` (#4315).
+
+### Changed
+
+- Nested pub workspaces analyze every file exactly once: the official
+  face normalizes analysis roots to a canonical non-overlapping ancestor
+  set before `setAnalysisRoots` (nested A/B 1.30s -> 0.68s, rows
+  set-equal with `dart analyze`; non-nested corpora byte-identical)
+  (#4311).
+- Plugin cold start drops from 6.7-18.5s to 0.13-0.15s per spawn via a
+  trained app-jit snapshot (content-keyed, source fallback, kill switch)
+  (#2748).
+- Written annotations that resolve to no type decide assignability both
+  ways instead of suppressing: the `Ty::Invalid` lattice lands with the
+  assignable entry fold, the armed-ty latch over unresolved type uses,
+  Invalid-receiver silencing of `undefined_*` lookups, creation-receiver
+  type-argument substitution, and instantiate-to-bounds for bare generic
+  typedef closures (#3544, #3771, #3545).
+
 ## [0.1.26] - 2026-11-15
 
 ### Added
