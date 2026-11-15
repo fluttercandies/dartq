@@ -2,7 +2,7 @@
 //! statement keywords, plus the `parseAssert` function-expression gate.
 //!
 //! Face 1 — `f() { @a( assert (true); }` (the oracle's
-//! partial_code/annotation `annotation_local_leftParen_assert` row in
+//! `partial_code/annotation` `annotation_local_leftParen_assert` row in
 //! the extracted fasta-recovery corpus): upstream's arg list parses
 //! `assert (true)` through `parseAssert(Assert.Expression)`
 //! (`parser_impl.dart:8165` — the `assert` keyword arm of `parsePrimary`),
@@ -12,7 +12,7 @@
 //! at `;` — upstream's `token != start` after the metadata walk lands the
 //! tail in the variable-declaration lane, :10021 `if (token == start)`),
 //! and the fabricated `assert` name carries the
-//! `undefined_identifier 'assert'` reference (ast_builder `endAssert`'s
+//! `undefined_identifier 'assert'` reference (`ast_builder` `endAssert`'s
 //! `CallInvocation`, ast_builder.dart:995-1017). This gate locks the
 //! parser-visible rows and the `assert` keyword's `Expression`-context
 //! identifier event.
@@ -29,6 +29,10 @@
 //! close-paren resolution, before the statement `;`/endAssert tail,
 //! matching upstream's order.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, setup};
 
 /// Count of a diagnostic code.
@@ -93,7 +97,7 @@ fn annotation_arg_assert_expression_recovery() {
 
 /// `class C { C() : assert((x) => x > 0); }` — the constructor
 /// initializer's `may_parse_function_expressions == false` posture
-/// (parser_impl.dart:4755) does NOT reach inside `parseAssert`: the
+/// (`parser_impl.dart:4755`) does NOT reach inside `parseAssert`: the
 /// condition parses with function expressions enabled
 /// (:11067-11068), so `(x) => x > 0` reads as a closure — one
 /// `expression_function_body`, zero recovery rows.
@@ -114,7 +118,7 @@ fn assert_in_initializer_parses_closure_condition() {
 /// `var y = switch (x) { assert((v) => v > 0) => 1 };` — the
 /// switch-expression case PATTERN's
 /// `may_parse_function_expressions == false` posture
-/// (parser_impl.dart:12405) likewise does not reach `parseAssert`'s
+/// (`parser_impl.dart:12405`) likewise does not reach `parseAssert`'s
 /// condition: `assert` in constant-pattern position parses as
 /// `Assert.Expression` (the `parsePrimary` 'assert' arm :8165, entered
 /// through the pattern operand's expression parse) and its closure still
@@ -136,7 +140,7 @@ fn assert_expression_in_switch_case_pattern_parses_closure_condition() {
 /// The statement form is untouched: `assert((x) => x > 0);` in a block
 /// parses the same closure — `may_parse_function_expressions` was
 /// already true there, the save/restore is a no-op (the flag's default
-/// posture, parser_impl.dart:277).
+/// posture, `parser_impl.dart:277`).
 #[test]
 fn assert_statement_closure_condition_unchanged() {
     let source = "f() { assert((x) => x > 0); }";

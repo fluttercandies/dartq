@@ -25,6 +25,7 @@
 //! genuine member-position `class_in_class` gate intact — the correct fix
 //! for a stale stream is never "report less".
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::Collector;
 use crate::parser::Parser;
 

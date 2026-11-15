@@ -13,6 +13,7 @@
 //! `crate::diagnose`'s private `test_rig` module — so it mounts the same
 //! engine face (`fold_unit_with_ops`) through the crate's public entries.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::clause_capture::capture_clause_trees;
 use crate::collector::collect;
 use crate::diagnose::types::FileReport;

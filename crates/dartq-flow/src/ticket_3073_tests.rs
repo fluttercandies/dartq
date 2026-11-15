@@ -9,7 +9,7 @@
 //! (`visitBlockFunctionBody`'s `checkUnreachableNode`,
 //! upstream Dart SDK source, pkg/analyzer/lib/src/generated/resolver.dart),
 //! so the row spans the body block's full extent, `}` included: the
-//! covering `flowEnd(constructor)` (dead_code_verifier.dart:3072) applies
+//! covering `flowEnd(constructor)` (`dead_code_verifier.dart:3072`) applies
 //! no last-statement trim to a constructor. The fix polls the body's
 //! `BlockBodyBegin` event (the `{` token) and widens a body-anchored row
 //! to the `}` at `BlockBodyEnd`; an EMPTY body stays silent
@@ -18,13 +18,14 @@
 //!
 //! The regression locks pin the census-verified 3.13.7 silences this
 //! crate already gets right (probed via the package-context A/B rig over
-//! the dead_code corpus): a plain `const bool` reference is NOT folded
+//! the `dead_code` corpus): a plain `const bool` reference is NOT folded
 //! into branch deadness (the only constant face is the boolean literal,
 //! resolver.dart `visitBooleanLiteral` — no const-variable resolution
 //! feeds `getExpressionInfo`), and a subtype-pattern arm chain leaves the
 //! later switch arms reachable (`switchStatement_beginAlternative`
-//! branches from the chained unmatched state, flow_analysis.dart:6606).
+//! branches from the chained unmatched state, `flow_analysis.dart:6606`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

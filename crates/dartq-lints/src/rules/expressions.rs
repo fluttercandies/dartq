@@ -5,6 +5,7 @@
 //! `prefer_conditional_assignment`, `prefer_if_null_operators`,
 //! `prefer_null_aware_operators`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::{Check, narrow_u32};

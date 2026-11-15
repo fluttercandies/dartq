@@ -11,7 +11,7 @@
 //! * built-in, plain/continuation faces (`isBuiltInIdentifierAllowed:
 //!   false`, :1512/:1542-1549) → report `builtInIdentifierAsType`, return
 //!   the token (consumed; `handleIdentifier` rides the parser-level wrapper,
-//!   parser_impl.dart:4031);
+//!   `parser_impl.dart:4031`);
 //! * built-in, prefixed face (`isBuiltInIdentifierAllowed: true`, :1523)
 //!   → silent;
 //! * reserved word → the `expectedType` else-branch (:1553-1556), consumed;
@@ -27,6 +27,7 @@
 //! single `expected_type_name`; `class D extends dynamic {}` and
 //! `int Function()` are silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 
 fn rows_with(source: &'static str) -> Vec<(String, u32, u32)> {
@@ -101,7 +102,7 @@ fn continuation_reserved_type_reports_expected_type_name() {
 
 /// `class C extends implements.Foo {}` (oracle: zero parser rows — the
 /// built-in + `.` head passes `isValidNonRecordTypeReference`,
-/// type_info.dart:145, and the prefixed face allows built-ins): the
+/// `type_info.dart:145`, and the prefixed face allows built-ins): the
 /// prefixed head is consumed silently.
 #[test]
 fn prefixed_builtin_head_is_silent() {

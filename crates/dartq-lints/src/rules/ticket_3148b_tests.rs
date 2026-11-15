@@ -10,6 +10,7 @@
 //! at `length` (column 12) where the oracle reports at `[]` (column 9). The
 //! pins below fix the anchor and fence the shapes that were already right.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
 /// One row for `source`, anchored at the `nth` `needle` token, with

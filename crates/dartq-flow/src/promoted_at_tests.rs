@@ -3,6 +3,9 @@
 //! their read offset (the if-null composite's `LUB(NonNull(readType),
 //! rhsType)` consumer).
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::forward::SharedFlow;
 use crate::record::Flow;
 use crate::ty::{Base, Ty};

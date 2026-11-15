@@ -18,6 +18,7 @@
 //!   `mixin_of_non_class` rows — the unresolved entry's clause error
 //!   short-circuits the constraint face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// The prelude's UTF-16 length (the `report_ops` fixtures' offset shift).

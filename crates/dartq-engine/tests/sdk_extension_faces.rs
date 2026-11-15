@@ -7,6 +7,30 @@
 //! missing one still reports, and an applicability violation (`byName`
 //! on an unbounded type parameter) keeps firing.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::path::Path;
@@ -20,7 +44,7 @@ use dartq_engine::{CancellationToken, Engine};
 /// the rows the pre-activation posture over-fired. (The unbounded
 /// violation lives in its own witness test: `codes` is per-file, so a
 /// firing control row would not be separable here.)
-const ENUM_FACE: &str = r#"enum Color { red, green, blue }
+const ENUM_FACE: &str = r"enum Color { red, green, blue }
 
 void concreteValues() {
   final c = Color.values.byName('red');
@@ -32,20 +56,20 @@ T pick<T extends Enum>(List<T> values, String name) => values.byName(name);
 void use() {
   pick<Color>(Color.values, 'red');
 }
-"#;
+";
 
 /// The G11 face without `dart:js_interop_unsafe`: a `JSObject` receiver
 /// resolves its container through the excerpt's extension-type
 /// declarations, so member/operator misses fire (the pre-activation
 /// posture read the receiver as unresolvable and stayed silent).
-const JS_INTEROP_BARE: &str = r#"import 'dart:js_interop';
+const JS_INTEROP_BARE: &str = r"import 'dart:js_interop';
 
 void f(JSObject o) {
   o['x'];
   o.callMethod('g');
   o.nope;
 }
-"#;
+";
 
 /// The same receiver with the unsafe import: the `JSObjectUnsafeUtilExtension`
 /// faces apply (`[]`, `callMethod`) and the accesses resolve — only the
@@ -53,7 +77,7 @@ void f(JSObject o) {
 /// names they declare, never blanket-suppress the member face). The
 /// argument rides `'g'.toJS` (the argument-type face is a separate
 /// family, not this pin's contract).
-const JS_INTEROP_UNSAFE: &str = r#"import 'dart:js_interop';
+const JS_INTEROP_UNSAFE: &str = r"import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 
 void g(JSObject o) {
@@ -61,7 +85,7 @@ void g(JSObject o) {
   o.callMethod('g'.toJS);
   o.nope;
 }
-"#;
+";
 
 /// The deduped, sorted diagnostic codes reported for the file whose path
 /// ends with `tail`.
@@ -151,7 +175,7 @@ fn unsafe_import_resolves_the_js_object_faces_and_keeps_genuine_misses() {
 /// parameter reads `String` (the pre-fix first-seen order collected the
 /// return's `V` ahead of the key's `K` and swapped the pairing: the key
 /// row read `String`, the closure parameter `E2`).
-const MAP_MEMBER_ENV: &str = r#"class E2 { const E2(); }
+const MAP_MEMBER_ENV: &str = r"class E2 { const E2(); }
 
 void f(Map<E2, String> m, E2 e) {
   m[e] = 'x';
@@ -160,7 +184,7 @@ void f(Map<E2, String> m, E2 e) {
   m.forEach((k, v) { print(v.length); });
   m.removeWhere((k, v) => v.isNotEmpty);
 }
-"#;
+";
 
 /// The control direction: a foreign-class key against the `E2` key
 /// parameter fires on the oracle's row (the pre-fix swapped pairing
@@ -168,13 +192,13 @@ void f(Map<E2, String> m, E2 e) {
 /// — a builtin-headed source (`String`) against a user-class parameter is
 /// a separate, pre-existing assignability under-report, not this pin's
 /// contract.
-const MAP_MEMBER_ENV_VIOLATION: &str = r#"class E2 { const E2(); }
+const MAP_MEMBER_ENV_VIOLATION: &str = r"class E2 { const E2(); }
 class F { const F(); }
 
 void f(Map<E2, String> m, F x) {
   m.putIfAbsent(x, () => 'x');
 }
-"#;
+";
 
 #[test]
 fn map_member_receiver_instantiation_pairs_declaration_order() {
@@ -197,7 +221,7 @@ fn map_member_receiver_instantiation_pairs_declaration_order() {
 /// every iterable receiver — the null-aware getters return `T?` (the
 /// `!= null` flow gate reads the real nullability), `elementAtOrNull` the
 /// declared method face.
-const ITERABLE_EXTENSIONS: &str = r#"class D {}
+const ITERABLE_EXTENSIONS: &str = r"class D {}
 
 void f(List<D> ds) {
   final D? first = ds.firstOrNull;
@@ -210,7 +234,7 @@ void f(List<D> ds) {
   final D d = ds.firstOrNull!;
   print(d);
 }
-"#;
+";
 
 #[test]
 fn iterable_extensions_family_resolves() {
@@ -228,12 +252,12 @@ fn iterable_extensions_family_resolves() {
 /// auto-import resolves the receiver's head to the LOCAL declaration; the
 /// pre-gate spelling-level applicability matched the bare name and added
 /// a spurious ambiguity row beside the oracle's set).
-const LOCAL_ITERABLE_SHADOW: &str = r#"class Iterable<T> {}
+const LOCAL_ITERABLE_SHADOW: &str = r"class Iterable<T> {}
 
 void f(Iterable<int> values) {
   values.byName('x');
 }
-"#;
+";
 
 #[test]
 fn local_iterable_shadow_kills_the_sdk_enum_by_name_face() {
@@ -279,7 +303,7 @@ fn user_extension_twin_silently_wins_over_the_sdk_face() {
 /// keeps resolving `nonNulls` (the oracle: "No issues found!" on the
 /// probe rig; the pre-fix posture read the bound against `L?` and
 /// reported `undefined_getter`).
-const NONNULLS_NULLABLE_ELEMENTS: &str = r#"class L {}
+const NONNULLS_NULLABLE_ELEMENTS: &str = r"class L {}
 
 void g(List<L> xs, Iterable<L?> it, List<L?> ls) {
   print(xs.map((x) => x as L?).nonNulls);
@@ -287,7 +311,7 @@ void g(List<L> xs, Iterable<L?> it, List<L?> ls) {
   print(ls.nonNulls);
   print(xs.nonNulls);
 }
-"#;
+";
 
 #[test]
 fn non_nulls_resolves_on_nullable_element_iterables() {

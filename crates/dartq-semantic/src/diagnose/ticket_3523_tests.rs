@@ -37,6 +37,7 @@
 //! an ignored live spec because the RECEIVER side of its fixture
 //! degrades (see its own note) — the bound map is no longer the gate.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows, types_for};
 use dartq_types::{TypeKind, UninternedType};
 
@@ -46,7 +47,7 @@ const AMBIGUOUS: &str = "ambiguous_extension_member_access";
 /// oracle's (`messages.yaml` `ambiguousExtensionMemberAccessTwo`): the
 /// member name and both extension displays ride the quoted argument
 /// slots. The slots' element rendering is `extension_display`'s face
-/// (row_resolution.rs); these fixtures pin the template text and both
+/// (`row_resolution.rs`); these fixtures pin the template text and both
 /// candidate names.
 fn assert_ambiguity_template(report: &super::FileReport, member: &str) {
     let message = &report.diagnostics[0].message;

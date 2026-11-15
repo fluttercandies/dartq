@@ -14,10 +14,11 @@
 //!   `b = false; if (b) {}` deads the then-block exactly like the
 //!   declaration's constant feed;
 //! * `&&`/`||` close a dead interval anchored INSIDE the right operand at
-//!   the operand's own `flowEnd` (binary_expression_resolver.dart:285/:331
+//!   the operand's own `flowEnd` (`binary_expression_resolver.dart:285/:331`
 //!   — unconditional at the construct's close), reporting
 //!   `firstDeadNode.offset .. rightOperand.end` — never a runaway tail.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 
@@ -101,7 +102,7 @@ fn is_not_same_type_deads_empty_block() {
 }
 
 /// The non-bottom `is!` keeps both arms live: `num`-vs-`int` factor is
-/// `num`, not bottom — no dead arm, no row. Oracle: silent on dead_code.
+/// `num`, not bottom — no dead arm, no row. Oracle: silent on `dead_code`.
 #[test]
 fn is_not_disjoint_declared_stays_live() {
     let source = "void t() {\n  num n = 0;\n  if (n is! int) {}\n}\n";

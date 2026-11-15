@@ -14,6 +14,7 @@
 //! the child's (per run) or dartdev's tiers over the full report
 //! (resident), never recomputed from the printed rows.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -584,7 +585,7 @@ mod tests {
         for budget in [None, Some(0)] {
             let run = run_with_budget(Some(&fake_dart), &[], None, budget).expect("finishes");
             assert_eq!(run.code, Some(0));
-            assert!(run.diagnostics.is_empty());
+            assert_eq!(run.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
         }
     }
 }

@@ -26,6 +26,7 @@
 //! branch dead — again not a parser row. Both downstream consumers are
 //! separate crates; these pins keep the parser side of that contract stable.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::listener::{MemberKind, ParserListener, Token};

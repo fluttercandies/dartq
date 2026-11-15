@@ -14,6 +14,7 @@
 //! `dynamic` argument, an empty `{}` keeps `Map<dynamic, dynamic>`, and
 //! an annotated declarator keeps its written context type.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

@@ -1,7 +1,7 @@
 //! The #3585 positive controls for the augment-fragment instance-scope
 //! filter of `conflicting_static_and_instance`.
 //!
-//! The upstream contract (member_duplicate_definition_verifier.dart,
+//! The upstream contract (`member_duplicate_definition_verifier.dart`,
 //! 3.13.7) has two separable halves, and the filter must touch only one:
 //!
 //! - **Claim side** (`_checkUnit` :536-557 — a complete pass over every
@@ -9,7 +9,7 @@
 //!   returns at :307-309 for a fragment whose `isAugmentation` is set, and
 //!   claims every other fragment at :316-319. `isAugmentation` is the
 //!   member's OWN `augment` keyword (`fragment.isAugmentation =
-//!   node.augmentKeyword != null`, element_builder.dart) — a member
+//!   node.augmentKeyword != null`, `element_builder.dart`) — a member
 //!   written WITHOUT the keyword inside an `augment class` body is an
 //!   introduction the fragment makes into the merged element, and it
 //!   joins `instanceScope` like any introduction.
@@ -28,6 +28,7 @@
 //! non-augmenting members a fragment introduces, and must not touch the
 //! probe side.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops_experiments_with;
 use dartq_language::Feature;

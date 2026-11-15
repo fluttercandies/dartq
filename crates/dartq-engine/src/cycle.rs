@@ -26,6 +26,7 @@
 //! the transitive closure of its changed dependency digests) and probes the
 //! standing workspace instead.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::hash::Hasher;
@@ -419,10 +420,10 @@ impl Condensation {
                                     })
                             })
                         })
-                        .map(|old| old.fingerprint)
-                        .unwrap_or_else(|| {
-                            fold_fingerprint(FINGERPRINT_TAG, &signatures, &dep_fps)
-                        });
+                        .map_or_else(
+                            || fold_fingerprint(FINGERPRINT_TAG, &signatures, &dep_fps),
+                            |old| old.fingerprint,
+                        );
                     condensation.cycles.push(CycleInfo {
                         members: members.into_boxed_slice(),
                         deps: dep_cycles.into_boxed_slice(),

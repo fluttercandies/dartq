@@ -1,6 +1,6 @@
 //! Post-build scan of a flutter build directory into an ingest draft.
 //!
-//! flutter_tools 3.47.1 keeps one directory per build configuration under
+//! `flutter_tools` 3.47.1 keeps one directory per build configuration under
 //! `.dart_tool/flutter_build/`, named by 32 lowercase hex digits (see
 //! [`crate::args_model::flutter_build_dir_name`]). Next to the payloads
 //! (`app.dill`, AOT snapshots, `App.framework/App`, …) it holds bookkeeping
@@ -21,7 +21,7 @@
 //! [`crate::orchestrator`]). A `flutter test` kernel dill is classified
 //! the same way through its embedded `file://` URIs: a foreign URI
 //! downgrades the dill to a verbatim clone ([`RewriteKind::None`]),
-//! which costs a frontend_server recompile, never a wrong artifact.
+//! which costs a `frontend_server` recompile, never a wrong artifact.
 //!
 //! Both faces share one re-ingest fast path: a file whose recorded
 //! identity matches — placed by this invocation's own materialization
@@ -32,6 +32,7 @@
 //! for byte is re-referenced after one read, so a warm run stores only
 //! what flutter actually changed (see [`reused_identity`]).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
@@ -102,6 +103,7 @@ pub struct ScanSkips {
 }
 
 impl ScanSkips {
+    #[must_use]
     pub fn total(&self) -> u64 {
         self.oversize_rewrite + self.non_regular + self.non_utf8_names
     }
@@ -233,7 +235,7 @@ fn unescape(bytes: &[u8]) -> Vec<u8> {
 /// or none, which is the foreign answer.
 struct ForeignUriScan<'a> {
     anchors: &'a PathAnchors,
-    /// Unprocessed bytes: at most `file://`.len() - 1 carry in search
+    /// Unprocessed bytes: at most `file://`.`len()` - 1 carry in search
     /// mode, the collected head in URI mode.
     buf: Vec<u8>,
     in_uri: bool,
@@ -278,19 +280,16 @@ impl<'a> ForeignUriScan<'a> {
                 }
                 continue;
             }
-            match memmem::find(&self.buf, URI_SCHEME) {
-                Some(at) => {
-                    self.buf.drain(..at + URI_SCHEME.len());
-                    self.in_uri = true;
+            if let Some(at) = memmem::find(&self.buf, URI_SCHEME) {
+                self.buf.drain(..at + URI_SCHEME.len());
+                self.in_uri = true;
+            } else {
+                let keep = URI_SCHEME.len() - 1;
+                if self.buf.len() > keep {
+                    let cut = self.buf.len() - keep;
+                    self.buf.drain(..cut);
                 }
-                None => {
-                    let keep = URI_SCHEME.len() - 1;
-                    if self.buf.len() > keep {
-                        let cut = self.buf.len() - keep;
-                        self.buf.drain(..cut);
-                    }
-                    return;
-                }
+                return;
             }
         }
     }
@@ -478,7 +477,7 @@ struct Vouched {
     /// [`PlacedFile::on_disk`]); a prior-manifest stamp vouches the
     /// blob's own bytes.
     on_disk: Option<BlobId>,
-    /// The vouching record's order-free FileStore identity (see
+    /// The vouching record's order-free `FileStore` identity (see
     /// [`PlacedFile::content`]); the next scan proves a reordered
     /// rewrite by it.
     content: Option<BlobId>,
@@ -537,7 +536,7 @@ impl Scanned {
     }
 
     /// A file hashed to its own content: a source, and a record entry
-    /// whose on-disk bytes are the blob's (`content`: the FileStore
+    /// whose on-disk bytes are the blob's (`content`: the `FileStore`
     /// identity of a `.filecache`, see [`PlacedFile::content`]).
     fn hashed(
         file: ScannedFile,
@@ -643,7 +642,7 @@ fn reused_identity(
         let proves = placed.stamp == file.stamp
             && (rerooted_ok || placed.verbatim())
             && blob_exists(&placed.blob);
-        return proves.then(|| Vouched {
+        return proves.then_some(Vouched {
             blob: placed.blob,
             rewrite: placed.rewrite,
             foreign_paths: placed.foreign_paths,
@@ -714,7 +713,7 @@ fn vouched_by_bytes(
     blob_exists: &(dyn Fn(&BlobId) -> bool + Sync),
 ) -> Option<Vouched> {
     let placed = recorded?;
-    (expected == Some(blob) && blob_exists(&placed.blob)).then(|| Vouched {
+    (expected == Some(blob) && blob_exists(&placed.blob)).then_some(Vouched {
         blob: placed.blob,
         rewrite: placed.rewrite,
         foreign_paths: placed.foreign_paths,
@@ -724,7 +723,7 @@ fn vouched_by_bytes(
 }
 
 /// The vouch a recorded file earns by what it records when its bytes
-/// moved: flutter rewrote its FileStore record in another order, or a
+/// moved: flutter rewrote its `FileStore` record in another order, or a
 /// hook result with fresh timestamps, and the normalized content still
 /// equals the placement's (see [`PlacedFile::content`]), so the
 /// recorded blob still renders it.
@@ -737,17 +736,19 @@ fn vouched_by_content(
     blob_exists: &(dyn Fn(&BlobId) -> bool + Sync),
 ) -> Option<Vouched> {
     let placed = recorded.filter(|placed| rerooted_ok || placed.verbatim())?;
-    (content.is_some() && placed.content == content && blob_exists(&placed.blob)).then(|| Vouched {
-        blob: placed.blob,
-        rewrite: placed.rewrite,
-        foreign_paths: placed.foreign_paths,
-        on_disk: placed.on_disk,
-        content: placed.content,
-    })
+    (content.is_some() && placed.content == content && blob_exists(&placed.blob)).then_some(
+        Vouched {
+            blob: placed.blob,
+            rewrite: placed.rewrite,
+            foreign_paths: placed.foreign_paths,
+            on_disk: placed.on_disk,
+            content: placed.content,
+        },
+    )
 }
 
 /// Scans the `flutter test` kernel-cache dir for ingest: every
-/// `*.cache.dill*` file below `cache_dir` (flutter_tools' TestCompiler
+/// `*.cache.dill*` file below `cache_dir` (`flutter_tools`' `TestCompiler`
 /// writes `<md5>.cache.dill[.track.dill]` under it; the file name encodes
 /// the config, so it doubles as the replay address), each stamped with
 /// its [`FileStamp`]. A dill whose embedded `file://` URIs all sit under
@@ -755,7 +756,7 @@ fn vouched_by_content(
 /// replay stays a byte-identical clone, a cross-tree replay rewrites the
 /// URI prefixes, a refused rewrite degrades to the clone); one carrying
 /// a foreign URI ingests as [`RewriteKind::None`] — placed verbatim
-/// everywhere, costing a frontend_server recompile on a cross-tree hit,
+/// everywhere, costing a `frontend_server` recompile on a cross-tree hit,
 /// never a wrong library.
 ///
 /// `prior` is the test-cache [`DirRecord`] of the entry currently stored
@@ -764,7 +765,7 @@ fn vouched_by_content(
 /// earlier ones (a same-tree hit places the dill verbatim, so a run
 /// that left it alone re-references it without reading tens of MB).
 /// Both feed [`reused_identity`] — verbatim placements only: a
-/// cross-tree dill rewrite is re-read, as frontend_server rewrites the
+/// cross-tree dill rewrite is re-read, as `frontend_server` rewrites the
 /// cache dill on every run anyway.
 ///
 /// `None` when the dir is missing, untouched since `since` (the run
@@ -887,7 +888,7 @@ fn is_kernel_cache(path: &Path) -> bool {
 /// ~100 MB payload that provably was not written is pure overhead. A
 /// recorded file whose stamp moved is read, and still rides along when
 /// its bytes are the placed ones (flutter rewrote it byte for byte, see
-/// [`expected_bytes`]) or, for flutter's FileStore record, when it
+/// [`expected_bytes`]) or, for flutter's `FileStore` record, when it
 /// records exactly what the placement recorded in another order (see
 /// [`PlacedFile::content`]). Everything else is hashed (in parallel) and
 /// becomes an ingest source.
@@ -992,10 +993,7 @@ pub fn scan_entry_files(
             let expected = expected_bytes(recorded, rerooted_ok, blob_exists);
             let mut scan = if file.bookkeeping {
                 Some(ByteScan::Bookkeeping {
-                    needles: needle_bytes
-                        .iter()
-                        .map(|needle| memmem::Finder::new(needle))
-                        .collect(),
+                    needles: needle_bytes.iter().map(memmem::Finder::new).collect(),
                     foreign: ForeignPathScan::new(anchors),
                 })
             } else if file.payload_dill {
@@ -1069,7 +1067,7 @@ fn classify(file: &ScannedFile, mentions: bool, foreign: bool) -> (RewriteKind, 
     (rewrite, file.bookkeeping && foreign)
 }
 
-/// Keeps the content-vouched files of one dir — the FileStore record and
+/// Keeps the content-vouched files of one dir — the `FileStore` record and
 /// the hook results it hashes — one consistent recorded build. The
 /// record's identity ignores the hook results' md5s and a hook result's
 /// ignores its timestamps (see [`crate::materialize::content_identity`]),
@@ -2471,7 +2469,7 @@ mod tests {
         // Only the dir touched at 300 — through its own mtime — survives
         // a `since` past the other's file-carried 250.
         assert_eq!(
-            find_touched_hash_dirs(&root, at(275)).expect("scan"),
+            find_touched_hash_dirs(root, at(275)).expect("scan"),
             vec![(by_dir.to_owned(), at(300))]
         );
     }
@@ -2506,7 +2504,7 @@ mod tests {
             ),
             (
                 "sdk.stamp",
-                format!(r#"{{"input":"/fake/flutter-sdk/bin/cache/artifacts/i.png"}}"#),
+                r#"{"input":"/fake/flutter-sdk/bin/cache/artifacts/i.png"}"#.to_string(),
             ),
             (
                 // An escaped space truncates the token after `/opt/my\`;
@@ -2624,7 +2622,7 @@ mod tests {
     /// URIs sit under the worktree root ingests as `DillUris` (the
     /// cross-tree rewriter's contract); one carrying a URI outside
     /// every anchor downgrades to a verbatim clone (`None`), and
-    /// package:/dart: URIs never matter.
+    /// <package:/dart>: URIs never matter.
     #[test]
     fn dill_uri_classification_foreign_vs_anchored() {
         let project = tempfile::tempdir().expect("tempdir");

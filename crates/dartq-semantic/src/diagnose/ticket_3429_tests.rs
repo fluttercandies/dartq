@@ -22,17 +22,18 @@
 //!
 //! Oracle provenance: `dart analyze` 3.13.7 — the expectations mirror
 //! `ObjectPatternResolutionTest`
-//! (test_typedef_functionType_notGeneric_hasName_{extensionGetter,
-//! hashCode,unresolved}, test_typedef_functionType_generic_
-//! withTypeArguments_hasName_extensionGetter, test_typeAlias_nullable)
+//! (`test_typedef_functionType_notGeneric_hasName`_{extensionGetter,
+//! hashCode,unresolved}, `test_typedef_functionType_generic`_
+//! `withTypeArguments_hasName_extensionGetter`, `test_typeAlias_nullable`)
 //! and the member verdict's shape arms (upstream
 //! type_property_resolver.dart:186-234).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// `Fn(hashCode: var y)` over `typedef Fn = void Function()` resolves
 /// `dart:core::Object::hashCode` — the interface lookup's last leg
-/// (upstream test_typedef_functionType_notGeneric_hasName_hashCode).
+/// (upstream `test_typedef_functionType_notGeneric_hasName_hashCode`).
 #[test]
 fn pattern_fn_head_object_member_silent() {
     let report = report_ops(
@@ -47,7 +48,7 @@ fn pattern_fn_head_object_member_silent() {
 /// `Fn(foo: var y)` over the same head is the oracle's
 /// `undefined_getter` "for the type 'Fn'" — the alias spelling at the
 /// field name (upstream
-/// test_typedef_functionType_notGeneric_hasName_unresolved).
+/// `test_typedef_functionType_notGeneric_hasName_unresolved`).
 #[test]
 fn pattern_fn_head_genuine_miss_reports() {
     let report = report_ops(
@@ -65,7 +66,7 @@ fn pattern_fn_head_genuine_miss_reports() {
 }
 
 /// An extension getter on the exact folded shape resolves the field
-/// (upstream test_typedef_functionType_notGeneric_hasName_
+/// (upstream `test_typedef_functionType_notGeneric_hasName`_
 /// extensionGetter).
 #[test]
 fn pattern_fn_head_extension_getter_silent() {
@@ -80,8 +81,8 @@ fn pattern_fn_head_extension_getter_silent() {
 }
 
 /// A generic alias's instantiated fold still reads the `on` shape
-/// (upstream test_typedef_functionType_generic_withTypeArguments_
-/// hasName_extensionGetter — `Fn<int>` folds to `int Function()`).
+/// (upstream `test_typedef_functionType_generic_withTypeArguments`_
+/// `hasName_extensionGetter` — `Fn<int>` folds to `int Function()`).
 #[test]
 fn pattern_fn_head_generic_alias_extension_silent() {
     let report = report_ops(
@@ -109,7 +110,7 @@ fn pattern_fn_head_call_silent() {
 
 /// A nullable folded FUNCTION head never spells `undefined_getter` —
 /// upstream's `isNullable` branch reports the unchecked family at the
-/// TYPE token (upstream test_typeAlias_nullable's
+/// TYPE token (upstream `test_typeAlias_nullable`'s
 /// `uncheckedPropertyAccessOfNullableValue`), a span the pending triple
 /// does not carry, so the verdict stands down on a genuine miss while
 /// `Object` members still resolve.

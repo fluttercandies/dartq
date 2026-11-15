@@ -362,7 +362,7 @@ fn condition_run(c: &Check<'_>, node: u32) -> Vec<u32> {
         })
         .collect();
     prefix.reverse();
-    prefix.extend(run.drain(..));
+    prefix.append(&mut run);
     prefix
 }
 
@@ -723,8 +723,7 @@ fn for_each_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let Some(loop_name_row) = loop_var_rows
         .iter()
         .copied()
-        .filter(|&row| c.kind(row) == NodeKind::Identifier)
-        .next_back()
+        .rfind(|&row| c.kind(row) == NodeKind::Identifier)
     else {
         return;
     };
@@ -745,8 +744,7 @@ fn for_each_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let Some(iter_name_row) = iterable_rows
         .iter()
         .copied()
-        .filter(|&row| c.kind(row) == NodeKind::Identifier)
-        .next()
+        .find(|&row| c.kind(row) == NodeKind::Identifier)
     else {
         return;
     };

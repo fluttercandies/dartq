@@ -19,6 +19,7 @@
 //!   `undefined_identifier`, while a plain instance field initializer
 //!   resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::diagnose::test_rig::report_ops;
 

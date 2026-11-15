@@ -31,6 +31,7 @@
 //! `conflicting_static_and_instance` arms), `dup_field_mix` (own-scope
 //! `conflicting_static_and_instance` over a mixed static+instance pair).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops, report_ops_wildcards};
 
 fn dup_messages(report: &crate::diagnose::FileReport) -> Vec<String> {

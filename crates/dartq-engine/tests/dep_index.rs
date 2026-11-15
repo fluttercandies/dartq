@@ -10,11 +10,35 @@
 //! root from `tests/fixtures/dep-interface/` (tracked verbatim): the `ws`
 //! package's hand-written `package_config.json` points the `dep` entry at
 //! the sibling directory (a relative `rootUri` is legal per the pub
-//! package_config format), and the hosted `pubspec.lock` entry classifies
+//! `package_config` format), and the hosted `pubspec.lock` entry classifies
 //! `dep` as cache content — not workspace source — which is the shape the
 //! lazy index keys on. The dep files are never fed as content: they reach
 //! the analysis only through the on-disk load the import triggers.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

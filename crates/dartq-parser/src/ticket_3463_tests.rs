@@ -16,6 +16,7 @@
 //!   `missing_function_body` ("A function body must be provided.") at
 //!   the `;`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;

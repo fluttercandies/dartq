@@ -18,6 +18,7 @@
 //! Oracle provenance: `dart analyze` 3.13.1, probed per shape before the
 //! fix; every expectation below is a live `<probe>` run, not a derivation.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 use super::*;
 

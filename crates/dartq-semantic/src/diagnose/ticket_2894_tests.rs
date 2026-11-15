@@ -9,6 +9,7 @@
 //! test_expression_interfaceType_nullable_hasCall#0`, whose oracle
 //! expectation is empty and whose only divergence was that extra row).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops};
 
 /// The corpus pin (unnamed extension — the whole face checks like a
@@ -18,14 +19,14 @@ use super::test_rig::{assert_silent, code_names, report_ops};
 #[test]
 fn invoked_unnamed_extension_call_is_not_unused() {
     let report = report_ops(
-        r#"
+        r"
 void f(int? a) {
   a();
 }
 extension on int? {
   int call() => 0;
 }
-"#,
+",
     );
     assert_silent(&report);
 }
@@ -37,14 +38,14 @@ extension on int? {
 #[test]
 fn invoked_named_private_extension_call_is_not_unused() {
     let report = report_ops(
-        r#"
+        r"
 void f(int? a) {
   a();
 }
 extension _N on int? {
   int call() => 0;
 }
-"#,
+",
     );
     assert_silent(&report);
 }
@@ -55,12 +56,12 @@ extension _N on int? {
 #[test]
 fn uninvoked_extension_call_still_reports_unused() {
     let report = report_ops(
-        r#"
+        r"
 void f(int? a) {}
 extension on int? {
   int call() => 0;
 }
-"#,
+",
     );
     assert_eq!(
         code_names(&report),
@@ -76,14 +77,14 @@ extension on int? {
 #[test]
 fn invoked_class_call_method_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 class C {
   int call() => 0;
 }
 void f(C c) {
   c();
 }
-"#,
+",
     );
     assert_silent(&report);
 }

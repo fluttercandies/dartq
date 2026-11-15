@@ -8,6 +8,7 @@
 //! through the resulting ids. The slice holds each referenced text once —
 //! the compact-facts discipline: no token payloads, no source bytes, only
 //! the columns the model already holds.
+#![allow(clippy::field_reassign_with_default)]
 
 use serde::{Deserialize, Serialize};
 
@@ -961,7 +962,7 @@ impl<'a> Slice<'a> {
                 .map(|formals| Box::new(self.formals(formals))),
             annotations: self.annotations(&entry.annotations),
             name_range: (entry.name_range.offset != u32::MAX)
-                .then(|| (entry.name_range.offset, entry.name_range.length)),
+                .then_some((entry.name_range.offset, entry.name_range.length)),
         }
     }
 }
@@ -1121,7 +1122,7 @@ impl PersistedElements {
                 is_complete: target.is_complete,
                 head_range: target.head_range.map(PersistedRange::of),
                 name_range: (target.name_range.offset != u32::MAX)
-                    .then(|| (target.name_range.offset, target.name_range.length)),
+                    .then_some((target.name_range.offset, target.name_range.length)),
             })
             .collect();
         let anon_methods = elements
@@ -1247,8 +1248,8 @@ impl PersistedElements {
                 .extension_faces
                 .into_iter()
                 .map(|face| ExtensionFace {
-                    name: face.name.map(&at_name),
-                    on_type: face.on_type.map(&at_name),
+                    name: face.name.map(at_name),
+                    on_type: face.on_type.map(at_name),
                     on_type_nullable: face.on_type_nullable,
                     on_ty: into_ty(face.on_ty, &ids, &mut type_args),
                     type_param_names: face.type_param_names.into_iter().map(&at_name).collect(),
@@ -1311,7 +1312,7 @@ impl PersistedElements {
                     display_name: at_name(aug.display_name),
                     name_range: aug.name_range.source_range(),
                     augment_kw: aug.augment_kw.source_range(),
-                    container: aug.container.map(&at_name),
+                    container: aug.container.map(at_name),
                     is_static: aug.is_static,
                     is_final: aug.is_final,
                     modifiers: aug.modifiers.into(),
@@ -1337,7 +1338,7 @@ impl PersistedElements {
                         .formals
                         .iter()
                         .map(|f| crate::model::AugmentFormal {
-                            name: f.name.map(&at_name),
+                            name: f.name.map(at_name),
                             name_range: f.name_range.source_range(),
                             full_range: f.full_range.source_range(),
                             ty: f.ty.clone().map(|ty| into_ty(ty, &ids, &mut type_args)),
@@ -1365,7 +1366,7 @@ impl PersistedElements {
                 .decl_kinds
                 .iter()
                 .map(|target| crate::model::AugTarget {
-                    container: target.container.map(&at_name),
+                    container: target.container.map(at_name),
                     name: at_name(target.name),
                     kind: target.kind.into(),
                     is_final: target.is_final,
@@ -1400,7 +1401,7 @@ impl PersistedElements {
                     }),
                     end: entry.end,
                     is_expression: entry.is_expression,
-                    first_param: entry.first_param.map(|range| range.source_range()),
+                    first_param: entry.first_param.map(PersistedRange::source_range),
                 })
                 .collect(),
             wildcard_duplicates: self

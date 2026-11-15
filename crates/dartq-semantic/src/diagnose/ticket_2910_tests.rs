@@ -12,6 +12,7 @@
 //! Behavioral oracle: dart 3.13.7 `deprecated_member_use_test.dart` /
 //! `experimental_member_use_test.dart` resolution probes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::diagnose::test_rig::{RigImport, report_ops_imports};
 use crate::library::ElementIndex;

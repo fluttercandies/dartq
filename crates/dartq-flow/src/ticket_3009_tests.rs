@@ -19,6 +19,7 @@
 //! `dead_code_test.dart`'s `test_flowEnd_forParts_*` /
 //! `test_flowEnd_forElementParts_*` families.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

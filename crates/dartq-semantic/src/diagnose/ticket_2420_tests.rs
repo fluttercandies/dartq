@@ -37,6 +37,7 @@
 //! `micro/mixin-dead`, `micro/frozen-ext`, `micro/frozen-miss`,
 //! `micro/frozen-getter`, `micro/ext-list`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

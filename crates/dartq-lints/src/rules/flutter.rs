@@ -23,6 +23,7 @@
 //! debug-method references) read their syntactic shapes; each rule's
 //! module doc registers its direction.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField};
 use dartq_parser::IdentifierContext;
 
@@ -1381,7 +1382,7 @@ pub(crate) mod sized_box_shrink_expand {
         }
     }
 
-    /// The `double.infinity` prefixed-identifier spelling: the DotAccess row
+    /// The `double.infinity` prefixed-identifier spelling: the `DotAccess` row
     /// seals the selector extent and keeps the dot token in payload word 0;
     /// the receiver identifier sits one token before the dot.
     fn infinity_at(c: &Check<'_>, dot: u32) -> Option<f64> {
@@ -2282,9 +2283,7 @@ pub(crate) mod no_logic_in_create_state {
                     let arrow = c.head_token(body);
                     let method_window = c.children(method);
                     (method_window.start..method_window.end)
-                        .filter(|&row| {
-                            row as u32 != body && c.unit.ast.token_range(row as u32).start >= arrow
-                        })
+                        .filter(|&row| row != body && c.unit.ast.token_range(row).start >= arrow)
                         .collect()
                 } else {
                     (window.start..window.end).collect()
@@ -2338,7 +2337,7 @@ pub(crate) mod no_logic_in_create_state {
                         let arrow = c.head_token(ret);
                         let ret_window = c.children(ret);
                         let returned: Vec<u32> = (ret_window.start..ret_window.end)
-                            .filter(|&row| c.unit.ast.token_range(row as u32).start > arrow)
+                            .filter(|&row| c.unit.ast.token_range(row).start > arrow)
                             .collect();
                         if returned.is_empty() {
                             // A bare `return;` reports at the body.
@@ -2725,8 +2724,8 @@ pub(crate) mod diagnostic_describe_all_properties {
             c.children(body)
         };
         let referenced: Vec<&str> = (window.start..window.end)
-            .filter(|&row| c.kind(row as u32) == NodeKind::Identifier)
-            .map(|row| c.lexeme(c.head_token(row as u32)))
+            .filter(|&row| c.kind(row) == NodeKind::Identifier)
+            .map(|row| c.lexeme(c.head_token(row)))
             .collect();
         properties.retain(|&property| {
             let name = c.lexeme(property);
@@ -3148,8 +3147,7 @@ mod semantic_identity {
 
         let cold: Vec<Lint> = RULES
             .iter()
-            .map(|rule| run_semantic(src, rule, None))
-            .flatten()
+            .flat_map(|rule| run_semantic(src, rule, None))
             .collect();
         assert_eq!(cold.len(), 2, "{cold:?}");
         assert_eq!(sorted(run_semantic_set(src, &multi, None)), sorted(cold));

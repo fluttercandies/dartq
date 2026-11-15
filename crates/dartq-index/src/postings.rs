@@ -45,6 +45,7 @@
 //! contributing unit — the term the bench adjudicates against the
 //! tombstone shape.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use rustc_hash::FxHashMap;
 
 use dartq_source::StringId;
@@ -188,6 +189,7 @@ pub fn distinct_decl_names(index: &crate::FileIndex) -> impl Iterator<Item = Str
 }
 
 #[cfg(test)]
+#[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
     use crate::capture::DeclKind;

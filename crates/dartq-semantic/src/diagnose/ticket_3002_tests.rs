@@ -9,6 +9,7 @@
 //! declaration read's tear-off static type — `PropertyAccessImpl`/
 //! `FunctionReference`'s static type).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 
 /// `unnecessary_type_check` rows in source order.

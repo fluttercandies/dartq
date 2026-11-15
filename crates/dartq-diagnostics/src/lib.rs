@@ -24,6 +24,7 @@
 //! single source of truth for file identity and the UTF-16 position
 //! convention.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 mod analyzer_docs;
 mod code;
 mod lint_docs;
@@ -47,9 +48,10 @@ pub use writer::{write_json, write_machine};
 /// for an unpublished analyzer/parser code and a code the first-party
 /// tables do not carry (a plugin lint — the oracle's URL is null).
 pub(crate) fn doc_prefix(name: &str, is_lint: bool) -> Option<&'static str> {
-    match is_lint {
-        true => lint_docs::lint_doc_prefix(name),
-        false => analyzer_docs::published(name).then_some("https://dart.dev/diagnostics/"),
+    if is_lint {
+        lint_docs::lint_doc_prefix(name)
+    } else {
+        analyzer_docs::published(name).then_some("https://dart.dev/diagnostics/")
     }
 }
 

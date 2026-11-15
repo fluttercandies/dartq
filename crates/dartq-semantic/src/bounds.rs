@@ -73,6 +73,7 @@
 //! expands reads `dynamic` — the always-satisfied default, the
 //! under-report direction.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cell::{Cell, Ref, RefCell};
 
 use dartq_source::{SourceRange, StringId, StringTable};
@@ -371,7 +372,7 @@ fn tree_any_head(tree: &TypeTree, pred: &dyn Fn(StringId) -> bool) -> bool {
 /// Attaches a sealed function node's own signature variables to its
 /// quantifier columns (#3692). The parser parses a signature's `<...>`
 /// groups ahead of its formals (upstream Dart SDK source,
-/// pkg/_fe_analyzer_shared/lib/src/parser/type_info_impl.dart :627-636),
+/// pkg/_`fe_analyzer_shared/lib/src/parser/type_info_impl.dart` :627-636),
 /// and the diagnose-side sinks never receive the collector's per-variable
 /// pairing, so without the stitch every generic-function-type bound and
 /// clause (`T extends void Function<U extends B>()`) degraded to its
@@ -913,7 +914,7 @@ pub(crate) struct CreationInference {
     pub(crate) twins: Vec<CreationTwinRow>,
 }
 
-/// `greatestClosure` (type_system.dart:592-620 over least_greatest_
+/// `greatestClosure` (type_system.dart:592-620 over `least_greatest`_
 /// closure.dart:12-105): every target type parameter eliminated to the
 /// top type in covariant positions and the bottom type in contravariant
 /// ones. Interface arguments keep the incoming variance — an invariant
@@ -1065,7 +1066,7 @@ pub(crate) struct Bounds<'a> {
     /// slice above the matching mark is that function level's own
     /// signature variables (the parser parses a signature's groups before
     /// its formals, upstream Dart SDK source,
-    /// pkg/_fe_analyzer_shared/lib/src/parser/type_info_impl.dart
+    /// pkg/_`fe_analyzer_shared/lib/src/parser/type_info_impl.dart`
     /// :627-636, so every group of a level closes before the level
     /// seals).
     fn_sig_marks: Vec<usize>,
@@ -1823,7 +1824,7 @@ impl<'a> Bounds<'a> {
     /// The RHS's function-type head event: `fn_seen` marks the RHS a
     /// function type (a named RHS finalizes differently at the close). The
     /// parser fires this before the return type parses (upstream Dart SDK
-    /// source, pkg/_fe_analyzer_shared/lib/src/parser/type_info_impl.dart,
+    /// source, pkg/_`fe_analyzer_shared/lib/src/parser/type_info_impl.dart`,
     /// `ComplexTypeInfo.parseType`'s pass 1 — outermost `Function` first),
     /// so the return's trees keep joining the sink; the return is claimed
     /// at the formals' open. A second head event inside the RHS is a
@@ -2037,7 +2038,7 @@ impl<'a> Bounds<'a> {
         };
         let stray = alias.sink.done.len();
         let rhs = if alias.fn_seen {
-            (stray == 0).then(|| AliasRhs::Fn {
+            (stray == 0).then_some(AliasRhs::Fn {
                 type_params: alias.rhs_vars,
                 ret: alias.ret,
                 positional: alias.positional,
@@ -2463,10 +2464,7 @@ impl<'a> Bounds<'a> {
                 }
                 (None, None) => continue,
             };
-            let kind = map
-                .as_ref()
-                .map(ScopeKind::Window)
-                .unwrap_or(ScopeKind::Decl);
+            let kind = map.as_ref().map_or(ScopeKind::Decl, ScopeKind::Window);
             issues.extend(self.check_named(
                 strings, tree.head, &tree.args, tree.range, &scope, kind, true,
             ));
@@ -2478,7 +2476,7 @@ impl<'a> Bounds<'a> {
     /// The alias-RHS face (#2936): a function-type alias's `typedef B =
     /// A<X>;` right-hand `NamedType` is itself a checked annotation — its
     /// parent `GenericTypeAlias` denies the super pass
-    /// (`_shouldAllowSuperBoundedTypes`, type_arguments_verifier.dart:742),
+    /// (`_shouldAllowSuperBoundedTypes`, `type_arguments_verifier.dart:742`),
     /// exactly like the clause contexts. A function-shaped RHS's own
     /// return/argument `NamedType`s keep the pass (their parents are the
     /// function type's nodes, absent from the deny list). Declaration
@@ -2535,7 +2533,7 @@ impl<'a> Bounds<'a> {
     /// another typedef / a class-or-mixin type-parameter bound
     /// ([`SelfReferenceState`]). The order is unspecified — the caller
     /// anchors each row at the declaration's name token
-    /// (`_checkForTypeAliasCannotReferenceItself`, error_verifier.dart:
+    /// (`_checkForTypeAliasCannotReferenceItself`, `error_verifier.dart`:
     /// 7116-7127) and source order follows from those anchors.
     pub(crate) fn check_alias_self_references(&self) -> Vec<StringId> {
         self.index
@@ -2578,7 +2576,7 @@ impl<'a> Bounds<'a> {
     /// positions recurse (`visitNamedType`, :8526-8532) — and a head
     /// shadowed by an in-scope type parameter resolves to that parameter,
     /// never a declaration. An unresolvable head answers `true` upstream
-    /// (simply_bounded.dart:304) and suppresses here (the in-file map is
+    /// (`simply_bounded.dart:304`) and suppresses here (the in-file map is
     /// the only resolution face, the under-report direction).
     ///
     /// Simple-boundedness is the dependency-graph verdict of
@@ -2608,13 +2606,13 @@ impl<'a> Bounds<'a> {
         let mut node_idx: FxHashMap<StringId, usize> = FxHashMap::default();
         let mut deps: Vec<Vec<usize>> = Vec::new();
         let mut killed: Vec<bool> = Vec::new();
-        for (name, capture) in &self.index.containers {
+        for name in self.index.containers.keys() {
             node_idx.insert(*name, deps.len());
             deps.push(Vec::new());
             killed.push(false);
         }
         let alias_base = deps.len();
-        for (name, capture) in &self.index.aliases {
+        for name in self.index.aliases.keys() {
             let slot = deps.len();
             deps.push(Vec::new());
             killed.push(false);
@@ -3048,16 +3046,16 @@ impl<'a> Bounds<'a> {
         // the class/mixin/enum/extension-type/alias kinds alike, a
         // zero-parameter alias included (its right-hand side still joins
         // reference cycles).
-        if let Some(&node) = node_idx.get(&tree.head) {
-            if !simply_bounded[node] {
-                rows.push(tree.range);
-            }
+        if let Some(&node) = node_idx.get(&tree.head)
+            && !simply_bounded[node]
+        {
+            rows.push(tree.range);
         }
     }
 
     /// The nested-`NamedType` walk: upstream's verifier visits every
     /// `NamedType` node independently (`checkNamedType`,
-    /// type_arguments_verifier.dart:243), so a type argument that itself
+    /// `type_arguments_verifier.dart:243`), so a type argument that itself
     /// carries arguments answers its own head's bounds — the `A<X?>` of
     /// `X extends FutureOr<A<X?>>` or the `G<U>` of `extends X<G<U>>`.
     /// An argument position's parent is a `TypeArgumentList`/`NamedType`,
@@ -3193,7 +3191,7 @@ impl<'a> Bounds<'a> {
     /// inverted re-check (`is_well_bounded`). `site` is the checked
     /// annotation's own span (the context row's anchor, and the report
     /// anchor when no written argument exists — `_typeArgumentErrorNode`
-    /// falls back to the `NamedType` itself, type_arguments_verifier.dart:
+    /// falls back to the `NamedType` itself, `type_arguments_verifier.dart`:
     /// 757-768).
     ///
     /// A bare `head` (no written arguments) resolves to its
@@ -3350,12 +3348,12 @@ impl<'a> Bounds<'a> {
             }
             let mut mapped_args = Vec::with_capacity(args.len());
             for arg in args {
-                let Some(ty) = ctx.map_tree(arg, &scope) else {
+                let Some(ty) = ctx.map_tree(arg, scope) else {
                     return Vec::new();
                 };
                 if !snapshot.type_is_safe(ty) {
                     return Vec::new();
-                };
+                }
                 mapped_args.push(ty);
             }
             (
@@ -3405,7 +3403,7 @@ impl<'a> Bounds<'a> {
                     &head_params,
                     &head_bounds,
                     args,
-                    &scope,
+                    scope,
                     true,
                 ) {
                     Some(inverted) => inverted,
@@ -3420,7 +3418,7 @@ impl<'a> Bounds<'a> {
                     &head_params,
                     &head_bounds,
                     args,
-                    &scope,
+                    scope,
                     false,
                 ) {
                     Some(inverted) => inverted,
@@ -3804,7 +3802,6 @@ impl<'a> Bounds<'a> {
     ///
     /// `None` where a subtree fails to map — the same refusal contract
     /// `map_tree` carries.
-    #[expect(clippy::too_many_arguments)]
     fn invert_to_ty<'s>(
         index: &'s BoundsIndex,
         snapshot: &'s Snapshot<'a>,
@@ -4186,11 +4183,11 @@ impl<'a> Bounds<'a> {
     /// that window's written parameter list (#3616 F3). `None` when a
     /// declaration of the name writes no bound (or an unmodelable one) or
     /// when no bounded declaration precedes `site_offset`.
-    fn latest_window_bound<'i>(
-        &'i self,
+    fn latest_window_bound(
+        &self,
         name: StringId,
         site_offset: u32,
-    ) -> Option<(&'i TypeTree, &'i [(StringId, Option<TypeTree>, bool)])> {
+    ) -> Option<(&TypeTree, &[(StringId, Option<TypeTree>, bool)])> {
         let mut latest: Option<(u32, &TypeTree, &[(StringId, Option<TypeTree>, bool)])> = None;
         for window in &self.index.param_windows {
             let Some((_, bound, poisoned)) = window.iter().find(|(param, _, _)| *param == name)
@@ -4490,7 +4487,7 @@ impl<'a> Bounds<'a> {
     /// (`GenericInferrer.tryChooseFinalTypes` → `chooseTypes` →
     /// `chooseTypeFromConstraint(grounded)`, upstream Dart SDK source,
     /// pkg/analyzer/lib/src/dart/element/generic_inferrer.dart:298-380 and
-    /// pkg/_fe_analyzer_shared/lib/src/type_inference/
+    /// pkg/_`fe_analyzer_shared/lib/src/type_inference`/
     /// type_analyzer_operations.dart:1018-1076), then the extends constraint
     /// re-checks the seed against the bound substituted with all seeds
     /// (`TypeConstraintFromExtendsClause.isSatisfiedBy`,
@@ -4845,7 +4842,7 @@ impl<'a> Bounds<'a> {
     /// direction), or an unconvertible default kind.
     ///
     /// The returned trees keep the oracle's alias decoration
-    /// (`getDisplayString(preferTypeAlias)`, display_string_builder.dart:
+    /// (`getDisplayString(preferTypeAlias)`, `display_string_builder.dart`:
     /// 379-382): a parameter whose written bound was an alias-headed tree
     /// answers the bound's own spelling under the grounding substitution
     /// (`X extends G` over `typedef G<X> = X Function()` renders
@@ -5733,7 +5730,7 @@ impl<'a> Snapshot<'a> {
             };
             let mut parameter_facts: Vec<(TypeParamId, ParamFacts)> = Vec::new();
             for (name, capture) in &index.aliases {
-                let Some(&decl) = registry.get(&name) else {
+                let Some(&decl) = registry.get(name) else {
                     continue;
                 };
                 let Some(scope) = alias_scopes.get(&decl) else {
@@ -6739,7 +6736,7 @@ impl<'a> Snapshot<'a> {
             .collect()
     }
 
-    /// `_findRawTypePathsToDeclaration` (default_types_builder.dart:
+    /// `_findRawTypePathsToDeclaration` (`default_types_builder.dart`:
     /// 207-273) over the WRITTEN bound trees: whether `tree` spells a bare
     /// parameterized head that is `end`, or one whose own declared bounds
     /// reach `end` through the same walk — a `NamedTypeBuilder` with empty

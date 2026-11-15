@@ -61,11 +61,14 @@
 //! final; every suite not provably green reruns under the stock runner, so
 //! each failure is reported exactly as `dart test` reports it.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use rustc_hash::FxHashSet;
 
 /// A compiled grouped runner.
 #[derive(Debug, Clone)]
@@ -213,7 +216,7 @@ pub fn compile(
 /// Both compilers print each error as `<path>:<line>:<column>: Error: …`
 /// with `<path>` relative to the working directory (`root`) or absolute.
 pub(crate) fn broken_suites(root: &Path, hosted: &[PathBuf], output: &str) -> Option<Vec<PathBuf>> {
-    let suites: std::collections::HashSet<&Path> = hosted.iter().map(PathBuf::as_path).collect();
+    let suites: FxHashSet<&Path> = hosted.iter().map(PathBuf::as_path).collect();
     let mut broken: Vec<PathBuf> = Vec::new();
     for line in output.lines() {
         let Some((location, _)) = line.split_once(": Error: ") else {

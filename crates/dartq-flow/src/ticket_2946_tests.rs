@@ -24,13 +24,14 @@
 //! `ifNullExpression_rightBegin` `nonNullable` arm,
 //! `flow_analysis.dart:5842-5864`) kills the RHS path: the operand's
 //! first token is the official's first dead node
-//! (dead_code_verifier.dart's `parent is AssignmentExpression` arm does
+//! (`dead_code_verifier.dart`'s `parent is AssignmentExpression` arm does
 //! not re-anchor to the operator — the interval covers operand start
 //! through the containing node's end, `1;` for a statement). The skip
 //! state restores at `Ev::Assign { if_null }`; an *exit*-dead RHS
 //! (`x ??= throw e`) restores live with no row (the skip path itself was
 //! never dead), and an outer dead region keeps its own interval.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -164,7 +165,7 @@ fn final_local_still_folds() {
 
 /// `int x; x ??= 1` — non-nullable LHS kills the RHS entry. The interval
 /// covers the operand through the containing statement's end
-/// (dead_code_verifier's `AssignmentExpression` arm does not re-anchor to
+/// (`dead_code_verifier`'s `AssignmentExpression` arm does not re-anchor to
 /// `??=`).
 #[test]
 fn if_null_assign_rhs_dead_on_nonnull_local() {

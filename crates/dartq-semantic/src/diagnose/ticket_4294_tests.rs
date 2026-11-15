@@ -21,6 +21,7 @@
 //!   rows are suppressed; the legacy fold reproduces that through the
 //!   optimistic step, pinned on both sides in `ticket_4304_tests`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{RigImport, report_ops, report_ops_bare, report_ops_imports};
 

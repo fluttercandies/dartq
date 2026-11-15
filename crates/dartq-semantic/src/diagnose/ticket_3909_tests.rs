@@ -9,6 +9,8 @@
 //! Offsets are UTF-16; `at` shifts by [`CORE_PRELUDE`] because the rig
 //! carries the fixture behind it on one line. All fixtures are ASCII.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -42,11 +44,11 @@ fn at(source: &str, needle: &str) -> u32 {
 /// extent. Fails before: the row anchored at the `!` with length 1.
 #[test]
 fn bang_on_null_anchors_whole_postfix_node() {
-    let source = r#"
+    let source = r"
 void f() {
   null!;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = spans_of(&report, "null_check_always_fails");
     assert_eq!(
@@ -64,12 +66,12 @@ void f() {
 /// argument face over-reported (`f(null!)`'s extra row).
 #[test]
 fn bang_on_null_result_is_never_for_arguments() {
-    let source = r#"
+    let source = r"
 void f(int x) {}
 void g() {
   f(null!);
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         spans_of(&report, "null_check_always_fails"),
@@ -101,7 +103,7 @@ void g() {
 /// `!`.
 #[test]
 fn super_bang_never_reports_unnecessary() {
-    let source = r#"
+    let source = r"
 class A {
   void foo() {}
 }
@@ -111,7 +113,7 @@ class C extends A {
     super!.foo();
   }
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         spans_of(&report, "unnecessary_non_null_assertion").is_empty(),
@@ -136,12 +138,12 @@ class C extends A {
 /// `unnecessary_non_null_assertion` plus `invalid_assignment`.
 #[test]
 fn function_interface_callee_send_is_dynamic() {
-    let source = r#"
+    let source = r"
 void g(Function f4) {
   f4(42)!;
   String s = f4(42);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         spans_of(&report, "unnecessary_non_null_assertion").is_empty(),
@@ -205,14 +207,14 @@ class C {
 // `Identifier.staticType` over a static-method read is the method's
 // tear-off signature (`A.foo` reads `void Function()`,
 // UnnecessaryNonNullAssertionTest.test_nonNull_method's row), so the
-/// `!` on it stages over a strictly non-null function type.
+// `!` on it stages over a strictly non-null function type.
 
 /// `A.sm!` and `A.foo!` stage the unnecessary assertion at each `!`.
 /// Fails before: the container-name receiver answered no tear-off face
 /// and both rows were missing.
 #[test]
 fn static_member_tearoff_face_answers() {
-    let source = r#"
+    let source = r"
 class A {
   static void foo() {}
   static int sm() => 2;
@@ -221,7 +223,7 @@ void f() {
   A.foo!;
   A.sm!;
 }
-"#;
+";
     let report = report_ops(source);
     let mut rows = spans_of(&report, "unnecessary_non_null_assertion");
     rows.sort_unstable();

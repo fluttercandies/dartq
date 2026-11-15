@@ -28,6 +28,7 @@
 //! diagnostic — a load failure has no source position, so the
 //! `first_failure` shape would be a lie. The remaining axes are unaffected.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde::{Deserialize, Serialize};
 
 /// The report contract version: breaking output changes bump the major.

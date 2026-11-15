@@ -15,6 +15,9 @@
 //! reached it dead — `C() : x = throw 0, this.other();` reports
 //! `this.other()`, and a third entry keeps the official one-interval fold.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

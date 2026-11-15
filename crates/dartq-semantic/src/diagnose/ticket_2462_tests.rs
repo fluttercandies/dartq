@@ -21,6 +21,7 @@
 //! Iterable<String>`, and `List<T extends num> is List<int>` stay live
 //! with no `dead_code`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::resolved_ops::{LibraryTypes, ResolvedTypeOps};

@@ -18,6 +18,7 @@
 //!   question, the other fields' nullable-vs-non-nullable mismatch
 //!   included.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -104,10 +105,7 @@ class Future<T> {}\n\
 fn null_into_future_or_of_nullable_value_is_clean() {
     let source = format!("{FUTURE_OR_STUBS}FutureOr<C?> f() {{\n  return null;\n}}\n");
     let names = code_names(&report(&source));
-    assert!(
-        !names.iter().any(|c| *c == "return_of_invalid_type"),
-        "{names:?}"
-    );
+    assert!(!names.contains(&"return_of_invalid_type"), "{names:?}");
 }
 
 /// `Null` into `FutureOr<C>` fails both legs (the value leg's `C` is
@@ -136,11 +134,8 @@ fn null_into_future_or_of_non_nullable_value_reports() {
 fn async_arrow_throw_of_never_is_clean() {
     let source = "class Future<T> {}\n\
                       Future<void> f() async => throw 'x';\n";
-    let names = code_names(&report(&source));
-    assert!(
-        !names.iter().any(|c| *c == "return_of_invalid_type"),
-        "{names:?}"
-    );
+    let names = code_names(&report(source));
+    assert!(!names.contains(&"return_of_invalid_type"), "{names:?}");
 }
 
 // —— the strict function-shape slots ——————————————————————————————————
@@ -158,7 +153,7 @@ fn tear_off_contravariant_dynamic_parameter_reports() {
                       Item nodeMake(Node n) => n;\n\
                       void take(Item Function(dynamic x) f) {}\n\
                       void use() {\n  take(nodeMake);\n}\n";
-    let names = code_names(&report(&source));
+    let names = code_names(&report(source));
     assert_eq!(
         names
             .iter()
@@ -180,9 +175,9 @@ fn tear_off_compatible_slots_stay_silent() {
                       Node nodeMake(Item i) => i as Node;\n\
                       void take(Node Function(Node n) f) {}\n\
                       void use() {\n  take(nodeMake);\n}\n";
-    let names = code_names(&report(&source));
+    let names = code_names(&report(source));
     assert!(
-        !names.iter().any(|c| *c == "argument_type_not_assignable"),
+        !names.contains(&"argument_type_not_assignable"),
         "{names:?}"
     );
 }
@@ -199,7 +194,7 @@ fn dynamic_argument_covariance_reports() {
     let source = "class Box<T> {}\n\
                       void takeBox(Box<int> b) {}\n\
                       void use(Box<dynamic> d) {\n  takeBox(d);\n}\n";
-    let names = code_names(&report(&source));
+    let names = code_names(&report(source));
     assert_eq!(
         names
             .iter()
@@ -220,7 +215,7 @@ fn compatible_covariant_arguments_stay_silent() {
                          void use(Box<int> b) {\n  takeBox(b);\n}\n";
     let names = code_names(&report(identical));
     assert!(
-        !names.iter().any(|c| *c == "argument_type_not_assignable"),
+        !names.contains(&"argument_type_not_assignable"),
         "{names:?}"
     );
     let undecidable = "class Box<T> {}\n\
@@ -229,7 +224,7 @@ fn compatible_covariant_arguments_stay_silent() {
                            void use(Box<int> b) {\n  takeNum(b);\n}\n";
     let names = code_names(&report(undecidable));
     assert!(
-        !names.iter().any(|c| *c == "argument_type_not_assignable"),
+        !names.contains(&"argument_type_not_assignable"),
         "{names:?}"
     );
 }
@@ -246,11 +241,8 @@ fn invalid_type_field_poisons_the_record_question() {
     let source = "class FS {}\n\
                       class V {}\n\
                       (FS, V) mk() {\n  FS? fs;\n  return (fs, zbad);\n}\n";
-    let names = code_names(&report(&source));
-    assert!(
-        !names.iter().any(|c| *c == "return_of_invalid_type"),
-        "{names:?}"
-    );
+    let names = code_names(&report(source));
+    assert!(!names.contains(&"return_of_invalid_type"), "{names:?}");
 }
 
 /// A fully-typed record pair keeps its field checks: the nullable first
@@ -261,7 +253,7 @@ fn fully_typed_record_nullable_field_reports() {
     let source = "class FS {}\n\
                       class V {}\n\
                       (FS, V) mk() {\n  (FS?, V) r = (FS(), V());\n  return r;\n}\n";
-    let names = code_names(&report(&source));
+    let names = code_names(&report(source));
     assert_eq!(
         names
             .iter()

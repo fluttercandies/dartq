@@ -16,6 +16,7 @@
 //! Oracle provenance: `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze`
 //! over a package fixture — each pin names the oracle verdict it encodes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{
     CORE_PRELUDE, assert_silent, code_names, report_ops, report_ops_experiments_with, rows,
 };

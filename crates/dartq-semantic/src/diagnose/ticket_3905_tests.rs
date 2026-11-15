@@ -29,6 +29,7 @@
 //!   mixin-application's interface edge accepts through the declared
 //!   walk — the oracle stays silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 
@@ -219,7 +220,7 @@ void m() {
 /// The M4 last-mile face (the i2b fallback's argument verdict): the
 /// failed inference fills the formal's parameter with its i2b default
 /// (`U := dynamic`), and the argument ask `A<int>` against
-/// `B<dynamic>` must REPORT — `A` is `B`'s SUPERtype (`B<S> extends
+/// `B<dynamic>` must REPORT — `A` is `B`'s `SUPERtype` (`B<S> extends
 /// A<S>`), and the verdict never unfolds the TARGET's supertype to
 /// accept the source through it (upstream `subtype.dart`'s interface
 /// case walks the SOURCE's supertype instantiations only). The

@@ -49,6 +49,7 @@
 //! one unwrap (`comparison(a, b)` on `int Function(E, E) comparison`).
 //! All oracle verdicts below were probed on 3.13.7.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// The exact repro: the send's result is the function type itself, and
@@ -97,7 +98,7 @@ fn t3588_plain_result_assignment_reports_with_result_type() {
     );
     let codes = code_names(&report);
     assert!(
-        codes.iter().any(|code| *code == "invalid_assignment"),
+        codes.contains(&"invalid_assignment"),
         "expected the assignment miss, got {:?}",
         rows(&report)
     );

@@ -74,6 +74,7 @@
 //! [`LibraryGraph::library_of_file`], the graph's canonical file → library
 //! answer.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::hash_map::Entry;
 
 use dartq_source::{FileId, StringId};
@@ -147,6 +148,7 @@ impl LibraryGraph {
     ///
     /// The finding's `{1}`/`{2}` library URIs resolve through
     /// [`Self::library_of_file`] on `first`/`second`.
+    #[must_use]
     pub fn ambiguous_exports(&self, lib: LibraryId) -> Vec<AmbiguousExportFinding> {
         let mut seen: FxHashMap<StringId, FileId> = FxHashMap::default();
         let mut findings = Vec::new();
@@ -253,6 +255,12 @@ impl LibraryGraph {
     /// can pair directives that are not source-adjacent — both upstream
     /// behaviors. Directives without a resolved target join no pair
     /// (`imports_verifier.dart:78-83`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a resolved export edge has no target (an internal invariant
+    /// violation, not reachable from well-formed input).
+    #[must_use]
     pub fn duplicate_export_directives(&self, lib: LibraryId) -> Vec<usize> {
         let edges = self.export_edges(lib);
         let mut resolved: Vec<usize> = edges
@@ -297,6 +305,7 @@ impl LibraryGraph {
     /// `isInternalSdkLibrary` target probe (`element.dart:7042-7044`).
     /// The message's `{0}` is the directive's written URI string — the
     /// caller renders it from the directive text.
+    #[must_use]
     pub fn export_internal_library_directives(&self, lib: LibraryId) -> Vec<usize> {
         let exporter_is_sdk = self.uri(lib).starts_with("dart:");
         self.export_edges(lib)
@@ -414,6 +423,7 @@ impl LibraryGraph {
 }
 
 #[cfg(test)]
+#[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
     use crate::library_graph::{CombinatorClause, ExportEdge};
@@ -471,20 +481,6 @@ mod tests {
                         [CombinatorClause::Hide([hidden].into())],
                         self.strings,
                     ),
-                },
-            );
-        }
-
-        fn deferred_import(&mut self, lib: LibraryId, target: Option<LibraryId>) {
-            let prefix = self.name("p");
-            self.builder.import(
-                lib,
-                ImportEdge {
-                    target,
-                    prefix: Some(prefix),
-                    deferred: true,
-                    non_library: false,
-                    combinators: Combinators::unfiltered(),
                 },
             );
         }
@@ -825,9 +821,11 @@ mod tests {
             true,
             |name| name == api,
             |name| {
-                (name == wrapped)
-                    .then(|| vec![alias, alias])
-                    .unwrap_or_default()
+                if name == wrapped {
+                    vec![alias, alias]
+                } else {
+                    Vec::default()
+                }
             },
         );
         assert_eq!(
@@ -899,7 +897,7 @@ mod tests {
         let ext = rig.builder.intern("package:x/ext.dart");
         let relay = rig.builder.intern("package:x/relay.dart");
         let plain = rig.builder.intern("package:x/plain.dart");
-        let app = rig.builder.intern("package:x/app.dart");
+        rig.builder.intern("package:x/app.dart");
         let ext_file = rig.file("ext.dart");
         let plain_file = rig.file("plain.dart");
         let on_int = rig.name("OnInt");
@@ -956,7 +954,7 @@ mod tests {
     #[test]
     fn deferred_import_unresolved_target_is_false() {
         let mut rig = Rig::new();
-        let app = rig.builder.intern("package:x/app.dart");
+        rig.builder.intern("package:x/app.dart");
         let prefix = rig.name("p");
         let graph = rig.builder.finish();
         let edge = ImportEdge {

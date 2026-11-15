@@ -5,6 +5,7 @@
 //! the parser's re-export list gained them); `record.rs` narrows the block
 //! kind to the recorded subset.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cell::RefCell;
 use std::rc::Rc;
 

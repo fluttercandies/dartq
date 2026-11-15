@@ -32,6 +32,7 @@
 //! `endOffset - 1, length 1` — the low surrogate when the final character
 //! is astral).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diag::msg;
 use crate::keyword::{Keyword, keyword_from_str};
 use crate::lexer::{Flow, Lexer};
@@ -683,7 +684,7 @@ impl Lexer<'_> {
     /// segment start (the opening quote, or just past the last `}`/`$id`)
     /// for a body-local break, the EOF position for the EOF cascade — with
     /// its length covering the real content (upstream `SyntheticStringToken(
-    /// type, value, offset, scanOffset - start)` at string_scanner.dart:181:
+    /// type, value, offset, scanOffset - start)` at `string_scanner.dart:181`:
     /// the synthetic closing quote joins the lexeme but not the length). The
     /// parser's recovery anchors on these segment boundaries, so the span is
     /// row-shape-bearing (sii leg: `expected_token` pins on the trailing

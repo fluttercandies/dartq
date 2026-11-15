@@ -39,6 +39,7 @@
 //! array at minimal) is a producer bug surfaced as the face's
 //! internal-tier error — never clamped, never a dead process.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;

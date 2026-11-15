@@ -29,6 +29,7 @@
 //!   (`parser_impl.dart:2229` consumes a typed formal's name only
 //!   `if (next.isIdentifier)`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, report_ops_wildcards};
 use crate::collector::collect;
 use crate::model::FileElements;

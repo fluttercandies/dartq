@@ -1,5 +1,6 @@
 //! Canonical package names (facts: `pubspec_parse.dart:17-19`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::borrow::Borrow;
 
 use crate::PackageError;

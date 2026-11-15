@@ -14,6 +14,7 @@
 //! ([`instantiate_type_formals_to_bounds_with`]), which answers
 //! `A<dynamic>` for pin 1's bounds — the divergence these tests pin down.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
 use crate::instantiate_to_bound::{
     instantiate_type_formals_to_bounds, instantiate_type_formals_to_bounds_directed,
@@ -63,6 +64,10 @@ fn plain(table: &TypeTable, decl: TypeDeclId) -> TypeId {
 }
 
 fn fn_type(table: &TypeTable, return_type: TypeId, positional: Vec<TypeId>) -> TypeId {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test fixture sizes are bounded"
+    )]
     let required_positional = positional.len() as u32;
     table
         .intern_function(
@@ -82,6 +87,10 @@ fn fn_type(table: &TypeTable, return_type: TypeId, positional: Vec<TypeId>) -> T
 /// `A`, `List`, `num`, `int` each declare a single legacy-covariant
 /// parameter (or none). `None` for an unmodelled declaration — the same
 /// under-report answer the semantic layer gives a decl outside its map.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the signature matches typedef_parameter_variances' expected callback shape"
+)]
 fn arg_variances(_: TypeDeclId, _: usize) -> Option<Variance> {
     Some(Variance::Covariant)
 }
@@ -467,7 +476,7 @@ fn non_generic_bound_ignores_the_seed() {
 /// `X extends Y, Y extends X` — the two-member SCC still reports
 /// `malbounded`; the directed rewrite answers per seed: covariant members
 /// → `dynamic` (the class answer), contravariant members → `Never` (the
-/// oracle's lower map, default_types_builder.dart:150/160).
+/// oracle's lower map, `default_types_builder.dart:150/160`).
 #[test]
 fn mutual_cycle_stays_malbounded_and_answers_per_seed() {
     let table = TypeTable::new();

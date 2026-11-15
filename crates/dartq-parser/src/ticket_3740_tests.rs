@@ -2,7 +2,7 @@
 //! members: two recovery decision-order fixes against oracle 3.13.7.
 //!
 //! (a) `ensureIdentifierPotentiallyRecovered` (`identifier_context_impl.dart`):
-//! the FieldDeclaration (:512-535) and MethodDeclaration (:1187-1209, shared
+//! the `FieldDeclaration` (:512-535) and `MethodDeclaration` (:1187-1209, shared
 //! by the continuation/operatorName/primaryConstructor constructors)
 //! context classes override the default `=> ensureIdentifier` route. On the
 //! recovered route an identifier-shaped head is consumed silently and a
@@ -24,6 +24,7 @@
 //! produced a cascade of `expected_token`/`expected_type_name`/
 //! `expected_body` rows the oracle never emits.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;
@@ -32,7 +33,7 @@ use dartq_language::{Feature, FeatureSet};
 use dartq_scanner::ScanConfig;
 
 /// Parses `source` at `set` and returns the scanner+parser rows as
-/// `(code, start, end)` — UTF-16 offsets, matching the ticket_3718 harness.
+/// `(code, start, end)` — UTF-16 offsets, matching the `ticket_3718` harness.
 fn rows_at(source: &'static str, set: FeatureSet) -> BTreeSet<(String, u32, u32)> {
     let config = ScanConfig::from_feature_set(set);
     let features = crate::ParserFeatures::from_feature_set(set);

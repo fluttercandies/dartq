@@ -2,7 +2,7 @@
 //!
 //! Upstream splits this face in two, and only the first half is parseable:
 //!
-//! - `parseFactoryMethod` (parser_impl.dart:6141) passes `allowAbstract:
+//! - `parseFactoryMethod` (`parser_impl.dart:6141`) passes `allowAbstract:
 //!   isAugmentationsFeatureEnabled` into `parseFunctionBody` (:6232-6235), so
 //!   with the augmentations feature on a `;` body is parse-legal and the
 //!   parser reports nothing at all;
@@ -22,6 +22,7 @@
 //! Emitting from the parser would add a `factory_without_body` row to every
 //! augmentation-completed and every two-fragment constructor.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 use dartq_language::{Feature, FeatureSet};
 

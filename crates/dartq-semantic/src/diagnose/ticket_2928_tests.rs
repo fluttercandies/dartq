@@ -24,6 +24,7 @@
 //!    left-to-right ask — the census faces
 //!    `variance_in_subtyping_test`/`_error_test` ride this flip.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, report_ops_wildcards, rows};
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, fold_unit, merge_source_ordered};

@@ -7,6 +7,7 @@
 //! (crate docs, "Verbosity tiers") — a benchmark sidecar has no trimmable
 //! prose.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

@@ -10,6 +10,7 @@
 //! reduced constant-expression engine until #20 (documented reduction; the
 //! official parses them with the full expression engine).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind};
 use dartq_source::SourceRange;
 
@@ -261,7 +262,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// the only scan-time record) and latches the begin so the parse-end
     /// pass skips it. A pre-#1485 silent relocation here relied on the
     /// scanner's own row, which no longer exists.
-
     /// Official `parseOptionalPositionalParameters`: `[`-bracketed group.
     fn parse_optional_positional_parameters(&mut self, kind: MemberKind) -> TokenSpan {
         let begin = self.peek_span(); // `[`
@@ -588,8 +588,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     if external.is_some() {
                         self.report(msg::duplicated_modifier("external"), t);
                     } else {
-                        if const_kw.is_some() {
-                            let earlier = self.cursor.lexeme(const_kw.unwrap().id);
+                        if let Some(const_kw) = const_kw {
+                            let earlier = self.cursor.lexeme(const_kw.id);
                             self.report(msg::modifier_out_of_order("external", earlier), t);
                         } else if static_kw.is_some() {
                             self.report(msg::modifier_out_of_order("external", "static"), t);
@@ -660,8 +660,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         if let Some(vfc) = var_final_or_const {
                             let earlier = self.cursor.lexeme(vfc.id);
                             self.report(msg::modifier_out_of_order("augment", earlier), t);
-                        } else if abstract_kw.is_some() {
-                            let earlier = self.cursor.lexeme(abstract_kw.unwrap().id);
+                        } else if let Some(abstract_kw) = abstract_kw {
+                            let earlier = self.cursor.lexeme(abstract_kw.id);
                             self.report(msg::modifier_out_of_order("augment", earlier), t);
                         } else if const_kw.is_some() {
                             self.report(msg::modifier_out_of_order("augment", "const"), t);
@@ -1077,10 +1077,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             // `parseType(beforeType)`). An untyped walked formal re-walks
             // nothing — its post-walk position (the name) stands, exactly
             // like the pre-reorder probe's reset target.
-            if !matches!(type_info, TypeInfo::NoType) {
-                self.cursor.reset(before_type);
-            } else {
+            if matches!(type_info, TypeInfo::NoType) {
                 self.cursor.reset(before_probe);
+            } else {
+                self.cursor.reset(before_type);
             }
         }
 

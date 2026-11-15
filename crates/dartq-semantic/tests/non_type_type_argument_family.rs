@@ -3,7 +3,7 @@
 //! explicit type-argument group resolves through the oracle's
 //! `_isTypeInTypeArgumentList` face whatever the callee's resolution
 //! (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/named_type_resolver.dart, the
+//! `pkg/analyzer/lib/src/dart/resolver/named_type_resolver.dart`, the
 //! `reportNullOrNonTypeElement` arm that checks the parent
 //! `TypeArgumentList` before the `undefined_class` fallthrough).
 //!

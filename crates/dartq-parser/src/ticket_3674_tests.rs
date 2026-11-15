@@ -23,11 +23,12 @@
 //!   `augment final x = …`) lands; the setter fragment exists only when
 //!   the variable is assignable (non-`final`, non-`const`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;
 use crate::tests::collector::Collector;
-use dartq_language::{Feature, FeatureSet, LanguageVersion};
+use dartq_language::{Feature, FeatureSet};
 use dartq_scanner::ScanConfig;
 
 /// Parses `source` at `set` and returns the scanner+parser rows as

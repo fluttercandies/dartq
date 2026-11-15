@@ -34,6 +34,7 @@
 //! A face that fails answers with an `error` row and the others still
 //! report: one torn manifest must not hide the rest of the cache.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
@@ -101,8 +102,7 @@ impl CacheConfig {
             bcache: governing
                 .as_ref()
                 .and_then(|config| config.build_cache.as_ref())
-                .map(shim_config)
-                .unwrap_or_else(default_shim_config),
+                .map_or_else(default_shim_config, shim_config),
             snapshot: SnapshotConfig {
                 root: None,
                 capacity_bytes: limit.unwrap_or(DEFAULT_CAPACITY_BYTES),
@@ -1064,7 +1064,7 @@ mod tests {
     fn gc_enforces_the_configured_cap_on_fixture_stores() {
         let scratch = Scratch::ticket("gc-configured");
         fs::write(
-            &scratch.0.join("dartq.yaml"),
+            scratch.0.join("dartq.yaml"),
             "cache:\n  size_limit_gib: 1\n",
         )
         .expect("config");
@@ -1115,14 +1115,13 @@ mod tests {
             .expect("snapshot row at the configured cap");
         assert_eq!((snapshot.generations, snapshot.entries), (2, 2));
         assert!(snapshot.bytes > cap, "grown past the configured cap");
-        assert_eq!(
+        assert!(
             before.rows.contains(&StatsRow::Content {
                 root: store_dir.clone(),
                 cap_bytes: cap,
                 entries: 2,
                 bytes: 2 * (600 << 20),
             }),
-            true,
             "the stats row names the governing cap: {:?}",
             before.rows
         );
@@ -1143,7 +1142,7 @@ mod tests {
             "the aged generation is the victim"
         );
         assert!(evicted.bytes_freed > cap);
-        assert_eq!(
+        assert!(
             report.rows.contains(&GcRow::Content {
                 root: store_dir.clone(),
                 entries_before: 2,
@@ -1153,7 +1152,6 @@ mod tests {
                 tmp_swept: 0,
                 tmp_bytes_freed: 0,
             }),
-            true,
             "the content pass evicted per the configured cap: {:?}",
             report.rows
         );
@@ -1170,14 +1168,13 @@ mod tests {
             .expect("snapshot row after gc");
         assert_eq!(snapshot.generations, 1);
         assert!(snapshot.bytes <= cap, "down to the configured cap");
-        assert_eq!(
+        assert!(
             after.rows.contains(&StatsRow::Content {
                 root: store_dir.clone(),
                 cap_bytes: cap,
                 entries: 1,
                 bytes: 600 << 20,
             }),
-            true,
             "the surviving blob is under the configured cap: {:?}",
             after.rows
         );

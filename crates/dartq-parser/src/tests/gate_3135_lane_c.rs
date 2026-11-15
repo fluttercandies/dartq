@@ -5,6 +5,7 @@
 //! name == enclosing declaration row. Every pinned span is the frozen
 //! oracle row (3.13.1 `dart analyze --format=json` syntactic face).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use super::collector::{Collector, latest_features};

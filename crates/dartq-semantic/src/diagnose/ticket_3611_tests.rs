@@ -23,6 +23,7 @@
 //! Probed against `dart analyze` 3.13.7: every expectation below is the
 //! oracle's live verdict.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, assert_silent, code_names, report_ops_imports, rows};
 use super::*;
 

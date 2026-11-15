@@ -33,20 +33,20 @@
 //!   `var type = parameter.type` — the `List<E>` element face carries
 //!   the parameter's own member reads (`InternalFormalParameterElement`,
 //!   upstream Dart SDK source,
-//!   pkg/analyzer/lib/src/dart/element/replacement_visitor.dart:251/256);
+//!   `pkg/analyzer/lib/src/dart/element/replacement_visitor.dart:251/256`);
 //! - `ffi_verifier.dart`'s `?.`-chain arm reads a `var` local bound
 //!   from a core-list index (`var f = invocation.argumentList.arguments2[0]`
 //!   over the `List<Expression>` face), where the NON-nullable element
 //!   face makes the `?.` continuation's receiver never-null and the
 //!   null-aware row fires at the `?.` (upstream Dart SDK source,
-//!   pkg/analyzer/lib/src/generated/ffi_verifier.dart:1806; probed
+//!   `pkg/analyzer/lib/src/generated/ffi_verifier.dart:1806`; probed
 //!   dart analyze 3.13.7);
 //! - `typed_literal_resolver.dart`'s context walk binds
 //!   `var elementType = literalType.typeArguments[0]` and reads the
 //!   `iterableType` param face off it — a `List<TypeImpl>` element that
 //!   decides the `CollectionLiteralContext` arm's parameter (upstream
 //!   Dart SDK source,
-//!   pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver.dart:166).
+//!   `pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver.dart:166`).
 //!
 //! Every face is the same `V?`/`E` result the `[]` fold already stages
 //! on the value row; the window gate that binds it into the declarator
@@ -56,6 +56,7 @@
 //! `IndexExpression.staticType` composes `V?` before the `!`, and the
 //! flow's own write/promotion machinery decides nullness from there).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 impl Engine<'_> {
@@ -168,7 +169,7 @@ mod tests {
     /// zero rows for this source).
     #[test]
     fn map_index_binds_nullable_then_switch_arm_promotes() {
-        let source = r#"
+        let source = r"
 class Reference {
   int get id => 0;
 }
@@ -185,7 +186,7 @@ int f(int index, int tag) {
   }
   return reference.id;
 }
-"#;
+";
         let report = unit_report(source);
         assert_eq!(
             codes(&report),
@@ -212,7 +213,7 @@ int f(int index, int tag) {
     /// zero rows for this source.
     #[test]
     fn map_index_binds_nullable_then_guard_promotes() {
-        let source = r#"
+        let source = r"
 class DartObjectImpl {
   int get value => 0;
 }
@@ -237,7 +238,7 @@ void f(Parameter parameter) {
   }
   Config(argumentValue.value);
 }
-"#;
+";
         let report = unit_report(source);
         assert_eq!(
             codes(&report),
@@ -251,17 +252,17 @@ void f(Parameter parameter) {
         );
     }
 
-    /// replacement_visitor.dart:251/256's List-element member face:
+    /// `replacement_visitor.dart:251/256`'s List-element member face:
     /// `var parameter = node.formalParameters[i]` binds the
     /// `List<Parameter>` element face `Parameter`, and `var type =
     /// parameter.type` reads the element's own member — the second
     /// bind carries the declared member type, so `type` is `int` and
     /// the argument verdict stays silent (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/element/replacement_visitor.dart:
+    /// `pkg/analyzer/lib/src/dart/element/replacement_visitor.dart`:
     /// 251/256).
     #[test]
     fn list_index_binds_element_then_member_face() {
-        let source = r#"
+        let source = r"
 class Parameter {
   Parameter(this.type);
   final int type;
@@ -280,7 +281,7 @@ void f(Node node, int i) {
   var type = parameter.type;
   Config(type);
 }
-"#;
+";
         let report = unit_report(source);
         assert_eq!(
             codes(&report),
@@ -294,7 +295,7 @@ void f(Node node, int i) {
         );
     }
 
-    /// ffi_verifier.dart:1806's `?.`-chain null-propagation face:
+    /// `ffi_verifier.dart:1806`'s `?.`-chain null-propagation face:
     /// `var f = invocation.argumentList.arguments2[0]` binds the
     /// `List<Expression>` element face `Expression`, and `f?.name`
     /// reads the member through the null-aware latch — the `?.`
@@ -303,12 +304,12 @@ void f(Node node, int i) {
     /// so the `f?.name` continuation's receiver can't be null and the
     /// verifier's `_checkForUnnecessaryNullAware` row fires at the `?.`
     /// (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/generated/ffi_verifier.dart:1806's chain shape;
-    /// probed dart analyze 3.13.7: one INVALID_NULL_AWARE_OPERATOR
+    /// `pkg/analyzer/lib/src/generated/ffi_verifier.dart:1806`'s chain shape;
+    /// probed dart analyze 3.13.7: one `INVALID_NULL_AWARE_OPERATOR`
     /// WARNING at `?.`, nothing else — the silent-prior record was wrong).
     #[test]
     fn list_index_binds_element_then_null_aware_chain() {
-        let source = r#"
+        let source = r"
 class Expression {
   String get name => '';
 }
@@ -325,7 +326,7 @@ String? f(Invocation invocation) {
   var f = invocation.argumentList.arguments2[0];
   return f?.name;
 }
-"#;
+";
         let report = unit_report(source);
         assert_eq!(
             codes(&report),
@@ -343,18 +344,18 @@ String? f(Invocation invocation) {
         );
     }
 
-    /// typed_literal_resolver.dart:166's iterableType param face:
+    /// `typed_literal_resolver.dart:166`'s iterableType param face:
     /// `var elementType = literalType.typeArguments[0]` binds the
     /// `List<TypeImpl>` element face `TypeImpl`, and the
     /// `iterableType(elementType)` send's formal reads it — the
     /// param's declared `TypeImpl` shape carries the element type
     /// into the call's result, so `result.kind` reads `int` and
     /// stays silent (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver.
+    /// `pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver`.
     /// dart:166).
     #[test]
     fn list_index_binds_element_then_iterable_param() {
-        let source = r#"
+        let source = r"
 class TypeImpl {
   int get kind => 0;
 }
@@ -372,7 +373,7 @@ int f(TypeProvider provider, LiteralType literalType) {
   var result = provider.iterableType(elementType);
   return result.kind;
 }
-"#;
+";
         let report = unit_report(source);
         assert_eq!(
             codes(&report),
@@ -393,7 +394,7 @@ int f(TypeProvider provider, LiteralType literalType) {
     /// own face, not a widened `Unknown` that would stay silent).
     #[test]
     fn list_index_bind_dead_null_aware_reports() {
-        let source = r#"
+        let source = r"
 class Reference {
   int get id => 0;
 }
@@ -407,7 +408,7 @@ int? f(int index) {
   var reference = byIndex()[index];
   return reference?.id;
 }
-"#;
+";
         let report = unit_report(source);
         assert_eq!(
             codes(&report),

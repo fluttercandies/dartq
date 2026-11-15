@@ -22,6 +22,7 @@
 //! * `show show;` — the clause keyword itself as a name (one
 //!   `undefined_shown_name`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_pub::{LockFile, Pubspec, build_graph};
 
@@ -189,8 +190,8 @@ fn shown_and_hidden_pseudo_names_resolve() {
 }
 
 /// `import 'existing.dart' hide sync;` — `sync` is a pseudo keyword and a
-/// hidden name the target does not export: DeadCodeVerifier reports
-/// `undefined_hidden_name` at the written token (dead_code_verifier.dart
+/// hidden name the target does not export: `DeadCodeVerifier` reports
+/// `undefined_hidden_name` at the written token (`dead_code_verifier.dart`
 /// :58-70), which proves the name reached the clause.
 #[test]
 fn hidden_pseudo_name_is_read() {

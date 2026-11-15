@@ -7,6 +7,7 @@
 //! its event handlers; [`NameWorld`] resolves the sealed/enum/subtype facts
 //! the exhaustiveness verdict reads, over the unit's element model.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::Engine;
 use crate::library::{ElementIndex, resolve_container};
 use crate::model::{ArgListId, Container, ContainerKind, MemberKind, RecordShapeId, Ty};
@@ -487,14 +488,11 @@ impl SwitchTracker {
                             // constraint is its OWN column's non-null
                             // projection (`createNullCheckSpace` over the
                             // property's static type).
-                            match column {
-                                NameTy::Named(column_name, _) => {
-                                    carried.push((name, Restriction::Named(column_name, false)));
-                                }
-                                _ => {
-                                    expressible = false;
-                                    break;
-                                }
+                            if let NameTy::Named(column_name, _) = column {
+                                carried.push((name, Restriction::Named(column_name, false)));
+                            } else {
+                                expressible = false;
+                                break;
                             }
                         }
                         Restriction::Named(lt, ln) => {
@@ -978,7 +976,7 @@ pub(crate) enum NameTy {
 /// shared analyzer's type-mismatch gate, and the enum-constant coverage
 /// walk — upstream Dart SDK source,
 /// pkg/analyzer/lib/src/dart/constant/constant_verifier.dart:1145-1182 and
-/// pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart,
+/// pkg/_`fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart`,
 /// `analyzeConstantPattern`'s `caseExpressionTypeMismatch` arm). `None`
 /// verdicts — a non-constant head already reported at its own span — carry
 /// no entry.
@@ -1049,7 +1047,7 @@ pub(crate) struct SwitchCtx {
     pub(crate) if_case_member_scrutinee: Option<SourceRange>,
     /// A case pattern's type head resolved to `InvalidType` (an
     /// unresolvable or non-type name): the official `hasInvalidType` gate
-    /// (constant_verifier.dart:1070, set by `createStaticType`) skips the
+    /// (`constant_verifier.dart:1070`, set by `createStaticType`) skips the
     /// whole reachability/covering pass.
     pub(crate) has_invalid_type: bool,
     /// The legacy-era head facts: one entry per completed statement-case
@@ -1230,7 +1228,6 @@ fn leaf_ty(leaf: &Restriction) -> Option<NameTy> {
 /// no name-level type of its own — the whole row degrades, the established
 /// posture for every other leaf shape.
 fn union_face(world: &NameWorld<'_>, column: &NameTy, parts: &[Restriction]) -> Option<bool> {
-    let mut narrowing = false;
     for part in parts {
         match part {
             // A parenthesized alternative (`(club || diamond) || heart`)
@@ -1239,19 +1236,17 @@ fn union_face(world: &NameWorld<'_>, column: &NameTy, parts: &[Restriction]) -> 
                 if union_face(world, column, nested)? {
                     return Some(true);
                 }
-                narrowing = true;
             }
             // A type-free alternative (`_ || club`) takes the column whole.
             Restriction::NamedContext => return Some(true),
             // `null` rides the column's nullable sub-space and an
             // unexplorable leaf its empty one — neither covers the column.
-            Restriction::Null | Restriction::Unknown => narrowing = true,
+            Restriction::Null | Restriction::Unknown => {}
             other => {
                 let part_ty = leaf_ty(other)?;
                 if world.is_subtype_of(column, &part_ty) {
                     return Some(true);
                 }
-                narrowing = true;
             }
         }
     }
@@ -1740,7 +1735,7 @@ impl NameTy {
 // panic.
 thread_local! {
     static FOLD_ENGINES: RefCell<Vec<*const Engine<'static>>> =
-        RefCell::new(Vec::new());
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Opens a parse-time window for `engine` ([`FOLD_ENGINES`]); the returned
@@ -1751,7 +1746,7 @@ pub(crate) fn push_fold_engine(engine: &Engine<'_>) -> FoldEngineGuard {
     FOLD_ENGINES.with(|stack| {
         stack
             .borrow_mut()
-            .push(engine as *const Engine<'_> as *const Engine<'static>);
+            .push(std::ptr::from_ref::<Engine<'_>>(engine).cast::<Engine<'static>>());
     });
     FoldEngineGuard
 }
@@ -2117,7 +2112,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 }
                 _ => None,
             };
-            return field.map(|ty| NameTy::from_semantic(ty));
+            return field.map(NameTy::from_semantic);
         }
         let (NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _)) = ty else {
             return None;
@@ -2158,7 +2153,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                     // The rest column IS the `List<E>` face (upstream
                     // `getListType` → `ListTypeStaticType` — the sealed
                     // list, not the unrestricted pattern face).
-                    Some(ty.clone())
+                    Some(*ty)
                 }
                 NameTy::ListPat { elem, .. } => Some(self.list_ty(*elem)),
                 _ => None,
@@ -2265,7 +2260,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 text.push_str(field(&Key::RecordIndex(index)).unwrap_or("_"));
                 comma = ", ";
             }
-            for (name, _) in shape.named.iter() {
+            for (name, _) in &shape.named {
                 text.push_str(comma);
                 comma = ", ";
                 let name = self.strings.resolve(*name);
@@ -2367,7 +2362,7 @@ impl<'a> NameWorld<'a> {
     /// which is the pinned corner where the two relations legitimately
     /// disagree: `Never <: Null` (subtype.dart:299-301) yet no `Never`
     /// value can sit in a `Null` slot. Undecided shapes answer `true` (the
-    /// official's conservative default, type_system.dart:322).
+    /// official's conservative default, `type_system.dart:322`).
     ///
     /// The arm order mirrors the official body: `FutureOr` splits into
     /// `base`/`Future<base>` before any head comparison
@@ -2386,7 +2381,7 @@ impl<'a> NameWorld<'a> {
     /// once per written type argument and once per `FutureOr` half, so the
     /// budget bounds the walk on a self-referential pool entry — an
     /// exhausted chain answers the official's conservative `true`
-    /// (type_system.dart:322).
+    /// (`type_system.dart:322`).
     fn can_be_subtype_of_within(&self, left: &NameTy, right: &NameTy, budget: u8) -> bool {
         if budget == 0 {
             return true;
@@ -2676,7 +2671,7 @@ impl<'a> NameWorld<'a> {
 
     /// The `FutureOr<T>` split (`FutureOrStaticType.getSubtypes`,
     /// upstream Dart SDK source,
-    /// pkg/_fe_analyzer_shared/lib/src/exhaustiveness/types/future_or.dart:
+    /// pkg/_`fe_analyzer_shared/lib/src/exhaustiveness/types/future_or.dart`:
     /// 29-32): the argument `T` first, then `Future<T>`. `None` when the
     /// union cannot be decomposed — no fold window (the argument slot's
     /// pool is unreachable), a malformed argument list, or a shadowed
@@ -2931,8 +2926,8 @@ impl<'a> NameWorld<'a> {
     /// the non-nullable shapes. The cast-pattern close reads it for the
     /// `null` half of `createCastSpace` (shared.dart:731-735). A function
     /// sentinel decodes its own `?` bit — the non-nullable `F` face is the
-    /// official's non-nullable FunctionType (`type_system.dart:1260`'s
-    /// `isDartCoreNull`-less FunctionType arm), disjoint from `Null`.
+    /// official's non-nullable `FunctionType` (`type_system.dart:1260`'s
+    /// `isDartCoreNull`-less `FunctionType` arm), disjoint from `Null`.
     pub(crate) fn is_potentially_nullable(ty: &NameTy) -> bool {
         if let Some((_, nullable)) = NameTy::function_face(ty) {
             return nullable;
@@ -3126,7 +3121,7 @@ impl<'a> NameWorld<'a> {
     }
 
     /// The interned `Function` spelling — dart:core's `abstract final
-    /// class Function` (function.dart:105), the head a FunctionType's
+    /// class Function` (function.dart:105), the head a `FunctionType`'s
     /// only non-`Object` interface face (`canBeSubtypeOf`'s
     /// `right.isDartCoreFunction`, type_system.dart:163-171).
     fn function_head(&self) -> StringId {
@@ -3562,7 +3557,7 @@ impl<'a> NameWorld<'a> {
     /// An unresolvable name still answers `false` here: whether its denoted
     /// type subtypes `Object` is undecidable at name level, and
     /// `can_be_subtype_of`'s undecided shapes take the `true` default on
-    /// their own (type_system.dart:324).
+    /// their own (`type_system.dart:324`).
     pub(crate) fn named_sub(&self, sub: StringId, sup: StringId) -> bool {
         if sub == sup {
             return true;
@@ -3915,7 +3910,7 @@ impl<'a> NameWorld<'a> {
     }
 
     /// The generic-enum filter of `EnumStaticType._createEnumElements`
-    /// (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/
+    /// (upstream Dart SDK source, pkg/_`fe_analyzer_shared/lib/src`/
     /// exhaustiveness/types/enum.dart:99-134): a constant only populates
     /// the enum's closed subtype set when its declared type is a subtype
     /// of the scrutinee's overapproximation — `E.b` (`E<String>`) can
@@ -4223,6 +4218,7 @@ impl<'a> NameWorld<'a> {
     /// [`Engine::slot_subtype`] is the name-level backstop when the snapshot
     /// declines to map either side. An undecided pair keeps the member (the
     /// under-report direction).
+    #[allow(unused_variables)]
     fn inhabits(&self, member: &NameTy, scrutinee: &NameTy) -> bool {
         return true;
         #[allow(unreachable_code)]

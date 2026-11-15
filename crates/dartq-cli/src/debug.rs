@@ -2,7 +2,7 @@
 //! proxy to the worktree's resident session over the same daemon-call
 //! transport the MCP server uses ([`crate::mcp`]). One engine, one
 //! protocol: every subcommand maps to exactly one `dartq/debug/*`
-//! daemon method with the daemon's own snake_case parameter spellings
+//! daemon method with the daemon's own `snake_case` parameter spellings
 //! (`--ws-uri`, `--dart-defines`, …), so the CLI and MCP faces are
 //! interchangeable — whatever one can drive, the other can too.
 //!
@@ -17,6 +17,7 @@
 //! (clap or an unresolvable worktree); 4 the proxy never got an answer
 //! (no resident session, transport, wedge).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};

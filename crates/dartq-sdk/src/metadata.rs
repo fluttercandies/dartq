@@ -6,6 +6,7 @@
 //! declaration order — so the same parsed metadata always serializes to the
 //! same bytes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
@@ -38,7 +39,7 @@ pub const IMPLICITLY_IMPORTED_LIBRARIES: [&str; 1] = ["core"];
 /// `cli/cli.dart` ("The functionality of this library is incomplete and may
 /// be removed in a later version"), `html`, `indexed_db`, `svg`,
 /// `web_audio`, `web_gl` (`*/dart2js/*_dart2js.dart`, all "Use package:web
-/// and dart:js_interop instead."), `js`/`js_util` ("Use dart:js_interop
+/// and `dart:js_interop` instead."), `js`/`js_util` ("Use `dart:js_interop`
 /// instead."), and `web_sql` (`web_sql/dart2js/web_sql_dart2js.dart`, bare
 /// `@deprecated`). `io` and the `_internal` helpers carry member-level
 /// deprecations only — no library annotation — and stay out. `web_sql` is

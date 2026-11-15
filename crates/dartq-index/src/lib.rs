@@ -61,6 +61,7 @@
 //! whole-unit law at its capture/surface mutation points — one law, no
 //! second index.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 
 use dartq_resolution::LibraryId;
@@ -116,6 +117,11 @@ impl SymbolIndex {
     ///
     /// The postings directories follow the whole-unit law: a replaced
     /// surface is unlisted from its old names before the new one lists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the file's index cannot be retrieved after insertion (an
+    /// internal invariant violation, not reachable from well-formed input).
     pub fn insert_file(&mut self, file: FileId, index: FileIndex) {
         if let Some(old) = self.files.insert(file, index) {
             for name in postings::distinct_decl_names(&old) {
@@ -129,6 +135,12 @@ impl SymbolIndex {
     }
 
     /// Stores (or replaces, on re-analysis) the reference surface of `lib`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the library's index cannot be retrieved after insertion
+    /// (an internal invariant violation, not reachable from well-formed
+    /// input).
     pub fn insert_library(&mut self, lib: LibraryId, index: LibraryIndex) {
         if let Some(old) = self.libraries.insert(lib, index) {
             for name in old.distinct_reference_names() {

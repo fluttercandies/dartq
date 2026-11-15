@@ -17,6 +17,7 @@
 //! recorded extra row (dartq-only) at the cited census anchor; the pins
 //! pass once the composite's own face reaches the verdict.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 /// The `type_argument_not_matching_bounds` rows of `report` as

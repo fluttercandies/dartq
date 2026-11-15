@@ -32,6 +32,7 @@
 //! cache): every expectation below is a live verdict, not a
 //! derivation.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, assert_silent, code_names, report_ops, report_ops_imports, rows};
 use super::*;
 

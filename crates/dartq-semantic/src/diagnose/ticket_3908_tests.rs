@@ -5,7 +5,7 @@
 //!
 //! Upstream anchors (Dart SDK 3.13.7, the pinned oracle):
 //!
-//! * `_checkForMixinWithConflictingPrivateMember` (error_verifier.dart
+//! * `_checkForMixinWithConflictingPrivateMember` (`error_verifier.dart`
 //!   :6192-6292): a mixin applied from ANOTHER library whose private member
 //!   name collides with the same name on an earlier `with` entry of that
 //!   library, or with a concrete member the declared supertype inherits from
@@ -18,6 +18,7 @@
 //! * `_checkForMixinSuperclassConstraints` (:6079-6122): the message
 //!   interpolates the INSTANTIATED faces — `'M<dynamic>'`, `'A<dynamic>'`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, RigImport, report_ops, report_ops_imports};
 
 /// The prelude's UTF-16 length (the `report_ops` fixtures' line/offset

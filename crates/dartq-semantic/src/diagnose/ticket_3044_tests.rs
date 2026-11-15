@@ -10,6 +10,7 @@
 //! exemption applies (required / generic-class ctor / public-accessible /
 //! super-corresponding-required / overriding-used). Oracle: dart 3.13.1.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use crate::FileReport;
 

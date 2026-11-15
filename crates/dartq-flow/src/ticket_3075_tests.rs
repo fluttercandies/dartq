@@ -21,6 +21,9 @@
 //! `_initialize`'s `promoteToTypeOfInterest: !isImplicitlyTyped && !isFinal`
 //! (flow_analysis.dart:7561-7595, :9052-9088).
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -53,6 +56,7 @@ fn facts_of(source: &str) -> Vec<FlowFact> {
 }
 
 /// `(snippet, ty)` of every `ReadType`/`PromotedRead` row, in fact order.
+#[allow(clippy::type_complexity)]
 fn reads<'a>(source: &'a str, facts: &[FlowFact]) -> (Vec<(&'a str, Ty)>, Vec<(&'a str, Ty)>) {
     let at = |span: dartq_source::SourceRange| {
         &source[span.offset as usize..(span.offset + span.length) as usize]
@@ -91,7 +95,7 @@ fn written_nullable_local_keeps_its_annotation_on_reads() {
 
 /// The promotion that SHOULD fire still fires: `int? q = 0` is the
 /// official's `promoteToTypeOfInterest` case (`!isImplicitlyTyped &&
-/// !isFinal`, flow_analysis.dart:7583) — `int <: int?` promotes `q` to
+/// !isFinal`, `flow_analysis.dart:7583`) — `int <: int?` promotes `q` to
 /// `int` at the declaration's own initialization write. The declared slot
 /// stays `int?`; the read row answers the promoted `int`.
 #[test]

@@ -78,15 +78,14 @@ pub(super) fn null_check_parts<'a>(
     // the Conditional's slot — among the node's children (hand-built
     // trees) or immediately before the node in the owner window
     // (production parses).
-    let (binary, below) = match condition_rows.pop() {
-        Some(binary) => (binary, condition_rows),
-        None => {
-            let parent = c.ancestor(1)?;
-            let kids = c.collect_direct(parent);
-            let pos = kids.iter().position(|&kid| kid == node)?;
-            let before = pos.checked_sub(1)?;
-            (kids[before], kids[..before].to_vec())
-        }
+    let (binary, below) = if let Some(binary) = condition_rows.pop() {
+        (binary, condition_rows)
+    } else {
+        let parent = c.ancestor(1)?;
+        let kids = c.collect_direct(parent);
+        let pos = kids.iter().position(|&kid| kid == node)?;
+        let before = pos.checked_sub(1)?;
+        (kids[before], kids[..before].to_vec())
     };
     if c.kind(binary) != NodeKind::BinaryExpression {
         return None;
@@ -225,20 +224,18 @@ pub(super) fn conditional_end(c: &Check<'_>, node: u32) -> u32 {
         .collect_direct(node)
         .into_iter()
         .filter(|&row| c.head_token(row) > colon)
-        .filter(|&row| {
+        .rfind(|&row| {
             !matches!(
                 c.kind(row),
                 NodeKind::NoTypeArguments | NodeKind::NoArguments | NodeKind::Send
             )
-        })
-        .last();
+        });
     let Some(last) = last else {
         return c.utf16_span(node).end;
     };
     let token = if matches!(c.kind(last), NodeKind::DotAccess | NodeKind::CascadeAccess) {
         c.field(last, PayloadField::Operator)
-            .map(|dot| dot + 1)
-            .unwrap_or_else(|| c.unit.ast.token_range(last).end - 1)
+            .map_or_else(|| c.unit.ast.token_range(last).end - 1, |dot| dot + 1)
     } else {
         c.unit.ast.token_range(last).end - 1
     };

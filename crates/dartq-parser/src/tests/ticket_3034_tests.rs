@@ -11,7 +11,7 @@
 //!   remapped to POSTFIX/SELECTOR at :7709-7719 before it can arrive). In the
 //!   loop no arm matches level 15, so infix `~` lands in the plain-binary
 //!   else arm (:7340-7364): `beginBinaryExpression(~)` fires, the RHS parses
-//!   at level 16, and the whole `5 ~ 3` is an ordinary BinaryExpression —
+//!   at level 16, and the whole `5 ~ 3` is an ordinary `BinaryExpression` —
 //!   the `not_binary_operator` row is the analyzer's *semantic* face
 //!   (`binary_expression_resolver.dart:67-74`), never a parser row. dartq's
 //!   `precedence_of` returned `None` for `~`, so `var a = 5 ~ 3;` broke out
@@ -19,6 +19,7 @@
 //!   `expected_token ';'` + `expected_executable` ×2 + `unexpected_token ';'`
 //!   cascade the recon buckets as B8 `semi:other` / B14 `unexpected:';'`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::ParserFeatures;
 use dartq_language::{Feature, FeatureSet};
@@ -39,8 +40,8 @@ fn anon_features() -> ParserFeatures {
 
 /// `var a = 5 ~ 3;` (oracle `diagnostics/not_binary_operator/doc_0`,
 /// `NonBinaryOperatorTest/test_unaryTilde`): the oracle's parser emits ZERO
-/// rows — `~` reaches the binary else arm at PREFIX_PRECEDENCE and the whole
-/// `5 ~ 3` is a BinaryExpression; the single oracle row is the semantic
+/// rows — `~` reaches the binary else arm at `PREFIX_PRECEDENCE` and the whole
+/// `5 ~ 3` is a `BinaryExpression`; the single oracle row is the semantic
 /// `not_binary_operator`, not a parser face.
 #[test]
 fn unary_tilde_in_infix_parses_as_binary() {

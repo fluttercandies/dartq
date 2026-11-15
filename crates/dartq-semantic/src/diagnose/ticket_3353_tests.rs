@@ -25,6 +25,7 @@
 //! class-modifiers feature turns `extends Function` into the outside-library
 //! error instead).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::library::ElementIndex;
 use crate::model::MicroKind;

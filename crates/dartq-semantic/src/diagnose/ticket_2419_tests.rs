@@ -26,6 +26,7 @@
 //! m2})`) — and stays silent on every sibling-GFT shape pinned silent
 //! below.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

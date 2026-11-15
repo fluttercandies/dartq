@@ -21,6 +21,7 @@
 //! arm at `end_function_type`, so both sides spell the same
 //! shape.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 /// The bare named-constructor tear-off (`C.constr is C Function()`

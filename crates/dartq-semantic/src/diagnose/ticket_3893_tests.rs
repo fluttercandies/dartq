@@ -93,7 +93,7 @@
 //! (`engine_core.rs`:12435, `diagnose.rs`:2502).
 //!
 //! **S3 — factory constructors reached THROUGH a type alias skip
-//! the could_not_infer face: 2 missing rows in
+//! the `could_not_infer` face: 2 missing rows in
 //! `test_instanceCreation_viaTypeAlias_notWellBounded`.**
 //! `typedef A<X extends G<C<X>>> = C<X>` with `A()`, `A.foo()`,
 //! `A.bar()`: the oracle emits `could_not_infer` at all three —
@@ -103,7 +103,7 @@
 //! factory body through the alias; `A.bar()` — a redirecting
 //! factory `= C`) reach no inference path at all. Owner: the
 //! `invocation.rs` lane (B4) — the constructor-through-alias
-//! send-close must run the same could_not_infer verdict the
+//! send-close must run the same `could_not_infer` verdict the
 //! bare-call arm already does.
 //!
 //! **S4 — int-to-double coercion never applies under a pattern's
@@ -124,6 +124,7 @@
 //! rig carries the fixture behind it on one line. All fixtures are
 //! ASCII.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -151,12 +152,12 @@ fn at(source: &str, needle: &str) -> u32 {
 /// the inferred face. The superinterface walk must keep this arm.
 #[test]
 fn control_future_head_flattens_written_arg() {
-    let source = r#"
+    let source = r"
 void f(Future<int> f) async {
   int a = await f;
   String bad = a;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -174,12 +175,12 @@ void f(Future<int> f) async {
 /// unconditionally.
 #[test]
 fn control_int_literal_stays_int_without_double_context() {
-    let source = r#"
+    let source = r"
 void f() {
   int i = 123;
   String s = i;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -203,7 +204,7 @@ void f() {
 #[test]
 #[ignore = "held: flatten_ty (engine_core.rs:13472) lacks the T.asInstanceOf(futureElement) superinterface walk (upstream type_system.dart:456-468, _futureTypeOfBounded :1843-1875); re-verified 2026-11-05 vs oracle 3.13.7: still fails — `await x` keeps `SubFuture` and emits invalid_assignment 'SubFuture'->'int' (the implements_non_class extra on the implements arm is fixed, #4001); owner engine_core.rs lane V"]
 fn await_uses_interface_derived_future_type() {
-    let source = r#"
+    let source = r"
 class SubFuture implements Future<int> {
   SubFuture();
 }
@@ -211,7 +212,7 @@ void f(SubFuture x) async {
   int a = await x;
   String bad = a;
 }
-"#;
+";
     let report = report_ops(source);
     let assign = rows_of(&report, "invalid_assignment");
     assert_eq!(assign.len(), 1, "{:#?}", report.diagnostics);
@@ -232,20 +233,20 @@ void f(SubFuture x) async {
 #[test]
 #[ignore = "held: flatten_param (engine_core.rs:9074) lacks the _futureTypeOfBounded promoted-bound arm (upstream type_system.dart:1843-1875, rule 4.1 walks X1's bound to Future<Never>); re-verified 2026-11-05 vs oracle 3.13.7: still fails — `await x` types `Unknown` and the member read reports undefined_method 'abs' instead of receiver_of_type_never + dead_code; owner engine_core.rs lane V"]
 fn await_promoted_bound_derives_never() {
-    let source = r#"
+    let source = r"
 void f<X, X1 extends Future<Never>>(X x) async {
   if (x is X1) {
     var a = await x;
     a.abs();
   }
 }
-"#;
+";
     let report = report_ops(source);
     let never_rows = rows_of(&report, "receiver_of_type_never");
     let dead_rows = rows_of(&report, "dead_code");
     assert_eq!(never_rows.len(), 1, "{:#?}", report.diagnostics);
     assert_eq!(dead_rows.len(), 1, "{:#?}", report.diagnostics);
-    assert_eq!(never_rows[0].0, at(source, "a.abs"), "{:#?}", never_rows);
+    assert_eq!(never_rows[0].0, at(source, "a.abs"), "{never_rows:#?}");
 }
 
 /// S1c acceptance: `x is X1?` — the NULLABLE promoted bound
@@ -260,13 +261,13 @@ void f<X, X1 extends Future<Never>>(X x) async {
 #[test]
 #[ignore = "held: flatten_param (engine_core.rs:9074) strips `?` and reads X1's bound directly instead of the upstream _futureTypeOfBounded(X1?) two-arm split (element bound then promoted bound, type_system.dart:406-422) — flatten(X & X1?) should fall through to flatten(X)=X; re-verified 2026-11-05 vs oracle 3.13.7: still fails — `await x` keeps X so the invalid_assignment 'X'->'Never?' row stays silent; owner engine_core.rs lane V"]
 fn await_nullable_promoted_bound_keeps_parameter() {
-    let source = r#"
+    let source = r"
 void f<X, X1 extends Future<Never>>(X x) async {
   if (x is X1?) {
     Never? a = await x;
   }
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -288,7 +289,7 @@ void f<X, X1 extends Future<Never>>(X x) async {
 #[test]
 #[ignore = "held: the map-pattern key's `const A()` never reaches the generic-send inference path — could_not_infer/type_argument_not_matching_bounds live on invocation.rs:7249/:7583/:8875 and constant_pattern_never_matches_value_type on engine_core.rs:12435/diagnose.rs:2502; re-verified 2026-11-05 vs oracle 3.13.7: still fails — zero rows at the key; owners invocation.rs lane B4 + engine_core.rs/diagnose.rs pattern faces"]
 fn map_pattern_key_runs_generic_inference() {
-    let source = r#"
+    let source = r"
 class A<T extends A<T>> {
   const A();
 }
@@ -298,7 +299,7 @@ void test1() {
       break;
   }
 }
-"#;
+";
     let report = report_ops(source);
     let cni = rows_of(&report, "could_not_infer");
     let bounds = rows_of(&report, "type_argument_not_matching_bounds");
@@ -306,19 +307,19 @@ void test1() {
     assert_eq!(cni.len(), 1, "{:#?}", report.diagnostics);
     assert_eq!(bounds.len(), 1, "{:#?}", report.diagnostics);
     assert_eq!(never.len(), 1, "{:#?}", report.diagnostics);
-    assert_eq!(cni[0].0, at(source, "const A()"), "{:#?}", cni);
+    assert_eq!(cni[0].0, at(source, "const A()"), "{cni:#?}");
 }
 
 /// S3 acceptance: `A.foo()`/`A.bar()` through
 /// `typedef A<X extends G<C<X>>> = C<X>` run the same
-/// could_not_infer verdict the bare `A()` already does — the
+/// `could_not_infer` verdict the bare `A()` already does — the
 /// factory spellings reach the constructor-through-alias
 /// inference face upstream. Fails today: only the bare call
 /// emits.
 #[test]
 #[ignore = "held: the constructor-through-alias send-close never runs the could_not_infer verdict the bare-call arm already does (upstream pkg/analyzer); re-verified 2026-11-05 vs oracle 3.13.7: still fails — zero could_not_infer rows on `A.foo()`/`A.bar()` factory spellings; owner invocation.rs lane B4"]
 fn factory_through_alias_runs_could_not_infer() {
-    let source = r#"
+    let source = r"
 class C<X> {
   C();
   factory C.foo() => C();
@@ -330,7 +331,7 @@ void f() {
   A.foo();
   A.bar();
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "could_not_infer");
     assert_eq!(rows.len(), 2, "{:#?}", report.diagnostics);
@@ -347,13 +348,13 @@ void f() {
 #[test]
 #[ignore = "held: the pattern context's required-type donation never applies the int-to-double coercion before the subtype ask (upstream type_analyzer.dart:353-365 isSubtypeOf sees double<:double after the conversion); re-verified 2026-11-05 vs oracle 3.13.7: still fails — pattern_type_mismatch_in_irrefutable_context 'int'->'double' fires on `var (double d) = 123` and `(x) = 234`; owner scopes_bodies.rs:4280 lane W"]
 fn pattern_context_coerces_int_literal_to_double() {
-    let source = r#"
+    let source = r"
 void f() {
   var (double d) = 123;
   double x = 0;
   (x) = 234;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "pattern_type_mismatch_in_irrefutable_context");
     assert_eq!(rows.len(), 0, "{:#?}", report.diagnostics);

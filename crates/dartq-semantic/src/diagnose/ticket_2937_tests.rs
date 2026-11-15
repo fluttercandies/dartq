@@ -19,6 +19,7 @@
 //! (test_const#0's dual). `a(b(int p)) { b('0'); }` reports ATA at
 //! `'0'` against the formal's `int` positional.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops, rows};
 
@@ -30,7 +31,7 @@ fn ata_rows(report: &FileReport) -> Vec<(u32, u32)> {
         .filter(|d| d.code.name == "argument_type_not_assignable")
         .map(|d| (d.range.offset, d.range.length))
         .collect();
-    out.sort();
+    out.sort_unstable();
     out
 }
 
@@ -177,7 +178,7 @@ fn index_expression_dynamic_receiver_silent() {
 /// The named-constructor annotation (`@Ctx.fromInt('0')` over
 /// `const Ctx.fromInt(int p)`): the constructor's formals pair the
 /// argument list — `const_constructor_param_type_mismatch` and ATA land
-/// at `'0'` together (the test_const#0 dual).
+/// at `'0'` together (the `test_const#0` dual).
 #[test]
 fn annotation_argument_named_ctor_reports() {
     let source = "class Ctx {\n\

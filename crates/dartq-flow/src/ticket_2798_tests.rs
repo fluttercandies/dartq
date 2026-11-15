@@ -3,7 +3,7 @@
 //!
 //! * A3 — the is-check branch-death faces. The verdict folds
 //!   (`isExpression_end`, upstream Dart SDK source,
-//!   pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:
+//!   pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart`:
 //!   7178-7205) and the promotion split's `ifFalseIsUnreachable`
 //!   (:4156-4160) already dead arms; the is-CONTINUATION dead row — a
 //!   Never-typed operand's `handleExit` (type_analyzer.dart:817-819:
@@ -28,6 +28,9 @@
 //!   read (`bool_expression_verifier.dart:45-73` for conditions; the
 //!   for-in iterable and spread reads carry their flow type through the
 //!   ordinary read rows).
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::ev::Ev;
 use crate::facts::FlowFact;
@@ -77,6 +80,7 @@ fn dead_of(source: &str) -> Vec<String> {
 
 /// `(snippet, nullable)` of every read-type row, and the
 /// `(snippet, nullable)` condition rows.
+#[allow(clippy::type_complexity)]
 fn read_tys(source: &str) -> (Vec<(&str, bool)>, Vec<(&str, bool)>) {
     let facts = scan_parse(source);
     let at = |span: dartq_source::SourceRange| {

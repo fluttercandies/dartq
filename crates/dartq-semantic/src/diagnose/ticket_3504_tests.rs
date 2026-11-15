@@ -4,7 +4,7 @@
 //!
 //! Upstream `_checkForReturnOfInvalidType` resolves the expected type
 //! from `enclosingExecutable.returnType` (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/generated/error_verifier.dart): the executable
+//! `pkg/analyzer/lib/src/generated/error_verifier.dart)`: the executable
 //! is the extension's own member, so the `on` clause type only arms the
 //! container face — it must not leak into a member's return verdict.
 //! An operator member latches its `ret` before its annotation parses,
@@ -15,6 +15,7 @@
 //! Anchors locate themselves with `find` over the prelude-prefixed
 //! source. Registered through `diagnose/tests.rs`'s `#[path]` tail.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

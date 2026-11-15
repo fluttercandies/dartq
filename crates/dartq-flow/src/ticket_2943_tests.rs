@@ -5,7 +5,7 @@
 //! static type; `resolveListLiteral`/`resolveSetOrMapLiteral`'s
 //! written-arguments arm spells `List<E>`/`Set<E>`/`Map<K,V>` (upstream
 //! Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver.dart:
+//! `pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver.dart`:
 //! 68-107, 732-758). That type is what `PromotionModel.write`'s
 //! `_tryPromoteToTypeOfInterest` consumes (`flow_analysis.dart:
 //! 4947-5062`): `int <: num` makes `num` a type of interest on
@@ -20,6 +20,9 @@
 //! cannot (`int <: num`, `double <: num`, `String <: Object`) — the
 //! resolved seam's answer. Everything else delegates to
 //! [`crate::ty::NameTypeOps`].
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
@@ -127,6 +130,7 @@ fn analyze<'t>(
 }
 
 /// `(snippet, ty, args)` of every `ReadType`/`PromotedRead` row.
+#[allow(clippy::type_complexity)]
 fn reads<'a>(
     source: &'a str,
     facts: &[FlowFact],
@@ -140,7 +144,7 @@ fn reads<'a>(
         match fact {
             FlowFact::ReadType { span, ty, args } => read.push((at(span.range), *ty, *args)),
             FlowFact::PromotedRead { span, ty, args } => {
-                promoted.push((at(span.range), *ty, *args))
+                promoted.push((at(span.range), *ty, *args));
             }
             _ => {}
         }

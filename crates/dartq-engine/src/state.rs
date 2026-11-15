@@ -2,6 +2,7 @@
 //! pending overlay, the library arena with its reverse-import index, the
 //! per-library result cache, and the bounded per-file facts cache.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 pub mod persist;
 
 use std::borrow::Borrow;
@@ -892,7 +893,7 @@ impl FeatureGrants {
     /// already pins the build.
     pub(crate) fn fingerprint(&self) -> u64 {
         let mut bytes = Vec::new();
-        let mut field = |bytes: &mut Vec<u8>, value: &[u8]| {
+        let field = |bytes: &mut Vec<u8>, value: &[u8]| {
             bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
             bytes.extend_from_slice(value);
         };
@@ -924,7 +925,7 @@ impl FeatureGrants {
                 field(&mut bytes, format!("{flag:?}").as_bytes());
             }
         }
-        for flag in self.cli_experiments.iter() {
+        for flag in &self.cli_experiments {
             field(&mut bytes, format!("{flag:?}").as_bytes());
         }
         field(&mut bytes, self.sdk_version.as_bytes());
@@ -968,28 +969,25 @@ impl FeatureGrants {
         // `Path::join` replaces the base) has no parent directory: the
         // library is unattributable and skips — a malformed embedder table
         // must not fail startup.
-        match sdk.embedder() {
-            Some((base, table)) => {
-                for (name, library) in &table.libraries {
-                    let path = base.join(&library.uri);
-                    let Some(dir) = path.parent() else {
-                        continue;
-                    };
-                    sdk_library_dirs.insert(Box::from(dir.to_path_buf()), Box::from(name.as_str()));
-                }
-                lib_root = Box::from(base);
+        if let Some((base, table)) = sdk.embedder() {
+            for (name, library) in &table.libraries {
+                let path = base.join(&library.uri);
+                let Some(dir) = path.parent() else {
+                    continue;
+                };
+                sdk_library_dirs.insert(Box::from(dir.to_path_buf()), Box::from(name.as_str()));
             }
-            None => {
-                let dart_lib_root: Box<Path> = sdk.dart_sdk_root().join("lib").into_boxed_path();
-                for (name, uri) in dartq_sdk::FLAT_LIBRARIES.iter().copied() {
-                    let path = dart_lib_root.join(uri);
-                    let Some(dir) = path.parent() else {
-                        continue;
-                    };
-                    sdk_library_dirs.insert(Box::from(dir.to_path_buf()), Box::from(name));
-                }
-                lib_root = dart_lib_root;
+            lib_root = Box::from(base);
+        } else {
+            let dart_lib_root: Box<Path> = sdk.dart_sdk_root().join("lib").into_boxed_path();
+            for (name, uri) in dartq_sdk::FLAT_LIBRARIES.iter().copied() {
+                let path = dart_lib_root.join(uri);
+                let Some(dir) = path.parent() else {
+                    continue;
+                };
+                sdk_library_dirs.insert(Box::from(dir.to_path_buf()), Box::from(name));
             }
+            lib_root = dart_lib_root;
         }
         any |= packages.iter().any(|package| {
             sdk.platform_metadata
@@ -2096,7 +2094,7 @@ pub(crate) struct EngineState {
 /// The bound is the oracle's context root: `PackageConfigWorkspace` is
 /// "rooted at the innermost package-config file" (pub.dart
 /// `PackageConfigWorkspace.find`), and the context-root folder walk
-/// (context_root.dart `_includedFilesInFolder`) covers that tree only.
+/// (`context_root.dart` `_includedFilesInFolder`) covers that tree only.
 /// Packages the config lists *outside* the bound — the pub cache, git
 /// checkouts, SDK-provided packages, and path dependencies pointing
 /// elsewhere — are resolution targets, never analyzed surface: the oracle
@@ -2756,8 +2754,8 @@ impl EngineState {
         if bytes > SCANNED_CACHE_BYTES {
             return;
         }
-        if self.scanned.contains_key(&key) {
-            self.scanned.insert(key, Arc::new(face));
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.scanned.entry(key) {
+            e.insert(Arc::new(face));
             return;
         }
         while !self.scanned.is_empty()
@@ -2822,10 +2820,10 @@ impl EngineState {
     /// is `without_sites`, not a recapture) — and a later rebuild
     /// re-derives the sites from content on the miss.
     fn feed_sites(&mut self, file: FileId) {
-        if !self.sites_cached.insert(file) {
-            if let Some(pos) = self.sites_order.iter().position(|&f| f == file) {
-                self.sites_order.remove(pos);
-            }
+        if !self.sites_cached.insert(file)
+            && let Some(pos) = self.sites_order.iter().position(|&f| f == file)
+        {
+            self.sites_order.remove(pos);
         }
         self.sites_order.push_back(file);
         while self.sites_order.len() > SITES_CACHE_CAP {
@@ -2833,11 +2831,11 @@ impl EngineState {
                 break;
             };
             self.sites_cached.remove(&oldest);
-            if let Some(slot) = self.captures.get_mut(oldest.index() as usize) {
-                if slot.is_some() {
-                    let old = slot.take().expect("checked");
-                    *slot = Some(Arc::new(old.without_sites()));
-                }
+            if let Some(slot) = self.captures.get_mut(oldest.index() as usize)
+                && slot.is_some()
+            {
+                let old = slot.take().expect("checked");
+                *slot = Some(Arc::new(old.without_sites()));
             }
         }
     }
@@ -2863,18 +2861,17 @@ impl EngineState {
         let facts = self.residency.get(&file)?;
         let bytes = self.store.get(facts.content)?;
         let text = std::str::from_utf8(bytes).ok()?;
-        let face = match self.settled_face(file) {
-            Some(face) => face,
-            None => {
-                let version = crate::l1::language_version_for(&self.packages, &self.files, file);
-                let (feature_set, settled, scanned, _) =
-                    crate::l1::scan_unit(text, version, file, &self.grants());
-                Arc::new(ScannedFace {
-                    tokens: scanned.tokens,
-                    features: feature_set,
-                    version: settled,
-                })
-            }
+        let face = if let Some(face) = self.settled_face(file) {
+            face
+        } else {
+            let version = crate::l1::language_version_for(&self.packages, &self.files, file);
+            let (feature_set, settled, scanned, _) =
+                crate::l1::scan_unit(text, version, file, &self.grants());
+            Arc::new(ScannedFace {
+                tokens: scanned.tokens,
+                features: feature_set,
+                version: settled,
+            })
         };
         Some(Arc::new(dartq_index::capture(
             file,
@@ -2903,10 +2900,10 @@ impl EngineState {
         }
         // The site cache follows the removal: a stale entry would inflate
         // the occupancy count and shed nothing.
-        if self.sites_cached.remove(&file) {
-            if let Some(pos) = self.sites_order.iter().position(|&f| f == file) {
-                self.sites_order.remove(pos);
-            }
+        if self.sites_cached.remove(&file)
+            && let Some(pos) = self.sites_order.iter().position(|&f| f == file)
+        {
+            self.sites_order.remove(pos);
         }
     }
 

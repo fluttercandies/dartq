@@ -33,6 +33,7 @@
 //!   follower `{` in the expected set) or the enum header's gunk skip
 //!   (:2744-2752) reports and consumes it once; the body then parses.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::setup;
 
 /// Parses `source` and asserts the exact in-order (code, start, end)

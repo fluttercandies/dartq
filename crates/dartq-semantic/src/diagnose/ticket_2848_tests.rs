@@ -24,6 +24,7 @@
 //!   face the verdict reads); the reflexive pair reports, the
 //!   non-provable one stays informative.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops;
 use crate::diagnose::types::FileReport;
 
@@ -39,7 +40,7 @@ fn type_check_rows(report: &FileReport) -> Vec<(u32, u32)> {
     found
 }
 
-/// —— the old-style generic alias fold ——
+// —— the old-style generic alias fold ——
 
 /// `baz is f1<int>` over `typedef int f1<T>([int? a, int? b, T? c]);`
 /// (the `type_alias2_test` shape): the tear-off's optional-positionals
@@ -140,7 +141,7 @@ fn param_shadowing_builtin_alias_tearoff_reports() {
     );
 }
 
-/// —— the qualified member tear-off ——
+// —— the qualified member tear-off ——
 
 /// A class-method tear-off against a parameterized alias (`remove is
 /// RemoveFunctionType<String, String>` — the `override_test` shape): the
@@ -222,7 +223,7 @@ fn super_member_tearoff_is_parameterized_alias_reports() {
     );
 }
 
-/// —— the nested generic groups ——
+// —— the nested generic groups ——
 
 /// `f22 is F22<int>` over `typedef F22<T> = Function<A>(List<T> x)
 /// Function(int x)` (the `function_type9_test` shape): the return type's
@@ -274,7 +275,7 @@ fn nested_generic_member_tearoff_reports() {
     );
 }
 
-/// —— the alias-returning member pieces ——
+// —— the alias-returning member pieces ——
 
 /// A member returning through an alias (`C foo()` under
 /// `typedef D C();` — the `type_alias6_test` shape): the tear-off's
@@ -318,7 +319,7 @@ fn alias_returning_member_tearoff_folds_pieces() {
     );
 }
 
-/// —— the no-regression net ——
+// —— the no-regression net ——
 
 /// The bare top-level tear-off over a `=`-form parameterized alias stays
 /// green (`f0 is F0<int>` — the #2790 pin's face, re-pinned against the

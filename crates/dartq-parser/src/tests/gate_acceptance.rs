@@ -19,6 +19,7 @@
 //!   field, no comma — is rejected by the walk's tail verdict
 //!   (:937-941).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::Parser;
 
@@ -464,7 +465,7 @@ fn record_type_args_guard_rejection_controls() {
 /// `!required` follower veto :849-852), so the argument type is the bare
 /// `List` and the group's `<` follower derails into `parseUnexpectedEnd`.
 /// The single row anchors on the last consumed type token — `List`
-/// (:1655-1657) — and the walk-to-endGroup tail (type_info_impl.dart:
+/// (:1655-1657) — and the walk-to-endGroup tail (`type_info_impl.dart`:
 /// 1711-1719) absorbs `<…>?` up to the scanner-paired real closer
 /// (abstract_scanner.dart:624-631 pairs `<`/`>` on the scanner stack), so
 /// the literal face sees the real `[` and the tail stays clean.
@@ -531,7 +532,7 @@ fn void_with_type_arguments_rows_anchor_after_void() {
 /// The type-argument flavor, pinned to the measured 3.13.1 oracle walk
 /// (`var x = <void<int>?, int>[];` — exactly two rows, clean tail).
 /// `void` in the argument slot takes `VoidType.parseType`, which reports
-/// `voidWithTypeArguments` on the inner `<` (type_info_impl.dart:455) and
+/// `voidWithTypeArguments` on the inner `<` (`type_info_impl.dart:455`) and
 /// parses the `<int>` group as its own; the follower `?` then derails into
 /// `parseUnexpectedEnd`, whose single row anchors on the last consumed
 /// type end — the inner `>` (:1655-1657; machine citation (1|18|1) =

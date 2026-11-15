@@ -3,4 +3,5 @@
 //! generated file's header for the regenerate command; its content is
 //! byte-checked by the `linter-meta-gen --check` CI step.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 pub(crate) mod rule_meta;

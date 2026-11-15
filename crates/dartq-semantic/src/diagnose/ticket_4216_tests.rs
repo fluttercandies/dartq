@@ -13,6 +13,7 @@
 //! declaring container at or before the reference, so each reference sees
 //! its own scope.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};

@@ -10,8 +10,8 @@
 //! `pattern_never_matches_value_type` against `int`, a record against a
 //! mismatched record, and neither reported
 //! `constant_pattern_never_matches_value_type` against a non-`Null`
-//! constant. The verdict arms the oracle fires (type_system.dart:
-//! 161-171's FunctionType faces, :269-320's RecordType faces, and
+//! constant. The verdict arms the oracle fires (`type_system.dart`:
+//! 161-171's `FunctionType` faces, :269-320's `RecordType` faces, and
 //! constant_verifier.dart:570-580's `_canBeEqual` value arms) now run
 //! before `head_name` returns `None`.
 //!
@@ -24,6 +24,7 @@
 //! Oracle rows: dart 3.13.7 (`dart analyze --format=machine`) over the
 //! fixtures below — verbatim messages pinned where they are the verdict.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// The `non_exhaustive_switch_expression` messages of `report`, in source
@@ -203,7 +204,7 @@ fn record_matched_against_same_record_stays_silent() {
 }
 
 /// `void Function()` matched vs `Function` required: `isDartCoreFunction`
-/// is the arm's admit head (type_system.dart:164) — silent.
+/// is the arm's admit head (`type_system.dart:164`) — silent.
 #[test]
 fn function_matched_against_function_head_stays_silent() {
     let rows = never_rows(
@@ -213,7 +214,7 @@ fn function_matched_against_function_head_stays_silent() {
 }
 
 /// `void Function()` matched vs `Object` required: `isDartCoreObject`
-/// likewise (type_system.dart:164) — silent.
+/// likewise (`type_system.dart:164`) — silent.
 #[test]
 fn function_matched_against_object_head_stays_silent() {
     let rows =
@@ -223,7 +224,7 @@ fn function_matched_against_object_head_stays_silent() {
 
 // —— `constant_pattern_never_matches_value_type` over the same faces ————
 
-/// `case null` over `void Function()`: the `_canBeEqual` FunctionType
+/// `case null` over `void Function()`: the `_canBeEqual` `FunctionType`
 /// value arm admits `Null` only when the value is nullable
 /// (constant_verifier.dart:570-572) — the non-nullable function matched
 /// never equals `null`.
@@ -240,7 +241,7 @@ fn null_constant_over_function_matched_reports() {
 }
 
 /// `case 1` over `void Function()`: a non-`Null` constant against a
-/// function value is provably never equal (constant_verifier.dart:573).
+/// function value is provably never equal (`constant_verifier.dart:573`).
 #[test]
 fn int_constant_over_function_matched_reports() {
     let rows =
@@ -253,7 +254,7 @@ fn int_constant_over_function_matched_reports() {
     );
 }
 
-/// `case 1` over `(int, int)`: the RecordType value arm answers the
+/// `case 1` over `(int, int)`: the `RecordType` value arm answers the
 /// same `false` for non-`Null` constants (constant_verifier.dart:575-578).
 #[test]
 fn int_constant_over_record_matched_reports() {
@@ -295,9 +296,7 @@ fn null_constant_over_nullable_record_stays_silent() {
 fn unresolvable_scrutinee_still_suppresses() {
     let report = report_ops("int f(Missing m) => switch (m) { Function _ => 1, _ => 2 };\n");
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "non_exhaustive_switch_expression"),
+        !code_names(&report).contains(&"non_exhaustive_switch_expression"),
         "{:?}",
         code_names(&report)
     );

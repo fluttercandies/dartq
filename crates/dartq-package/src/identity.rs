@@ -1,5 +1,6 @@
 //! Per-package identity types.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::PathBuf;
 
 use dartq_pub::{PackageInstance, SourceKind, SourceRef, Version};

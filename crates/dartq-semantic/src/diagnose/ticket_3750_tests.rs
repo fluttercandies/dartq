@@ -12,6 +12,8 @@
 //! Oracle provenance: `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze`
 //! over single-file fixtures.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{assert_silent, report_ops, rows};
 
 /// The `type_argument_not_matching_bounds` rows of `report`.

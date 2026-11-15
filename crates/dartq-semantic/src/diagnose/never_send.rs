@@ -9,6 +9,7 @@
 //! first readable, and the exit latches there. A null-aware access
 //! (`x?.m(...)`) types `Never?` and is no exit.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 impl Engine<'_> {

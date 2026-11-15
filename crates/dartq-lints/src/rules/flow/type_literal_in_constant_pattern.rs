@@ -282,31 +282,29 @@ fn enclosing_static_declares(c: &Check<'_>, name: &str) -> bool {
                                     return true;
                                 }
                             }
-                            NodeKind::Method if static_member => {
+                            NodeKind::Method if static_member
                                 // The name row's head token — `member_name`
                                 // answers a ROW id, never a token index.
-                                if crate::rules::declarations::member_declaration_name(c, member)
+                                && crate::rules::declarations::member_declaration_name(c, member)
                                     .is_some_and(|row| c.lexeme(c.head_token(row)) == name)
-                                {
+                                => {
                                     return true;
                                 }
-                            }
                             _ => {}
                         }
                     }
                 }
             }
-            NodeKind::EnumBody => {
+            NodeKind::EnumBody
                 // The enclosing enum's own constants: plain values in
                 // scope inside the enum's members (a childless handle
                 // anchored at the name — the span head answers).
                 if c.collect_direct(ancestor).into_iter().any(|element| {
                     c.kind(element) == NodeKind::EnumElement
                         && c.lexeme(c.head_token(element)) == name
-                }) {
+                }) => {
                     return true;
                 }
-            }
             _ => {}
         }
     }

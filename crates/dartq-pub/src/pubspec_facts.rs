@@ -27,6 +27,7 @@
 //! would read as `u0041.example`). Spans mirror the official
 //! `YamlNode.span`: the raw scalar extent, quotes included.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use core::ops::Range;
 
 /// One scalar fact: `range` is the raw source extent in the scanned text

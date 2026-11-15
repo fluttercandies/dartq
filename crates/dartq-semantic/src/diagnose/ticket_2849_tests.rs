@@ -9,6 +9,7 @@
 //! equality rule (#2834) then decides over real populated params, and
 //! the byte-exact message spells the resolved instantiations both ways.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{report_ops, rows};
 use crate::diagnose::types::FileReport;
 

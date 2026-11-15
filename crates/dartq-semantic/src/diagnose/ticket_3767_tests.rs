@@ -5,7 +5,7 @@
 //! defects broke that contract and each minted rows the oracle never
 //! emits:
 //!
-//! - a ParenthesizedExpression operand folded to a `)`-anchored row — or a
+//! - a `ParenthesizedExpression` operand folded to a `)`-anchored row — or a
 //!   leaf row nested inside one — so `!(x)`, `dynamic z = (x)`, `while
 //!   ((x))`, `<Object?>[(x)]`, `(x) && true` and `(true ? x : x) is T`
 //!   reads reported the inner leaf's span instead of the group's (`(x)`
@@ -36,6 +36,7 @@
 //!   function-typed formal/local) still fires — the function-expression
 //!   invocation face is unchanged.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{report_ops, rows};
 
 /// The oracle's `useOfVoidResult` message spelling (messages.yaml:19638).
@@ -264,6 +265,6 @@ fn ticket_3767_member_field_void_function_still_flagged() {
 fn ticket_3767_bare_void_read_still_flagged() {
     let fixture = "void v() {}\nvoid main() {\n  void x = v();\n  bool b = !x;\n}";
     let report = report_ops(fixture);
-    let at = fixture.rfind("x").unwrap();
+    let at = fixture.rfind('x').unwrap();
     assert_void_rows(&report, fixture, &[(at, 1)]);
 }

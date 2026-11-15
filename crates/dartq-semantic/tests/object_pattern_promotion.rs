@@ -2,7 +2,7 @@
 //! `case Some():` clause's body must resolve members on the promoted
 //! scrutinee type, not the declared one (official `promoteForPattern`,
 //! upstream Dart SDK source,
-//! pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:7703-
+//! pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:7703`-
 //! 7755, fed by `analyzeObjectPattern` through the clause's pattern walk).
 //! The regression is the analyzer corpus's `issue60264` family: the
 //! diagnoser reported `undefined_getter 'value'` on the declared `Option`
@@ -50,7 +50,7 @@ void fun<T>(Option<T> option) {
 /// Runs `source` through the live pipeline (the corpus posture: language
 /// 3.13, a standalone library over the synthetic core face) and returns
 /// the whole fold — report and read-type faces.
-fn unit_fold<'s>(source: &'s str, strings: &StringTable) -> UnitFold {
+fn unit_fold(source: &str, strings: &StringTable) -> UnitFold {
     let mut files = FileTable::new();
     let file = files.intern(Path::new("main.dart"));
     let set = FeatureSet::for_language_version(LanguageVersion::new(3, 13));
@@ -117,7 +117,7 @@ fn unit_fold<'s>(source: &'s str, strings: &StringTable) -> UnitFold {
 /// the failed arm joins the unmatched chain).
 #[test]
 fn matched_object_pattern_resolves_case_body_members() {
-    let mut strings = StringTable::default();
+    let strings = StringTable::default();
     let fold = unit_fold(OPTION_SOME_NONE, &strings);
     let getters: Vec<_> = fold
         .report
@@ -140,7 +140,7 @@ fn case_body_read_rows_carry_the_matched_types() {
         "void fun<T>(Option<T> option) { switch (option) { case Some(): option.value; ",
         "case None(): option.noneProp; } if (option is Some) { option.value; } }"
     );
-    let mut strings = StringTable::default();
+    let strings = StringTable::default();
     let fold = unit_fold(source, &strings);
     let spelling = |offset: usize| -> String {
         let row = fold

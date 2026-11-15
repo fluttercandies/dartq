@@ -46,6 +46,7 @@
 //! stays a variant; its descriptor stays the single source for
 //! `ambiguous_export`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_diagnostics::DiagnosticType;
 
 /// The frozen resolution diagnostic code set.
@@ -216,19 +217,19 @@ pub const DUPLICATE_EXPORT: ResolutionCodeInfo = ResolutionCodeInfo {
     has_published: true,
 };
 
-/// One export directive exports a name a previous export directive of the
-/// same library already exports as a **different** element — the frozen
-/// row is [`ResolutionCode::AmbiguousExport`]'s (registry row verbatim,
-/// `diagnostic.g.dart:264`, dart 3.13.7). `COMPILE_TIME_ERROR`,
-/// published; `{0}` the conflicting name, `{1}`/`{2}` the two elements'
-/// declaring-library URIs. One report per directive (the first conflicting
-/// name only), anchored at the directive, accumulated across the library's
-/// directives in source order (`error_verifier.dart:2593-2621`
-/// `_checkForAmbiguousExport` over `LibraryVerificationContext
-/// ._exportedElements`; the directive namespace is the target's export
-/// scope under the directive's combinators, `scope.dart:99-110`
-/// `createExportNamespaceForDirective2`). The decision face is
-/// [`crate::export_graph`]`::LibraryGraph::ambiguous_exports`.
+// One export directive exports a name a previous export directive of the
+// same library already exports as a **different** element — the frozen
+// row is [`ResolutionCode::AmbiguousExport`]'s (registry row verbatim,
+// `diagnostic.g.dart:264`, dart 3.13.7). `COMPILE_TIME_ERROR`,
+// published; `{0}` the conflicting name, `{1}`/`{2}` the two elements'
+// declaring-library URIs. One report per directive (the first conflicting
+// name only), anchored at the directive, accumulated across the library's
+// directives in source order (`error_verifier.dart:2593-2621`
+// `_checkForAmbiguousExport` over `LibraryVerificationContext
+// ._exportedElements`; the directive namespace is the target's export
+// scope under the directive's combinators, `scope.dart:99-110`
+// `createExportNamespaceForDirective2`). The decision face is
+// [`crate::export_graph`]`::LibraryGraph::ambiguous_exports`.
 
 /// An export directive targets an internal SDK library (`dart:_…`) from a
 /// non-system library — registry row verbatim (`diagnostic.g.dart:5332`,
@@ -598,6 +599,7 @@ impl ResolutionCode {
 }
 
 #[cfg(test)]
+#[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
 
@@ -813,6 +815,7 @@ mod tests {
     /// `invalid_export_of_internal_element`(_indirectly) are
     /// `STATIC_WARNING`, the rest `COMPILE_TIME_ERROR`.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn export_graph_rows_are_verbatim_oracle_descriptors() {
         assert_eq!(
             ResolutionCode::AmbiguousExport.info().message,

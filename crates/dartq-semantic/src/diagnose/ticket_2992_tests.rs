@@ -9,6 +9,7 @@
 //! the instantiate-to-bounds fill without re-entering a held borrow, and
 //! the `is` verdict stays honest either way.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

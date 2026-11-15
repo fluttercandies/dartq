@@ -18,6 +18,7 @@
 //! * skip-to-sync — group-aware jump to a boundary set, with a no-progress
 //!   guard at every loop level (official strategy C, `parser_impl.dart:445`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind};
 
 use crate::listener::IdentifierContext;
@@ -132,7 +133,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// synthetic still splices at the current token, but the row anchors on
     /// `anchor` — the #2024 separator recovery anchor (the token the
     /// recovery lands behind, upstream Dart SDK source,
-    /// pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart
+    /// pkg/_`fe_analyzer_shared/lib/src/parser/parser_impl.dart`
     /// `rewriteAndRecover` reports at the resumed token).
     pub(crate) fn expect_lexeme_but_got_anchored(
         &mut self,
@@ -168,12 +169,13 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// statement, class member, or top-level declaration — the synthetic
     /// name splices in front of it so the annotation carries an empty name
     /// and the keyword stays for the declaration/statement parse (oracle
-    /// partial_code/annotation `@ assert (true);` / `@ var x;`:
+    /// `partial_code/annotation` `@ assert (true);` / `@ var x;`:
     /// `missing_identifier` at the keyword, `undefined_annotation` on the
     /// empty name). `ImportPrefixDeclaration` branch 3 (:706-716): a
     /// declaration head after `as` splices a synthetic prefix (`import
     /// 'a.dart' as class A {}` — `;` anchored at `as`, the class parses at
     /// top level).
+    #[allow(clippy::match_same_arms)]
     fn reserved_name_recovery_at(&self, context: crate::listener::IdentifierContext) -> bool {
         match context {
             // `LibraryIdentifierContext.ensureIdentifier` recovery branch 2b
@@ -206,16 +208,8 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                             | TokenKind::Eof
                     )
             }
-            crate::listener::IdentifierContext::LocalVariableDeclaration => {
-                self.looks_like_statement_start_at(0)
-            }
-            // `LocalFunctionDeclarationIdentifierContext.ensureIdentifier`
-            // (identifier_context_impl.dart:805-810): the local-function name
-            // slot splices a synthetic name when the head starts a statement
-            // (`var`/`final`/`void`/`for`/`if`/`return`/...) — the keyword
-            // stays current for the statement loop instead of being eaten as
-            // the function name.
-            crate::listener::IdentifierContext::LocalFunctionDeclaration => {
+            crate::listener::IdentifierContext::LocalVariableDeclaration
+            | crate::listener::IdentifierContext::LocalFunctionDeclaration => {
                 self.looks_like_statement_start_at(0)
             }
             // `DottedNameIdentifierContext.ensureIdentifier` recovery arm
@@ -607,7 +601,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         // `builtInIdentifierInDeclaration`.
                         || context == crate::listener::IdentifierContext::ClassOrMixinOrExtensionDeclaration
                 }
-                _ => false,
+                dartq_scanner::KeywordStyle::Pseudo => false,
             },
             _ => false,
         };
@@ -1197,7 +1191,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     }
 
     /// Official missing-identifier report span (upstream Dart SDK source,
-    /// pkg/_fe_analyzer_shared/lib/src/parser/util.dart
+    /// pkg/_`fe_analyzer_shared/lib/src/parser/util.dart`
     /// `findNonZeroLengthToken` + the analyzer's `handleRecoverableError`
     /// offset/end formula): a real got token anchors on its own span; a
     /// zero-width got (the scanner's synthetic interpolation closer parked
@@ -1396,7 +1390,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         )
     }
 
-    /// `looksLikeStartOfNextClassMember` (identifier_context_impl.dart:1641)
+    /// `looksLikeStartOfNextClassMember` (`identifier_context_impl.dart:1641`)
     /// evaluated at cursor-relative offset `n`: a member modifier, an
     /// annotation head, `get`/`set`/`void`, or EOF.
     fn looks_like_start_of_next_class_member_at(&self, n: usize) -> bool {
@@ -1602,9 +1596,9 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// are the spill run, and the mark arms the ensureSemicolon
     /// relocation-anchor override — a construct that resumes here and
     /// consumes nothing real beyond it anchors past the mark (sii-probes
-    /// double_dollar: the `;` on the resumed `$$` head), while a recovery
+    /// `double_dollar`: the `;` on the resumed `$$` head), while a recovery
     /// that mints its own zero-width tail walks back instead
-    /// (oracle for_each_statement in_block: the body `;` on the iterable's
+    /// (oracle `for_each_statement` `in_block`: the body `;` on the iterable's
     /// `}`, not the resume token).
     ///
     /// `parked` is the scanner-synthesized closer being adopted — the
@@ -1644,7 +1638,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// the begin token, not EOF — the row is length-1 AT the eof offset
     /// (oracle machine rows: `f('${` → '}' @2:1|1, `void main() {` → '}' at
     /// offset = source length). Identical rows collapse: the oracle dedupes
-    /// them downstream (two_unclosed_curly's two `}`-groups parked at EOF
+    /// them downstream (`two_unclosed_curly`'s two `}`-groups parked at EOF
     /// surface as a single row). `at` carries the closer's handle + its
     /// as-scanned span; the encoded range is the translation's law above, not
     /// `at` verbatim.
@@ -1656,7 +1650,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             at.range.offset
         };
         let key = (lexeme, offset);
-        if self.unmatched_seen.iter().any(|&k| k == key) {
+        if self.unmatched_seen.contains(&key) {
             return;
         }
         self.unmatched_seen.push(key);
@@ -1687,12 +1681,9 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             // indices through `append_inserted`), so the lookup always
             // succeeds; a miss degrades by skipping the row (under-report
             // only — the parity face is untouched) instead of panicking.
-            let closer = match self.table.get(close as usize) {
-                Some(t) => t,
-                None => {
-                    debug_assert!(false, "pair indexes the table");
-                    continue;
-                }
+            let Some(closer) = self.table.get(close as usize) else {
+                debug_assert!(false, "pair indexes the table");
+                continue;
             };
             let lexeme = closer.kind.fixed_lexeme().unwrap_or("}");
             // The span length is a placeholder — report_unmatched_row encodes
@@ -1844,7 +1835,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// `expectedIdentifierButGotKeyword` with no declaration-head reparse —
     /// only non-keyword junk falls back to the normal `ensureIdentifier`
     /// template. The typedef callers pass `isIdentifierRecovered` for the
-    /// `name (`/`name <T>(` group shapes (parser_impl.dart:1494/:1590).
+    /// `name (`/`name <T>(` group shapes (`parser_impl.dart:1494/:1590`).
     ///
     /// The member-name contexts override the base `=> ensureIdentifier`
     /// route (`identifier_context_impl.dart`): `FieldDeclaration`
@@ -1963,7 +1954,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// real beyond it, the frozen oracle anchors past the relocation on the
     /// resume token instead (`findNonZeroLengthToken` over the resume
     /// point, `util.dart`; the #2024 drain pins and sii-probes
-    /// double_dollar) — while a recovery that mints its own zero-width tail
+    /// `double_dollar`) — while a recovery that mints its own zero-width tail
     /// after the resume point ends the walk on the construct's real tail
     /// (`f() { for (var a in {} }` anchors the body `;` on the iterable's
     /// `}`: the missing-identifier insert is the walk's starting synthetic).
@@ -2276,7 +2267,7 @@ fn context_tolerates_keyword_as_name(context: crate::listener::IdentifierContext
 /// report `expectedIdentifierButGotKeyword` for reserved words; the
 /// declaration-name contexts carry the per-context built-in face (the
 /// converter re-faces the shared parser's `builtInIdentifierInDeclaration`
-/// through `_checkForBuiltInIdentifierAsName`, error_verifier.dart:3760);
+/// through `_checkForBuiltInIdentifierAsName`, `error_verifier.dart:3760`);
 /// the type-reference family reports its own built-in/`expectedType` faces
 /// (`TypeReferenceIdentifierContext.ensureIdentifier`); everything else
 /// falls back to the generic `missing_identifier` path.

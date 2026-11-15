@@ -31,6 +31,8 @@
 //!   and the explicit-argument bound clamp fires where the oracle clamps
 //!   only the inferred solution — `invocation.rs`, in-flight.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -183,7 +185,7 @@ void main() {
 /// (pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart:808-813):
 /// `void f(x,)` resolves `void Function(dynamic)`, so the `topx`
 /// tear-off assigns cleanly. dartq's `fn_capture_formal`
-/// (diagnose/type_capture.rs, in-flight #3099) poisons the untyped
+/// (`diagnose/type_capture.rs`, in-flight #3099) poisons the untyped
 /// formal instead — the captured shape drops it and the arity compare
 /// sees a phantom extra required positional.
 #[test]
@@ -252,7 +254,7 @@ void main() { argfn(topy); }
 }
 
 /// IA1 — instantiate-to-bound seeds the declared bound else `Object?`
-/// (pkg/analyzer/lib/src/dart/element/generic_inferrer.dart:449), never
+/// (`pkg/analyzer/lib/src/dart/element/generic_inferrer.dart:449`), never
 /// `Never`: the mutual-bound typedef pair resolves `fsource` to a real
 /// `F<…>` face and both `invalid_assignment` rows fire at the RHS reads.
 /// dartq clobbers the `toF(source)` send's instantiated return to `Void`

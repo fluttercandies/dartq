@@ -24,6 +24,7 @@
 //!
 //! Oracle: dart 3.13.7, upstream `pkg/analyzer`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::super::{FileReport, StrictModes, diagnose_with};
 use crate::collector::collect;
 use crate::library::ElementIndex;
@@ -195,7 +196,7 @@ fn report_with_part_file_imports(
     // rows would leave `main.dart` run-less and starve the count gate).
     // Only `main_imports` land here: a main source that writes no import
     // keeps a zero-edge run and a zero-length `self.imports`.
-    for &(aux_index, prefix) in main_imports.iter() {
+    for &(aux_index, prefix) in main_imports {
         builder.import_in(
             lib,
             file,
@@ -212,7 +213,7 @@ fn report_with_part_file_imports(
     // declaration order, attributed to `part_file` (`builder.import_in`,
     // owner=Some(part_file)).
     if let Some((part_file, _, _)) = &part_data {
-        for &(aux_index, prefix) in part_imports.iter() {
+        for &(aux_index, prefix) in part_imports {
             builder.import_in(
                 lib,
                 *part_file,

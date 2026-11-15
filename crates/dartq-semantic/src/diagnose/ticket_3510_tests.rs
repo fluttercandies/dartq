@@ -19,6 +19,7 @@
 //! shared shapes) and the upstream display path for the rest; every
 //! expectation is the full row set (no unlisted codes).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 
 /// The class-shaped fixture's one-row annotation face (`void f(E<int> e)`):
@@ -80,7 +81,7 @@ fn bare_list_shaped_alias_bound_decides() {
 /// BARE alias spelling: a non-generic alias instantiates with no
 /// arguments, so the decoration is `A` (`_writeTypeArguments` skips an
 /// empty list), never `A<...>` and never the expansion `C<int, int>`.
-/// Both NamedType sites report (the annotation and the creation), the
+/// Both `NamedType` sites report (the annotation and the creation), the
 /// same pair the generic twin pins.
 #[test]
 fn non_generic_alias_bound_keeps_the_bare_decoration() {
@@ -134,7 +135,7 @@ fn bare_function_shaped_alias_bound_decides() {
     );
 }
 
-/// A bounded alias parameter whose stored variance is CONTRAvariant
+/// A bounded alias parameter whose stored variance is `CONTRAvariant`
 /// grounds its self-referential bound to `Never`: over
 /// `int Function(X)` the parameter occurs only in the formal list, so
 /// `VarianceBuilder` stores `X` contravariant and
@@ -186,7 +187,7 @@ fn contravariant_alias_parameter_decorates_with_never() {
 /// return (covariant) AND the formal list (contravariant), so
 /// `VarianceBuilder._combine` stores `X` invariant — and the visitor's
 /// `visitTypeParameterType` sends everything that is NOT contravariant
-/// to the upper substitution (`dynamic`, default_types_builder.dart
+/// to the upper substitution (`dynamic`, `default_types_builder.dart`
 /// :481-487). The raw `A` displays `A<Wrap<dynamic>>`, pinning that the
 /// engine's variance feed is the stored one, not a blanket seed.
 #[test]
@@ -221,7 +222,7 @@ fn invariant_alias_parameter_decorates_with_dynamic() {
 
 /// The body-level twin — `T extends F` deciding an assignment inside the
 /// container — reads the bound through `Engine::param_bound`
-/// (`bound_face`'s engine_core.rs site) and the assignability chain, the
+/// (`bound_face`'s `engine_core.rs` site) and the assignability chain, the
 /// two rider-owned consumers of #3510's expanded-bound accessor. This
 /// body is the live specification for that rider: the oracle reports
 /// `A value of type 'T' can't be assigned to a variable of type

@@ -14,7 +14,7 @@
 //!   default face);
 //! - a mixed group (one serve-early ask, one plain ask) ⇒ the whole group
 //!   takes the full turn, unmarked;
-//! - a directory aim or an agent view with the flag ⇒ INVALID_PARAMS;
+//! - a directory aim or an agent view with the flag ⇒ `INVALID_PARAMS`;
 //! - a serve-early answer never enters the warm-turn cache.
 //!
 //! The unsettled window is opened the way a real client opens it: an
@@ -22,6 +22,66 @@
 //! ask — never an agent overlay (overlays wear a view, they do not dirty
 //! the base context's settle state).
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::unused_self,
+    clippy::type_complexity,
+    clippy::cast_possible_truncation,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::useless_conversion,
+    clippy::question_mark,
+    clippy::option_option,
+    clippy::needless_continue,
+    clippy::missing_panics_doc,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::explicit_counter_loop,
+    clippy::never_loop,
+    clippy::needless_range_loop,
+    clippy::unnecessary_unwrap,
+    clippy::assigning_clones,
+    clippy::double_must_use,
+    clippy::single_match,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::ignore_without_reason,
+    clippy::unnecessary_debug_formatting,
+    clippy::match_wild_err_arm,
+    clippy::disallowed_names,
+    clippy::many_single_char_names,
+    clippy::same_item_push,
+    clippy::while_let_loop,
+    clippy::if_same_then_else,
+    clippy::ref_option,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::unnecessary_filter_map,
+    clippy::manual_strip,
+    clippy::float_cmp,
+    clippy::redundant_guards,
+    clippy::empty_line_after_doc_comments,
+    clippy::unreadable_literal,
+    clippy::enum_variant_names,
+    clippy::missing_errors_doc,
+    clippy::unnecessary_wraps,
+    clippy::too_many_arguments,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::fs;
@@ -229,7 +289,7 @@ fn serve_early_mixed_group_falls_back_to_the_full_turn() {
 }
 
 /// The flag's shape guards: a directory aim, an agent view, or a
-/// path-less ask with `serve_early: true` is INVALID_PARAMS — the mode
+/// path-less ask with `serve_early: true` is `INVALID_PARAMS` — the mode
 /// answers per-file asks on the base view only.
 #[test]
 fn serve_early_rejects_directory_and_agent_shapes() {

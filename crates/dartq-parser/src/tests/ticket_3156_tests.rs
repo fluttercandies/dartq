@@ -11,6 +11,7 @@
 //! slot splices a synthetic name (`missing_identifier`) and stays for the
 //! declaration loop.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -143,7 +144,7 @@ fn directive_name_keyword_head_inserts_synthetic_name() {
 /// splices a synthetic name and anchors `expected_token '('` on that
 /// keyword — the spliced identifier sits at the keyword's own offset, so
 /// its follower is the keyword, never the token after it
-/// (`insertParens(includeIdentifier: false)`, parser_impl.dart:4948). A
+/// (`insertParens(includeIdentifier: false)`, `parser_impl.dart:4948`). A
 /// real name instead anchors the `(`-expect on the real follower.
 #[test]
 fn super_initializer_keyword_name_paren_anchor() {

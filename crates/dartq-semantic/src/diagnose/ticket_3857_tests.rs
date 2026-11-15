@@ -28,6 +28,7 @@
 //! as its absence of `unnecessary_null_comparison` corroborates. That gap
 //! lives in the promotion staging, not in this file's shape check.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 /// The member-face codes a shape receiver answers — the family these pins

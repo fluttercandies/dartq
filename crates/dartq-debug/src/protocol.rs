@@ -9,6 +9,7 @@
 //! backwards-compatible protocol change, so a single unknown message
 //! must never take the connection down.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -161,7 +162,7 @@ pub struct Isolate {
     /// The isolate's most recent pause/resume event.
     #[serde(default)]
     pub pause_event: Option<Event>,
-    /// Root library reference (initialized at IsolateRunnable).
+    /// Root library reference (initialized at `IsolateRunnable`).
     #[serde(default)]
     pub root_lib: Option<LibraryRef>,
     /// All breakpoints currently set on this isolate.
@@ -518,7 +519,7 @@ pub struct BoundVariable {
 }
 
 /// An `@Instance|Sentinel` slot (BoundVariable.value, BoundField.value,
-/// MapAssociation key/value, elements entries).
+/// `MapAssociation` key/value, elements entries).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueOrSentinel {
     /// An instance reference (possibly a full `Instance`).
@@ -536,14 +537,15 @@ impl<'de> Deserialize<'de> for ValueOrSentinel {
     {
         let value = Value::deserialize(deserializer)?;
         Ok(match value.get("type").and_then(Value::as_str) {
-            Some("Sentinel") => serde_json::from_value(value)
-                .map(Self::Sentinel)
-                .unwrap_or_else(|_| {
+            Some("Sentinel") => serde_json::from_value(value).map_or_else(
+                |_| {
                     Self::Sentinel(Sentinel {
                         kind: SentinelKind::Other("Unparseable".into()),
                         value_as_string: None,
                     })
-                }),
+                },
+                Self::Sentinel,
+            ),
             // Parse from a borrow so a shape the model does not accept
             // still reaches the caller verbatim.
             Some(tag) if tag.contains("Instance") => match Instance::deserialize(&value) {
@@ -583,7 +585,7 @@ impl Serialize for ValueOrSentinel {
 }
 
 /// `InstanceKind`, with an `Other` catch-all for kinds added by newer
-/// protocol versions (spec: treat unrecognized kinds as PlainInstance).
+/// protocol versions (spec: treat unrecognized kinds as `PlainInstance`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstanceKind {
     /// A plain Dart object.
@@ -610,33 +612,33 @@ pub enum InstanceKind {
     Float64x2,
     /// Vector kinds.
     Int32x4,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Uint8ClampedList,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Uint8List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Uint16List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Uint32List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Uint64List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Int8List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Int16List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Int32List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Int64List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Float32List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Float64List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Int32x4List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Float32x4List,
-    /// TypedData kinds.
+    /// `TypedData` kinds.
     Float64x2List,
     /// A record.
     Record,
@@ -845,7 +847,7 @@ pub struct Instance {
     #[serde(default, rename = "class")]
     pub class: Option<ClassRef>,
     /// Primitive/string render (kinds Null, Bool, Double, Int, String,
-    /// StackTrace, Pointer, vector kinds).
+    /// `StackTrace`, Pointer, vector kinds).
     #[serde(default)]
     pub value_as_string: Option<String>,
     /// Set when `value_as_string` was truncated.
@@ -866,7 +868,7 @@ pub struct Instance {
     /// `Map` associations.
     #[serde(default)]
     pub associations: Vec<MapAssociation>,
-    /// Base64 bytes for TypedData kinds.
+    /// Base64 bytes for `TypedData` kinds.
     #[serde(default)]
     pub bytes: Option<String>,
     /// `Closure` function.
@@ -1017,7 +1019,7 @@ pub enum EventKind {
     BreakpointUpdated,
     /// GC event.
     Gc,
-    /// Stdout/stderr bytes (WriteEvent).
+    /// Stdout/stderr bytes (`WriteEvent`).
     WriteEvent,
     /// `dart:developer.inspect` argument.
     Inspect,
@@ -1212,7 +1214,7 @@ pub struct Event {
     /// Flag value (`VMFlagUpdate`).
     #[serde(default)]
     pub new_value: Option<String>,
-    /// Whether a HeapSnapshot group ended (`HeapSnapshot`).
+    /// Whether a `HeapSnapshot` group ended (`HeapSnapshot`).
     #[serde(default)]
     pub last: Option<bool>,
     /// Overtime detail (`TimerSignificantlyOverdue`).
@@ -1323,14 +1325,15 @@ impl VmObject {
     #[must_use]
     pub fn from_value(value: Value) -> Self {
         match value.get("type").and_then(Value::as_str).unwrap_or("") {
-            "Sentinel" => serde_json::from_value(value)
-                .map(Self::Sentinel)
-                .unwrap_or_else(|_| {
+            "Sentinel" => serde_json::from_value(value).map_or_else(
+                |_| {
                     Self::Sentinel(Sentinel {
                         kind: SentinelKind::Other("Unparseable".into()),
                         value_as_string: None,
                     })
-                }),
+                },
+                Self::Sentinel,
+            ),
             "Error" | "@Error" => Self::Error {
                 kind: value
                     .get("kind")

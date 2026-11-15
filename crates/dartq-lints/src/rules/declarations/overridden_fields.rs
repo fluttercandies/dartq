@@ -219,16 +219,16 @@ mod oracle_corpus_pins {
     /// 25 single-file cases pinned (23 oracle rows).
     /// Not representable in a single-source fixture (aux files or packages):
     /// `OverriddenFieldsTest/test_augmentationClass#0` (aux part file a.dart holds the overridden field's ancestor).
-    /// `OverriddenFieldsTest/test_augmentationClass#1` (multi_file).
-    /// `OverriddenFieldsTest/test_augmentedField#1` (multi_file).
+    /// `OverriddenFieldsTest/test_augmentationClass#1` (`multi_file`).
+    /// `OverriddenFieldsTest/test_augmentedField#1` (`multi_file`).
     /// `OverriddenFieldsTest/test_externalLibrary#0` (imported a.dart declares the ancestor field).
     #[test]
     fn overridden_fields_oracle_corpus_pins() {
         // (case, source, oracle rows as (line, column, length)).
         let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_augmentedField#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_augmentedField#0",
+                r"
 part 'b.dart';
 
 class O {
@@ -239,12 +239,12 @@ class A extends O {
   @override
   final a = '';
 }
-"#,
+",
                 &[(10, 9, 1)],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_conflictingFieldAndMethod#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_conflictingFieldAndMethod#0",
+                r"
 class A {
   int x() => 0;
 }
@@ -252,12 +252,12 @@ class A {
 class B extends A {
   int x = 9;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_conflictingStaticAndInstance#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_conflictingStaticAndInstance#0",
+                r"
 class A {
   static final String field = 'value';
 }
@@ -265,24 +265,24 @@ class A {
 class B extends A {
   String field = 'otherValue';
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_extendingClass_multipleDeclarations#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_extendingClass_multipleDeclarations#0",
+                r"
 class A {
   int y = 1;
 }
 class B extends A {
   final x = 1, y = 2;
 }
-"#,
+",
                 &[(6, 16, 1)],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_extendingClass_overridingAbstract#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_extendingClass_overridingAbstract#0",
+                r"
 abstract class A {
   abstract int x;
 }
@@ -290,24 +290,24 @@ class B extends A {
   @override
   int x = 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_extendingClass_staticField#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_extendingClass_staticField#0",
+                r"
 class A {
   static int x = 1;
 }
 class B extends A {
   static int x = 2;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_extendsClass_indirectly#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_extendsClass_indirectly#0",
+                r"
 class A {
   int x = 0;
 }
@@ -316,22 +316,22 @@ class C extends B {
   @override
   int x = 1;
 }
-"#,
+",
                 &[(8, 7, 1)],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_externalLibraryWithPrivateField#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_externalLibraryWithPrivateField#0",
+                r"
 import 'a.dart';
 class B extends A {
   int? _private;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_fieldOverridesGetter#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_fieldOverridesGetter#0",
+                r"
 class A {
   int get a => 0;
 }
@@ -339,12 +339,12 @@ class B extends A {
   @override
   int a = 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_implementingClass#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_implementingClass#0",
+                r"
 class A {
   int x = 1;
 }
@@ -352,12 +352,12 @@ class B implements A {
   @override
   int x = 2;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_mixinInheritsFromNotObject#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_mixinInheritsFromNotObject#0",
+                r"
 class Base {
   Object field = 'lorem';
 
@@ -422,7 +422,7 @@ class GC34 extends GC33 {
   @override
   Object gc33 = 'yada';
 }
-"#,
+",
                 &[
                     (10, 16, 5),
                     (15, 10, 9),
@@ -439,8 +439,8 @@ class GC34 extends GC33 {
                 ],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_mixinSuperclassConstraint#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_mixinSuperclassConstraint#0",
+                r"
 class A {
   int x = 1;
 }
@@ -448,12 +448,12 @@ mixin M on A {
   @override
   final x = 1;
 }
-"#,
+",
                 &[(7, 9, 1)],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_mixingInMixin#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_mixingInMixin#0",
+                r"
 mixin M {
   int x = 1;
 }
@@ -461,12 +461,12 @@ class A with M {
   @override
   int x = 2;
 }
-"#,
+",
                 &[(7, 7, 1)],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_mixingInMixin_overridingAbstract#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_mixingInMixin_overridingAbstract#0",
+                r"
 mixin M {
   abstract int x;
 }
@@ -474,12 +474,12 @@ class A with M {
   @override
   int x = 2;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_overridingAbstractField#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_overridingAbstractField#0",
+                r"
 abstract class A {
   abstract int x;
 }
@@ -488,12 +488,12 @@ class B extends A {
   @override
   int x = 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_privateFieldInSameLibrary#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_privateFieldInSameLibrary#0",
+                r"
 class A {
   int _x = 0;
 }
@@ -501,23 +501,23 @@ class A {
 class B extends A {
   int _x = 9;
 }
-"#,
+",
                 &[(7, 7, 2)],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_publicFieldFromDeclaringParameter#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_publicFieldFromDeclaringParameter#0",
+                r"
 class A {
   int x = 0;
 }
 
 class B(var int x) extends A {}
-"#,
+",
                 &[(6, 17, 1)],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_publicFieldInSameLibrary#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_publicFieldInSameLibrary#0",
+                r"
 class A {
   int x = 0;
 }
@@ -525,22 +525,22 @@ class A {
 class B extends A {
   int x = 9;
 }
-"#,
+",
                 &[(7, 7, 1)],
             ),
             (
-                r#"lints/overridden_fields/OverriddenFieldsTest/test_recursiveInterfaceInheritance#0"#,
-                r#"
+                r"lints/overridden_fields/OverriddenFieldsTest/test_recursiveInterfaceInheritance#0",
+                r"
 class A extends B {}
 class B extends A {
   int field = 0;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/doc_bad_0"#,
-                r#"class A {
+                r"lints/overridden_fields/doc_bad_0",
+                r"class A {
   int f = 1;
 }
 
@@ -548,12 +548,12 @@ class B extends A {
   @override
   int f = 2;
 }
-"#,
+",
                 &[(7, 7, 1)],
             ),
             (
-                r#"lints/overridden_fields/doc_bad_1"#,
-                r#"class Base {
+                r"lints/overridden_fields/doc_bad_1",
+                r"class Base {
   Object field = 'lorem';
 
   Object something = 'change';
@@ -568,34 +568,34 @@ class Bad2 extends Base {
   @override
   Object something = 'done'; // LINT
 }
-"#,
+",
                 &[(9, 9, 5), (14, 10, 9)],
             ),
             (
-                r#"lints/overridden_fields/doc_good_0"#,
-                r#"class A {
+                r"lints/overridden_fields/doc_good_0",
+                r"class A {
   int f = 1;
 }
 
 class B extends A {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/doc_good_1"#,
-                r#"class A {
+                r"lints/overridden_fields/doc_good_1",
+                r"class A {
   int f = 1;
 }
 
 class B extends A {
   int g = 2;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/doc_good_2"#,
-                r#"class Base {
+                r"lints/overridden_fields/doc_good_2",
+                r"class Base {
   Object field = 'lorem';
 
   Object something = 'change';
@@ -606,12 +606,12 @@ class Ok extends Base {
 
   final Object newFinal = 'ignore'; // OK
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/overridden_fields/doc_good_3"#,
-                r#"abstract class BaseLoggingHandler {
+                r"lints/overridden_fields/doc_good_3",
+                r"abstract class BaseLoggingHandler {
   Base transformer;
 }
 
@@ -619,7 +619,7 @@ class LogPrintHandler implements BaseLoggingHandler {
   @override
   Derived transformer; // OK
 }
-"#,
+",
                 &[],
             ),
         ];

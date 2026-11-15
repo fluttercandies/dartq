@@ -12,6 +12,7 @@
 //! * `unused_local_elements_verifier.dart`'s `_isUsedElement` /
 //!   `_isReadMember` / `_isUsedMember` read `element.isPrivate`/`isPublic`,
 //!   so a null-name field/local/member lands on the private arm.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::*;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops, rows};
@@ -34,7 +35,7 @@ fn code_rows(report: &FileReport, code: &str) -> Vec<(u32, u32)> {
         .filter(|d| d.code.name == code)
         .map(|d| (d.range.offset, d.range.length))
         .collect();
-    out.sort();
+    out.sort_unstable();
     out
 }
 
@@ -84,7 +85,7 @@ fn named_local_variable_still_reports() {
 
 /// A nameless instance field inside a class (`var ;` — the keyword
 /// commits the fields parse, so the head-scan synthetic name flows
-/// through the slot like a parsed one, parser_impl.dart:4109
+/// through the slot like a parsed one, `parser_impl.dart:4109`
 /// unconditional `handleIdentifier`) registers a real `FieldElement`
 /// upstream; `isPrivate` maps its null name private (element.dart:2179),
 /// so `_isReadMember`'s gate owns it and the unused-field face reports

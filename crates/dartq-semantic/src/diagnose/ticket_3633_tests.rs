@@ -31,6 +31,7 @@
 //! Fixtures declare their own member-bearing class (`N`) so the pin does
 //! not depend on the shared prelude's stub surface.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{assert_silent, report_ops};
 

@@ -23,6 +23,7 @@
 //! factory call without the write context solves upward, and a
 //! declared-type context on the creation itself matches the parameter.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

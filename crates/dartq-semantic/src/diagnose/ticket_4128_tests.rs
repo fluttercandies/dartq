@@ -12,7 +12,7 @@
 //!
 //! * a `Null` leaf re-arms the suffix on the join of the non-null forms
 //!   (`{1, null}` reads `Set<int?>`, not `Set<Object>`;
-//!   least_upper_bound.dart's `UP(int, Null)` = `int?`);
+//!   `least_upper_bound.dart`'s `UP(int, Null)` = `int?`);
 //! * a `?`-suffixed leaf re-arms it too, on both the primitive rung
 //!   (`{1, 2.0, null}` → `Set<num?>`, `{true, 1, null}` → `Set<Object?>`)
 //!   and the shared-supertype rung (`int?` + `bool` → `Object?`);
@@ -25,7 +25,7 @@
 //!   (`{if (c) 1: 'a' else 2: 3}` → `Map<int, Object>`,
 //!   `{if (c) 1: 'a' else 'k': 'b'}` → `Map<Object, String>`), a
 //!   branchless `if` keeps its then entry
-//!   (typed_literal_resolver.dart's `_computeElementType` IfElementImpl
+//!   (`typed_literal_resolver.dart`'s `_computeElementType` `IfElementImpl`
 //!   arm applies to entries exactly as to elements).
 //!
 //! The shapes the lattice cannot spell stay the direct face's under-report
@@ -33,6 +33,7 @@
 //! parameterized head beside a bare one — never a guessed `Object` the
 //! oracle's join would not print.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops;
 use crate::diagnose::types::FileReport;
 

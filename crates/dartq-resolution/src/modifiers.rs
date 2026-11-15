@@ -86,6 +86,7 @@
 //! error_verifier.dart:7424-7437), and it is gated only on library
 //! equality — no `_mayIgnoreClassModifiers` exemption.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::LibraryId;
 use dartq_diagnostics::DiagnosticType;
 
@@ -165,7 +166,7 @@ impl ClassModifiers {
 pub struct LibraryFeatureFacts {
     /// `libraryElement.isInSdk`.
     pub is_sdk: bool,
-    /// `superLibrary._isDartFfiLibrary` (error_verifier.dart:8876 — the
+    /// `superLibrary._isDartFfiLibrary` (`error_verifier.dart:8876` — the
     /// library's name is `dart.ffi`, the `dart:ffi` platform library).
     pub is_dart_ffi: bool,
     /// `featureSet.isEnabled(Feature.class_modifiers)`.
@@ -1167,6 +1168,7 @@ impl ModifierCode {
 }
 
 #[cfg(test)]
+#[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
     use rustc_hash::FxHashMap;

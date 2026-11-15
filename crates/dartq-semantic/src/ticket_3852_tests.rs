@@ -17,6 +17,7 @@
 //! Direction control is pinned too: a *non-constancy* keeps the failing
 //! leaf's span (`Verdict::NotConstant`), only operator *faults* widen.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_source::StringTable;
 

@@ -19,6 +19,7 @@
 //! * the enum's own `index` field carries no required-initialization
 //!   obligation (`_forInterface` skips `EnumElement.index`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

@@ -18,7 +18,7 @@
 //!
 //! `applicableTo` instantiates the extended type against the receiver
 //! (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/extension_member_resolver.dart's
+//! `pkg/analyzer/lib/src/dart/resolver/extension_member_resolver.dart`'s
 //! `_getApplicable`): an `on int?` face accepts the `int?` receiver as the
 //! SAFE match — `ExtensionApp::Single`, the silent arm — while an `on int`
 //! face against the same receiver is the `UnsafeSingle` arm and keeps the
@@ -26,13 +26,14 @@
 //! `operator_face_extension_resolved` asks the compound spelling (`x +=
 //! 1`'s `+`, `x++`'s `+`) through the same `extension_application` — the
 //! resolver's compound consult runs the identical `findExtension` before
-//! the `isNullable` tail fires (binary_expression_resolver.dart /
-//! assignment_expression_resolver.dart).
+//! the `isNullable` tail fires (`binary_expression_resolver.dart` /
+//! `assignment_expression_resolver.dart`).
 //!
 //! Every expectation below was oracle-verified against
 //! `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze` (probes under
 //! /tmp/3494 and /tmp/3502).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// ① The discriminating repro, verbatim: `extension on int?` declares the

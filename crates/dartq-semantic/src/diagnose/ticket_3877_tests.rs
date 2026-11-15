@@ -20,17 +20,18 @@
 //!   generic function context (`typedef check<X> = X Function(X x)`,
 //!   `f<X>(check<X> Function() g)`) types its body's param context
 //!   through `closure_param_context_ty` / `closure_callee_params`
-//!   (scopes_bodies.rs, lane M) and the send solver (invocation.rs,
+//!   (`scopes_bodies.rs`, lane M) and the send solver (invocation.rs,
 //!   lane B3) — the greatest-closure `X := Never` substitution is not
 //!   reachable from this lane's files.
 //! - M10 `==` promote-to-nullable residual: `check_equals_argument`
-//!   (engine_core.rs) already applies `makeNullable` to the formal —
+//!   (`engine_core.rs`) already applies `makeNullable` to the formal —
 //!   the direct `covar1Var == true` arm reports `Covar1?`. The 18 census
 //!   rows are receivers typed `X extends Covar1` / `Y extends Covar1?`
 //!   inside `fun<...>`: `member_formals_full` cannot resolve `==`
 //!   through the type-parameter bound, so the check early-returns —
 //!   `engine_core.rs`, lane D.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// Members face, `FutureOr`-collapsed column (the
@@ -204,14 +205,14 @@ void main() {
 /// M10 direct arm — already landed. `operator ==(covariant Covar1
 /// other)` promotes the right-operand formal to `Covar1?`
 /// (`checkForArgumentTypeNotAssignableForArgument(..., promoteParameter
-/// ToNullable: true)`, binary_expression_resolver.dart): `covar1Var ==
+/// ToNullable: true)`, `binary_expression_resolver.dart)`: `covar1Var ==
 /// true` reports `argument_type_not_assignable` naming `Covar1?`. The
 /// direct arm is the control; the type-parameter-receiver arm below is
 /// the routed residual.
 #[test]
 fn equality_direct_covariant_formal_promotes_to_nullable() {
     let report = report_ops(
-        r#"
+        r"
 class Covar1 {
   operator ==(covariant Covar1 other) => identical(this, other);
 }
@@ -220,7 +221,7 @@ void main() {
   Covar1 covar1Var = Covar1();
   covar1Var == true;
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(
@@ -234,13 +235,13 @@ void main() {
 /// `check_equals_argument` reads `member_formals_full` on the
 /// type-parameter head, which cannot resolve `==` through `X`'s bound —
 /// the check early-returns and the `Covar1?` row stays missing
-/// (engine_core.rs, lane D). Un-ignored by the M10 fix: the receiver now
+/// (`engine_core.rs`, lane D). Un-ignored by the M10 fix: the receiver now
 /// resolves through the parameter's declared bound before the formals
 /// lookup.
 #[test]
 fn equality_type_param_receiver_promotes_to_nullable() {
     let report = report_ops(
-        r#"
+        r"
 class Covar1 {
   operator ==(covariant Covar1 other) => identical(this, other);
 }
@@ -248,7 +249,7 @@ class Covar1 {
 void fun<X extends Covar1>(X covar1Var) {
   covar1Var == true;
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(

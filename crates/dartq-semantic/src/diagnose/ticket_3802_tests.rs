@@ -3,7 +3,7 @@
 //! Upstream `_checkForUnnecessaryNullAware` bails on a `super` target
 //! before the type test (`if (target is SuperExpression) return;`,
 //! upstream Dart SDK source,
-//! pkg/analyzer/lib/src/generated/error_verifier.dart:7301). No
+//! `pkg/analyzer/lib/src/generated/error_verifier.dart:7301`). No
 //! `super?[i]` spelling reaches an `IndexExpression`: the parser rejects
 //! the selector (`super![0]` is the only legal spelling, and `super![i]?[j]`
 //! is not a receiver the check sees), so the oracle emits no
@@ -19,7 +19,7 @@
 //! the operand and the node type `dynamic`, and the walk returns before
 //! any promotion — so the `?[` that follows reads a `dynamic` receiver
 //! and every null-aware question on it stays silent (probed dart
-//! analyze 3.13.7: one MISSING_ASSIGNABLE_SELECTOR at `super!`,
+//! analyze 3.13.7: one `MISSING_ASSIGNABLE_SELECTOR` at `super!`,
 //! nothing else).
 //!
 //! The listener's index face decides from that rewritten row
@@ -34,6 +34,7 @@
 //! the module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 
@@ -67,10 +68,10 @@ fn anchors(report: &FileReport) -> Vec<(u32, u32)> {
     at
 }
 
-/// `super!?[0]`: the resolver's `_resolveNullCheck` SuperExpression arm
+/// `super!?[0]`: the resolver's `_resolveNullCheck` `SuperExpression` arm
 /// reports the parser-tier selector row over the whole `super!` node and
 /// types it `dynamic` — the `?[` face never fires (probed dart analyze
-/// 3.13.7: one MISSING_ASSIGNABLE_SELECTOR at `super!`, nothing else).
+/// 3.13.7: one `MISSING_ASSIGNABLE_SELECTOR` at `super!`, nothing else).
 #[test]
 fn super_receiver_index_reports_the_selector_row() {
     let fixture = "\

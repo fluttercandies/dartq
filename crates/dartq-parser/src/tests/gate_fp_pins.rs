@@ -8,6 +8,7 @@
 //! re-firing them: a pin failure here means the shape is parser-home after
 //! all and the fix belongs in the recovery code.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{ScanConfig, TokenTable};
 use dartq_source::FileTable;
 
@@ -36,7 +37,7 @@ fn sorted_unit_codes_with_scanner(source: &'static str, scanner_codes: &[&str]) 
     let file = files.intern(std::path::Path::new("test.dart"));
     let result = dartq_scanner::scan(source, config, file);
     let mut got: Vec<&str> = result.diagnostics.iter().map(|d| d.code.name).collect();
-    got.sort();
+    got.sort_unstable();
     assert_eq!(got, scanner_codes, "scanner rows in {source:?}");
     let table: &'static TokenTable = Box::leak(Box::new(result.tokens));
     let text: &'static str = Box::leak(source.to_string().into_boxed_str());

@@ -95,6 +95,7 @@
 //!   table's posture — a warm session engine would silently miss
 //!   declarations), so its bytes read the disk fresh every time.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -237,6 +238,7 @@ impl std::fmt::Debug for ReadError {
 /// whatever a chunk read brought past this frame — the next frame's
 /// leading bytes; a caller reading several frames off one connection
 /// passes the same vec to every call, one-shot callers `&mut Vec::new()`.
+#[cfg(test)]
 pub(crate) fn read_frame(
     stream: &mut UnixStream,
     pending: &mut Vec<u8>,
@@ -481,10 +483,7 @@ fn locate_stdout_string(frame: &[u8]) -> Option<std::ops::Range<usize>> {
         let key = from + hit;
         let mut at = key + KEY.len();
         let whitespace = |at: &mut usize| {
-            while matches!(
-                frame.get(*at),
-                Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
-            ) {
+            while matches!(frame.get(*at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
                 *at += 1;
             }
         };
@@ -564,47 +563,47 @@ fn unescape_in_place(
         }
         // One escape at `run_end`; `skip` covers its whole spelling.
         let escape_at = run_end;
-        let skip;
-        match *frame.get(escape_at + 1).ok_or("a truncated escape")? {
+
+        let skip = match *frame.get(escape_at + 1).ok_or("a truncated escape")? {
             b'"' => {
                 frame[write] = b'"';
                 write += 1;
-                skip = 2;
+                2
             }
             b'\\' => {
                 frame[write] = b'\\';
                 write += 1;
-                skip = 2;
+                2
             }
             b'/' => {
                 frame[write] = b'/';
                 write += 1;
-                skip = 2;
+                2
             }
             b'b' => {
                 frame[write] = 0x08;
                 write += 1;
-                skip = 2;
+                2
             }
             b'f' => {
                 frame[write] = 0x0C;
                 write += 1;
-                skip = 2;
+                2
             }
             b'n' => {
                 frame[write] = 0x0A;
                 write += 1;
-                skip = 2;
+                2
             }
             b'r' => {
                 frame[write] = 0x0D;
                 write += 1;
-                skip = 2;
+                2
             }
             b't' => {
                 frame[write] = 0x09;
                 write += 1;
-                skip = 2;
+                2
             }
             b'u' => {
                 let hex = |at: usize| -> Result<u16, String> {
@@ -641,10 +640,10 @@ fn unescape_in_place(
                 // Safe by the cursor invariant: `write` trails the read
                 // cursor by at least the escape's surplus.
                 write += decoded.encode_utf8(&mut frame[write..write + 4]).len();
-                skip = escape_len;
+                escape_len
             }
             _ => return Err("an invalid escape".to_owned()),
-        }
+        };
         read = escape_at + skip;
     }
     frame.truncate(write);
@@ -777,9 +776,9 @@ pub(crate) fn route_analyze(
 fn universe_matches_disk(root: &Path, packages: Option<&Value>) -> bool {
     /// The universe's package config as the daemon's answer names it.
     enum Wire {
-        /// No config anywhere at assembly (the BasicWorkspace floor).
+        /// No config anywhere at assembly (the `BasicWorkspace` floor).
         None,
-        /// The named path, with the (mtime_ns, size) it was read at.
+        /// The named path, with the (`mtime_ns`, size) it was read at.
         Stamped {
             path: PathBuf,
             mtime_ns: u64,
@@ -819,8 +818,9 @@ fn universe_matches_disk(root: &Path, packages: Option<&Value>) -> bool {
             .modified()
             .ok()
             .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |since| {
+                u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+            });
         (mtime_ns, meta.len())
     });
     match (wire, disk) {
@@ -1600,7 +1600,7 @@ mod tests {
     fn routed_analyze_matches_the_cold_bytes_on_every_format() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for format in [AnalyzeFormat::Lon, AnalyzeFormat::Json, AnalyzeFormat::Text] {
             let root = broken_fixture("route-bytes");
             serve(&root);
@@ -1646,7 +1646,7 @@ mod tests {
     fn the_ladder_spawns_and_waits_when_nothing_is_live() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = broken_fixture("route-spawn");
         let spawn_root = root.clone();
         let spawn = move |_: &Layout, _: &SessionTriple| {
@@ -1704,7 +1704,7 @@ mod tests {
     fn a_routed_call_reconciles_out_of_band_edits() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = broken_fixture("route-fresh");
         serve(&root);
         let targets = [TargetKind::Dir(root.clone())];
@@ -1762,7 +1762,7 @@ mod tests {
     fn a_routed_call_answers_over_a_changed_package_universe() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = crate::tests::analyze_fixture(
             "route-universe",
             &[(
@@ -1897,7 +1897,7 @@ mod tests {
     fn check_consults_an_attached_session_with_the_cold_bytes() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A parse-broken library: the M0 pipeline's own rows keep the
         // byte identity honest (a tree that parses clean would pin only
         // the empty shape).
@@ -1959,7 +1959,7 @@ mod tests {
     fn a_warm_routed_call_answers_within_the_bound() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut libraries: Vec<(String, String)> = (0..80)
             .map(|i| {
                 (
@@ -2033,7 +2033,7 @@ mod tests {
     fn a_killed_daemon_falls_back_to_the_cold_answer() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = broken_fixture("route-kill");
         // The killed-mid-work residue: a just-exited child's pid under a
         // fresh heartbeat and the matching generation, and a plain file
@@ -2118,7 +2118,7 @@ mod tests {
     fn a_stale_binary_stamp_is_taken_over_not_hung_on() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = broken_fixture("route-stale");
         // The stale generation's state: a live pid (the harness's own —
         // the reaper's self-guard skips it), a fresh heartbeat, and a
@@ -2189,7 +2189,7 @@ mod tests {
 
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = broken_fixture("route-coldflag");
         // The live-looking session over a sentinel socket: same root,
         // same binary stamp, live pid, fresh heartbeat — every consult
@@ -2392,7 +2392,7 @@ mod tests {
     fn routed_query_matches_the_cold_bytes_on_every_format() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = answer_fixture("route-q");
         let formats = [
             (crate::OutputFormat::Lon, "lon"),
@@ -2427,7 +2427,7 @@ mod tests {
     fn routed_batch_matches_the_cold_bytes() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = answer_fixture("route-qb");
         let mut cold: Vec<u8> = Vec::new();
         let code = crate::query_batch_run(&batch_args(&root, crate::OutputFormat::Lon), &mut cold);
@@ -2452,7 +2452,7 @@ mod tests {
     fn routed_explain_matches_the_cold_bytes() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = answer_fixture("route-ex");
         let mut cold: Vec<u8> = Vec::new();
         let code = crate::explain_run(&explain_args(&root, crate::OutputFormat::Lon), &mut cold);
@@ -2476,7 +2476,7 @@ mod tests {
     fn routed_impact_matches_the_cold_bytes() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = answer_fixture("route-im");
         let postures: [(Vec<String>, &str); 2] = [
             (Vec::new(), "file-level"),
@@ -2515,7 +2515,7 @@ mod tests {
     fn routed_rename_matches_the_cold_bytes() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = answer_fixture("route-rn");
         let mut cold: Vec<u8> = Vec::new();
         let code = crate::rename::run(&rename_args(&root, crate::OutputFormat::Lon), &mut cold);
@@ -2544,7 +2544,7 @@ mod tests {
     fn routed_resolve_and_complete_match_the_cold_bytes() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = answer_fixture("route-pos");
         let resolve = position_args(&root, "lib/b.dart:4:3", crate::OutputFormat::Lon);
         let complete = position_args(&root, "lib/b.dart:4:5", crate::OutputFormat::Lon);
@@ -2595,7 +2595,7 @@ mod tests {
 
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = answer_fixture("route-consult");
         let layout = Layout::new(&root);
         std::fs::create_dir_all(&layout.dir).expect("the state dir");
@@ -2712,7 +2712,7 @@ mod tests {
     fn a_killed_daemon_falls_back_cold_on_the_answer_faces() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = answer_fixture("route-kill2");
         // The cold bytes first, over a quiet tree.
         let mut cold_query: Vec<u8> = Vec::new();
@@ -2792,7 +2792,7 @@ mod tests {
     fn a_routed_query_reconciles_out_of_band_edits() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = answer_fixture("route-fresh2");
         serve(&root);
         let args = symbol_args(&root, "bar", crate::OutputFormat::Lon);

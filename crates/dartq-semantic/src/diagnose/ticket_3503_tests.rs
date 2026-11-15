@@ -33,6 +33,7 @@
 //! ("The element can't be null, so the null-aware operator '?' is
 //! unnecessary.", correction "Try removing the operator '?'.").
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_bare};
 
 /// The null-aware element rows of `report` as `(code, offset, text at the

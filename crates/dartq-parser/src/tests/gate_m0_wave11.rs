@@ -8,6 +8,10 @@
 //! rows for several of these files predate intermediate parser work, so the
 //! pins lock the CURRENT traced behavior, not the stale captures.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{scan_ok, setup};
 use crate::ParserFeatures;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -63,7 +67,7 @@ fn legacy_switch_case_head_parses_as_expression() {
 /// `isModifier`, modifier_context.dart:13-53), so it stays in the name slot
 /// and the field is declared NAMED `late` (no synthetic insert; the oracle
 /// traces `late;` through the `!next.isIdentifier` fall-through,
-/// parser_impl.dart:4356). `parseFields`'s type face is the only diagnostic
+/// `parser_impl.dart:4356`). `parseFields`'s type face is the only diagnostic
 /// (probed 3.13.1: one row, `missingConstFinalVarOrType` anchored on
 /// `late`).
 #[test]
@@ -156,16 +160,16 @@ fn missing_class_body_reexpands_primary_params_as_junk() {
 // —— #2181 union residual: `late;` declares a field named `late` ——————————
 
 /// The recovered top-level field carries the `late` token as its NAME event
-/// (official `!next.isIdentifier` fall-through, parser_impl.dart:4356): the
+/// (official `!next.isIdentifier` fall-through, `parser_impl.dart:4356)`: the
 /// declared variable is `late`, so a later bare `late` read resolves (the
-/// m0 union-gate dartq_only `undefined_identifier` at
-/// use_late_in_non_nnbd.dart 19:3 was a synthetic-named recovery — the read
+/// m0 union-gate `dartq_only` `undefined_identifier` at
+/// `use_late_in_non_nnbd.dart` 19:3 was a synthetic-named recovery — the read
 /// had nothing to bind to). Offsets: `late` 0..4, `x` 10..11.
 #[test]
 fn late_semicolon_top_level_field_named_late() {
     let mut p = setup("late;\nint x;\n");
     p.parse_unit();
-    let c = &mut p.listener;
+    let c = &mut *p.listener;
     assert_eq!(
         std::mem::take(&mut c.errors),
         vec![("missing_const_final_var_or_type".to_owned(), 0, 4)],
@@ -196,12 +200,12 @@ fn late_semicolon_top_level_field_named_late() {
 }
 
 /// The class-member flavor: the field inside `class C` is likewise named
-/// `late` (FieldDeclaration name event on the keyword, 12..16).
+/// `late` (`FieldDeclaration` name event on the keyword, 12..16).
 #[test]
 fn late_semicolon_class_member_field_named_late() {
     let mut p = setup("class C {\n  late;\n}\n");
     p.parse_unit();
-    let c = &mut p.listener;
+    let c = &mut *p.listener;
     assert_eq!(
         std::mem::take(&mut c.errors),
         vec![("missing_const_final_var_or_type".to_owned(), 12, 16)],
@@ -221,7 +225,7 @@ fn late_semicolon_class_member_field_named_late() {
 /// `late` as a plain identifier (official trace: `isModifier` false before
 /// `;` → `token == start` → `parseExpressionStatement`,
 /// parser_impl.dart:10019-10026) — with the top-level field named `late`
-/// declared above, this read resolves and the union-gate dartq_only row
+/// declared above, this read resolves and the union-gate `dartq_only` row
 /// disappears. The only row is the top-level field's type-less rider (the
 /// oracle emits the same row on its `late;` line); the statement `late` is
 /// an `Expression` ident on the keyword (22..26).
@@ -229,7 +233,7 @@ fn late_semicolon_class_member_field_named_late() {
 fn late_semicolon_statement_reads_identifier_late() {
     let mut p = setup("late;\nvoid main() {\n  late;\n}\n");
     p.parse_unit();
-    let c = &mut p.listener;
+    let c = &mut *p.listener;
     assert_eq!(
         std::mem::take(&mut c.errors),
         vec![("missing_const_final_var_or_type".to_owned(), 0, 4)],
@@ -248,12 +252,12 @@ fn late_semicolon_statement_reads_identifier_late() {
 // —— #2181 union residual: method named `operator` —————————————————————————
 
 /// `int operator(int x)` with a body calling it (the
-/// keyword_named_class_methods_2.dart 227/229 shape): `(` is not a
+/// `keyword_named_class_methods_2.dart` 227/229 shape): `(` is not a
 /// user-definable operator, so the official `operator` branch falls through
 /// and `operator` is a PLAIN method name (parser_impl.dart:5490-5558). The
-/// parser must declare the method under that name (MethodDeclaration ident)
+/// parser must declare the method under that name (`MethodDeclaration` ident)
 /// and emit the call-site `operator(x-1)` as an identically named send —
-/// the m0 union-gate dartq_only `undefined_method` row is a consumer-side
+/// the m0 union-gate `dartq_only` `undefined_method` row is a consumer-side
 /// lookup defect iff this stream holds.
 #[test]
 fn method_named_operator_declares_and_calls_by_name() {
@@ -262,7 +266,7 @@ fn method_named_operator_declares_and_calls_by_name() {
     let call = src[decl as usize + 8..].find("operator").unwrap() as u32 + decl + 8;
     let mut p = setup(src);
     p.parse_unit();
-    let c = &mut p.listener;
+    let c = &mut *p.listener;
     assert!(
         c.errors.is_empty(),
         "oracle stream for the operator-named member is empty: {:?}",
@@ -296,7 +300,7 @@ fn method_named_operator_declares_and_calls_by_name() {
 /// outer `Report(` call. Canonical parser event order — the type-arguments
 /// group opens AFTER the `List` identifier and closes BEFORE the `.of`
 /// identifier — pins the anchoring at the parser tier; the torture-gate
-/// dartq_only `wrong_number_of_type_arguments` on `Report` is a
+/// `dartq_only` `wrong_number_of_type_arguments` on `Report` is a
 /// consumer-side attribution defect iff this order holds.
 #[test]
 fn generic_argument_type_args_stay_anchored_at_list_head() {
@@ -305,7 +309,7 @@ fn generic_argument_type_args_stay_anchored_at_list_head() {
     let of_at = src.find(".of(").unwrap() as u32 + 1;
     let mut p = setup(src);
     p.parse_unit();
-    let c = &mut p.listener;
+    let c = &mut *p.listener;
     assert!(
         c.errors.is_empty(),
         "the builders.dart call shape parses clean: {:?}",

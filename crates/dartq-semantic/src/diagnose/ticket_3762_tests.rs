@@ -32,6 +32,8 @@
 //! - The `dynamic` operand still suppresses — `isAssignableTo(dynamic, X)`
 //!   holds upstream and the const-eval verdict owns the row.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// The oracle's `useOfVoidResult` message spelling (messages.yaml:19638).
@@ -75,7 +77,7 @@ fn ticket_3762_equals_right_invoked_void() {
 fn ticket_3762_equals_right_bare_void_local() {
     let fixture = "void v() {}\nvoid main() {\n  void x = v();\n  1 == x;\n}";
     let report = report_ops(fixture);
-    let use_at = fixture.rfind("x").unwrap();
+    let use_at = fixture.rfind('x').unwrap();
     assert_void_rows(&report, fixture, &[(use_at, 1)]);
 }
 
@@ -116,7 +118,7 @@ fn ticket_3762_plus_right_invoked_void() {
 fn ticket_3762_minus_right_bare_void_local() {
     let fixture = "void v() {}\nvoid main() {\n  void x = v();\n  1 - x;\n}";
     let report = report_ops(fixture);
-    let use_at = fixture.rfind("x").unwrap();
+    let use_at = fixture.rfind('x').unwrap();
     assert_void_rows(&report, fixture, &[(use_at, 1)]);
 }
 

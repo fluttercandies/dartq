@@ -12,6 +12,7 @@
 //! out of the rows); no writer emits `since` on this face (the pull face
 //! has no delta parameter), so none is declared.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

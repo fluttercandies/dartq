@@ -26,6 +26,7 @@
 //! This constructor can't be declared 'const' because a mixin adds the
 //! instance field: 'A.a'.`
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops, rows};
 

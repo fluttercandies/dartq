@@ -11,6 +11,10 @@
 //! the #2880 faces), so these rows are pinned straight from the upstream
 //! semantics.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::parser::Parser;
 
@@ -20,7 +24,7 @@ use crate::parser::Parser;
 type Row = (&'static str, u32, u32, u32, &'static str);
 
 /// Parses `source` and returns the parser rows as
-/// `(code, start, end, text)` sorted by position (gate_2791 harness shape).
+/// `(code, start, end, text)` sorted by position (`gate_2791` harness shape).
 fn faces(source: &'static str) -> Vec<(String, u32, u32, String)> {
     let (table, text) = scan_ok(source);
     let mut parser = Parser::new(

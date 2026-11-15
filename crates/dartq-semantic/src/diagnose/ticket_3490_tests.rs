@@ -38,10 +38,11 @@
 //! `conformance/expected.tsv`
 //! (`diagnostics/pattern_never_matches_value_type/…`) and the upstream
 //! spec source pkg/analyzer/test/src/diagnostics/
-//! pattern_never_matches_value_type_test.dart. The oracle emits a
+//! `pattern_never_matches_value_type_test.dart`. The oracle emits a
 //! `dead_code` row beside the reporting fixtures; the dead-region face is
 //! #3465's domain and is not pinned here.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops};
 
 /// The pattern-family rows of `report` as `(code, message)` in emission

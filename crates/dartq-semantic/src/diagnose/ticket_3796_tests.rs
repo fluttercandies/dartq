@@ -2,17 +2,18 @@
 //! four oracle-verified contracts landed in `row_resolution.rs`.
 //!
 //! Oracle contract (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/binary_expression_resolver.dart):
+//! `pkg/analyzer/lib/src/dart/resolver/binary_expression_resolver.dart)`:
 //! a failed binary-operator lookup stamps the composite `InvalidType`,
 //! and `InvalidType` suppresses every downstream operator face — so
 //! `(a < 5) < 2` reports the inner `<` once, never the outer. Extension
 //! operator families (`[]`/`[]=` share one basename in
-//! applicable_extensions.dart) and implicit `this`-receiver extension
+//! `applicable_extensions.dart`) and implicit `this`-receiver extension
 //! application follow the same oracle text.
 //!
 //! Probed against `dart analyze` 3.13.7 (the pinned oracle at
 //! `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops};
 use crate::diagnose::types::FileReport;
 
@@ -135,7 +136,7 @@ fn implicit_this_inside_extension_resolves_operator() {
 /// `a[0] = v` on `class A { operator [](int i) }` + `extension E on A
 /// { operator []= }` — `[]`/`[]=` are one extension family: the
 /// interface declaring EITHER member blocks ALL implicit extension
-/// index resolution (upstream applicable_extensions.dart resolves both
+/// index resolution (upstream `applicable_extensions.dart` resolves both
 /// spellings under the `[]` basename). Oracle: `[]=` misses on `A`
 /// even though only `[]` is declared there.
 ///
@@ -193,7 +194,7 @@ fn postfix_increment_on_never_silent() {
 /// declaring only `set topLevelGetter`, the bare READ of `topLevelGetter`
 /// never falls through to the top-level getter — the basename claim
 /// blocks the enclosing scope (upstream `ExtensionMemberScope`,
-/// lexical_lookup.dart).
+/// `lexical_lookup.dart`).
 ///
 /// Probed: `undefined_identifier` on both bare reads.
 #[test]

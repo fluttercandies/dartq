@@ -19,6 +19,7 @@
 //! never `0;`. The flow side must therefore trim an interior-death window to
 //! the assignment's end, not the statement's `;`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 #[cfg(test)]
 mod tests {
     use crate::facts::FlowFact;

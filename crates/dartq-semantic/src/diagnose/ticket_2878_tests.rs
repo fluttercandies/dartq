@@ -14,6 +14,7 @@
 //! `factory4_test`/`factory5_test`) against `dart analyze` (Dart 3.13,
 //! fvm 3.47.1).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::model::ArgPool;
@@ -211,7 +212,6 @@ fn payload_round_trips_the_group() {
     let group: Box<[(StringId, Option<Ty>)]> = Box::new([(t, Some(Ty::named(name("num"))))]);
     let generic = pool.function_generic(&group, Ty::Void, &[], &[], false);
     let counted = pool.function(1, Ty::Void, &[], &[], false);
-    drop(pool);
     let elements = FileElements {
         decls: crate::model::NameMap::from_iter([
             (

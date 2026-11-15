@@ -19,6 +19,7 @@
 //! `reportErrorIfSuper` caller, and the invoked type-args flavor
 //! (`super<int>(3)`) checks its arguments instead.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -134,7 +135,7 @@ fn wrapper_statement_silence_faces_match_oracle() {
 }
 
 /// The variable-initializer face (`endVariableInitializer`,
-/// ast_builder.dart:3459) on the local flavor, the member field flavor
+/// `ast_builder.dart:3459`) on the local flavor, the member field flavor
 /// (shared call), and the for-in iterable face (`endForIn`, :4282).
 #[test]
 fn initializer_and_for_in_faces_match_oracle() {
@@ -162,7 +163,7 @@ fn initializer_and_for_in_faces_match_oracle() {
 }
 
 /// The arrow-body face (`handleExpressionFunctionBody`,
-/// ast_builder.dart:4179) on the function-expression and named-function
+/// `ast_builder.dart:4179`) on the function-expression and named-function
 /// flavors, and the parenthesized-condition face
 /// (`endParenthesizedCondition`, :5229) across if/while/switch statements,
 /// the switch expression, and the synthetic-group recovery
@@ -208,7 +209,7 @@ fn body_and_condition_faces_match_oracle() {
 }
 
 /// The type-argument-application receiver face
-/// (`handleTypeArgumentApplication`, ast_builder.dart:5608): a standalone
+/// (`handleTypeArgumentApplication`, `ast_builder.dart:5608)`: a standalone
 /// group on a bare `super` receiver reports; the invoked flavor
 /// (`super<int>(3)`) checks its arguments and stays silent.
 #[test]

@@ -6,6 +6,7 @@
 //! `<`/`>`/`<=`/`>=` comparisons that intersect. There is **no** `~`/`~>`
 //! syntax and no comma lists — pub's `startComparison` is `^[<>]=?` only.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -354,10 +355,9 @@ fn scan_comparison(text: &str) -> Option<(Option<Bound>, Option<Bound>, &str)> {
         (">=", r)
     } else if let Some(r) = text.strip_prefix('<') {
         ("<", r)
-    } else if let Some(r) = text.strip_prefix('>') {
-        (">", r)
     } else {
-        return None;
+        let r = text.strip_prefix('>')?;
+        (">", r)
     };
     let (version, remainder) = scan_bare_version(rest.trim_start())?;
     let bound = match op {

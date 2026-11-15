@@ -20,6 +20,30 @@
 //!   `abstract final base`, `abstract final interface`), including the
 //!   legal-combination negatives.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -232,12 +256,12 @@ fn final_class_implemented_outside_its_library() {
         "invalid_use_of_type_outside_library",
         "The class 'F' can't be implemented outside of its library because it's a final class.",
     );
-    assert!(
+    assert_eq!(
         with_code(
             &diagnostics,
             "subtype_of_base_or_final_is_not_base_final_or_sealed"
-        )
-        .is_empty()
+        ),
+        [] as [&dartq_diagnostics::Diagnostic; 0]
     );
 }
 
@@ -354,7 +378,10 @@ fn unmarked_class_extending_cross_library_base_class() {
         "subtype_of_base_or_final_is_not_base_final_or_sealed",
         "The type 'C' must be 'base', 'final' or 'sealed' because the supertype 'B' is 'base'.",
     );
-    assert!(with_code(&diagnostics, "invalid_use_of_type_outside_library").is_empty());
+    assert_eq!(
+        with_code(&diagnostics, "invalid_use_of_type_outside_library"),
+        [] as [&dartq_diagnostics::Diagnostic; 0]
+    );
 }
 
 /// The final twin of the subtype requirement for a class, same library

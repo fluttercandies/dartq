@@ -15,6 +15,7 @@
 //! (`TypeArgumentNotMatchingBoundsTest.test_extensionType_superBounded`,
 //! `doc_0`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 
 /// The `type_argument_not_matching_bounds` rows of `report` as

@@ -26,6 +26,7 @@
 //! oracle-exact set, their shapes transcribed to the oracle-verified
 //! rig forms (probe2484).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

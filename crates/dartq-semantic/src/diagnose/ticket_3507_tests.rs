@@ -8,7 +8,7 @@
 //! `const` declaration / default value / annotation context —
 //! `constantContext`, pkg/analyzer/lib/src/dart/ast/ast.dart) runs the
 //! element verifier (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/constant/constant_verifier.dart,
+//! `pkg/analyzer/lib/src/dart/constant/constant_verifier.dart`,
 //! `_ConstLiteralVerifier.verify`) over ITS OWN elements:
 //!
 //! - a `for` element reports `const_eval_for_element` at the whole element
@@ -22,11 +22,11 @@
 //!   a nested literal is evaluated, never verified, so its keys stay silent;
 //! - a bare expression where a map entry is expected reports
 //!   `expression_in_map` at the expression, for const AND non-const typed
-//!   maps (pkg/analyzer/lib/src/error/literal_element_verifier.dart :100/:135;
+//!   maps (`pkg/analyzer/lib/src/error/literal_element_verifier.dart` :100/:135;
 //!   an untyped literal reports the ambiguity face instead).
 //!
 //! `invalid_type_argument_in_const_literal` is the const typed literal's
-//! type-argument check (error_verifier.dart): a type parameter anywhere
+//! type-argument check (`error_verifier.dart)`: a type parameter anywhere
 //! inside the written type arguments reports at the parameter's own
 //! identifier; non-const literals are silent.
 //!
@@ -76,6 +76,7 @@
 //!   to `assignability.rs` `typed_list_literal_ty`: walk the written type
 //!   arguments, function types included, for in-scope type parameters).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops_bare};
 
@@ -112,7 +113,7 @@ fn family_rows<'a>(report: &FileReport, source: &'a str) -> Vec<(&'static str, u
             )
         })
         .collect();
-    rows.sort();
+    rows.sort_unstable();
     rows
 }
 

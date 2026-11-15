@@ -8,8 +8,8 @@
 //! these pins lock the same emission through the corpus's exact call
 //! shape, including the multitest marker comment surviving on the active
 //! line and the trailing comma.
+#![allow(clippy::disallowed_types, clippy::semicolon_if_nothing_returned)]
 
-use super::*;
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

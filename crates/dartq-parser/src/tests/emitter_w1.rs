@@ -15,6 +15,7 @@
 //! * `representation_field_trailing_comma` — dead at 3.13: no analyzer
 //!   emitter, probed silent; dartq must not manufacture a row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok, setup};
 use crate::Parser;
 
@@ -209,7 +210,7 @@ fn factory_with_initializers_rows_match_the_oracle() {
 }
 
 /// The registry texts behind the same face (message halves of the
-/// factory_with_initializers/1 pairs and the expected-string pair).
+/// `factory_with_initializers/1` pairs and the expected-string pair).
 #[test]
 fn registry_templates_carry_no_but_got_suffix() {
     let source =
@@ -243,7 +244,7 @@ fn registry_templates_carry_no_but_got_suffix() {
 /// `diagnostics/invalid_inline_function_type/doc_0`: `int f(String s)` →
 /// the inner `(` at 1:31|1): the anchor is the token opening the
 /// parameter's own suffix (`beforeInlineFunctionType.next!`,
-/// parser_impl.dart:2326), never the name, and the registry text names the
+/// `parser_impl.dart:2326`), never the name, and the registry text names the
 /// generic-function-type position.
 #[test]
 fn invalid_inline_function_type_anchors_on_the_suffix_opener() {

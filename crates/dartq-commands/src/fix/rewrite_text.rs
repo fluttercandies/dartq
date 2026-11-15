@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Keyword, SourceRange, TokenKind, TokenTable, cut_line, hit_tokens, is_identifier_char, kind_of,
+    line_bounds, quote_run, slice16, token_end, utf16_count, utf16_offset_to_byte, word_slice,
+};
 
 /// A width-0 keyword hit (`new`, `late`): the rewrite drops the keyword
 /// plus its trailing horizontal whitespace (a newline stays — joining
@@ -255,10 +258,10 @@ fn line_content_at(text: &str, mut at: usize, bound: usize) -> Option<usize> {
         match bytes[at] {
             b' ' | b'\t' | b'\r' => at += 1,
             b'/' if bytes.get(at + 1) == Some(&b'/') => return None,
-            b'/' if bytes.get(at + 1) == Some(&b'*') => match skip_block_comment(text, at, bound) {
-                Some(next) => at = next,
-                None => return None,
-            },
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                let next = skip_block_comment(text, at, bound)?;
+                at = next;
+            }
             _ => return Some(at),
         }
     }
@@ -318,8 +321,8 @@ fn last_semicolon_before(text: &str, at: usize, bound: usize) -> Option<usize> {
 /// `unused_import` (and its `duplicate_import`/`unnecessary_import`
 /// siblings): the URI literal's span expands to its directive's deletion
 /// range, the official `RemoveUnusedImport` posture over the analyzer's
-/// line arithmetic (upstream Dart SDK source, pkg/analysis_server,
-/// remove_unused_import.dart — `_deletionRange` over `getLinesRange`):
+/// line arithmetic (upstream Dart SDK source, `pkg/analysis_server`,
+/// `remove_unused_import.dart` — `_deletionRange` over `getLinesRange`):
 ///
 /// * a directive alone on its line drops the whole line, terminator with
 ///   it (CRLF aware; the last line of the file carries none);

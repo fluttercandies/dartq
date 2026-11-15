@@ -22,6 +22,8 @@
 //!   (`correspondingParameter.type`,
 //!   error_detection_helpers.dart:72-75).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

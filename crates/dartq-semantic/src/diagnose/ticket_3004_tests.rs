@@ -20,6 +20,7 @@
 //!   (`isNullable` recurses the argument, type_system.dart:1220-1222), so
 //!   `FutureOr<int?> v` carries no required-initialization face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -37,7 +38,7 @@ fn mdv_spans(report: &FileReport, full: &str) -> Vec<String> {
 }
 
 /// The rows of `code` as the exact anchored source text, source order.
-fn spans_of<'r>(report: &'r FileReport, full: &str, code: &str) -> Vec<String> {
+fn spans_of(report: &FileReport, full: &str, code: &str) -> Vec<String> {
     report
         .diagnostics
         .iter()

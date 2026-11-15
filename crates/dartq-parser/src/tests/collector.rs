@@ -1,5 +1,6 @@
 //! Shared test scaffolding: scan helper, event collector, parser setup.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_scanner::{ScanConfig, TokenTable};
 use dartq_source::FileTable;

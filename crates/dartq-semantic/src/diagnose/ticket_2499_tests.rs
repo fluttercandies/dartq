@@ -16,6 +16,7 @@
 //! and j (the ambiguous `shared` getter leaves `_gone` reporting once —
 //! the #2481 pin's presence-based posture stands beside this count pin).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::model::FileElements;
@@ -103,13 +104,13 @@ fn unused_rows(source: &str) -> Vec<String> {
 /// duplicate: the site arm and the face loop both staged the row).
 #[test]
 fn unnamed_extension_member_reports_once() {
-    let source = r#"
+    let source = r"
 class C3 {}
 
 extension on C3 {
   void _gone() {}
 }
-"#;
+";
     assert_eq!(
         unused_rows(source),
         vec!["The declaration '_gone' isn't referenced.".to_string()],
@@ -120,7 +121,7 @@ extension on C3 {
 /// credit decides, and the deferral must not drop the face's spare.
 #[test]
 fn unnamed_extension_member_param_receiver_spares() {
-    let source = r#"
+    let source = r"
 class C3 {}
 
 extension on C3 {
@@ -130,7 +131,7 @@ extension on C3 {
 void f(C3? v) {
   v?._gone();
 }
-"#;
+";
     assert!(unused_rows(source).is_empty(), "{:?}", unused_rows(source));
 }
 
@@ -138,7 +139,7 @@ void f(C3? v) {
 /// once — the #2481 ambiguous posture stands, the duplicate does not.
 #[test]
 fn ambiguous_var_receiver_reports_member_once() {
-    let source = r#"
+    let source = r"
 class C3 {}
 
 extension A1 on C3 {
@@ -157,7 +158,7 @@ void f(C3 c) {
   var v = c.shared;
   v?._gone();
 }
-"#;
+";
     assert_eq!(
         unused_rows(source),
         vec!["The declaration '_gone' isn't referenced.".to_string()],
@@ -168,13 +169,13 @@ void f(C3 c) {
 /// verdicts; only the unnamed faces defer).
 #[test]
 fn named_private_extension_member_reports_once() {
-    let source = r#"
+    let source = r"
 class C3 {}
 
 extension _E on C3 {
   void _gone() {}
 }
-"#;
+";
     assert_eq!(
         unused_rows(source),
         vec!["The declaration '_gone' isn't referenced.".to_string()],
@@ -185,13 +186,13 @@ extension _E on C3 {
 /// covers statics (the loop's static spelling arm reads the same sets).
 #[test]
 fn unnamed_extension_static_member_reports_once() {
-    let source = r#"
+    let source = r"
 class C3 {}
 
 extension on C3 {
   static void _sgone() {}
 }
-"#;
+";
     assert_eq!(
         unused_rows(source),
         vec!["The declaration '_sgone' isn't referenced.".to_string()],
@@ -203,7 +204,7 @@ extension on C3 {
 /// face loop reads).
 #[test]
 fn unnamed_extension_static_self_use_spares_target() {
-    let source = r#"
+    let source = r"
 class C3 {}
 
 extension on C3 {
@@ -213,7 +214,7 @@ extension on C3 {
     _sgone();
   }
 }
-"#;
+";
     assert_eq!(
         unused_rows(source),
         vec!["The declaration '_user' isn't referenced.".to_string()],
@@ -223,13 +224,13 @@ extension on C3 {
 /// The unnamed face's static field reports `unused_field` exactly once.
 #[test]
 fn unnamed_extension_static_field_reports_once() {
-    let source = r#"
+    let source = r"
 class C3 {}
 
 extension on C3 {
   static int _sf = 0;
 }
-"#;
+";
     assert_eq!(
         unused_rows(source),
         vec!["The value of the field '_sf' isn't used.".to_string()],

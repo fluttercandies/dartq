@@ -324,16 +324,14 @@ fn check(c: &mut Check<'_>) {
     // exemption; the FEI keep below covers that shape). The flat
     // send-group tiling of the invoked tear-off answers through the
     // token face ([`constructor_reference_inner`]).
-    if inner_has_kind(c, node, NodeKind::ConstructorReference)
-        || constructor_reference_inner(c, node)
-    {
-        if !owner_kids
+    if (inner_has_kind(c, node, NodeKind::ConstructorReference)
+        || constructor_reference_inner(c, node))
+        && !owner_kids
             .get(pos + 1)
             .is_some_and(|&piece| c.kind(piece) == NodeKind::TypeArguments)
-        {
-            report(c, node);
-            return;
-        }
+    {
+        report(c, node);
+        return;
     }
     // `a..b = (c..d)` (:218-222): any cascade position keeps the parens
     // (a cascade inner row, a `..`/`?..` link token, or a cascade
@@ -581,7 +579,7 @@ fn same_file_top_level_function(c: &Check<'_>, name: &str) -> Option<u32> {
 
 /// Whether the formal's written type is a record type — the direct type
 /// child (the parameter tiling keeps the annotation inside the row) or,
-/// the variable-face tiling, a RecordType owner sibling immediately
+/// the variable-face tiling, a `RecordType` owner sibling immediately
 /// before the row.
 fn written_record_type(c: &Check<'_>, row: u32) -> bool {
     if c.collect_direct(row)
@@ -662,7 +660,7 @@ fn has_null_aware_index_inner(c: &Check<'_>, node: u32) -> bool {
 /// / [`NodeKind::NonNullAssert`] starting at its end). The row's position
 /// in the owner slice is completion order — the operator seals last —
 /// so the read is a span-adjacency scan, not a sibling offset.
-fn operand_of_unary(c: &Check<'_>, node: u32, owner_kids: &[u32], pos: usize) -> bool {
+fn operand_of_unary(c: &Check<'_>, node: u32, owner_kids: &[u32], _pos: usize) -> bool {
     let span = c.utf16_span(node);
     owner_kids.iter().any(|&row| match c.kind(row) {
         NodeKind::UnaryPrefix => c.utf16_span(row).end == span.start,
@@ -805,10 +803,9 @@ fn whitespace_inner(c: &Check<'_>, node: u32) -> bool {
         .iter()
         .copied()
         .min_by_key(|&kid| c.utf16_span(kid).start)
+        && c.kind(head) == NodeKind::ConstLiteral
     {
-        if c.kind(head) == NodeKind::ConstLiteral {
-            return true;
-        }
+        return true;
     }
     // The `new`-keyword creation arm (`(new Foo())` tiles the creation
     // through a generic head, not a `NewExpression` row).

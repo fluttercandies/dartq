@@ -20,6 +20,7 @@
 //! upstream's `InvalidType` actually covers (a namespace miss, an
 //! ambiguous name, a prefix, or an indexed-but-non-type declaration).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 use crate::collector::collect;
 use crate::diagnose::FileReport;
@@ -97,7 +98,7 @@ fn object_stub_scrutinee_exhaustive_stays_silent() {
 
 /// The expression face keeps both rows the oracle reports over the
 /// `Object?` stub head: the covering gap (`non_exhaustive_switch_expression`,
-/// "doesn't match the pattern 'Object()'") — an engine-side under-report
+/// "doesn't match the pattern '`Object()`'") — an engine-side under-report
 /// the gate suppressed until #3728 taught `name_resolvable` that the
 /// names-only `Object` root is fully decided — and the duplicate `Null _`
 /// arm's `unreachable_switch_case` (probed `dart analyze`: the oracle also

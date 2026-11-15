@@ -111,6 +111,7 @@
 //!   imports): M1 has a single two-level chain, and a parent-delegation
 //!   abstraction would model nothing that varies yet.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_source::{FileId, StringId};
 
 use crate::library_graph::{CombinatorClause, LibraryGraph, LibraryId, LocalLookup};
@@ -455,6 +456,7 @@ impl Namespaces {
     /// `lib`, `None` when the caller asked a library question (no file, or a
     /// file this library does not own) — the answer is then
     /// [`Self::lookup`]'s, the defining unit's scope.
+    #[allow(clippy::unused_self)]
     fn scope_start(
         &self,
         graph: &LibraryGraph,
@@ -661,7 +663,7 @@ fn fold(graph: &LibraryGraph, hits: impl Iterator<Item = NamespaceEntry>) -> Loo
             Some(existing) if existing == hit => {}
             Some(existing) => {
                 if rest.is_empty() {
-                    let (existing_sdk, hit_sdk) = (is_sdk(graph, &existing), is_sdk(graph, &hit));
+                    let (existing_sdk, hit_sdk) = (is_sdk(graph, existing), is_sdk(graph, hit));
                     if existing_sdk && !hit_sdk {
                         first = Some(hit);
                         continue;
@@ -675,7 +677,7 @@ fn fold(graph: &LibraryGraph, hits: impl Iterator<Item = NamespaceEntry>) -> Loo
                     // `Future` is `dart:async`'s class), so both are the one
                     // element — the declaration-backed entry wins.
                     if existing_sdk && hit_sdk {
-                        match (is_face(graph, &existing), is_face(graph, &hit)) {
+                        match (is_face(graph, existing), is_face(graph, hit)) {
                             (true, false) => {
                                 first = Some(hit);
                                 continue;
@@ -707,8 +709,8 @@ fn fold(graph: &LibraryGraph, hits: impl Iterator<Item = NamespaceEntry>) -> Loo
 /// is `dart:`. The unindexed face cannot occur here (`probe` only returns
 /// declarations the graph's export scopes carry), and an unregistered file
 /// reads as non-SDK — the plain-ambiguity behavior.
-fn is_sdk(graph: &LibraryGraph, entry: &NamespaceEntry) -> bool {
-    let NamespaceEntry::Decl(file) = *entry else {
+fn is_sdk(graph: &LibraryGraph, entry: NamespaceEntry) -> bool {
+    let NamespaceEntry::Decl(file) = entry else {
         return false;
     };
     graph
@@ -718,8 +720,8 @@ fn is_sdk(graph: &LibraryGraph, entry: &NamespaceEntry) -> bool {
 
 /// Whether `entry` is declared on a synthetic SDK names-only face file
 /// ([`LibraryGraph::is_face_file`]).
-fn is_face(graph: &LibraryGraph, entry: &NamespaceEntry) -> bool {
-    matches!(*entry, NamespaceEntry::Decl(file) if graph.is_face_file(file))
+fn is_face(graph: &LibraryGraph, entry: NamespaceEntry) -> bool {
+    matches!(entry, NamespaceEntry::Decl(file) if graph.is_face_file(file))
 }
 
 #[cfg(test)]
@@ -813,8 +815,8 @@ mod tests {
         }
 
         /// Registers the `part`-include edge `includer` → `included`.
-        fn part(&mut self, lib: LibraryId, includer: FileId, included: FileId) {
-            self.builder.part(lib, includer, included);
+        fn part(&mut self, lib: LibraryId, parent: FileId, child: FileId) {
+            self.builder.part(lib, parent, child);
         }
 
         fn settle(self) -> (&'static StringTable, LibraryGraph, Namespaces) {
@@ -935,7 +937,7 @@ mod tests {
     /// A package spelling hides the same-named SDK declaration in either
     /// directive order, with no ambiguity — the oracle's SDK preference
     /// (`PrefixScope._merge`, scope.dart:811-832: non-SDK hides SDK,
-    /// `return other` / `return existing`). This is the empty_unmodifiable_set
+    /// `return other` / `return existing`). This is the `empty_unmodifiable_set`
     /// face: `import 'dart:collection'` grafts the SDK's `UnmodifiableSetView`
     /// beside the package's, and the package spelling must keep the class the
     /// `@override` climb walks.

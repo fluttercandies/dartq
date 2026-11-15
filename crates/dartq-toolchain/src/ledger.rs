@@ -62,6 +62,7 @@
 //! Waits never hold the gate. The module is unix-only (`flock`);
 //! elsewhere callers run ungated.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
@@ -759,8 +760,8 @@ fn estimate(dir: &Path, face: Face, source_bytes: Option<u64>) -> Option<u64> {
             *src > 0 && *src >= my_source.div_ceil(4) && *src <= my_source.saturating_mul(4)
         })
         .map(|(peak, src)| {
-            let scale = (my_source as u128).div_ceil(src as u128);
-            peak as u128 * scale.max(1)
+            let scale = u128::from(my_source).div_ceil(u128::from(src));
+            u128::from(peak) * scale.max(1)
         })
         .max()?;
     let estimate = u64::try_from(bound).unwrap_or(u64::MAX);
@@ -816,6 +817,7 @@ fn inherited_token() -> Option<String> {
 /// holds a slot now. A holder that left its slot (a session daemon hosting
 /// a debug session) shelters nothing: a nested request then takes a slot
 /// of its own, so the count cap still holds.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn env_token(dir: &Path) -> Option<String> {
     let token = std::env::var(TOKEN_ENV).ok().filter(|token| {
         token.starts_with("h-") && token.ends_with(".json") && !token.contains('/')
@@ -872,6 +874,7 @@ fn unix_secs(time: SystemTime) -> u64 {
 /// process snapshot. A holder file whose lock is free is a dead owner's:
 /// it is removed, freeing its lease, and its start is kept for
 /// [`take_dead`].
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn scan(dir: &Path) -> Vec<(PathBuf, Holder)> {
     let mut records = Vec::new();
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -925,9 +928,7 @@ fn scan(dir: &Path) -> Vec<(PathBuf, Holder)> {
                 crate::proc::rss_of(&rows, &crate::proc::tree_excluding(&rows, pid, &roots))
             });
             let idle = record.release.as_ref().map(|release| {
-                File::open(&release.busy)
-                    .ok()
-                    .is_some_and(|busy| try_lock(&busy).unwrap_or(false))
+                File::open(&release.busy).is_ok_and(|busy| try_lock(&busy).unwrap_or(false))
             });
             let holder = Holder {
                 face: record.face,
@@ -1192,7 +1193,7 @@ fn joins(request: &mut Request, dir: &Path) -> bool {
     if !request.slot {
         return false;
     }
-    if HELD.lock().map(|held| !held.is_empty()).unwrap_or(false) {
+    if HELD.lock().is_ok_and(|held| !held.is_empty()) {
         request.slot = false;
         return false;
     }
@@ -1227,6 +1228,7 @@ fn open_gate(dir: &Path) -> io::Result<File> {
 
 /// [`acquire`] over an explicit directory and figures source (the tests'
 /// seam); `decay_after` is [`SIZED_WAIT_DECAY`], shortened by tests.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn acquire_in(
     dir: &Path,
     mut request: Request,
@@ -1434,9 +1436,7 @@ impl Ticket {
             .into_iter()
             .filter(|(seq, rand, _)| (*seq, *rand) < (self.seq, self.rand))
             .filter(|(_, _, path)| {
-                let live = File::open(path)
-                    .ok()
-                    .is_some_and(|file| !try_lock(&file).unwrap_or(true));
+                let live = File::open(path).is_ok_and(|file| !try_lock(&file).unwrap_or(true));
                 if !live {
                     let _ = fs::remove_file(path);
                 }
@@ -1526,6 +1526,10 @@ fn release_holder(path: &Path) -> bool {
     true
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "display-only GB formatting; precision loss at u64 scale is irrelevant"
+)]
 fn gib(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / f64::from(1u32 << 30))
 }
@@ -1988,7 +1992,7 @@ mod tests {
         ];
         match decide(&holders, ask(3 * GIB, false, 0, true), figures) {
             Decision::Admit { release, .. } => assert_eq!(release, [1]),
-            other => panic!("expected an admission, got {other:?}"),
+            decision @ Decision::Wait(_) => panic!("expected an admission, got {decision:?}"),
         }
         // A busy resident is never released.
         let busy = [holder(8 * GIB, 0, Some(false))];
@@ -2055,7 +2059,7 @@ mod tests {
         assert!(!short_of(at(32 * GIB, Some(5 * GIB), 90)));
         // Under the reserve is the one shortfall signal.
         assert!(short_of(at(32 * GIB, Some(3 * GIB), 90)));
-        assert!(short_of(at(32 * GIB, Some(1 * GIB), 90)));
+        assert!(short_of(at(32 * GIB, Some(GIB), 90)));
         // An unreadable figure is never low (the pre-existing posture).
         assert!(!short_of(at(32 * GIB, None, 90)));
     }
@@ -2069,7 +2073,7 @@ mod tests {
         resident.cap = 1;
         match decide(&[booking, resident], ask(GIB, true, 1, true), roomy()) {
             Decision::Admit { release, .. } => assert_eq!(release, [1]),
-            other => panic!("expected an admission, got {other:?}"),
+            decision @ Decision::Wait(_) => panic!("expected an admission, got {decision:?}"),
         }
     }
 
@@ -2313,12 +2317,12 @@ mod tests {
         assert!(resident.sized() && resident.holds_slot());
         drop(busy);
         for handle in [second, third] {
-            let (result, notes, waited) = handle.join().expect("waiter");
+            let (result, notes, elapsed) = handle.join().expect("waiter");
             let lease = result.expect("admitted").expect("a lease");
             assert!(lease.sized(), "the waiter borrowed the recorded peak");
             assert_eq!(lease.bytes(), 3 * GIB);
             assert!(
-                waited < Duration::from_secs(5),
+                elapsed < Duration::from_secs(5),
                 "admitted once the peak landed"
             );
             assert!(
@@ -2984,6 +2988,7 @@ mod tests {
         idle: bool,
         used: SystemTime,
     ) -> File {
+        use std::os::unix::fs::FileExt as _;
         let busy = dir.join(format!("{name}.busy"));
         let busy_file = File::create(&busy).expect("busy lock");
         if !idle {
@@ -3004,12 +3009,12 @@ mod tests {
         };
         let file = OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .read(true)
             .open(&path)
             .expect("holder file");
         file.lock().expect("live holder lock");
-        use std::os::unix::fs::FileExt as _;
         file.write_all_at(serde_json::to_vec(&record).expect("json").as_slice(), 0)
             .expect("record");
         file.set_modified(used).expect("mtime");

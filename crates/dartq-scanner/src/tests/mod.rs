@@ -1,5 +1,6 @@
 //! Shared test helpers.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 mod curly_recovery;
 mod dedup;
 mod errors;

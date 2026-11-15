@@ -32,6 +32,7 @@
 //!   clause-silence half is re-pinned here against a shape that does not hit
 //!   the flatten seam.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// Pin 1 re-pinned: under the covariant `check<X>` column the oracle stays
@@ -103,7 +104,7 @@ void main() {
 #[test]
 fn implements_stub_future_clause_head_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 class SubFuture implements Future<int> {
   SubFuture();
 }
@@ -111,7 +112,7 @@ class SubFuture implements Future<int> {
 void f(SubFuture x) {
   x.hashCode;
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(

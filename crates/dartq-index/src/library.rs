@@ -39,6 +39,7 @@
 //! keeping dartq-semantic out of this crate's dependency set (its model is
 //! mid-flight on #120, and the reference surface must not move with it).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, SourceRange, StringId};
 
@@ -248,10 +249,9 @@ impl LibraryIndex {
     /// starts at slot ≥ k), and slicing `name_refs[start..]` leaked the
     /// first run of every name group preceding the queried one in id
     /// order (#2652): `query references` answered sibling members' rows
-    /// — which exact siblings leaked followed the StringId allocation
+    /// — which exact siblings leaked followed the `StringId` allocation
     /// order, so parallel folds' interleaved interning made the answer
     /// vary run to run.
-    #[must_use]
     pub fn references_named(&self, name: StringId) -> impl Iterator<Item = &[RefRow]> + '_ {
         let group_name = |slot: usize| {
             let run = self.name_refs[slot] as usize;
@@ -281,7 +281,6 @@ impl LibraryIndex {
 
     /// The distinct reference-target names, ascending — the name-keyed run
     /// groups themselves, one name per group.
-    #[must_use]
     pub fn distinct_reference_names(&self) -> impl Iterator<Item = StringId> + '_ {
         self.name_runs.iter().copied().map(move |slot| {
             let run = self.name_refs[slot as usize] as usize;
@@ -648,6 +647,7 @@ impl<'a> LibraryBuilder<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) mod tests {
     use super::*;
     use crate::capture::{DeclKind, capture};
@@ -945,10 +945,7 @@ pub(crate) mod tests {
         assert!(fa_refs[0].range.offset < fa_refs[1].range.offset);
         assert!(fa_refs.iter().all(|row| row.kind == RefKind::Invoked));
         assert_eq!(
-            fa_refs
-                .iter()
-                .map(|row| row.qualified())
-                .collect::<Vec<_>>(),
+            fa_refs.iter().map(RefRow::qualified).collect::<Vec<_>>(),
             vec![false, true]
         );
         assert_eq!(

@@ -25,6 +25,9 @@
 //! discarded-value verifier owned by another lane — the pin stands so
 //! that fix cannot silence the true positive.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(unused_imports)]
+
 use super::*;
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
@@ -242,7 +245,7 @@ void m() {
 }
 ";
     let report = unit_report(source);
-    let at = (source.find("l);").unwrap() as u32);
+    let at = source.find("l);").unwrap() as u32;
     assert_eq!(
         codes(&report, "non_constant_record_field"),
         vec![(at, 1)],

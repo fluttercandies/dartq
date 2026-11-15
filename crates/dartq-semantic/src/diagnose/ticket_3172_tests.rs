@@ -12,6 +12,7 @@
 //! never reaches this face — the `Null`-receiver dead continuations ride
 //! the reachability facts, not this join.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// `i?.member` over an unassigned `int? i` reports `?.member` — the
@@ -90,7 +91,7 @@ fn ticket_3172_unassigned_method_invocation_property_access() {
 
 /// A two-link property chain climbs through both — `i?.sign.sign`
 /// reports `?.sign.sign` (upstream
-/// test_unassigned_propertyAccess_propertyAccess).
+/// `test_unassigned_propertyAccess_propertyAccess`).
 #[test]
 fn ticket_3172_unassigned_property_access_property_access() {
     let fixture = "void f() {\n  int? i;\n  i?.sign.sign;\n}";
@@ -108,7 +109,7 @@ fn ticket_3172_unassigned_property_access_property_access() {
 
 /// `unParenthesized` (:486): `(i)?.sign` unwraps the group and roots on
 /// the inner `i` read — reports `?.sign`, upstream
-/// test_unassigned_propertyAccess.
+/// `test_unassigned_propertyAccess`.
 #[test]
 fn ticket_3172_unassigned_parenthesized_property_access() {
     let fixture = "void f() {\n  int? i;\n  (i)?.sign;\n}";
@@ -126,7 +127,7 @@ fn ticket_3172_unassigned_parenthesized_property_access() {
 
 /// `(i)?.sign.sign` — the unwrapped root plus the parent climb:
 /// `?.sign.sign` whole (upstream
-/// test_unassigned_propertyAccess_propertyAccess).
+/// `test_unassigned_propertyAccess_propertyAccess`).
 #[test]
 fn ticket_3172_unassigned_parenthesized_property_access_property_access() {
     let fixture = "void f() {\n  int? i;\n  (i)?.sign.sign;\n}";
@@ -144,7 +145,7 @@ fn ticket_3172_unassigned_parenthesized_property_access_property_access() {
 
 /// `l?[0]` over an unassigned `List<int>?` reports `?[0]` — the `?`
 /// token through the bracket's own `]` (upstream
-/// test_unassigned_indexExpression).
+/// `test_unassigned_indexExpression`).
 #[test]
 fn ticket_3172_unassigned_index_expression() {
     let fixture = "void f() {\n  List<int>? l;\n  l?[0];\n}";
@@ -162,7 +163,7 @@ fn ticket_3172_unassigned_index_expression() {
 
 /// `l?[0][0]` — the index-continuation climb grows the dead span through
 /// the outer `[0]`: `?[0][0]` whole (upstream
-/// test_unassigned_indexExpression_indexExpression).
+/// `test_unassigned_indexExpression_indexExpression`).
 #[test]
 fn ticket_3172_unassigned_index_expression_index_expression() {
     let fixture = "void f() {\n  List<List<int>>? l;\n  l?[0][0];\n}";
@@ -181,7 +182,7 @@ fn ticket_3172_unassigned_index_expression_index_expression() {
 /// `l?[0]?[1]` — the second `?[` is the same climb (the inner `?[`'s
 /// parent is an IndexExpression): one row at `?[0]?[1]`, no second row
 /// on the outer operator (the outer `?[`'s own target is the inner
-/// IndexExpression, not a SimpleIdentifier).
+/// `IndexExpression`, not a `SimpleIdentifier`).
 #[test]
 fn ticket_3172_unassigned_index_index_aware() {
     let fixture = "void f() {\n  List<List<int>>? l;\n  l?[0]?[1];\n}";
@@ -218,7 +219,7 @@ fn ticket_3172_unassigned_cascade_property_access() {
 /// `i?..sign..isEven` — two bare sections keep the `first is
 /// PropertyAccess` gate (`first.operator` is the `?..`): the cascade
 /// grows to its own end (upstream
-/// test_unassigned_cascadeExpression_propertyAccess).
+/// `test_unassigned_cascadeExpression_propertyAccess`).
 #[test]
 fn ticket_3172_unassigned_cascade_two_sections() {
     let fixture = "void f() {\n  int? i;\n  i?..sign..isEven;\n}";
@@ -236,7 +237,7 @@ fn ticket_3172_unassigned_cascade_two_sections() {
 
 /// `i?..toInt()..isEven` — a method-invocation first section keeps the
 /// `first is MethodInvocation` gate (upstream
-/// test_unassigned_cascadeExpression_methodInvocation).
+/// `test_unassigned_cascadeExpression_methodInvocation`).
 #[test]
 fn ticket_3172_unassigned_cascade_method_invocation() {
     let fixture = "void f() {\n  int? i;\n  i?..toInt()..isEven;\n}";
@@ -254,7 +255,7 @@ fn ticket_3172_unassigned_cascade_method_invocation() {
 
 /// `l?..[0]..length` — an index-expression first section keeps the
 /// `first is IndexExpression` gate (upstream
-/// test_unassigned_cascadeExpression_indexExpression).
+/// `test_unassigned_cascadeExpression_indexExpression`).
 #[test]
 fn ticket_3172_unassigned_cascade_index_expression() {
     let fixture = "void f() {\n  List<int>? l;\n  l?..[0]..length;\n}";
@@ -279,7 +280,7 @@ fn ticket_3172_unassigned_cascade_index_expression() {
 fn ticket_3172_unassigned_cascade_index_continuation() {
     let report = report_ops("void f() {\n  List<List<int>>? l;\n  l?..[0][1];\n}");
     assert!(
-        !code_names(&report).iter().any(|name| *name == "dead_code"),
+        !code_names(&report).contains(&"dead_code"),
         "{:?}",
         rows(&report)
     );
@@ -346,7 +347,7 @@ fn ticket_3172_unassigned_parenthesized_cascade_index_expression() {
 fn ticket_3172_cascade_chained_body_stays_silent() {
     let report = report_ops("void f() {\n  int? i;\n  i?..toInt().bitLength;\n}");
     assert!(
-        !code_names(&report).iter().any(|name| *name == "dead_code"),
+        !code_names(&report).contains(&"dead_code"),
         "{:?}",
         rows(&report)
     );
@@ -358,7 +359,7 @@ fn ticket_3172_cascade_chained_body_stays_silent() {
 fn ticket_3172_assigned_receiver_stays_silent() {
     let report = report_ops("void f() {\n  int? i = 0;\n  i?.sign;\n}");
     assert!(
-        !code_names(&report).iter().any(|name| *name == "dead_code"),
+        !code_names(&report).contains(&"dead_code"),
         "{:?}",
         rows(&report)
     );
@@ -372,7 +373,7 @@ fn ticket_3172_assigned_receiver_stays_silent() {
 fn ticket_3172_dynamic_receiver_stays_silent() {
     let report = report_ops("void f() {\n  var i;\n  i?.m;\n}");
     assert!(
-        !code_names(&report).iter().any(|name| *name == "dead_code"),
+        !code_names(&report).contains(&"dead_code"),
         "{:?}",
         rows(&report)
     );

@@ -4,7 +4,7 @@
 //! # The defect
 //!
 //! `handle_spread_expression` (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/error/error_verifier.dart `visitSpreadElement`
+//! `pkg/analyzer/lib/src/dart/error/error_verifier.dart` `visitSpreadElement`
 //! → `_checkForUnnecessaryNullAware`) asks
 //! `Engine::strictly_non_nullable` whether the `...?` operand's static
 //! type makes the operator dead. A `FutureOr`-head operand routed through
@@ -14,7 +14,7 @@
 //! The two pools share the id type but not the id universe: any slot the
 //! listener minted past the unit clone's tail indexed another universe —
 //! `len is 1 but the index is 1`, rc=4 on user input (the census's three
-//! spread-case crashes: StaticSemantic_A10_t03 / A10_t09 / A11_t03).
+//! spread-case crashes: `StaticSemantic_A10_t03` / `A10_t09` / `A11_t03`).
 //!
 //! # The contract
 //!
@@ -42,6 +42,7 @@
 //! engine lane with no emit site yet (a known under-report, pinned silent
 //! here so a future lane's green row turns this pin red on arrival).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// Offset of `needle` inside the first occurrence of `line`.

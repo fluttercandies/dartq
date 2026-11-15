@@ -3,6 +3,7 @@
 //! spaces and the wiring layer remaps them onto the live engine's ids at
 //! load time.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};

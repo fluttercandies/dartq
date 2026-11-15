@@ -28,6 +28,8 @@
 //! a bare assigned variable and a declaration's own pattern head out of
 //! the face.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

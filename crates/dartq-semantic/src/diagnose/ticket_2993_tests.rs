@@ -13,6 +13,7 @@
 //! column/length) — plus the silent negatives (an allowed target, a
 //! non-set arrow body, a statement `final`, a supplied named argument).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::library::ElementIndex;
 use crate::model::MicroKind;
@@ -27,7 +28,7 @@ use std::path::Path;
 /// (the conformance mocks' declarations, pared to the names the faces
 /// read): `library meta;` carries the `required` getter and `Required`
 /// class, `library meta_meta;` carries `Target`.
-const META_MOCK: &str = r#"library meta;
+const META_MOCK: &str = r"library meta;
 
 const Required required = Required();
 
@@ -35,15 +36,15 @@ class Required {
   final String reason;
   const Required([this.reason = '']);
 }
-"#;
+";
 
-const META_META_MOCK: &str = r#"library meta_meta;
+const META_META_MOCK: &str = r"library meta_meta;
 
 class Target {
   const Target(this.kinds);
   final List<Object> kinds;
 }
-"#;
+";
 
 fn code_rows<'a>(report: &'a FileReport, name: &str) -> Vec<&'a Diagnostic> {
     report

@@ -33,6 +33,7 @@
 //! real-engine repro reaches after the hop (identical entries; the
 //! declared twin's oracle-correct answer proves the equivalence).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 
 /// The analyzed text and its report: the shared rig mounts [`CORE_PRELUDE`]

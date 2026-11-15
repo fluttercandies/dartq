@@ -28,6 +28,7 @@
 //!   the `undefined_function` face (both engines agree the creation
 //!   split's `undefined_class` arm is a TYPE-position face only).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

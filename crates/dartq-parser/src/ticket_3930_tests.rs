@@ -3,8 +3,8 @@
 //! is a malformed annotation group.
 //!
 //! **Verdict: `metadata.rs` is already correct.** Every probe below emits the
-//! exact `(code, offset)` set the oracle reports for its SYNTACTIC_ERROR
-//! face; the family diverges only on the COMPILE_TIME_ERROR side, which the
+//! exact `(code, offset)` set the oracle reports for its `SYNTACTIC_ERROR`
+//! face; the family diverges only on the `COMPILE_TIME_ERROR` side, which the
 //! analyzer's metadata resolver and verifier emit from the annotation AST —
 //! a semantic-tier fix outside this crate.
 //!
@@ -36,7 +36,7 @@
 //!
 //! The five residual faces whose full oracle verdict needs a non-parser
 //! landing (the parser-side SYNTACTIC subset is pinned green below; the
-//! COMPILE_TIME_ERROR rows they name are semantic-tier and outside this
+//! `COMPILE_TIME_ERROR` rows they name are semantic-tier and outside this
 //! crate):
 //!
 //! * **synthetic-name `undefined_annotation`** — `class C { @ var f; }`:
@@ -71,7 +71,7 @@
 //!   but the closed-junk variant `class C { @a( }` reports NO
 //!   `undefined_annotation` — the unclosed group suppresses the
 //!   annotation's own resolution row. Owner: `crates/dartq-semantic`
-//!   `listener.rs` end_metadata arm (`emit_undefined_annotation`'s
+//!   `listener.rs` `end_metadata` arm (`emit_undefined_annotation`'s
 //!   group-closed gate).
 //! * **`operator>()` reparse tail** — `@p.A.ctor<B>()`: after the
 //!   `top_level_operator` row at `>`, the `()` group reparses as an
@@ -81,6 +81,7 @@
 //!   `declarations.rs`/`members.rs` top-level dispatch (Lane AM #3929's
 //!   in-flight scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::parser::Parser;
 use crate::tests::collector::{Collector, latest_features, scan_ok};
 
@@ -279,8 +280,8 @@ fn annotation_args_statement_start_reports_missing_identifier() {
 /// into the head and wrongly lets a `<` between the second and third
 /// `.`s open the annotation's type arguments.
 ///
-/// `@p.a.b()` (3 segments): `p` + `.a` (MetadataContinuation) + `.b`
-/// (MetadataContinuationAfterTypeArguments) — a valid `qualifiedName`
+/// `@p.a.b()` (3 segments): `p` + `.a` (`MetadataContinuation`) + `.b`
+/// (`MetadataContinuationAfterTypeArguments`) — a valid `qualifiedName`
 /// `.`-selector chain. The annotation's span ends at `b`.
 #[test]
 fn three_segment_annotation_parses_as_name_dot_name() {
@@ -316,9 +317,9 @@ fn four_segment_annotation_reparses_the_tail() {
     );
 }
 
-/// `@p.A.ctor<B>()`: after `p` + `.A` (MetadataContinuation), `<` does
+/// `@p.A.ctor<B>()`: after `p` + `.A` (`MetadataContinuation`), `<` does
 /// NOT open type arguments — the third-segment `.ctor` already sits in
-/// the constructor-selector slot (MetadataContinuationAfterTypeArguments)
+/// the constructor-selector slot (`MetadataContinuationAfterTypeArguments`)
 /// which fires AFTER `computeTypeParamOrArg`. The `<B>` reparses as a
 /// `<` operator at top level.
 #[test]

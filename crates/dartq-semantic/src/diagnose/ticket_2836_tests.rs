@@ -14,6 +14,7 @@
 //! variables, invocation type arguments) are the lints crate's face, not
 //! the engine's.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -43,7 +44,7 @@ fn uv(name: &str, offset: usize) -> String {
 
 /// The repro shape: a cast-initialized local unread reports the
 /// `unused_local_variable` row at its name — the initializer's cast is
-/// not a use and not a verdict input (the specify_nonobvious census
+/// not a use and not a verdict input (the `specify_nonobvious` census
 /// family's 28 rows all carry this shape).
 #[test]
 fn cast_initialized_local_unread_reports() {
@@ -71,7 +72,7 @@ fn plain_initialized_local_unread_still_reports() {
     assert_eq!(uv_rows(&report), [uv("d", d)], "{:?}", uv_rows(&report));
 }
 
-/// The exact census case (SpecifyNonObviousLocalVariableTypesTest.test_as,
+/// The exact census case (`SpecifyNonObviousLocalVariableTypesTest.test_as`,
 /// the family's materialized source): an untyped `f()` and the cast
 /// initializer together — the row reports at `d`.
 #[test]

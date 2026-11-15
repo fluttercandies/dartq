@@ -9,6 +9,7 @@
 //! under pin; the rigs stay self-contained so the shared `tests` rig is
 //! untouched.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;
@@ -151,7 +152,7 @@ fn typed_list_literal_element_check_fires_with_wide_prefix() {
     );
 }
 
-/// Pin 2 — `trimmed_span` (engine_core.rs): the `== null` comparison's
+/// Pin 2 — `trimmed_span` (`engine_core.rs)`: the `== null` comparison's
 /// operator anchor over a never-null operand is re-derived from the
 /// operand/null row spans through the byte domain; with wide characters
 /// upstream, the pre-fix raw slice desynced. The reported span opens at

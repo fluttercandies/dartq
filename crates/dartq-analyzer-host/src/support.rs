@@ -12,6 +12,7 @@
 //! plugins (the top-level `plugins:` options key) load from Dart 3.9.0,
 //! the floor of the first published `analysis_server_plugin` package.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 
 /// The oldest SDK the resident path serves.

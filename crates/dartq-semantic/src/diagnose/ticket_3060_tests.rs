@@ -17,6 +17,7 @@
 //! nullable conjunct, a different parameter source rejects, and the same
 //! parameter is reflexive.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 
@@ -38,7 +39,7 @@ fn tanmb_count(folded: &FileReport) -> usize {
 
 /// The self-referential bound's own annotation site is silent: `A<X> <:
 /// A<A<A<X>>>` holds through `bound(X) = A<A<X>>` reflexivity, the oracle's
-/// answer at `class A<X extends A<A<X>>>` (class_l1_t02's declaration
+/// answer at `class A<X extends A<A<X>>>` (`class_l1_t02`'s declaration
 /// line reports nothing).
 #[test]
 fn self_referential_bound_site_is_silent() {
@@ -51,7 +52,7 @@ fn self_referential_bound_site_is_silent() {
 }
 
 /// The same declaration's written argument sites keep firing: `A<Null>`
-/// asks `Null <: A<A<Null>>` — a definite rejection (class_l1_t02 line 74).
+/// asks `Null <: A<A<Null>>` — a definite rejection (`class_l1_t02` line 74).
 #[test]
 fn written_argument_on_self_referential_bound_reports() {
     let folded = report_ops("class A<X extends A<A<X>>> {}\nvoid f(A<Null> x) {}\n");
@@ -105,7 +106,7 @@ fn extension_type_written_args_report_twice() {
 }
 
 /// A bounded alias application's written argument keeps its verdict
-/// (`G<Null>` against bound `num` — typedef_l1_t02's surviving rows).
+/// (`G<Null>` against bound `num` — `typedef_l1_t02`'s surviving rows).
 #[test]
 fn alias_application_argument_reports() {
     let folded = report_ops("typedef G<X extends num> = void Function();\nvoid f(G<Null> g) {}\n");

@@ -18,6 +18,7 @@
 //!   supertype twin in the step 3-4 ordering (no
 //!   `ambiguous_extension_member_access`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops_bare as report_ops};
 
 /// The generic hop's argument projection: `Box<A>` declares

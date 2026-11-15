@@ -15,6 +15,8 @@
 //!   `factory T.named() = T` forwards nothing, so `T`'s optional formals
 //!   still report.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -63,9 +65,9 @@ fn method_tearoff_credits_all_parameters() {
     assert_eq!(uep_spans(&report, &full), Vec::<String>::new());
 }
 
-/// A `super._named()` initializer invocation is a non-
-/// `InstanceCreationExpression` read upstream — the super constructor's
-/// optional formals are all used even with no argument supplied.
+// A `super._named()` initializer invocation is a non-
+// `InstanceCreationExpression` read upstream — the super constructor's
+// optional formals are all used even with no argument supplied.
 
 /// A top-level function tear-off credits its formals identically — the
 /// bare `_f` read resolves the element in a non-call position.

@@ -23,6 +23,7 @@
 //! row already carries), so the walk re-types the stub up front and ONE
 //! `fn_sig_subtype` ask decides on the real faces.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

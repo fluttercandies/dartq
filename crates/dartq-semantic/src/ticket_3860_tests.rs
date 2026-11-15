@@ -30,6 +30,7 @@
 //! failing **leaf** (operator faults widen; `Verdict::NotConstant` never
 //! does).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_source::StringTable;
 
@@ -71,7 +72,7 @@ fn spans_of(source: &str, expr: &str) -> (SourceRange, SourceRange, SourceRange)
 
 /// The source text a span covers — the guard that keeps the computed
 /// offsets honest (`-  D` must slice back to `-  D`, not to `-D`).
-fn text_at<'s>(source: &'s str, span: SourceRange) -> &'s str {
+fn text_at(source: &str, span: SourceRange) -> &str {
     &source[usize::try_from(span.offset).unwrap()..usize::try_from(span.end()).unwrap()]
 }
 

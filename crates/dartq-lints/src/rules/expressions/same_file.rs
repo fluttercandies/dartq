@@ -505,8 +505,8 @@ pub(crate) fn declares_value(c: &Check<'_>, use_node: u32, name: &str) -> bool {
 }
 
 /// The resolve-then-judge verdict for the paren's trailing accessor
-/// (the unnecessary_parenthesis null-aware-shorting faces, upstream
-/// Dart SDK source, pkg/linter/lib/src/rules/unnecessary_parenthesis.dart
+/// (the `unnecessary_parenthesis` null-aware-shorting faces, upstream
+/// Dart SDK source, `pkg/linter/lib/src/rules/unnecessary_parenthesis.dart`
 /// :117-124, :132-139): `true` keeps the parentheses, `false` lets the
 /// one-token report stand. The accessor is judged per RESOLVED member
 /// over the receiver's written type — never per name — so two
@@ -689,7 +689,7 @@ fn block_binding(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> Opt
     for kid in c.collect_direct(block) {
         match c.kind(kid) {
             NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType | NodeKind::RecordType => {
-                written = Some(kid)
+                written = Some(kid);
             }
             NodeKind::VariablesDeclaration => {
                 // The name identifier: a direct child (hand-built trees)
@@ -805,7 +805,7 @@ fn fields_binding(c: &Check<'_>, fields: u32, name: &str) -> Option<Option<u32>>
     for kid in c.collect_direct(fields) {
         match c.kind(kid) {
             NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType | NodeKind::RecordType => {
-                written = Some(kid)
+                written = Some(kid);
             }
             NodeKind::Identifier
                 if c.field(kid, PayloadField::Context) == Some(ctx)

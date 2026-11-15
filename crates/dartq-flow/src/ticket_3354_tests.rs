@@ -15,7 +15,7 @@
 //!   lib/src/flow_analysis/flow_analysis.dart:6620-6640):
 //!   `if (!isExhaustive) breakState = _join(breakState, _unmatched);` then
 //!   `breakState ??= _previous.setUnreachable()`. `isExhaustive` is
-//!   `hasDefault || isAlwaysExhaustiveType(scrutineeType)` (type_analyzer.dart
+//!   `hasDefault || isAlwaysExhaustiveType(scrutineeType)` (`type_analyzer.dart`
 //!   `analyzeSwitchStatement`), so an always-exhaustive scrutinee (enum,
 //!   sealed class, `bool`, `Null`, `FutureOr<T>` of one) whose members all
 //!   terminate leaves the code after the switch dead.
@@ -26,7 +26,7 @@
 //! Ticket probing (2026-11-01) over co19 `nnbd`,
 //! `Patterns/Exhaustiveness` and `Constructor-tear-offs` against the oracle
 //! showed the two arms above already answering correctly for these shapes:
-//! every BodyMayCompleteNormally row the corpus over-reports traces to the
+//! every `BodyMayCompleteNormally` row the corpus over-reports traces to the
 //! *consumer* faces instead — the declared return type staged for an
 //! unannotated executable (a type-parameter bound or a body-local type is
 //! picked up as the return, so `test1<T extends Sealed>(T t) {}` is read as
@@ -39,6 +39,9 @@
 //! directions, so that a rework of the join — or a future consumer fix that
 //! starts trusting a pattern-space verdict — cannot silently reintroduce the
 //! over-report on the reachable side.
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::{ParserFeatures, TokenSpan};

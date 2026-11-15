@@ -76,6 +76,7 @@
 //! rewritten to `name=` at capture (one interning per setter — capture-time
 //! cost, not lookup-time).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::capture::{TreeSink, TypeTree};
 use crate::model::{
     Annotation, AnonMethodInvocation, ArgListId, ArgPool, ArityDecl, ArityViolation, AugKind,
@@ -556,7 +557,7 @@ struct Builder<'src, 'tab> {
     /// resolves `_getElementContext(fragment.element.firstFragment)`).
     member_scopes: Vec<MemberScope>,
     /// The top-level setter claims (`definedSetters`, upstream
-    /// duplicate_definition_verifier.dart checkUnit): a non-final
+    /// `duplicate_definition_verifier.dart` checkUnit): a non-final
     /// top-level variable claims its induced `name=` setter alongside
     /// its getter, so a later `set name` or a same-name setter claim
     /// collides here; `decls` keys the induced setter under `name=`
@@ -934,7 +935,7 @@ struct Builder<'src, 'tab> {
     /// element's tags onto the same sticky stacks as every declaration's,
     /// so a deprecated library silences the tag across its whole unit
     /// (upstream `element_usage_frontier_detector.dart`'s
-    /// `pushElement(_currentLibrary)` — best_practices_verifier.dart:166).
+    /// `pushElement(_currentLibrary)` — `best_practices_verifier.dart:166`).
     library_annotations: Vec<Annotation>,
 }
 
@@ -1197,7 +1198,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// augmentation model: an `augment` fragment is a fragment of the
     /// element the introduction declares (`element.firstFragment` is the
     /// introduction, upstream Dart SDK source,
-    /// pkg/_fe_analyzer_shared augmentation handling), so it introduces no
+    /// pkg/_`fe_analyzer_shared` augmentation handling), so it introduces no
     /// name of its own. Claiming a vacant slot would invent a unit-local
     /// declaration for a target declared in a sibling unit of the library —
     /// the name would then resolve to the augmenting unit's own (partial)
@@ -1295,7 +1296,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     }
 
     /// The setter-side half of the top-level duplicate check (upstream
-    /// `checkUnit`'s `definedSetters`, duplicate_definition_verifier.dart
+    /// `checkUnit`'s `definedSetters`, `duplicate_definition_verifier.dart`
     /// :116-307): `spelling` is the `name=` lookup spelling. A non-final
     /// top-level variable claims its induced `name=` setter here
     /// alongside its `decls` getter claim; a real `set name` collides
@@ -1308,7 +1309,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             return;
         }
         match self.top_setters.entry(spelling) {
-            Entry::Occupied(_) => {
+            Entry::Occupied(()) => {
                 self.record_duplicate(spelling, range, false);
             }
             Entry::Vacant(slot) => {
@@ -1612,7 +1613,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             match bytes.get(i)? {
                 b';' | b',' => break,
                 b'+' | b'-' | b'*' | b'/' | b'%' | b'~' | b'|' | b'^' | b'&' | b'(' | b')' => {
-                    i += 1
+                    i += 1;
                 }
                 b'<' | b'>' => {
                     let run = bytes[i..]
@@ -1668,31 +1669,31 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     fn typed_literal_initializer_ty(&mut self, name_end: u32) -> Option<Ty> {
         let bytes = self.source.as_bytes();
         let mut i = name_end as usize;
-        Self::skip_literal_ws(&bytes, &mut i);
+        Self::skip_literal_ws(bytes, &mut i);
         if bytes.get(i) != Some(&b'=') {
             return None;
         }
         i += 1;
-        Self::skip_literal_ws(&bytes, &mut i);
+        Self::skip_literal_ws(bytes, &mut i);
         // A `const` keyword may ride the literal (`= const <int>[]`).
         if bytes.get(i..i + 5) == Some("const".as_bytes())
-            && bytes.get(i + 5).is_some_and(|b| b.is_ascii_whitespace())
+            && bytes.get(i + 5).is_some_and(u8::is_ascii_whitespace)
         {
             i += 5;
-            Self::skip_literal_ws(&bytes, &mut i);
+            Self::skip_literal_ws(bytes, &mut i);
         }
         if bytes.get(i) != Some(&b'<') {
             return None;
         }
-        let spellings = Self::parse_literal_spellings(&bytes, &mut i)?;
-        Self::skip_literal_ws(&bytes, &mut i);
+        let spellings = Self::parse_literal_spellings(bytes, &mut i)?;
+        Self::skip_literal_ws(bytes, &mut i);
         let head = match (bytes.get(i)?, spellings.len()) {
             (b'{', 2) => "Map",
             (b'{', 1) => "Set",
             (b'[', 1) => "List",
             _ => return None,
         };
-        if !Self::literal_ends_declarator(&bytes, i) {
+        if !Self::literal_ends_declarator(bytes, i) {
             return None;
         }
         let args: Vec<Ty> = spellings
@@ -1731,7 +1732,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             if bytes.get(i..i + keyword.len()) == Some(keyword.as_bytes())
                 && bytes
                     .get(i + keyword.len())
-                    .is_some_and(|b| b.is_ascii_whitespace())
+                    .is_some_and(u8::is_ascii_whitespace)
             {
                 i += keyword.len();
                 Self::skip_literal_ws(bytes, &mut i);
@@ -1880,7 +1881,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         i += 1;
         Self::skip_literal_ws(bytes, &mut i);
         if bytes.get(i..i + 5) == Some(b"const")
-            && bytes.get(i + 5).is_some_and(|b| b.is_ascii_whitespace())
+            && bytes.get(i + 5).is_some_and(u8::is_ascii_whitespace)
         {
             i += 5;
             Self::skip_literal_ws(bytes, &mut i);
@@ -1970,10 +1971,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             {
                 // An empty segment (the trailing comma) or a positional
                 // argument: only the empty tail is admissible.
-                if bytes[label_start..end]
-                    .iter()
-                    .all(|b| b.is_ascii_whitespace())
-                {
+                if bytes[label_start..end].iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
                 return None;
@@ -2401,16 +2399,13 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 ContainerKind::ExtensionType => AugKind::ExtensionType,
             };
             let type_params = std::mem::take(&mut open.augment_type_params);
-            let (name, name_range) = open.name.map_or(
-                (
-                    self.strings.intern(""),
-                    SourceRange {
-                        offset: 0,
-                        length: 0,
-                    },
-                ),
-                |(n, r)| (n, r),
-            );
+            let (name, name_range) = open.name.unwrap_or((
+                self.strings.intern(""),
+                SourceRange {
+                    offset: 0,
+                    length: 0,
+                },
+            ));
             self.augmentations.push(AugmentDecl {
                 kind,
                 name,
@@ -2612,7 +2607,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// this container, so the merged member map (the introduction face every
     /// member-shaped consumer reads) must not absorb it — upstream keeps the
     /// fragment identity on the member's own chain
-    /// (`fragment.isAugmentation`, element_builder.dart:
+    /// (`fragment.isAugmentation`, `element_builder.dart`:
     /// `fragment.isAugmentation = node.augmentKeyword != null`), and the
     /// augmentation verifier walks that chain, never the merged map. A
     /// member WITHOUT the modifier folds as before — it is an introduction
@@ -3021,11 +3016,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .header_trees
             .iter()
             .position(|tree| tree.range.offset <= offset && offset < tree.range.end())
-            .map(|at| {
+            .map_or(ArgListId::EMPTY, |at| {
                 let tree = self.header_trees.remove(at);
                 self.clause_tree_args(tree)
-            })
-            .unwrap_or(ArgListId::EMPTY);
+            });
         if let Some(open) = self.containers.last_mut()
             && open.superclass.is_none()
         {
@@ -3052,7 +3046,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// parameter shape is wrong (`error_verifier.dart:5688-5740` for the
     /// operator count table). Setters are absent by design: the parse tier
     /// owns that face outright (the `_ensureSetterFormalParameter` mirror,
-    /// upstream Dart SDK source, pkg/analyzer/lib/src/fasta/ast_builder.dart
+    /// upstream Dart SDK source, `pkg/analyzer/lib/src/fasta/ast_builder.dart`
     /// :6464-6495 — the parser reports it at the setter name), and a second
     /// capture-time log row would double it in the merged report.
     fn member_arity_violation(
@@ -3200,7 +3194,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             if pending
                 .shape
                 .as_ref()
-                .map_or(false, |(_, _, range)| range.offset < group_end)
+                .is_some_and(|(_, _, range)| range.offset < group_end)
             {
                 pending.type_params = count;
                 pending.type_param_names = std::mem::take(&mut self.type_var_group);
@@ -3219,7 +3213,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             if pending
                 .name
                 .as_ref()
-                .map_or(false, |(_, range)| range.offset < group_end)
+                .is_some_and(|(_, range)| range.offset < group_end)
             {
                 pending.type_params = count;
                 // A generic top-level function's spellings ride the declaration
@@ -3858,7 +3852,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     /// Enum-element exit: the constant's own `augment` keyword lands on its
     /// member row — upstream `fieldFragment.isAugmentation =
-    /// constant.augmentKeyword != null` (element_builder.dart:1468), a
+    /// constant.augmentKeyword != null` (`element_builder.dart:1468`), a
     /// PER-CONSTANT fact the insert at `EnumValueDeclaration` could not see
     /// (the constant's `augment` token parses ahead of its name, while this
     /// event fires after its constructor invocation). A constant of an
@@ -4280,7 +4274,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let sealed = builder
             .capture
             .as_ref()
-            .is_some_and(|site| site.top_is_function());
+            .is_some_and(super::capture::TreeSink::top_is_function);
         if let Some(site) = builder.capture.as_mut() {
             site.end_function(question.is_some(), range);
         }
@@ -4366,7 +4360,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.record_entry_mark = builder
             .capture
             .as_ref()
-            .map_or(0, |site| site.record_entry_mark());
+            .map_or(0, super::capture::TreeSink::record_entry_mark);
     }
 
     fn end_record_type_entry(&mut self, last: Token) {
@@ -4577,10 +4571,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     // below, which `open` holds across the member insert.
                     let has_init = builder.has_initializer(name_end);
                     if context == IdentifierContext::TopLevelVariableDeclaration {
-                        if builder.top_const_group {
-                            if let Some(face) = builder.const_creation_face(name_end) {
-                                builder.const_creations.insert(name, face);
-                            }
+                        if builder.top_const_group
+                            && let Some(face) = builder.const_creation_face(name_end)
+                        {
+                            builder.const_creations.insert(name, face);
                         }
                         // The target-kind row every INTRODUCTORY top-level
                         // variable contributes: the induced-setter face
@@ -5212,7 +5206,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.declaring_augment = augment_kw.is_some();
         if let (Some(kw), Some((spelling, range))) = (augment_kw, shape.map(|(s, _, r)| (s, r))) {
             let accessor = get_or_set.and_then(|t| builder.name_of(t));
-            let kind = match accessor.map(|id| builder.strings.resolve(id)).unwrap_or("") {
+            let kind = match accessor.map_or("", |id| builder.strings.resolve(id)) {
                 "get" => AugKind::Getter,
                 "set" => AugKind::Setter,
                 _ => AugKind::Method,
@@ -5783,7 +5777,6 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             completion: false,
         }));
         let mut capture_named: Vec<StringId> = Vec::new();
-        let mut capture_unnamed = false;
         let mut factory_complete = false;
         if let Some(capture) = capture
             && let Some(open) = builder.containers.last_mut()
@@ -5803,7 +5796,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     *key = head;
                 }
             }
-            capture_unnamed = capture.has_unnamed;
+            let capture_unnamed = capture.has_unnamed;
             factory_complete =
                 capture.completion || std::mem::take(&mut builder.pending_ctor_external);
             for name in &named {
@@ -5827,7 +5820,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 .factory_kw_range
                 .take()
                 .and_then(|kw| ctor_head_range(builder.source, builder.strings, kw, container));
-            let push = |builder: &mut Builder, name: StringId| {
+            let push = |builder: &mut Builder<'_, '_>, name: StringId| {
                 builder.decl_kinds.push(AugTarget {
                     container: Some(container),
                     name,
@@ -5990,8 +5983,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     .containers
                     .last()
                     .and_then(|open| open.name)
-                    .map(|(name, _)| name)
-                    .unwrap_or(key);
+                    .map_or(key, |(name, _)| name);
                 Some((key, None))
             }
             (Some(key), None) => Some((key, None)),
@@ -6086,7 +6078,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if !builder.declaring_augment
             && let Some((container, _)) = builder.containers.last().and_then(|open| open.name)
         {
-            let push = |builder: &mut Builder, name: StringId| {
+            let push = |builder: &mut Builder<'_, '_>, name: StringId| {
                 builder.decl_kinds.push(AugTarget {
                     container: Some(container),
                     name,
@@ -6638,7 +6630,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let opener_range = builder
             .tokens
             .get(token.id as usize)
-            .map(|t| t.byte_range());
+            .map(dartq_scanner::Token::byte_range);
         if let Some(site) = builder.capture.as_mut()
             && site.top_is_function()
             && let Some(range) = opener_range
@@ -6810,7 +6802,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 .builder
                 .capture
                 .as_ref()
-                .is_some_and(|site| site.top_is_function());
+                .is_some_and(super::capture::TreeSink::top_is_function);
         if in_shape {
             // Its name/kind feeds the shape's columns — named formals trail
             // the positional ones, exactly like record fields.
@@ -7220,6 +7212,107 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 #[cfg(test)]
 #[path = "diagnose/ticket_2934_tests.rs"]
 mod ticket_2934_tests;
+
+/// The shape of one numeric literal run: `int` for a plain-digit or hex
+/// spelling, `double` once a `.`, `e`, or `E` marker appears outside the
+/// hex prefix. Anything else (a member access glued to a literal, an
+/// invalid suffix letter) is not a literal this face can type.
+enum LiteralShape {
+    Int,
+    Double,
+}
+
+fn numeric_literal_shape(bytes: &[u8]) -> Option<LiteralShape> {
+    let is_hex = bytes.len() > 2 && bytes[0] == b'0' && (bytes[1] | 0x20) == b'x';
+    if is_hex {
+        let hex_only = bytes[2..]
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() || *b == b'_');
+        return hex_only.then_some(LiteralShape::Int);
+    }
+    let mut saw_dot = false;
+    let mut saw_exp = false;
+    for (index, &b) in bytes.iter().enumerate() {
+        match b {
+            b'0'..=b'9' | b'_' => {}
+            b'.' if !saw_dot && !saw_exp => saw_dot = true,
+            b'e' | b'E' if !saw_exp && index > 0 => saw_exp = true,
+            _ => return None,
+        }
+    }
+    // An exponent marker without a following digit (`1e`) is not a
+    // literal this face claims; the leading position rules out `e`
+    // starting the run (the digit-first caller guarantees it).
+    if saw_exp && !bytes.iter().any(|&b| b.is_ascii_digit() && b != b'_') {
+        return None;
+    }
+    Some(if saw_dot || saw_exp {
+        LiteralShape::Double
+    } else {
+        LiteralShape::Int
+    })
+}
+
+/// The constructor head's `errorRange` (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/dart/ast/ast.dart` `ConstructorDeclarationImpl
+/// .errorRange`): the `typeName` token through the selector name when a
+/// type name is written, else the `factory` keyword through the name. The
+/// unnamed spellings collapse to the token that is present — `factory A()`
+/// reads `A`, `factory ()` reads `factory` alone. ASCII sources only: the
+/// reverse byte↔UTF-16 mapping is not worth a hop for a head, and a
+/// non-ASCII file keeps the row silent.
+fn ctor_head_range(
+    source: &str,
+    strings: &StringTable,
+    factory_kw: SourceRange,
+    container: StringId,
+) -> Option<SourceRange> {
+    if !source.is_ascii() {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let skip_trivia = |mut at: usize| {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    };
+    let is_name = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut at = skip_trivia(factory_kw.end() as usize);
+    if bytes.get(at).is_none_or(|b| !is_name(*b)) {
+        return Some(factory_kw);
+    }
+    let head_start = at;
+    while at < bytes.len() && is_name(bytes[at]) {
+        at += 1;
+    }
+    let spelled = source.get(head_start..at)?;
+    let after = skip_trivia(at);
+    if bytes.get(after) == Some(&b'.') {
+        let mut name = skip_trivia(after + 1);
+        let name_start = name;
+        while name < bytes.len() && is_name(bytes[name]) {
+            name += 1;
+        }
+        if name == name_start {
+            return None;
+        }
+        return Some(SourceRange {
+            offset: head_start as u32,
+            length: (name - head_start) as u32,
+        });
+    }
+    if spelled == strings.resolve(container) {
+        return Some(SourceRange {
+            offset: head_start as u32,
+            length: (at - head_start) as u32,
+        });
+    }
+    Some(SourceRange {
+        offset: factory_kw.offset,
+        length: (at as u32) - factory_kw.offset,
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -8502,8 +8595,7 @@ mod tests {
                         .iter()
                         .find(|f| f.name == id(&strings, name))
                 })
-                .map(|f| f.covariant)
-                .unwrap_or_else(|| panic!("formal {name}"))
+                .map_or_else(|| panic!("formal {name}"), |f| f.covariant)
         };
         assert!(covariant("a"), "written covariant captures true");
         assert!(!covariant("b"), "unmodified formal stays false");
@@ -8870,105 +8962,4 @@ mod tests {
         assert_eq!(elements.duplicates()[0].range.offset, at);
         assert_eq!(winner(&elements, &strings, "M"), MicroKind::TopLevelVar);
     }
-}
-
-/// The shape of one numeric literal run: `int` for a plain-digit or hex
-/// spelling, `double` once a `.`, `e`, or `E` marker appears outside the
-/// hex prefix. Anything else (a member access glued to a literal, an
-/// invalid suffix letter) is not a literal this face can type.
-enum LiteralShape {
-    Int,
-    Double,
-}
-
-fn numeric_literal_shape(bytes: &[u8]) -> Option<LiteralShape> {
-    let is_hex = bytes.len() > 2 && bytes[0] == b'0' && (bytes[1] | 0x20) == b'x';
-    if is_hex {
-        let hex_only = bytes[2..]
-            .iter()
-            .all(|b| b.is_ascii_hexdigit() || *b == b'_');
-        return hex_only.then_some(LiteralShape::Int);
-    }
-    let mut saw_dot = false;
-    let mut saw_exp = false;
-    for (index, &b) in bytes.iter().enumerate() {
-        match b {
-            b'0'..=b'9' | b'_' => {}
-            b'.' if !saw_dot && !saw_exp => saw_dot = true,
-            b'e' | b'E' if !saw_exp && index > 0 => saw_exp = true,
-            _ => return None,
-        }
-    }
-    // An exponent marker without a following digit (`1e`) is not a
-    // literal this face claims; the leading position rules out `e`
-    // starting the run (the digit-first caller guarantees it).
-    if saw_exp && !bytes.iter().any(|&b| b.is_ascii_digit() && b != b'_') {
-        return None;
-    }
-    Some(if saw_dot || saw_exp {
-        LiteralShape::Double
-    } else {
-        LiteralShape::Int
-    })
-}
-
-/// The constructor head's `errorRange` (upstream Dart SDK source,
-/// `pkg/analyzer/lib/src/dart/ast/ast.dart` `ConstructorDeclarationImpl
-/// .errorRange`): the `typeName` token through the selector name when a
-/// type name is written, else the `factory` keyword through the name. The
-/// unnamed spellings collapse to the token that is present — `factory A()`
-/// reads `A`, `factory ()` reads `factory` alone. ASCII sources only: the
-/// reverse byte↔UTF-16 mapping is not worth a hop for a head, and a
-/// non-ASCII file keeps the row silent.
-fn ctor_head_range(
-    source: &str,
-    strings: &StringTable,
-    factory_kw: SourceRange,
-    container: StringId,
-) -> Option<SourceRange> {
-    if !source.is_ascii() {
-        return None;
-    }
-    let bytes = source.as_bytes();
-    let skip_trivia = |mut at: usize| {
-        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
-            at += 1;
-        }
-        at
-    };
-    let is_name = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-    let mut at = skip_trivia(factory_kw.end() as usize);
-    if bytes.get(at).is_none_or(|b| !is_name(*b)) {
-        return Some(factory_kw);
-    }
-    let head_start = at;
-    while at < bytes.len() && is_name(bytes[at]) {
-        at += 1;
-    }
-    let spelled = source.get(head_start..at)?;
-    let after = skip_trivia(at);
-    if bytes.get(after) == Some(&b'.') {
-        let mut name = skip_trivia(after + 1);
-        let name_start = name;
-        while name < bytes.len() && is_name(bytes[name]) {
-            name += 1;
-        }
-        if name == name_start {
-            return None;
-        }
-        return Some(SourceRange {
-            offset: head_start as u32,
-            length: (name - head_start) as u32,
-        });
-    }
-    if spelled == strings.resolve(container) {
-        return Some(SourceRange {
-            offset: head_start as u32,
-            length: (at - head_start) as u32,
-        });
-    }
-    Some(SourceRange {
-        offset: factory_kw.offset,
-        length: (at as u32) - factory_kw.offset,
-    })
 }

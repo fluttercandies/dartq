@@ -13,7 +13,7 @@
 //! ```
 //!
 //! The corpus must be supplied (a directory scanned recursively for `*.dart`
-//! files in sorted order, `.dart_tool` skipped — via DARTQ_BENCH_CORPUS or a
+//! files in sorted order, `.dart_tool` skipped — via `DARTQ_BENCH_CORPUS` or a
 //! single positional argument); there is no vendored default. Files are
 //! read once; the K rounds do no I/O. Throughput is reported in MB/s using
 //! the 10^6-byte convention.

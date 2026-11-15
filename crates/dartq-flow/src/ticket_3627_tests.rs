@@ -13,7 +13,7 @@
 //! 1. `hasFlags && flags.contains(...)` — the `&&` right operand runs in
 //!    the condition variable's true arm: `flags` reads non-null.
 //! 2. `!hasFlags || flags.contains(...)` — upstream `logicalNot_end`
-//!    inverts the operand's `ExpressionInfo` (flow_analysis.dart:7336),
+//!    inverts the operand's `ExpressionInfo` (`flow_analysis.dart:7336`),
 //!    so the `||` right operand runs in the inverted replay's false arm:
 //!    `flags` reads non-null. The `!` must carry the condition-variable
 //!    linkage — a bare `Expr` rebuild drops it.
@@ -34,6 +34,7 @@
 //!    the binding exactly like the plain `=` face (the upstream version
 //!    check covers every write, not only `Ev::Assign`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -89,8 +90,10 @@ fn ty_at(source: &str, needle: &str) -> crate::ty::Ty {
     read_types(source)
         .into_iter()
         .find(|(at, _)| *at == offset)
-        .map(|(_, ty)| ty)
-        .unwrap_or_else(|| panic!("no ReadType at {needle:?} in {source:?}"))
+        .map_or_else(
+            || panic!("no ReadType at {needle:?} in {source:?}"),
+            |(_, ty)| ty,
+        )
 }
 
 /// The replay's true arm promotes the tested variable inside the `&&`

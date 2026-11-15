@@ -10,9 +10,10 @@
 //! OWN bounds explicitly, mapped from the name-level `ExtensionFace`
 //! columns (`type_param_names` ∥ `type_param_bounds`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
-impl<'a> Engine<'a> {
+impl Engine<'_> {
     /// The face's parameters with their declared bounds mapped into the
     /// structural world: `(id, None)` for an unbounded parameter
     /// (`Ty::Dynamic` is the absent bound), `(id, Some(bound))` for a

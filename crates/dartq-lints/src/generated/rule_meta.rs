@@ -1,20 +1,21 @@
 //! GENERATED lint rule metadata — DO NOT EDIT.
 //! Regenerate with:
-//!   DARTQ_SDK_SRC=<dart-sdk-tree> DART_LINTS_SRC=<lints-tree> cargo run -p upstream-gen --bin linter-meta-gen
+//!   `DARTQ_SDK_SRC`=<dart-sdk-tree> `DART_LINTS_SRC`=<lints-tree> cargo run -p upstream-gen --bin linter-meta-gen
 //! SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable) — conformance/pin.toml (verified by --check).
 //! Source: pkg/linter/messages.yaml of the pinned SDK checkout (dart 3.13.7, stable),
 //!   canonical code selection from the pkg/linter/lib/src/rules/*.dart
 //!   registrations, group sets from the pinned package:lints snapshot
 //!   (lib/core.yaml, lib/recommended.yaml), removed/deprecated since
 //!   versions from those registrations (version constants of
-//!   pkg/analyzer/lib/analysis_rule/rule_state.dart).
+//!   `pkg/analyzer/lib/analysis_rule/rule_state.dart`).
 //! 315 consts fold to 275 name rows; the selection chain, its overrides,
 //!   and the pinned wordings are documented in tools/upstream-gen/src/
-//!   linter_meta.rs. Rows are sorted by name; messages render '{i}'
+//!   `linter_meta.rs`. Rows are sorted by name; messages render '{i}'
 //!   positional slots (the yaml '#param' references resolved through
 //!   the const's parameter order). Removed rules carry no message —
-//!   the options face renders the removed_lint templates.
+//!   the options face renders the `removed_lint` templates.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::registry::Group;
 
 /// The upstream rule state the option faces render. `Stable` covers

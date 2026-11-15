@@ -12,6 +12,7 @@
 //! resolution in `withTypeParameterScope(element.typeParameters)` — the
 //! same shape a top-level declaration owns).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// The bound-violating WRITTEN type-argument group checks against the
@@ -29,9 +30,7 @@ fn written_type_arguments_check_the_local_bound() {
     );
     let names = code_names(&report);
     assert!(
-        names
-            .iter()
-            .any(|name| *name == "type_argument_not_matching_bounds"),
+        names.contains(&"type_argument_not_matching_bounds"),
         "expected the bounds face, got {:?}",
         rows(&report)
     );
@@ -59,9 +58,7 @@ fn bare_local_generic_fn_pairs_its_bound() {
     );
     let names = code_names(&report);
     assert!(
-        names
-            .iter()
-            .any(|name| *name == "type_argument_not_matching_bounds"),
+        names.contains(&"type_argument_not_matching_bounds"),
         "expected the bounds face, got {:?}",
         rows(&report)
     );
@@ -82,9 +79,7 @@ fn a_local_generic_inside_a_method_pairs() {
     );
     let names = code_names(&report);
     assert!(
-        names
-            .iter()
-            .any(|name| *name == "type_argument_not_matching_bounds"),
+        names.contains(&"type_argument_not_matching_bounds"),
         "expected the bounds face, got {:?}",
         rows(&report)
     );

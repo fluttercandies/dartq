@@ -35,6 +35,7 @@
 //! The module is unix-only: elsewhere there is no `flock`, and callers run
 //! unqueued — the queue is best-effort there.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read};
@@ -56,7 +57,7 @@ struct Clock {
 
 const CLOCK: Clock = Clock {
     stale: Duration::from_secs(60),
-    notice: Duration::from_secs(10 * 60),
+    notice: Duration::from_mins(10),
 };
 
 /// What a contender reports to its caller on the way in.

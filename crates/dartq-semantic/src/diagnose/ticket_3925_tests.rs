@@ -16,6 +16,7 @@
 //!   spelled through an import prefix (`p.A`) is the very interface `A`
 //!   the closure reaches.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, RigImport, report_ops, report_ops_imports};
 
 /// The prelude's UTF-16 length (the `report_ops` fixtures' offset shift).

@@ -21,6 +21,7 @@
 //! of `F`; a control left out would render its own name instead of the
 //! substituted face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 #[cfg(test)]
 mod tests {
     use crate::facts::FlowFact;

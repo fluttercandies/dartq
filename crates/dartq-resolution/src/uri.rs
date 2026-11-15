@@ -19,6 +19,7 @@
 //! `../x.dart` from `package:p/a/b.dart` selects `package:p/x.dart`, i.e.
 //! `lib/x.dart`, not `root/x.dart`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
@@ -144,9 +145,8 @@ impl SdkFileKinds {
         if let Some(kind) = self.cache.get(&path) {
             return kind.clone();
         }
-        let kind = std::fs::read(&path)
-            .map(|bytes| scan_sdk_part_of(&bytes))
-            .unwrap_or(SdkFileKind::Library);
+        let kind =
+            std::fs::read(&path).map_or(SdkFileKind::Library, |bytes| scan_sdk_part_of(&bytes));
         self.cache.insert(path, kind.clone());
         kind
     }
@@ -235,7 +235,7 @@ pub enum DirectiveKind {
 /// root config, and those stay invisible outside their own context). The
 /// oracle splits the analyzed tree into exactly these context roots
 /// (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/context/context_locator.dart `_createContextRoots`:
+/// `pkg/analyzer/lib/src/context/context_locator.dart` `_createContextRoots`:
 /// a locally different packages file splits the root), so a cross-package
 /// name visible only in a SIBLING's universe stays undefined here — the
 /// flat union would resolve it.
@@ -333,6 +333,7 @@ impl PackageTable {
     /// # Errors
     ///
     /// Same contract as [`Self::new`].
+    #[allow(clippy::items_after_statements)]
     pub fn new_with_context_roots(
         config: &PackageConfig,
         config_dir: &Path,
@@ -402,7 +403,7 @@ impl PackageTable {
         let mut contexts: Vec<(PathBuf, ContextUniverse)> = Vec::new();
         for package in &resolved {
             let root = canonical_dir(&package.root);
-            if root == workspace_root || !root.strip_prefix(&workspace_root).is_ok() {
+            if root == workspace_root || root.strip_prefix(&workspace_root).is_err() {
                 continue;
             }
             if !root.join("pubspec.yaml").is_file()
@@ -422,7 +423,7 @@ impl PackageTable {
         for extra in context_roots {
             let root = normalize(extra);
             if root == workspace_root
-                || !root.strip_prefix(&workspace_root).is_ok()
+                || root.strip_prefix(&workspace_root).is_err()
                 || !root.join("pubspec.yaml").is_file()
                 || !root.join(".dart_tool/package_config.json").is_file()
                 || contexts.iter().any(|(known, _)| *known == root)
@@ -749,6 +750,7 @@ fn canonical_uri_memo(
 /// through to a sibling universe). Outside every context the flat merged
 /// scan spells exactly as before — the common single-root shape keeps one
 /// `contexts`-is-empty check plus the flat scan, byte-identical.
+#[must_use]
 pub fn compose_canonical_uri(packages: &PackageTable, path: &Path) -> Box<str> {
     let spelled = match packages.context_for(path) {
         Some(universe) => universe.package_of(path),
@@ -1045,10 +1047,10 @@ impl<'a> UriResolver<'a> {
                 // `uri_does_not_exist`.
                 match self.sdk.flat_library_to_path(&library, &part) {
                     Some(file) => {
-                        let code = if !part.is_empty() {
-                            (!self.exists(&file)).then(|| missing_file_code(&file))
-                        } else {
+                        let code = if part.is_empty() {
                             None
+                        } else {
+                            (!self.exists(&file)).then(|| missing_file_code(&file))
                         };
                         UriResolution {
                             uri: ResolvedUri::Dart {
@@ -1237,6 +1239,11 @@ pub struct RawUri<'a> {
 ///
 /// [`InvalidUriSyntax`] where Dart throws `FormatException` — reported as
 /// `invalid_uri`.
+///
+/// # Panics
+///
+/// Panics if `has_scheme` implies a colon but none is found (an internal
+/// invariant violation, not reachable from well-formed input).
 pub fn parse_directive_uri(uri: &str) -> Result<RawUri<'_>, InvalidUriSyntax> {
     // `Uri.parse` routes any string starting with a case-insensitive `data:`
     // to `UriData._parse` before the general scanner runs (uri.dart:931-939),
@@ -1476,10 +1483,10 @@ fn is_normalized_base64(bytes: &[u8]) -> bool {
     }
 }
 
-/// The path character table (`_pathCharOrSlashMask`): pchar + `/`.
-/// `Uri.parse` never rejects a byte outside the table — it percent-escapes
-/// it — so the table decides *spelling*, not validity. Query/fragment text
-/// never reaches file resolution, so only the path table is needed.
+// The path character table (`_pathCharOrSlashMask`): pchar + `/`.
+// `Uri.parse` never rejects a byte outside the table — it percent-escapes
+// it — so the table decides *spelling*, not validity. Query/fragment text
+// never reaches file resolution, so only the path table is needed.
 
 /// Whether `b` is legal in a path under `_pathCharOrSlashMask`
 /// (pchar + `/`); the authority table adds `:`/`@`, and the query table adds
@@ -1511,7 +1518,7 @@ fn is_path_char(b: u8) -> bool {
 
 /// Whether `b` is RFC 3986 unreserved — the only class `Uri.parse` decodes
 /// a `%XX` escape to in the path (`%41`→`A`, `%2D`→`-`, but `%2F`/`%3A`
-////`%20` stay escapes).
+///`%20` stay escapes).
 fn is_unreserved(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
 }
@@ -1549,7 +1556,16 @@ fn lowered_scheme(slice: &str) -> Cow<'_, str> {
 /// (a `\` inside the query/fragment escapes to `%5C`, which this would
 /// produce too if `Uri.parse` ever saw it here). Borrows `text` verbatim
 /// when it is already normalized — the overwhelmingly common shape.
+#[allow(clippy::items_after_statements)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "to_digit(16) returns 0..=15, always fits u8"
+)]
 fn normalize_component(text: &str) -> Cow<'_, str> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "to_digit(16) returns 0..=15, always fits u8"
+    )]
     fn needs_normalization(bytes: &[u8]) -> bool {
         let mut index = 0;
         while index < bytes.len() {
@@ -1792,9 +1808,9 @@ fn scan_sdk_part_of(bytes: &[u8]) -> SdkFileKind {
             return SdkFileKind::Library;
         };
         match word.as_str() {
-            // A `library` directive classifies the file as a library outright
+            // `library` and any unrecognized word fall through to `_`:
+            // a `library` directive classifies the file as a library outright
             // (`_updateKind`'s first branch) — nothing later can change it.
-            "library" => return SdkFileKind::Library,
             "import" | "export" | "part" => {
                 if word == "part" {
                     scan.skip_trivia();
@@ -1816,7 +1832,7 @@ struct Scan<'b> {
     at: usize,
 }
 
-impl<'b> Scan<'b> {
+impl Scan<'_> {
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.at).copied()
     }
@@ -1882,9 +1898,7 @@ impl<'b> Scan<'b> {
     /// place (the caller's byte loop resumes from it).
     fn skip_string(&mut self) {
         let mut raw = false;
-        if self.peek() == Some(b'r')
-            && matches!(self.bytes.get(self.at + 1), Some(b'\'') | Some(b'"'))
-        {
+        if self.peek() == Some(b'r') && matches!(self.bytes.get(self.at + 1), Some(b'\'' | b'"')) {
             raw = true;
             self.at += 1;
         }
@@ -2000,8 +2014,8 @@ impl<'b> Scan<'b> {
     /// before one).
     fn at_string(&self) -> bool {
         match self.peek() {
-            Some(b'\'') | Some(b'"') => true,
-            Some(b'r') => matches!(self.bytes.get(self.at + 1), Some(b'\'') | Some(b'"')),
+            Some(b'\'' | b'"') => true,
+            Some(b'r') => matches!(self.bytes.get(self.at + 1), Some(b'\'' | b'"')),
             _ => false,
         }
     }

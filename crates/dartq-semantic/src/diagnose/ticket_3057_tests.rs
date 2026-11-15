@@ -7,6 +7,7 @@
 //! case-scope join's guard-vs-body split comes from `_resolveGuardedPattern`,
 //! resolution_visitor.dart:926-929).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// An existing-variable for-in target is a WRITE per iteration, never a

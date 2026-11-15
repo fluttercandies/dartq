@@ -3,7 +3,7 @@
 //!
 //! An enum constant is a static field whose induced getter is a static
 //! accessor, so `_checkEnumStatic` (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/error/member_duplicate_definition_verifier.dart
+//! `pkg/analyzer/lib/src/error/member_duplicate_definition_verifier.dart`
 //! :423-479) probes it like any other static member. It is never a
 //! *target*, though: `_getInterfaceMember` reads
 //! `InheritanceManager3.getMember`, whose interface map is built by
@@ -27,6 +27,7 @@
 //! stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::report_ops;
 

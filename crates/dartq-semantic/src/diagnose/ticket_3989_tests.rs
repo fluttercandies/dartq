@@ -18,6 +18,7 @@
 //!   `callable_result_of(callee_return_ty)`, so an un-applied send
 //!   re-derives the function face exactly as before.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

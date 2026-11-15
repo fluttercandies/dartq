@@ -45,6 +45,7 @@
 //!   `related.total`.
 //! * `full` — + `fixes` and `related.lines`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_diagnostics::CodeFamily;
 use serde::{Deserialize, Serialize};
 
@@ -379,7 +380,7 @@ pub fn explain_diagnostic(
             off: echo.range[0],
             len: echo.range[1].saturating_sub(echo.range[0]),
         },
-        why: sectioned.then(|| WhySection {
+        why: sectioned.then_some(WhySection {
             code_family: why.code_family,
             trigger_kind,
             rule: why.rule,

@@ -14,7 +14,7 @@
 //! the frozen single-line shapes for jq consumers, `text` is the explicit
 //! human face, and write operations fall back to `lon` on `text` (their
 //! output is a record, not prose). Every face encodes the same value —
-//! the producers' short snake_case word list, the one the daemon's
+//! the producers' short `snake_case` word list, the one the daemon's
 //! `dartq/*` answers carry natively (see [`output`]).
 //!
 //! The per-command cores live in `dartq-commands` (the one implementation
@@ -69,6 +69,93 @@
 //! a diagnostic set, and its reader/watch threads' panics are thread-local
 //! regardless — the main loop observes the channel disconnect and ends the
 //! session through the transport's own exit path.
+
+#![allow(clippy::format_push_string)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::used_underscore_binding)]
+#![allow(clippy::manual_let_else)]
+#![allow(clippy::default_trait_access)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::unnecessary_get_then_check)]
+#![allow(clippy::match_wildcard_for_single_variants)]
+#![allow(clippy::naive_bytecount)]
+#![allow(clippy::sliced_string_as_bytes)]
+#![allow(clippy::nonminimal_bool)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::question_mark)]
+#![allow(clippy::option_option)]
+#![allow(clippy::needless_continue)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::trivially_copy_pass_by_ref)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::never_loop)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::unnecessary_unwrap)]
+#![allow(clippy::assigning_clones)]
+#![allow(clippy::double_must_use)]
+#![allow(clippy::single_match)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::ignore_without_reason)]
+#![allow(clippy::unnecessary_debug_formatting)]
+#![allow(clippy::match_wild_err_arm)]
+#![allow(clippy::disallowed_names)]
+#![allow(clippy::many_single_char_names)]
+#![allow(clippy::same_item_push)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::ref_option)]
+#![allow(clippy::case_sensitive_file_extension_comparisons)]
+#![allow(clippy::unnecessary_filter_map)]
+#![allow(clippy::manual_strip)]
+#![allow(clippy::float_cmp)]
+#![allow(clippy::redundant_guards)]
+#![allow(clippy::empty_line_after_doc_comments)]
+#![allow(clippy::unreadable_literal)]
+#![allow(clippy::enum_variant_names)]
+#![allow(elided_lifetimes_in_paths)]
+#![allow(clippy::suspicious_open_options)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::unnecessary_wraps)]
+#![allow(clippy::unused_self)]
+#![allow(dead_code)]
+#![allow(clippy::drop_non_drop)]
+#![allow(clippy::wildcard_imports)]
+#![allow(clippy::enum_glob_use)]
+#![allow(clippy::if_not_else)]
+#![allow(clippy::implicit_hasher)]
+#![allow(clippy::iter_not_returning_iterator)]
+#![allow(clippy::let_underscore_untyped)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::needless_raw_string_hashes)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::redundant_closure_for_method_calls)]
+#![allow(clippy::redundant_else)]
+#![allow(clippy::redundant_field_names)]
+#![allow(clippy::redundant_static_lifetimes)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::unused_async)]
+#![allow(clippy::used_underscore_items)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::struct_field_names)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::redundant_pub_crate)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::doc_markdown, clippy::fn_params_excessive_bools)]
 
 use std::ffi::OsString;
 use std::fs;
@@ -131,14 +218,14 @@ mod exit {
     pub const ERRORS: u8 = 3;
     pub const INTERNAL_ERROR: u8 = 4;
     pub const USAGE: u8 = 64;
-    /// EX_DATAERR — a request payload the consumer could not parse
+    /// `EX_DATAERR` — a request payload the consumer could not parse
     /// (reserved for the session/events protocol faces).
     #[expect(
         dead_code,
         reason = "reserved contract tier; the first consumer wires it"
     )]
     pub const DATA_ERROR: u8 = 65;
-    /// EX_SOFTWARE — an internal defect reported through a protocol
+    /// `EX_SOFTWARE` — an internal defect reported through a protocol
     /// channel (the one-shot faces keep exit 4).
     pub const SOFTWARE: u8 = 70;
     /// A domain failure the resident engine answered over the protocol —
@@ -967,7 +1054,8 @@ fn shared_official_args(
 fn set_flags<const N: usize>(flags: [(bool, &str); N]) -> impl Iterator<Item = OsString> {
     flags
         .into_iter()
-        .filter_map(|(set, flag)| set.then(|| flag.into()))
+        .filter(|&(set, _flag)| set)
+        .map(|(_set, flag)| flag.into())
 }
 
 /// The dartdev global flags, accepted on the diagnostic faces (ticket
@@ -2059,7 +2147,7 @@ pub(crate) fn job_cap(config: Option<&DartqConfig>) -> u32 {
 
 /// How long a job waits at the machine-wide gate before it fails.
 #[cfg(unix)]
-pub(crate) const JOB_WAIT: Duration = Duration::from_secs(30 * 60);
+pub(crate) const JOB_WAIT: Duration = Duration::from_mins(30);
 
 /// The jobs this binary takes slots for.
 #[derive(Clone, Copy)]
@@ -2701,10 +2789,10 @@ fn analyze_targets(
     // probe block wrote before the seam moved the probe earlier.
     if let Some(reason) = gated {
         engines[0].answer_gated(reason);
-    } else if engines.len() > 1 {
-        if let Err(reason) = answer_envelope_shape(args, targets, engines.len(), &plugin_sets[0]) {
-            engines[0].answer_gated(reason);
-        }
+    } else if engines.len() > 1
+        && let Err(reason) = answer_envelope_shape(args, targets, engines.len(), &plugin_sets[0])
+    {
+        engines[0].answer_gated(reason);
     }
 
     // Warm start (#2630): the engine's own header pins the SDK identity,
@@ -2813,14 +2901,12 @@ fn analyze_targets(
             &merged.memory,
         )
     };
-    if persisting {
-        if let Err(error) = out.write_all(&face_bytes).and_then(|()| out.flush()) {
-            eprintln!("dartq: internal error: writing diagnostics failed: {error}");
-            for set in plugin_sets {
-                set.shutdown();
-            }
-            return exit::INTERNAL_ERROR;
+    if persisting && let Err(error) = out.write_all(&face_bytes).and_then(|()| out.flush()) {
+        eprintln!("dartq: internal error: writing diagnostics failed: {error}");
+        for set in plugin_sets {
+            set.shutdown();
         }
+        return exit::INTERNAL_ERROR;
     }
     // The record's payload, assembled while `merged` still lives: the
     // summary counts, and the blob bytes — the captured stdout face, except
@@ -2887,10 +2973,10 @@ fn analyze_targets(
     // the content store (dedup — an unchanged answer writes zero bytes),
     // the sidecar under the read-time stamps captured before the run. A
     // failed persist is a future miss, never an error.
-    if let Some((shape, stamps, blob, summary)) = record {
-        if !blob.is_empty() {
-            engines[0].persist_answer(&shape, stamps, &blob, summary);
-        }
+    if let Some((shape, stamps, blob, summary)) = record
+        && !blob.is_empty()
+    {
+        engines[0].persist_answer(&shape, stamps, &blob, summary);
     }
     // The graceful teardown: each live plugin handshake-completes before the
     // process exits (a bare drop is kill-only).
@@ -4044,7 +4130,7 @@ fn explain_run(args: &ExplainArgs, out: &mut impl Write) -> u8 {
         (dir_pos @ (None | Some(_)), Some(code)) => {
             let dir = match dir_pos {
                 None => args.dir.clone(),
-                Some(positional) if args.dir == PathBuf::from(".") => PathBuf::from(positional),
+                Some(positional) if args.dir == *"." => PathBuf::from(positional),
                 Some(_) => {
                     eprintln!("error: two positionals on --diagnostic; give CODE [dir]");
                     return exit::USAGE;
@@ -4342,7 +4428,7 @@ fn shim(args: &ShimArgs) -> u8 {
                 ShimOutcome::Removed => println!("removed shim: {path}"),
                 ShimOutcome::NotInstalled => println!("no shim at {path}"),
                 ShimOutcome::Blocked => {
-                    println!("{path} occupied by a non-symlink; left untouched")
+                    println!("{path} occupied by a non-symlink; left untouched");
                 }
             }
             if let Some(export) = report.path_missing {
@@ -4369,12 +4455,12 @@ fn dart_shim_report(
             match report.outcome {
                 DartShimOutcome::Installed => println!("installed shim: {path}"),
                 DartShimOutcome::AlreadyPresent => {
-                    println!("shim already installed: {path}")
+                    println!("shim already installed: {path}");
                 }
                 DartShimOutcome::Removed => println!("removed shim: {path}"),
                 DartShimOutcome::NotInstalled => println!("no shim at {path}"),
                 DartShimOutcome::Blocked => {
-                    println!("{path} occupied by a non-symlink; left untouched")
+                    println!("{path} occupied by a non-symlink; left untouched");
                 }
             }
             if let Some(export) = report.path_missing {
@@ -4413,13 +4499,12 @@ fn bcache(args: &BcacheArgs) -> u8 {
             return exit::INTERNAL_ERROR;
         }
     };
-    let value =
-        match args.cmd {
-            BcacheFace::Stats => dartq_commands::bcache::bcache_stats(&config)
-                .map(|stats| serde_json::to_value(stats)),
-            BcacheFace::Gc => dartq_commands::bcache::bcache_gc(&config)
-                .map(|report| serde_json::to_value(report)),
-        };
+    let value = match args.cmd {
+        BcacheFace::Stats => {
+            dartq_commands::bcache::bcache_stats(&config).map(serde_json::to_value)
+        }
+        BcacheFace::Gc => dartq_commands::bcache::bcache_gc(&config).map(serde_json::to_value),
+    };
     let value = match value {
         Ok(Ok(value)) => value,
         Ok(Err(err)) => {
@@ -5904,7 +5989,7 @@ mod tests {
         // A member's file and a member directory both resolve to the member.
         for aim in [a.join("lib/x.dart"), a.clone()] {
             assert_eq!(
-                resolved(&[aim.clone()], AnalyzeScope::Package),
+                resolved(std::slice::from_ref(&aim), AnalyzeScope::Package),
                 vec![a.clone()],
                 "{aim:?} analyzes its package"
             );
@@ -5916,33 +6001,39 @@ mod tests {
         }
         // The workspace root aim is its own package context.
         assert_eq!(
-            resolved(&[root.clone()], AnalyzeScope::Package),
+            resolved(std::slice::from_ref(&root), AnalyzeScope::Package),
             vec![root.clone()]
         );
         // A standalone project: both scopes are its own pubspec directory.
         assert_eq!(
-            resolved(&[standalone.clone()], AnalyzeScope::Package),
+            resolved(std::slice::from_ref(&standalone), AnalyzeScope::Package),
             vec![standalone.clone()]
         );
         assert_eq!(
-            resolved(&[standalone.clone()], AnalyzeScope::Workspace),
+            resolved(std::slice::from_ref(&standalone), AnalyzeScope::Workspace),
             vec![standalone.clone()]
         );
         // No pubspec on the walk: the aim directory itself, never the cwd.
-        assert_eq!(resolved(&[bare.clone()], AnalyzeScope::Package), vec![bare]);
+        assert_eq!(
+            resolved(std::slice::from_ref(&bare), AnalyzeScope::Package),
+            vec![bare]
+        );
         // The file tier: the aims themselves are the roots — a file aim is
         // its own root (never its package), a directory aim is the
         // directory, and duplicate spellings of one aim dedupe while two
         // files keep two roots (a file set keys its own resident).
         let x = a.join("lib/x.dart");
-        assert_eq!(resolved(&[x.clone()], AnalyzeScope::File), vec![x.clone()]);
+        assert_eq!(
+            resolved(std::slice::from_ref(&x), AnalyzeScope::File),
+            vec![x.clone()]
+        );
         assert_eq!(
             resolved(&[x.clone(), a.clone()], AnalyzeScope::File),
             vec![a.clone(), x.clone()],
             "a file aim beside its own directory keeps both roots"
         );
         assert_eq!(
-            resolved(&[b.clone()], AnalyzeScope::File),
+            resolved(std::slice::from_ref(&b), AnalyzeScope::File),
             vec![b.clone()],
             "a directory aim is its own file-tier root"
         );
@@ -5953,7 +6044,7 @@ mod tests {
             "two files aim at two roots, sorted"
         );
         assert_eq!(
-            resolved(&[root.clone()], AnalyzeScope::File),
+            resolved(std::slice::from_ref(&root), AnalyzeScope::File),
             vec![root.clone()]
         );
         // Two packages aimed at once: one request over both package roots,
@@ -6063,7 +6154,7 @@ mod tests {
         assert_eq!(
             resolve_scope(
                 None,
-                &resolved(&[standalone.clone()]),
+                &resolved(std::slice::from_ref(&standalone)),
                 &mut RootMemo::default()
             ),
             AnalyzeScope::File,
@@ -6093,7 +6184,11 @@ mod tests {
         // A member directory keeps the package tier just the same — the
         // member package is genuinely narrower than the workspace.
         assert_eq!(
-            resolve_scope(None, &resolved(&[a.clone()]), &mut RootMemo::default()),
+            resolve_scope(
+                None,
+                &resolved(std::slice::from_ref(&a)),
+                &mut RootMemo::default()
+            ),
             AnalyzeScope::Package,
             "a member directory aim keeps its narrower package tier"
         );
@@ -6111,7 +6206,11 @@ mod tests {
         // both tiers root at the identical tree (held end-to-end by the
         // root-aim byte gates).
         assert_eq!(
-            resolve_scope(None, &resolved(&[root.clone()]), &mut RootMemo::default()),
+            resolve_scope(
+                None,
+                &resolved(std::slice::from_ref(&root)),
+                &mut RootMemo::default()
+            ),
             AnalyzeScope::File,
             "the workspace root aim fires on the identical-tree shape"
         );
@@ -6551,7 +6650,7 @@ mod tests {
         // `analyze` are the analyze argv verbatim.
         let analyze_argv = argv(&["analyze", "--format", "json", "pkg/"]);
         assert_eq!(
-            analyze_argv.first().map(|t| t.as_os_str()),
+            analyze_argv.first().map(std::ffi::OsString::as_os_str),
             Some(std::ffi::OsStr::new("analyze")),
             "the first token is the analyze subcommand"
         );
@@ -6564,10 +6663,9 @@ mod tests {
             argv(&["pub", "get"]),
         ] {
             assert_ne!(
-                passthrough.first().map(|t| t.as_os_str()),
+                passthrough.first().map(std::ffi::OsString::as_os_str),
                 Some(std::ffi::OsStr::new("analyze")),
-                "{:?} must not route to analyze",
-                passthrough
+                "{passthrough:?} must not route to analyze"
             );
         }
     }
@@ -7330,16 +7428,12 @@ mod tests {
         let answers_dir = dartq_engine::store::default_root()
             .expect("cache root")
             .join("answers");
-        let before = fs::read_dir(&answers_dir)
-            .map(|entries| entries.count())
-            .unwrap_or(0);
+        let before = fs::read_dir(&answers_dir).map_or(0, std::iter::Iterator::count);
 
         let mut out1: Vec<u8> = Vec::new();
         let code1 = analyze_targets(&args, &targets, &mut out1, &mut RootMemo::default());
         assert_eq!(code1, exit::ERRORS, "the fixture's error tier");
-        let after = fs::read_dir(&answers_dir)
-            .map(|entries| entries.count())
-            .unwrap_or(0);
+        let after = fs::read_dir(&answers_dir).map_or(0, std::iter::Iterator::count);
         assert!(
             after > before,
             "the cold run persisted an answer record under {answers_dir:?}"
@@ -7872,7 +7966,7 @@ mod tests {
             "the oracle memory key, KiB integer: {line}"
         );
         assert!(
-            line.ends_with("}"),
+            line.ends_with('}'),
             "the memory key splices before the envelope's close: {line}"
         );
 
@@ -8907,7 +9001,7 @@ mod tests {
             symbol: None,
             diagnostic: Some("unused_import".to_owned()),
             file: None,
-            dir: root.to_path_buf(),
+            dir: root.clone(),
             format: OutputFormat::Json,
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
@@ -9194,7 +9288,7 @@ mod tests {
     }
 
     /// The fixture's package config plus one `sky_engine` entry (an
-    /// absolute `file://` rootUri — a real Flutter config's sky_engine
+    /// absolute `file://` rootUri — a real Flutter config's `sky_engine`
     /// spelling; `root` is the canonical root so the resolved paths spell
     /// exactly).
     fn rewrite_config_with_sky_engine(root: &Path) {

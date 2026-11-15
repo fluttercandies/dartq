@@ -12,6 +12,8 @@
 //! context — evaluation.dart:1520/1640/1762's `toBoolValue` misses are
 //! additional rows, not the decision's owner).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use crate::diagnose::test_rig::{code_names, report_ops, report_ops_bare, rows};
 
 /// The `non_bool_operand` code exists and reports both operand faces of
@@ -36,7 +38,7 @@ fn ticket_2935_non_bool_operand_unimplemented_codes() {
 }
 
 /// `||` reports its own lexeme, and a parenthesized operand anchors at
-/// the whole ParenthesizedExpression (the oracle's `.at(operand)` — the
+/// the whole `ParenthesizedExpression` (the oracle's `.at(operand)` — the
 /// `(`/`)` pair included: `(0)` anchors length 3, not the bare `0`'s 1).
 #[test]
 fn ticket_2935_non_bool_operand_lexeme_and_paren_anchor() {
@@ -231,7 +233,7 @@ fn ticket_2935_condition_bool_operands_stay_silent() {
 /// `dynamic` stays silent under the default mode and reports
 /// `non_bool_condition` under strict-casts — upstream
 /// `isAssignableTo(dynamic, bool, strictCasts: true)` is `false`
-/// (NonBoolExpressionWithStrictCasts tests).
+/// (`NonBoolExpressionWithStrictCasts` tests).
 #[test]
 fn ticket_2935_condition_dynamic_respects_strict_casts() {
     let report = report_ops("void main(dynamic x) {\n  if (x) {}\n}");
@@ -247,7 +249,7 @@ fn ticket_2935_condition_dynamic_respects_strict_casts() {
 /// source type `Object` (the promoted non-null face); dartq spells
 /// `Object?`. The probe runs the exact repro and shows the divergence
 /// sits in the type the read carries out of `apply_write`/`promotions`
-/// — dartq-flow's initializer promotion — not in engine_core's verdict
+/// — dartq-flow's initializer promotion — not in `engine_core`'s verdict
 /// or `ty_display`. Per the brief's probe-first rule: recorded and
 /// skipped (layer: dartq-flow), no in-scope fix. `#[ignore]`d because
 /// it encodes oracle output dartq does not yet produce.

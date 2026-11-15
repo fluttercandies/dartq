@@ -44,6 +44,7 @@
 //!   membership queries only, so the init-batch permutation is
 //!   unobservable.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::model::{MemberEntry, MemberKind, Ty};
 use crate::switch_tracker::CORE_SUPERTYPES;
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
@@ -340,9 +341,9 @@ pub(crate) fn core_ctor_formals(
         .map(|(_, _, positional, named)| (*positional, *named))
 }
 
-/// The [`CORE_MEMBER_RETURNS`] lookup — a linear scan over the small
-/// table on the send-return miss path (a resolved member never consults
-/// it).
+// The [`CORE_MEMBER_RETURNS`] lookup — a linear scan over the small
+// table on the send-return miss path (a resolved member never consults
+// it).
 
 /// The distinct head spellings of [`CORE_MEMBER_RETURNS`], interned once
 /// per engine ([`MemberFace::new`]).

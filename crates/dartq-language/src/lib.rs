@@ -105,6 +105,7 @@
 //! golden-fingerprint and horizon pins in `tests/language.rs` fail loudly so
 //! the drift is decided, not swallowed.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/feature_registry.rs"));
 }

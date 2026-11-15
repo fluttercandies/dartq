@@ -21,11 +21,11 @@ struct DeferredDefault {
     named: bool,
 }
 
-/// The current unit's deferred optional-parameter rows: staged at the
-/// executable's body event, drained by [`Engine::finalize_default_checks`]
-/// at the fold tail. Thread-local rather than an engine field so the fold
-/// state stays untouched — a sequential fold drains it before the next
-/// unit parses.
+// The current unit's deferred optional-parameter rows: staged at the
+// executable's body event, drained by `Engine::finalize_default_checks`
+// at the fold tail. Thread-local rather than an engine field so the fold
+// state stays untouched — a sequential fold drains it before the next
+// unit parses.
 thread_local! {
     static DEFERRED_DEFAULTS: std::cell::RefCell<Vec<DeferredDefault>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -277,7 +277,7 @@ enum HitEntry<'a> {
     Frozen(MemberEntry),
 }
 
-impl<'a> HitEntry<'a> {
+impl HitEntry<'_> {
     fn get(&self) -> &MemberEntry {
         match self {
             HitEntry::Projected(entry) => entry,
@@ -286,7 +286,7 @@ impl<'a> HitEntry<'a> {
     }
 }
 
-impl<'a> FaceHit<'a> {
+impl FaceHit<'_> {
     fn entry(&self) -> &MemberEntry {
         self.entry.get()
     }
@@ -396,7 +396,7 @@ fn push_concrete_faces(
     if let Some(superclass) = decl.superclass {
         pending.push((superclass, writer, writer_file, lib));
     }
-    for mixin in decl.with_clause.iter() {
+    for mixin in &decl.with_clause {
         pending.push((*mixin, writer, writer_file, lib));
     }
 }
@@ -413,12 +413,12 @@ fn push_concrete_faces(
 /// for the enum-constant superset face: this one answers the member ENTRY
 /// (its metadata is the question) and kind-matches the getter/setter lookup
 /// forms the `@nonVirtual` face asks in.
-fn concrete_member_of<'c>(
-    decl: &'c Container,
+fn concrete_member_of(
+    decl: &Container,
     plain: StringId,
     setter: StringId,
     setter_face: bool,
-) -> Option<&'c MemberEntry> {
+) -> Option<&MemberEntry> {
     let joinable = |entry: &MemberEntry| !entry.is_static && !entry.is_abstract;
     if setter_face {
         if let Some(entry) = decl.members.get(&setter)
@@ -1395,7 +1395,7 @@ impl<'a> Engine<'a> {
                     // An `on`-less mixin constrains `Object` (the analyzer's
                     // `superclassConstraints` default).
                     ContainerKind::Mixin if decl.on_clause.is_empty() => {
-                        faces.push(self.intern("Object"))
+                        faces.push(self.intern("Object"));
                     }
                     _ => {}
                 }
@@ -1624,10 +1624,10 @@ impl<'a> Engine<'a> {
                 // face, an `Object` member) identity by their underlying
                 // entry where one exists and stay per-face where the oracle
                 // reports per superinterface.
-                if let Some(ptr) = hit.identity() {
-                    if broken_seen.contains(&ptr) {
-                        continue;
-                    }
+                if let Some(ptr) = hit.identity()
+                    && broken_seen.contains(&ptr)
+                {
+                    continue;
                 }
                 // The inherited member's effective signature first
                 // (`instance_member_inferrer.dart` on the DECLARING
@@ -1979,20 +1979,20 @@ impl<'a> Engine<'a> {
                 Option<MemberEntry>,
                 Projected<'a, MemberEntry>,
             )> = Vec::new();
-            for (spelling, member) in mixin_container.members.iter() {
+            for (spelling, member) in &mixin_container.members {
                 if member.is_static {
                     continue;
                 }
                 let projected = self.boundary.member(mixin_owner, mixin, *spelling, member);
                 match member.kind {
                     MemberKind::Method => {
-                        declared.push((*spelling, MemberKind::Method, None, projected))
+                        declared.push((*spelling, MemberKind::Method, None, projected));
                     }
                     MemberKind::Getter => {
-                        declared.push((*spelling, MemberKind::Getter, None, projected))
+                        declared.push((*spelling, MemberKind::Getter, None, projected));
                     }
                     MemberKind::Setter => {
-                        declared.push((*spelling, MemberKind::Setter, None, projected))
+                        declared.push((*spelling, MemberKind::Setter, None, projected));
                     }
                     MemberKind::Field => {
                         declared.push((*spelling, MemberKind::Getter, None, projected.clone()));
@@ -2090,13 +2090,12 @@ impl<'a> Engine<'a> {
                     if !kind_matches {
                         continue;
                     }
-                    if let Some(ptr) = hit.identity() {
-                        if broken_seen
+                    if let Some(ptr) = hit.identity()
+                        && broken_seen
                             .iter()
                             .any(|(tag, p)| *tag == setter_face && *p == ptr)
-                        {
-                            continue;
-                        }
+                    {
+                        continue;
                     }
                     let substituted;
                     let inherited_ref: &MemberEntry = match self.instantiate_inherited(
@@ -2439,7 +2438,7 @@ impl<'a> Engine<'a> {
                 ContainerKind::Class => faces.push(self.intern("Object")),
                 ContainerKind::Enum => faces.push(self.intern("Enum")),
                 ContainerKind::Mixin if decl.on_clause.is_empty() => {
-                    faces.push(self.intern("Object"))
+                    faces.push(self.intern("Object"));
                 }
                 _ => {}
             },
@@ -2499,26 +2498,25 @@ impl<'a> Engine<'a> {
             if !seen.insert(name) {
                 return false;
             }
-            let (found, found_owner) =
-                match self.resolve_clause_face(hop_writer, owner, scope_lib, name) {
-                    Some(pair) => pair,
-                    None => {
-                        // The unindexed hop — a dart:core/`dart:collection` face —
-                        // answers by its frozen member face.
-                        if frozen_hit(self.strings.resolve(name)) {
-                            return true;
-                        }
-                        let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
-                        else {
-                            return false;
-                        };
-                        name = next;
-                        owner = next_owner;
-                        scope_lib = next_lib;
-                        hop_writer = next_writer;
-                        continue;
-                    }
+            let (found, found_owner) = if let Some(pair) =
+                self.resolve_clause_face(hop_writer, owner, scope_lib, name)
+            {
+                pair
+            } else {
+                // The unindexed hop — a dart:core/`dart:collection` face —
+                // answers by its frozen member face.
+                if frozen_hit(self.strings.resolve(name)) {
+                    return true;
+                }
+                let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front() else {
+                    return false;
                 };
+                name = next;
+                owner = next_owner;
+                scope_lib = next_lib;
+                hop_writer = next_writer;
+                continue;
+            };
             if let Some(entry) = found.members.get(&spelling)
                 && !entry.is_static
                 && self.member_visible_to(found_owner, name, spelling, scope_lib)
@@ -2570,7 +2568,7 @@ impl<'a> Engine<'a> {
                         let mixin_owner_lib = self
                             .owner_library_of(mixin_owner, *mixin)
                             .unwrap_or(owner_lib);
-                        for mixin_face in mixin_container.with_clause.iter() {
+                        for mixin_face in &mixin_container.with_clause {
                             pending.push_back((*mixin_face, mixin_owner, mixin_owner_lib, *mixin));
                         }
                     }
@@ -2583,23 +2581,19 @@ impl<'a> Engine<'a> {
             for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
                 pending.push_back((*super_face, found_owner, owner_lib, name));
             }
-            match found.superclass {
-                Some(superclass) => {
-                    scope_lib = owner_lib;
-                    hop_writer = name;
-                    name = superclass;
-                    owner = found_owner;
-                }
-                None => {
-                    let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
-                    else {
-                        return false;
-                    };
-                    name = next;
-                    owner = next_owner;
-                    scope_lib = next_lib;
-                    hop_writer = next_writer;
-                }
+            if let Some(superclass) = found.superclass {
+                scope_lib = owner_lib;
+                hop_writer = name;
+                name = superclass;
+                owner = found_owner;
+            } else {
+                let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front() else {
+                    return false;
+                };
+                name = next;
+                owner = next_owner;
+                scope_lib = next_lib;
+                hop_writer = next_writer;
             }
         }
     }
@@ -2924,8 +2918,8 @@ impl<'a> Engine<'a> {
     /// immediately (`defaultValuesAreExpected` answers true unconditionally
     /// there, :8368-8370). An `augment` fragment's formal stages like any
     /// other: every fragment's formal list is checked against the merged
-    /// element (upstream MissingDefaultValueForParameterTest.
-    /// test_function_nonNullable_positional_optional_noDefault_augmentation:
+    /// element (upstream `MissingDefaultValueForParameterTest`.
+    /// `test_function_nonNullable_positional_optional_noDefault_augmentation`:
     /// `void f([int a]);` + `augment void f([int a]) {}` reports at both
     /// `a`s); the renamed-slot and merged-type exceptions live in
     /// [`Self::chain_supplies_default`]. Without the augmentation merge
@@ -3023,7 +3017,7 @@ impl<'a> Engine<'a> {
     /// The fold-tail verdict for the staged optional-parameter rows
     /// (upstream `parameterElement.hasDefaultValue` is the merged element's
     /// flag — one fragment's written default settles every fragment of the
-    /// chain, error_verifier.dart `_checkUseOfDefaultValuesInParameters`).
+    /// chain, `error_verifier.dart` `_checkUseOfDefaultValuesInParameters`).
     /// Runs once per unit inside [`Self::verify_enum_member_set`], after all
     /// `augment` declarations are captured.
     pub(crate) fn finalize_default_checks(&mut self) {
@@ -3102,7 +3096,7 @@ impl<'a> Engine<'a> {
             }
         }
         if owner.is_none() {
-            for site in self.decl_sites.iter() {
+            for site in &self.decl_sites {
                 if site.range.offset >= item.range.offset {
                     continue;
                 }
@@ -3145,7 +3139,7 @@ impl<'a> Engine<'a> {
                         .ctor_formals
                         .get(&name)
                         .or_else(|| found.factory_formals.get(&name))
-                        .map(|formals| formals.as_ref())
+                        .map(std::convert::AsRef::as_ref)
                 }),
                 (Some(owner_name), false) => elements
                     .container(owner_name)
@@ -3380,8 +3374,7 @@ impl<'a> Engine<'a> {
                         .checked_sub(1)
                         .map(|i| self.tokens.lexeme(self.source, i));
                     match before {
-                        Some("(") | Some(",") | Some("=") | Some(":") | Some("{")
-                        | Some("const") => {
+                        Some("(" | "," | "=" | ":" | "{" | "const") => {
                             index = brace - 1;
                             continue;
                         }
@@ -3805,7 +3798,7 @@ impl<'a> Engine<'a> {
     /// `with` clause upgrades the tag to `AliasSuper` — the oracle's clause
     /// switch codes a class-declaration extends miss `mixin_with_non_class_
     /// superclass` when `declaration.withClause != null` (upstream Dart SDK
-    /// source, pkg/analyzer/lib/src/dart/resolver/scope_analyzer.dart:
+    /// source, `pkg/analyzer/lib/src/dart/resolver/scope_analyzer.dart`:
     /// 1216-1221). The tag must therefore stay provisional until the header
     /// knows whether a with clause exists.
     pub(crate) fn header_extends_commit(&mut self) {
@@ -4072,7 +4065,7 @@ impl<'a> Engine<'a> {
         self.report.diagnostics.iter().any(|d| {
             d.code.name == "conflicting_static_and_instance"
                 && d.range == range
-                && d.message.to_string() == message
+                && d.message == message
         })
     }
 
@@ -4114,7 +4107,7 @@ impl<'a> Engine<'a> {
     /// 1. The OWN-scope arm — a static member whose bare name collides
     ///    with an instance member of the same container reports at the
     ///    static member's own name (`_checkClassStatic`/`_checkEnumStatic`/
-    ///    `_checkExtensionStatic`, member_duplicate_definition_verifier.dart
+    ///    `_checkExtensionStatic`, `member_duplicate_definition_verifier.dart`
     ///    :179-234/:423-522). Extensions report the dedicated one-argument
     ///    `extension_conflicting_static_and_instance`; `values` is exempt
     ///    on ACCESSORS only (a `values` METHOD still collides).
@@ -4245,7 +4238,7 @@ impl<'a> Engine<'a> {
                     .and_then(|elements| elements.container(container))
             };
             let Some(decl) = decl else { continue };
-            for (name, entry) in decl.members.iter() {
+            for (name, entry) in &decl.members {
                 if entry.is_static {
                     continue;
                 }
@@ -4357,15 +4350,13 @@ impl<'a> Engine<'a> {
             if is_extension {
                 // The extension arm reports the one-argument dedicated
                 // code — own-face only (extensions never inherit).
-                if base != values || !accessor {
-                    if instance_names.contains(&base) {
-                        self.emit(
-                            SemanticCode::ExtensionConflictingStaticAndInstance,
-                            range,
-                            &base_text,
-                            "",
-                        );
-                    }
+                if (base != values || !accessor) && instance_names.contains(&base) {
+                    self.emit(
+                        SemanticCode::ExtensionConflictingStaticAndInstance,
+                        range,
+                        &base_text,
+                        "",
+                    );
                 }
                 continue;
             }
@@ -4433,9 +4424,10 @@ impl<'a> Engine<'a> {
                 && !entry.is_static
                 && !object_owned
             {
-                let owner = origin
-                    .map(|name| self.strings.resolve(name).to_string())
-                    .unwrap_or_else(|| container_text.clone());
+                let owner = origin.map_or_else(
+                    || container_text.clone(),
+                    |name| self.strings.resolve(name).to_string(),
+                );
                 self.emit_static_instance3(range, &container_text, &base_text, &owner);
                 continue;
             }
@@ -4456,9 +4448,10 @@ impl<'a> Engine<'a> {
             {
                 let origin = self.member_faces.last_origin();
                 if !(is_extension_type && origin == Some(object_name)) {
-                    let owner = origin
-                        .map(|name| self.strings.resolve(name).to_string())
-                        .unwrap_or_else(|| container_text.clone());
+                    let owner = origin.map_or_else(
+                        || container_text.clone(),
+                        |name| self.strings.resolve(name).to_string(),
+                    );
                     self.emit_static_instance3(range, &container_text, &base_text, &owner);
                 }
             }
@@ -4622,7 +4615,7 @@ impl<'a> Engine<'a> {
     /// The library facts the platform-exemption gate reads
     /// (`_mayIgnoreClassModifiers`, error_verifier.dart:8468-8482):
     /// platform (`dart:`) membership, the `dart:ffi` identity
-    /// (`_isDartFfiLibrary`, error_verifier.dart:8876 — the library name
+    /// (`_isDartFfiLibrary`, `error_verifier.dart:8876` — the library name
     /// `dart.ffi`, spelled `dart:ffi` as the synthetic face node's URI), and
     /// the library's `class-modifiers` feature state — the defining file's
     /// settled language version (the `@dart` override applied) resolved
@@ -5432,7 +5425,7 @@ impl<'a> Engine<'a> {
                     let mixin_owner_lib = self
                         .owner_library_of(mixin_owner, *mixin)
                         .unwrap_or(owner_lib);
-                    for mixin_face in mixin_container.with_clause.iter() {
+                    for mixin_face in &mixin_container.with_clause {
                         applied.push_back((*mixin_face, mixin_owner, mixin_owner_lib, true));
                     }
                     for mixin_face in mixin_container
@@ -5482,7 +5475,7 @@ impl<'a> Engine<'a> {
                     // `B = Object with M`): each hop's `with` faces join
                     // concrete, its `on`/`implements` join the interface.
                     let next_lib = self.owner_library_of(face_owner, face).unwrap_or(face_lib);
-                    for next in face_container.with_clause.iter() {
+                    for next in &face_container.with_clause {
                         applied.push_back((*next, face_owner, next_lib, true));
                     }
                     for next in face_container
@@ -6211,7 +6204,7 @@ impl<'a> Engine<'a> {
         // map), then the `with` mixin faces in application order.
         let mut running: Option<&FaceEntry<'a>> =
             decl.superclass.and_then(|s| seated.get(&s).copied());
-        for mixin in decl.with_clause.iter() {
+        for mixin in &decl.with_clause {
             let Some(&mixin_hit) = seated.get(mixin) else {
                 continue;
             };
@@ -6299,7 +6292,7 @@ impl<'a> Engine<'a> {
         let entry = decl
             .members
             .get(&name)
-            .filter(|e| declared(*e))
+            .filter(|e| declared(e))
             .or_else(|| {
                 if !setter_face {
                     return None;
@@ -6309,7 +6302,7 @@ impl<'a> Engine<'a> {
                     .intern(self.strings.resolve(name).strip_suffix('=')?);
                 decl.members
                     .get(&bare)
-                    .filter(|e| declared(*e) && e.kind == MemberKind::Field && !e.is_final)
+                    .filter(|e| declared(e) && e.kind == MemberKind::Field && !e.is_final)
             })?;
         Some(FaceEntry {
             name,
@@ -6353,19 +6346,15 @@ impl<'a> Engine<'a> {
                         || e.kind == MemberKind::Field
                 }
         };
-        let entry = decl
-            .members
-            .get(&name)
-            .filter(|e| matches(*e))
-            .or_else(|| {
-                if !setter_face {
-                    return None;
-                }
-                let bare = self
-                    .strings
-                    .intern(self.strings.resolve(name).strip_suffix('=')?);
-                decl.members.get(&bare).filter(|e| matches(*e))
-            })?;
+        let entry = decl.members.get(&name).filter(|e| matches(e)).or_else(|| {
+            if !setter_face {
+                return None;
+            }
+            let bare = self
+                .strings
+                .intern(self.strings.resolve(name).strip_suffix('=')?);
+            decl.members.get(&bare).filter(|e| matches(e))
+        })?;
         Some(FaceEntry {
             name,
             entry: self.boundary.member(self.file, container, name, entry),
@@ -6641,21 +6630,20 @@ impl<'a> Engine<'a> {
             if !seen.insert(name) {
                 return None;
             }
-            let (found, found_owner) =
-                match self.resolve_clause_face(hop_writer, owner, scope_lib, name) {
-                    Some(pair) => pair,
-                    None => {
-                        let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
-                        else {
-                            return None;
-                        };
-                        name = next;
-                        owner = next_owner;
-                        scope_lib = next_lib;
-                        hop_writer = next_writer;
-                        continue;
-                    }
+            let (found, found_owner) = if let Some(pair) =
+                self.resolve_clause_face(hop_writer, owner, scope_lib, name)
+            {
+                pair
+            } else {
+                let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front() else {
+                    return None;
                 };
+                name = next;
+                owner = next_owner;
+                scope_lib = next_lib;
+                hop_writer = next_writer;
+                continue;
+            };
             chain.push((name, found_owner));
             if let Some(entry) = found.members.get(&spelling)
                 && !entry.is_static
@@ -6706,7 +6694,7 @@ impl<'a> Engine<'a> {
                     let mixin_owner_lib = self
                         .owner_library_of(mixin_owner, *mixin)
                         .unwrap_or(mixin_lib);
-                    for mixin_face in mixin_container.with_clause.iter() {
+                    for mixin_face in &mixin_container.with_clause {
                         pending.push_back((*mixin_face, mixin_owner, mixin_owner_lib, *mixin));
                     }
                 }
@@ -6718,23 +6706,19 @@ impl<'a> Engine<'a> {
             for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
                 pending.push_back((*super_face, found_owner, owner_lib, name));
             }
-            match found.superclass {
-                Some(superclass) => {
-                    scope_lib = owner_lib;
-                    hop_writer = name;
-                    name = superclass;
-                    owner = found_owner;
-                }
-                None => {
-                    let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
-                    else {
-                        return None;
-                    };
-                    name = next;
-                    owner = next_owner;
-                    scope_lib = next_lib;
-                    hop_writer = next_writer;
-                }
+            if let Some(superclass) = found.superclass {
+                scope_lib = owner_lib;
+                hop_writer = name;
+                name = superclass;
+                owner = found_owner;
+            } else {
+                let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front() else {
+                    return None;
+                };
+                name = next;
+                owner = next_owner;
+                scope_lib = next_lib;
+                hop_writer = next_writer;
             }
         }
     }
@@ -6758,7 +6742,7 @@ impl<'a> Engine<'a> {
     /// spells the merged signature — or on a synthesized one carrying it
     /// when none does. When no candidate survives, the candidates conflict
     /// and the interface map carries no name — `getMember3` answers null and
-    /// the face reports nothing (test_33's `I: int`/`J: num` setter pair:
+    /// the face reports nothing (`test_33`'s `I: int`/`J: num` setter pair:
     /// the `num` setter is the subtype, so the diagnostic anchors at `J`,
     /// not at the first-declared `I`).
     ///
@@ -6874,21 +6858,20 @@ impl<'a> Engine<'a> {
                 break;
             }
             let (found, found_owner) =
-                match self.resolve_clause_face(hop_writer, owner, scope_lib, name) {
-                    Some(pair) => pair,
-                    None => {
-                        let Some((next, next_owner, next_lib, next_writer, next_chain)) =
-                            pending.pop_front()
-                        else {
-                            break;
-                        };
-                        name = next;
-                        owner = next_owner;
-                        scope_lib = next_lib;
-                        hop_writer = next_writer;
-                        chain = next_chain;
-                        continue;
-                    }
+                if let Some(pair) = self.resolve_clause_face(hop_writer, owner, scope_lib, name) {
+                    pair
+                } else {
+                    let Some((next, next_owner, next_lib, next_writer, next_chain)) =
+                        pending.pop_front()
+                    else {
+                        break;
+                    };
+                    name = next;
+                    owner = next_owner;
+                    scope_lib = next_lib;
+                    hop_writer = next_writer;
+                    chain = next_chain;
+                    continue;
                 };
             // The merge container itself is not a chain hop: the first
             // entry's incoming edge lives in `merge_container`'s own header
@@ -7007,25 +6990,22 @@ impl<'a> Engine<'a> {
             for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
                 pending.push_back((*super_face, found_owner, owner_lib, name, chain.clone()));
             }
-            match found.superclass {
-                Some(superclass) => {
-                    scope_lib = owner_lib;
-                    hop_writer = name;
-                    name = superclass;
-                    owner = found_owner;
-                }
-                None => {
-                    let Some((next, next_owner, next_lib, next_writer, next_chain)) =
-                        pending.pop_front()
-                    else {
-                        break;
-                    };
-                    name = next;
-                    owner = next_owner;
-                    scope_lib = next_lib;
-                    hop_writer = next_writer;
-                    chain = next_chain;
-                }
+            if let Some(superclass) = found.superclass {
+                scope_lib = owner_lib;
+                hop_writer = name;
+                name = superclass;
+                owner = found_owner;
+            } else {
+                let Some((next, next_owner, next_lib, next_writer, next_chain)) =
+                    pending.pop_front()
+                else {
+                    break;
+                };
+                name = next;
+                owner = next_owner;
+                scope_lib = next_lib;
+                hop_writer = next_writer;
+                chain = next_chain;
             }
         }
         self.merge_face_candidates(collected, merge_container, face, facts)
@@ -7445,7 +7425,7 @@ impl<'a> Engine<'a> {
                 }
                 // Named formals pair by name, not by written order (the
                 // function type's named set is a name set).
-                for slot in formals.named.iter_mut() {
+                for slot in &mut formals.named {
                     let counterpart = b.named_formal(slot.name)?;
                     if slot.required != counterpart.required {
                         return None;
@@ -7570,7 +7550,7 @@ impl<'a> Engine<'a> {
                     positional.push(self.top_merge_ty(p, q)?);
                 }
                 let mut named = Vec::with_capacity(x.named.len());
-                for &(name, p) in x.named.iter() {
+                for &(name, p) in &x.named {
                     let Some(&(_, q)) = y.named.iter().find(|&&(yn, _)| yn == name) else {
                         return None;
                     };
@@ -7672,40 +7652,41 @@ impl<'a> Engine<'a> {
                 // `Object` to itself, `Never` to `Future<Never>`, `Null`
                 // to `Future<Null>?`, else `FutureOr<NORM(T)>`
                 // (normalize.dart `_futureOr`).
-                if name == self.intern("FutureOr") && args != ArgListId::EMPTY {
-                    if let Some(argument) = self.boundary.pool().get(args).first().copied() {
-                        let s = self.norm_ty(argument);
-                        let object = Ty::Named {
-                            name: self.intern("Object"),
-                            nullable: false,
-                            args: ArgListId::EMPTY,
-                        };
-                        if self.is_top_ty(s) || s == object {
-                            return s;
-                        }
-                        if s == Ty::Never {
-                            return Ty::Named {
-                                name: self.intern("Future"),
-                                nullable: false,
-                                args: self.boundary.intern_list(&[Ty::Never]),
-                            };
-                        }
-                        if s == Ty::Null {
-                            return Ty::Named {
-                                name: self.intern("Future"),
-                                nullable: true,
-                                args: self.boundary.intern_list(&[Ty::Null]),
-                            };
-                        }
-                        if s != argument {
-                            return Ty::Named {
-                                name,
-                                nullable: false,
-                                args: self.boundary.intern_list(&[s]),
-                            };
-                        }
-                        return ty;
+                if name == self.intern("FutureOr")
+                    && args != ArgListId::EMPTY
+                    && let Some(argument) = self.boundary.pool().get(args).first().copied()
+                {
+                    let s = self.norm_ty(argument);
+                    let object = Ty::Named {
+                        name: self.intern("Object"),
+                        nullable: false,
+                        args: ArgListId::EMPTY,
+                    };
+                    if self.is_top_ty(s) || s == object {
+                        return s;
                     }
+                    if s == Ty::Never {
+                        return Ty::Named {
+                            name: self.intern("Future"),
+                            nullable: false,
+                            args: self.boundary.intern_list(&[Ty::Never]),
+                        };
+                    }
+                    if s == Ty::Null {
+                        return Ty::Named {
+                            name: self.intern("Future"),
+                            nullable: true,
+                            args: self.boundary.intern_list(&[Ty::Null]),
+                        };
+                    }
+                    if s != argument {
+                        return Ty::Named {
+                            name,
+                            nullable: false,
+                            args: self.boundary.intern_list(&[s]),
+                        };
+                    }
+                    return ty;
                 }
                 // NORM(C<T0..Tn>) = C<NORM(Ti)>.
                 if args != ArgListId::EMPTY {
@@ -8045,7 +8026,7 @@ impl<'a> Engine<'a> {
                 let combined = self.combined_inherited(container, candidates, facts);
                 let mut effective = entry.clone();
                 if effective.return_ty == Ty::UNKNOWN {
-                    effective.return_ty = combined.as_ref().map(|c| c.return_ty).unwrap_or(dynamic);
+                    effective.return_ty = combined.as_ref().map_or(dynamic, |c| c.return_ty);
                 }
                 if let Some(formals) = effective.formals.as_deref_mut() {
                     let slots = combined.as_ref().and_then(|c| c.formals.as_deref());
@@ -8055,17 +8036,15 @@ impl<'a> Engine<'a> {
                         }
                         param.ty = slots
                             .and_then(|f| f.positional.get(index))
-                            .map(|p| p.ty)
-                            .unwrap_or(dynamic);
+                            .map_or(dynamic, |p| p.ty);
                     }
-                    for param in formals.named.iter_mut() {
+                    for param in &mut formals.named {
                         if param.ty != Ty::UNKNOWN {
                             continue;
                         }
                         param.ty = slots
                             .and_then(|f| f.named.iter().find(|p| p.name == param.name))
-                            .map(|p| p.ty)
-                            .unwrap_or(dynamic);
+                            .map_or(dynamic, |p| p.ty);
                     }
                 }
                 (effective, false)
@@ -8246,13 +8225,13 @@ impl<'a> Engine<'a> {
                     .and_then(|entry| self.face_args(&entry.args))
             } else {
                 let (prev, prev_file) = chain[index - 1];
-                if prev_file != self.file {
-                    None
-                } else {
+                if prev_file == self.file {
                     clause(self, facts)
                         .for_name(prev)
                         .and_then(|c| c.supers.iter().find(|entry| entry.head == hop))
                         .and_then(|entry| self.face_args(&entry.args))
+                } else {
+                    None
                 }
             };
             let Some(args) = incoming else {
@@ -8375,23 +8354,24 @@ impl<'a> Engine<'a> {
                 if !seen.insert(edge) {
                     continue;
                 }
-                match resolve_container(self.graph, self.namespaces, self.index, lib, file, edge) {
-                    Some((_, edge_owner)) => queue.push_back((edge_owner, edge)),
-                    None => {
-                        // A type parameter's supertypes ride its invisible
-                        // bound — the walk cannot close over one.
-                        if self
-                            .index
-                            .get(file)
-                            .and_then(|f| f.decl(edge))
-                            .is_some_and(|d| d.kind == crate::model::MicroKind::TypeParam)
-                        {
-                            return None;
-                        }
-                        // The oracle's dead hop: the face collapses to
-                        // `Object`, contributing nothing.
-                        dead = true;
+                if let Some((_, edge_owner)) =
+                    resolve_container(self.graph, self.namespaces, self.index, lib, file, edge)
+                {
+                    queue.push_back((edge_owner, edge))
+                } else {
+                    // A type parameter's supertypes ride its invisible
+                    // bound — the walk cannot close over one.
+                    if self
+                        .index
+                        .get(file)
+                        .and_then(|f| f.decl(edge))
+                        .is_some_and(|d| d.kind == crate::model::MicroKind::TypeParam)
+                    {
+                        return None;
                     }
+                    // The oracle's dead hop: the face collapses to
+                    // `Object`, contributing nothing.
+                    dead = true;
                 }
             }
             for (base, parent) in crate::switch_tracker::CORE_SUPERTYPES {
@@ -8445,7 +8425,7 @@ impl<'a> Engine<'a> {
         // (`S extends List<T>` under `C<int>`), and the override face's
         // name unification renames the member's own parameters inside the
         // bound (`f<A, B extends A>` → `f<T, S extends T>`).
-        for bound in copy.type_param_bounds.iter_mut() {
+        for bound in &mut copy.type_param_bounds {
             *bound = self.substitute_ty(*bound, keys);
         }
         if let Some(formals) = &mut copy.formals {
@@ -8866,8 +8846,7 @@ impl<'a> Engine<'a> {
             let additive = !keyword_head
                 && matches!(
                     (kind, entry.tag),
-                    (ContainerKind::Mixin, SuperTag::On)
-                        | (ContainerKind::Mixin, SuperTag::Extends)
+                    (ContainerKind::Mixin, SuperTag::On | SuperTag::Extends)
                 );
             if additive {
                 self.remove_clause_miss(span.offset);
@@ -9199,7 +9178,7 @@ impl<'a> Engine<'a> {
     /// The dead-edge probe for a clause face ([`supertype_hop_dead`]'s
     /// prefixed arm): a dotted spelling the prefix table cannot answer
     /// (unregistered prefix, absent local) is the oracle's
-    /// `undefined_class`-on-the-continuation — the InvalidType dead edge —
+    /// `undefined_class`-on-the-continuation — the `InvalidType` dead edge —
     /// regardless of the bare name's fate; a resolved-but-unindexed target
     /// is the broken chain, not dead. A bare spelling keeps
     /// [`Engine::supertype_hop_dead`].
@@ -9258,7 +9237,7 @@ impl<'a> Engine<'a> {
                     Some(",") if depth == 1 => after_extends = false,
                     Some("extends") if depth == 1 => after_extends = true,
                     _ if depth == 1 && !after_extends => {
-                        if matches!(lex_at(i + 1), Some(",") | Some(">") | Some("extends"))
+                        if matches!(lex_at(i + 1), Some("," | ">" | "extends"))
                             && let Some(id) = self.intern_checked(i)
                         {
                             params.push(id);
@@ -9291,12 +9270,11 @@ impl<'a> Engine<'a> {
                     };
                     end += 1;
                     loop {
-                        match self.scan_clause_type(end, tag, &mut supers) {
-                            Some(next) => end = next,
-                            None => {
-                                faithful = false;
-                                break;
-                            }
+                        if let Some(next) = self.scan_clause_type(end, tag, &mut supers) {
+                            end = next
+                        } else {
+                            faithful = false;
+                            break;
                         }
                         match lex_at(end) {
                             Some(",") => end += 1,
@@ -9675,7 +9653,7 @@ impl<'a> Engine<'a> {
     /// forward references, type parameters, cross-file chains) suppresses,
     /// the under-report direction.
     ///
-    /// The InvalidType arm (`subtype.dart:274-276` — `T0 is InvalidType ||
+    /// The `InvalidType` arm (`subtype.dart:274-276` — `T0 is InvalidType ||
     /// T1 is InvalidType` answers the subtype question `true`, so the
     /// override is satisfied and stays silent): a `Ty::Named` whose head
     /// resolves to no type in the *member's defining scope* is the oracle's
@@ -9963,7 +9941,7 @@ impl<'a> Engine<'a> {
     /// no comparable type, so no break may be reported from it — answers
     /// `None`, the caller's under-report direction.
     ///
-    /// The InvalidType arm (`subtype.dart:274-276` — `T0 is InvalidType ||
+    /// The `InvalidType` arm (`subtype.dart:274-276` — `T0 is InvalidType ||
     /// T1 is InvalidType` answers the subtype question `true`, so the
     /// override is satisfied and stays silent): a `Ty::Named` whose head
     /// resolves to no type in the *member's defining scope* is the oracle's
@@ -10340,7 +10318,7 @@ impl<'a> Engine<'a> {
                     p.covariant = true;
                 }
             }
-            for p in marked_formals.named.iter_mut() {
+            for p in &mut marked_formals.named {
                 if covariant_named.contains(&p.name) {
                     p.covariant = true;
                 }
@@ -10412,7 +10390,7 @@ impl<'a> Engine<'a> {
                 ContainerKind::Class => faces.push(self.intern("Object")),
                 ContainerKind::Enum => faces.push(self.intern("Enum")),
                 ContainerKind::Mixin if decl.on_clause.is_empty() => {
-                    faces.push(self.intern("Object"))
+                    faces.push(self.intern("Object"));
                 }
                 _ => {}
             },
@@ -10504,7 +10482,7 @@ impl<'a> Engine<'a> {
                 ContainerKind::Class => faces.push(self.intern("Object")),
                 ContainerKind::Enum => faces.push(self.intern("Enum")),
                 ContainerKind::Mixin if decl.on_clause.is_empty() => {
-                    faces.push(self.intern("Object"))
+                    faces.push(self.intern("Object"));
                 }
                 _ => {}
             },
@@ -10562,7 +10540,7 @@ impl<'a> Engine<'a> {
         match entry.kind {
             MemberKind::Method => {
                 if effective.return_ty == Ty::UNKNOWN {
-                    effective.return_ty = combined.as_ref().map(|c| c.return_ty).unwrap_or(dynamic);
+                    effective.return_ty = combined.as_ref().map_or(dynamic, |c| c.return_ty);
                 }
                 if let Some(formals) = effective.formals.as_deref_mut() {
                     let slots = combined.as_ref().and_then(|c| c.formals.as_deref());
@@ -10570,32 +10548,27 @@ impl<'a> Engine<'a> {
                         if param.ty == Ty::UNKNOWN {
                             param.ty = slots
                                 .and_then(|f| f.positional.get(index))
-                                .map(|p| p.ty)
-                                .unwrap_or(dynamic);
+                                .map_or(dynamic, |p| p.ty);
                         }
                     }
-                    for param in formals.named.iter_mut() {
+                    for param in &mut formals.named {
                         if param.ty == Ty::UNKNOWN {
                             param.ty = slots
                                 .and_then(|f| f.named.iter().find(|p| p.name == param.name))
-                                .map(|p| p.ty)
-                                .unwrap_or(dynamic);
+                                .map_or(dynamic, |p| p.ty);
                         }
                     }
                 }
             }
             MemberKind::Getter => {
                 if effective.return_ty == Ty::UNKNOWN {
-                    effective.return_ty = combined
-                        .as_ref()
-                        .map(|c| {
-                            if c.kind == MemberKind::Field {
-                                c.var_ty
-                            } else {
-                                c.return_ty
-                            }
-                        })
-                        .unwrap_or(dynamic);
+                    effective.return_ty = combined.as_ref().map_or(dynamic, |c| {
+                        if c.kind == MemberKind::Field {
+                            c.var_ty
+                        } else {
+                            c.return_ty
+                        }
+                    });
                 }
             }
             MemberKind::Setter => {
@@ -11273,7 +11246,7 @@ mod invalid_type_override_tests {
         );
     }
 
-    /// The InvalidType arm on the result face: `Missing?` over `Missing`
+    /// The `InvalidType` arm on the result face: `Missing?` over `Missing`
     /// compares `InvalidType` against `InvalidType` upstream — the subtype
     /// question answers `true` regardless of the `?`, so the override is
     /// satisfied and stays silent (`subtype.dart:274-276`). Only the
@@ -11406,7 +11379,7 @@ mod invalid_type_override_tests {
 #[cfg(test)]
 mod function_subtype_override_tests {
     use crate::collector::collect;
-    use crate::diagnose::{FileReport, StrictModes, diagnose, fold_unit, merge_source_ordered};
+    use crate::diagnose::{FileReport, StrictModes, fold_unit, merge_source_ordered};
     use crate::library::ElementIndex;
     use crate::model::MicroKind;
     use dartq_language::{FeatureSet, LanguageVersion};

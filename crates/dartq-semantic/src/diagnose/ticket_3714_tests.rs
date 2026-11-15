@@ -10,6 +10,7 @@
 //! member access, not the invocation of its nullable result, so `a?.cb()`
 //! and `a?..cb()` report too.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 
 /// `(utf16 offset, length, message)` of every unchecked-nullable row.

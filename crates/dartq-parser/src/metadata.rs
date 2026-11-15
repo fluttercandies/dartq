@@ -6,6 +6,7 @@
 //! (shape, events, `@`-loop, type-argument + `(` requirements) mirrors the
 //! official productions.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::TokenKind;
 
 use crate::listener::{IdentifierContext, ParserListener};

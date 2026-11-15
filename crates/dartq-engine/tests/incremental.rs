@@ -2,6 +2,30 @@
 //! single-file recompute after one edit, the cascade reach, and the
 //! apply+analyze vs analyze-alone byte-equality.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use common::{EventLog, Fixture, GREETER_0, GREETER_1, MAIN_0, STANDALONE_0};
@@ -35,7 +59,7 @@ fn identical_rewrite_is_a_gate_no_op() {
     let clean = engine
         .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
-    assert!(clean.is_empty());
+    assert_eq!(clean, [] as [dartq_diagnostics::Diagnostic; 0]);
 
     // Rewrite with identical bytes: legal changeFile, zero cascade.
     let greeter = fixture.path("lib/greeter.dart");
@@ -100,7 +124,7 @@ fn single_edit_recomputes_only_its_cascade() {
     let diagnostics = engine
         .analyze(&[target], &mut log.sink(), &CancellationToken::default())
         .expect("edit");
-    assert!(diagnostics.is_empty());
+    assert_eq!(diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 
     assert_eq!(log.overlay_applied, vec![(1, 0)], "one file changed");
     assert_eq!(log.revalidated.len(), 1, "only the edited file revalidates");
@@ -290,7 +314,7 @@ fn cancel_then_remove_then_analyze_does_not_panic() {
     let diagnostics = engine
         .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::new())
         .expect("analyze after remove");
-    assert!(diagnostics.is_empty());
+    assert_eq!(diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     assert_eq!(engine.libraries().len(), 1, "only b's library remains");
 }
 
@@ -301,9 +325,9 @@ fn cancel_then_remove_then_analyze_does_not_panic() {
 /// (`part 'pn.dart';`) alone must not claim it. The one diagnostic row is
 /// the name-form directive itself: with the feature granted, upstream
 /// reports `part_of_name` on the dotted name (upstream Dart SDK source,
-/// ast_builder.dart `endPartOf`, the `Feature.enhanced_parts` branch),
+/// `ast_builder.dart` `endPartOf`, the `Feature.enhanced_parts` branch),
 /// while the include's name-form mismatch row is above the reporting
-/// horizon (library_analyzer.dart `_resolvePartDirective`, the
+/// horizon (`library_analyzer.dart` `_resolvePartDirective`, the
 /// `Feature.enhanced_parts` branch); the clean contents bake nothing else.
 #[test]
 fn name_form_part_bounded_name_scan() {
@@ -404,7 +428,7 @@ fn name_form_part_bounded_name_scan() {
 /// The depth-2 chain joins through the attached middle: `root ← mid ← leaf`
 /// where leaf's `part of 'mid.dart'` binds to its direct includer — the
 /// URI-form claim is against the including file, not the defining library
-/// (upstream file_state.dart's `LibraryFileKind` part check; the lints-new
+/// (upstream `file_state.dart`'s `LibraryFileKind` part check; the lints-new
 /// `deprecated_member_use_from_same_package/part_mid.dart` shape carries
 /// no `part_of_different_library`). The middle's own `part` directive
 /// keeps its `non_part_of_directive_in_part` row — the oracle emits it on
@@ -442,7 +466,7 @@ fn depth2_part_chain_joins_through_the_attached_middle() {
 /// 3.5, no grants): the URI include of a name-form part whose part-of name
 /// does not match the includer's declared library name reports
 /// `part_of_different_library` on the include's URI literal — the oracle's
-/// ungated-at-3.5 row (upstream Dart SDK source, library_analyzer.dart
+/// ungated-at-3.5 row (upstream Dart SDK source, `library_analyzer.dart`
 /// `_resolvePartDirective`, the `!featureSet.isEnabled(Feature.enhanced_parts)`
 /// branch) — while the include still claims nothing: the unmatched part
 /// stays an orphan singleton, and matching the name heals the row and joins
@@ -564,7 +588,7 @@ fn interpolated_part_include_claims_nothing() {
 /// whose `part of` carries no resolvable string (`part of '${x}.dart';` —
 /// shapeless, no URI and no name) reports NO interpolation row of its own:
 /// upstream `uriWithInterpolation` has exactly three fire sites
-/// (library_analyzer.dart:742 import / :954 export / :993 part include) and
+/// (`library_analyzer.dart:742` import / :954 export / :993 part include) and
 /// `part of` is none of them — the shapeless URI only classifies the file
 /// (`PartOfUriUnknownFileKind`, file_state.dart:941-955). The include side
 /// reports `part_of_different_library` (expected = enclosing URI, actual =
@@ -622,7 +646,7 @@ fn interpolated_part_of_is_an_orphan_singleton() {
 /// The `uri_with_interpolation` row anchors on the whole interpolated
 /// literal — the oracle reports `uriWithInterpolation.at(directive.uri)`,
 /// the URI node's beginToken..endToken (upstream Dart SDK source,
-/// library_analyzer.dart:732/:993/:1031), so `'${'foo'}.dart'` spans from
+/// `library_analyzer.dart:732/:993/:1031`), so `'${'foo'}.dart'` spans from
 /// its opening quote through the closing quote (conformance
 /// `UriWithInterpolationTest.test_library_import`, `2:8|15`), never a
 /// zero-width face at offset 0.
@@ -685,7 +709,7 @@ fn duplicate_part_include_reports_on_the_second_uri() {
 /// A name-form `part of foo;` under an UNNAMED includer, below the
 /// enhanced-parts horizon, reports `part_of_unnamed_library` on the
 /// include's URI (pipeline.rs's unnamed-library arm; upstream
-/// library_analyzer.dart `_resolvePartDirective`, the
+/// `library_analyzer.dart` `_resolvePartDirective`, the
 /// `!Feature.enhanced_parts` branch). Oracle probed 3.13.1: error
 /// `part_of_unnamed_library` on the directive, "The library is unnamed.
 /// A URI is expected, not a library name 'foo', in the part-of

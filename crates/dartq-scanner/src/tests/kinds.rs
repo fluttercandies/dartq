@@ -1,5 +1,6 @@
 //! Token kinds, full keyword set, operator golden table, group matching, script tag, gating.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::{assert_codes, assert_kinds, config_off, kinds_of, scan_src};
 use crate::{Keyword, KeywordStyle, TokenKind as K, keyword_from_str};
 
@@ -8,7 +9,7 @@ fn empty_source_yields_only_eof() {
     let r = scan_src("");
     assert_eq!(r.tokens.len(), 1);
     assert_eq!(r.tokens.first().kind, K::Eof);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     assert!(r.language_version_override.is_none());
 }
 
@@ -16,7 +17,7 @@ fn empty_source_yields_only_eof() {
 fn whitespace_only_source() {
     let r = scan_src(" \t\n\r\n  ");
     assert_eq!(r.tokens.len(), 1);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]
@@ -256,10 +257,10 @@ fn lazy_assignment_ops_are_two_tokens() {
         &r,
         &[K::Identifier, K::AmpersandAmpersand, K::Eq, K::Identifier],
     );
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     let r = scan_src("a ||= b");
     assert_kinds(&r, &[K::Identifier, K::BarBar, K::Eq, K::Identifier]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]

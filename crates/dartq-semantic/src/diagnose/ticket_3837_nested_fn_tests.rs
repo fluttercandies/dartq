@@ -33,20 +33,21 @@
 //! Both directions are pinned: the unprovable pairs stay silent, and every
 //! pair the oracle does fix at a constant keeps reporting.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, report_ops_core_prefixed, rows};
 
 /// The declarations every nested fixture shares: the corpus's own shape —
 /// the alias parameter sits inside the INNER function's return type
 /// (`List<T>`), while the inner formal spells the prefixed leaf the corpus
 /// writes (`core.List<core.int>`).
-const NESTED_PROLOGUE: &str = r#"
+const NESTED_PROLOGUE: &str = r"
 typedef F15<T> = List<T> Function(int, [core.List<core.int> x]) Function();
 
 List<int> Function(int, [core.List<core.int> x]) f15() => throw 0;
 
 class U0<T> {
   List<T> Function(int, [core.List<core.int> x]) m15() => throw 0;
-"#;
+";
 
 /// [`NESTED_PROLOGUE`] under the corpus's own header: `dart:core` imported
 /// bare and as `core`, one library behind both spellings — the alias RHS's
@@ -64,8 +65,8 @@ fn nested_report(body: &str) -> super::FileReport {
 #[test]
 fn undecidable_nested_argument_pairs_stay_silent() {
     let report = nested_report(
-        r#"
-  List<bool> test() => [f15 is F15<bool>, m15 is F15<int>, m15 is F15<bool>];"#,
+        r"
+  List<bool> test() => [f15 is F15<bool>, m15 is F15<int>, m15 is F15<bool>];",
     );
     assert_silent(&report);
 }
@@ -75,8 +76,8 @@ fn undecidable_nested_argument_pairs_stay_silent() {
 #[test]
 fn identical_instantiation_keeps_reporting() {
     let report = nested_report(
-        r#"
-  List<bool> test() => [f15 is F15<int>];"#,
+        r"
+  List<bool> test() => [f15 is F15<int>];",
     );
     assert_eq!(
         code_names(&report),
@@ -91,8 +92,8 @@ fn identical_instantiation_keeps_reporting() {
 #[test]
 fn identical_parameterized_instantiation_keeps_reporting() {
     let report = nested_report(
-        r#"
-  List<bool> test() => [m15 is F15<T>];"#,
+        r"
+  List<bool> test() => [m15 is F15<T>];",
     );
     assert_eq!(
         code_names(&report),
@@ -108,8 +109,8 @@ fn identical_parameterized_instantiation_keeps_reporting() {
 #[test]
 fn negated_identical_instantiation_reports_the_false_polarity() {
     let report = nested_report(
-        r#"
-  List<bool> test() => [f15 is! F15<int>];"#,
+        r"
+  List<bool> test() => [f15 is! F15<int>];",
     );
     assert_eq!(
         code_names(&report),
@@ -129,8 +130,8 @@ fn negated_identical_instantiation_reports_the_false_polarity() {
 #[test]
 fn widened_nested_argument_keeps_reporting() {
     let report = nested_report(
-        r#"
-  List<bool> test() => [f15 is F15<dynamic>];"#,
+        r"
+  List<bool> test() => [f15 is F15<dynamic>];",
     );
     assert_eq!(
         code_names(&report),
@@ -147,7 +148,7 @@ fn widened_nested_argument_keeps_reporting() {
 #[test]
 fn bare_spelled_family_keeps_its_answers() {
     let silent = report_ops(
-        r#"
+        r"
 typedef F15<T> = List<T> Function(int, [List<int> x]) Function();
 
 List<int> Function(int, [List<int> x]) f15() => throw 0;
@@ -161,18 +162,18 @@ class U0<T> {
     m15 is F15<bool>,
   ];
 }
-"#,
+",
     );
     assert_silent(&silent);
 
     let true_pair = report_ops(
-        r#"
+        r"
 typedef F15<T> = List<T> Function(int, [List<int> x]) Function();
 
 List<int> Function(int, [List<int> x]) f15() => throw 0;
 
 List<bool> test() => [f15 is F15<int>];
-"#,
+",
     );
     assert_eq!(
         code_names(&true_pair),

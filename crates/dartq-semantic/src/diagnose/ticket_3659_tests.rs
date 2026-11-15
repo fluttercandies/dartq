@@ -39,6 +39,7 @@
 //! the `call_member`/`null_check_operator`/`static_errors` invocation
 //! faces.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops, rows};
 
 fn code_count(report: &crate::diagnose::FileReport, code: &str) -> usize {
@@ -277,7 +278,7 @@ fn literal_send_through_extension_call_stays_silent() {
 }
 
 /// `this()` inside `extension on Function` types as `Function` — the
-/// `resolveToBound` FunctionType face is callable outright.
+/// `resolveToBound` `FunctionType` face is callable outright.
 #[test]
 fn this_send_inside_function_extension_stays_silent() {
     let report = report_ops(
@@ -419,7 +420,7 @@ fn nullable_send_through_nullable_extension_call_stays_silent() {
 /// A parenthesized callee reports at the `function` node's extent — the
 /// parens ride the span: `(1)` is three columns, not the literal's one. A
 /// literal callee keeps the row in the `Value` arm (bare rows defer to
-/// the pass-2 face, whose span is the inner token's — a row_resolution
+/// the pass-2 face, whose span is the inner token's — a `row_resolution`
 /// gap outside this ticket's scope).
 #[test]
 fn parenthesized_nonfunction_send_reports_at_wrapped_extent() {

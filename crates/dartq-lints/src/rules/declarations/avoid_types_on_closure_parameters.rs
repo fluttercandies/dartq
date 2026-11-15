@@ -129,11 +129,10 @@ fn context_is_function_type(c: &Check<'_>, closure: u32) -> bool {
                 if !is_identifier_target {
                     return false;
                 }
-                match crate::rules::expressions::same_file::binding(c, closure, c.lexeme(eq - 1)) {
-                    Some((_, Some(type_row))) => {
-                        return c.kind(type_row) == NodeKind::FunctionType;
-                    }
-                    _ => {}
+                if let Some((_, Some(type_row))) =
+                    crate::rules::expressions::same_file::binding(c, closure, c.lexeme(eq - 1))
+                {
+                    return c.kind(type_row) == NodeKind::FunctionType;
                 }
                 // The resolved-target face (`f = (…) => …` with no
                 // same-file written type): the target's static type

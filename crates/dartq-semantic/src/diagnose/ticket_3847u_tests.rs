@@ -7,12 +7,13 @@
 //!
 //! Upstream keeps the argument-bearing clause annotations on the element
 //! (`endNamedMixinApplication`, upstream Dart SDK source,
-//! pkg/analyzer/lib/src/fasta/ast_builder.dart:2499 — the with-clause
+//! `pkg/analyzer/lib/src/fasta/ast_builder.dart:2499` — the with-clause
 //! `NamedType`s carry their `typeArguments` into the element, where the
 //! mixin application instantiates through them); these pins hold the
 //! element face here to the same facts. Detector pins over the
 //! substitution cascade live in `ticket_3847_tests.rs`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::model::{ArgListId, Container, ContainerKind, Ty};
 use crate::persisted::PersistedElements;

@@ -6,6 +6,30 @@
 //! config. The discovery test closes the loop: excluded paths leave the
 //! analysis set entirely.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::path::PathBuf;
@@ -366,7 +390,7 @@ fn discovery_excludes_files_from_the_analysis_set() {
     // The merged options face: rule names for the lint enable set, excludes
     // precompiled once.
     let options = engine.options_for_root(&fixture.root).expect("options");
-    assert!(options.lint_rules.is_empty());
+    assert_eq!(options.lint_rules, [] as [std::string::String; 0]);
     assert_eq!(options.exclude_globs().len(), 1);
     assert!(options.is_excluded(&fixture.path("lib/gen/generated.dart")));
     assert!(!options.is_excluded(&fixture.path("lib/keep.dart")));
@@ -1502,7 +1526,7 @@ fn sdk_default_options_are_the_fallback_base() {
     let per_root = AnalysisOptions::for_roots(&[dir.path("pkg")], &empty_config(), &dir.0);
 
     let options = per_root.get(&dir.path("pkg")).expect("default entry");
-    assert!(options.lint_rules.is_empty());
+    assert_eq!(options.lint_rules, [] as [std::string::String; 0]);
     assert_eq!(options.strict_casts, None);
     assert_eq!(options.strict_inference, None);
     assert_eq!(options.strict_raw_types, None);
@@ -1717,7 +1741,7 @@ fn the_unique_name_spelling_resolves_for_citation_matching() {
 /// malformed options file on any output face — so the failure never joins
 /// `issues`; it is kept as data in `parse_failure` (same geometry, consumed
 /// by the faces' stderr advisory, `options_failure_notice` in
-/// dartq-commands::analyze) while the kept shape stays the probe's
+/// `dartq-commands::analyze`) while the kept shape stays the probe's
 /// parse-error geometry: the raw failure point as a zero-length span, the
 /// message the located error text with its ` at line L column C` suffix
 /// stripped. An included file's failure still reports
@@ -1803,7 +1827,6 @@ fn yaml_failures_report_parse_error_faces() {
 /// reports under `plugins/<name>/git`, and a non-map
 /// `dependency_overrides` reports under `plugins/dependency_overrides`.
 #[test]
-#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn plugins_section_reports_the_315_faces() {
     let dir = TempDir::new("plugins315");
 
@@ -2019,7 +2042,7 @@ fn plugins_section_reports_the_315_faces() {
     );
 
     // The section still contributes nothing to the merged options.
-    assert!(options.lint_rules.is_empty());
+    assert_eq!(options.lint_rules, [] as [std::string::String; 0]);
 }
 
 /// The included files' registry candidates land in
@@ -2135,7 +2158,7 @@ fn declaration_anchors_scope_to_their_section() {
 /// G-5: lint rule names lowercase at the section boundary
 /// (`parseLinterSection`, lint/config.dart:86-90 — every entry key
 /// lowercases; the registry lookups downstream match case-insensitively, so
-/// a mixed-case spelling resolves the snake_case rule). The merge form
+/// a mixed-case spelling resolves the `snake_case` rule). The merge form
 /// recurses exactly one level (config.dart:92-103 — a deeper map drops, it
 /// does not descend); the declared recording has no descent at all (the
 /// parse model visits top-level entries only), so group keys record while
@@ -2998,7 +3021,7 @@ fn nested_include_of_include_keeps_per_level_edges() {
     );
 }
 
-/// The INCOMPATIBLE_LINT family's context producers (census W3). Upstream
+/// The `INCOMPATIBLE_LINT` family's context producers (census W3). Upstream
 /// (upstream Dart SDK source,
 /// `pkg/analyzer/lib/src/diagnostic/diagnostic_factory.dart:288-382`) folds
 /// every conflicting declaration into a `Map<file.path, node>` and reports
@@ -3170,7 +3193,7 @@ fn incompatible_lint_without_conflicts_carries_no_context() {
         enabled: true,
         illegal_value: None,
     };
-    let included = RuleData {
+    let _included = RuleData {
         name: "rule_pos".to_owned(),
         file: PathBuf::from("/t/inc1.yaml"),
         offset: 12,

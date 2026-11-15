@@ -50,6 +50,7 @@
 //!    `clause_miss` offset no scanned [`SuperEntry`] owns silences with
 //!    its row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{
     CORE_PRELUDE, RigImport, assert_silent, report_ops, report_ops_imports, rows,
 };

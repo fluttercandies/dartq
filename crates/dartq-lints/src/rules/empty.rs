@@ -1,6 +1,7 @@
 //! The emptiness family: `empty_statements`, `empty_constructor_bodies`,
 //! `empty_catches`, `avoid_empty_else`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
@@ -1070,7 +1071,7 @@ pub(crate) mod unnecessary_final {
         /// `test_patternVariableDeclaration` face: the declaration keyword
         /// reports once per declared pattern variable — but both variables
         /// of `final (a, b) = …` anchor at the one statement keyword, and
-        /// the oracle's DiagnosticSet dedup (code, offset, length, message)
+        /// the oracle's `DiagnosticSet` dedup (code, offset, length, message)
         /// collapses the identical rows: the oracle-of-record emits ONE
         /// row (probed 2026-10-18 on 3.13.1), and so does dartq.
         #[test]
@@ -1175,7 +1176,7 @@ pub(crate) mod unnecessary_final {
 
         /// The official registers `visitForStatement`; a for-element inside
         /// a collection literal is a `ForElement`, never visited
-        /// (unnecessary_final.dart:86). Oracle 3.13.7: zero lint rows on
+        /// (`unnecessary_final.dart:86`). Oracle 3.13.7: zero lint rows on
         /// `[for (final x in xs) x]`.
         #[test]
         fn ignores_a_collection_for_element_declaration() {

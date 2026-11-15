@@ -18,6 +18,7 @@
 //!   family, and the condition-internal two-expression recovery
 //!   (`expected_token ')'` on the second expression).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.

@@ -6,7 +6,7 @@
 //!
 //! Upstream, an `augment` fragment belongs to the element its introduction
 //! declares (`element.firstFragment` is the introduction, upstream Dart SDK
-//! source, pkg/_fe_analyzer_shared augmentation handling), so the unit that
+//! source, pkg/_`fe_analyzer_shared` augmentation handling), so the unit that
 //! writes an `augment` head introduces no name of its own. The collector used
 //! to claim a vacant slot for it, which invented a unit-local declaration for
 //! a target declared in a sibling unit — the name then resolved to the
@@ -34,6 +34,7 @@
 //! library face — and the prefix's own merged table filters by the same
 //! clauses (upstream `named_type_resolver.dart:105-121`, `scope.dart:352-357`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_resolution::{

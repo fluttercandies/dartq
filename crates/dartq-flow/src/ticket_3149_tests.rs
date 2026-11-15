@@ -24,6 +24,9 @@
 //!    `PromotedRead` mirror misreports the very `!` as
 //!    `unnecessary_non_null_assertion` on a genuinely-nullable operand.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

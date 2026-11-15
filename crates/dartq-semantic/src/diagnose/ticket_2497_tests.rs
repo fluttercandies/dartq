@@ -10,6 +10,7 @@
 //! `Object?` and the concrete bound rejects it — across the
 //! `List`-to-`Iterable` subtype hop exactly as across the same head.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

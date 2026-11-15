@@ -23,6 +23,8 @@
 //! `isPotentiallyNonNullable`/`hasDefaultValue`/`defaultValuesAreExpected`
 //! gates and the `external` exclusion).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::*;
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
@@ -147,7 +149,7 @@ fn at(source: &str, needle: &str) -> u32 {
 /// `E<num>` over `enum E<T> { a<int>(), b<String>(), c<double>() }`:
 /// `E.b` (`E<String>`) is not a subtype of `overapproximate(E<num>)` =
 /// `E<num>`, so the populated set is `{a, c}` and `E.a || E.c` covers it
-/// — the oracle stays silent (exhaustiveness_enum_A01_t01).
+/// — the oracle stays silent (`exhaustiveness_enum_A01_t01`).
 #[test]
 fn generic_enum_dead_constant_populates_nothing() {
     let src = "enum E<T> { a<int>(), b<String>(), c<double>() }\n\
@@ -172,7 +174,7 @@ fn plain_enum_missing_constant_reports() {
 }
 
 /// `E<T>` over `T extends num` overapproximates to `E<num>` — the same
-/// `E.b` exclusion (exhaustiveness_enum_A01_t02).
+/// `E.b` exclusion (`exhaustiveness_enum_A01_t02`).
 #[test]
 fn generic_enum_type_param_scrutinee_still_silent() {
     let src = "enum E<T> { a<int>(), b<String>(), c<double>() }\n\
@@ -226,7 +228,7 @@ fn extension_type_bare_use_keeps_written_face() {
 // —— non_exhaustive_switch_expression: the const-value leaves ————
 
 /// `const c = true; case c:` folds to `BoolValue(true)` — paired with
-/// `case false` the `bool` scrutinee is covered (constant_A02 shape).
+/// `case false` the `bool` scrutinee is covered (`constant_A02` shape).
 #[test]
 fn const_bool_variable_pattern_covers_its_value() {
     let src = "const c = true;\n\
@@ -294,7 +296,7 @@ fn annotated_super_formal_reports_missing_default() {
 
 /// The unannotated `this.` formal reads the bound field's type —
 /// `ET.c({this.id})` over `extension type ET(int id)` reports `id`
-/// (static_analysis_extension_types_A02_t03's `c1` row).
+/// (`static_analysis_extension_types_A02_t03`'s `c1` row).
 #[test]
 fn unannotated_this_formal_reads_field_ty() {
     let src = "extension type ET(int id) { ET.c1({this.id}); }\n";

@@ -1,17 +1,23 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::needless_range_loop,
+    clippy::unnecessary_debug_formatting,
+    clippy::many_single_char_names
+)]
 use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
-/// The #2927 census pins: the three under-report faces' oracle
-/// shapes through the production bridge with the semantic face
-/// mounted (the census-case sources read verbatim; every pin cites
-/// its `conformance/expected.tsv` row so the conformance diff is the
-/// same verdict the pin asserts).
-///
-/// `no_dynamic_casts` — the implicit-`dynamic` reads through
-/// `static_type_faces::expr_type` (identifier and bare-send runs).
+// The #2927 census pins: the three under-report faces' oracle
+// shapes through the production bridge with the semantic face
+// mounted (the census-case sources read verbatim; every pin cites
+// its `conformance/expected.tsv` row so the conformance diff is the
+// same verdict the pin asserts).
+//
+// `no_dynamic_casts` — the implicit-`dynamic` reads through
+// `static_type_faces::expr_type` (identifier and bare-send runs).
 
-/// `lints/no_dynamic_casts/NoDynamicCastsTest/test_return#0` —
-/// `INFO|no_dynamic_casts|lib/test.dart|3:10|1` — a `dynamic` return
-/// value against the written `int` return reports at the operand.
+// `lints/no_dynamic_casts/NoDynamicCastsTest/test_return#0` —
+// `INFO|no_dynamic_casts|lib/test.dart|3:10|1` — a `dynamic` return
+// value against the written `int` return reports at the operand.
 #[test]
 fn ndc_return_reports_the_dynamic_operand() {
     let f = Fixture::parse("int f(dynamic a) {\n  return a;\n}\n");
@@ -23,9 +29,9 @@ fn ndc_return_reports_the_dynamic_operand() {
     assert_eq!(lints[0].range.end - lints[0].range.start, 1);
 }
 
-/// `lints/no_dynamic_casts/NoDynamicCastsTest/test_argument#0` —
-/// `INFO|no_dynamic_casts|lib/test.dart|4:5|1` — a `dynamic` positional
-/// against the `int` formal reports.
+// `lints/no_dynamic_casts/NoDynamicCastsTest/test_argument#0` —
+// `INFO|no_dynamic_casts|lib/test.dart|4:5|1` — a `dynamic` positional
+// against the `int` formal reports.
 #[test]
 fn ndc_positional_argument_reports() {
     let f = Fixture::parse("void f(int x) {}\nvoid g(dynamic a) {\n  f(a);\n}\n");
@@ -83,9 +89,9 @@ fn ndc_explicit_cast_passes() {
     );
 }
 
-/// `avoid_dynamic_calls` — the report-span math the census diff
-/// flagged: the operand-run anchors, not the container row's own
-/// tiling.
+// `avoid_dynamic_calls` — the report-span math the census diff
+// flagged: the operand-run anchors, not the container row's own
+// tiling.
 
 /// `lints/avoid_dynamic_calls/AvoidDynamicCallsTest/test_dynamicBinaryExpression_plus#0`
 /// — `INFO|avoid_dynamic_calls|lib/test.dart|3:3|1` — `a + 1` reports
@@ -172,9 +178,9 @@ fn adc_explicit_cast_receiver_stays_silent() {
     );
 }
 
-/// `unnecessary_parenthesis` — the repaired faces' oracle rows (the
-/// helper set `inner_has_kind`/`binary_child_operator`/`spread_token_-
-/// before` drives the record-literal, return, and assignment parents).
+// `unnecessary_parenthesis` — the repaired faces' oracle rows (the
+// helper set `inner_has_kind`/`binary_child_operator`/`spread_token_-
+// before` drives the record-literal, return, and assignment parents).
 
 /// `lints/unnecessary_parenthesis/UnnecessaryParenthesisTest/test_intLiteralInside_recordLiteral#0`
 /// — `INFO|unnecessary_parenthesis|lib/test.dart|3:15|3` — `(2)` inside

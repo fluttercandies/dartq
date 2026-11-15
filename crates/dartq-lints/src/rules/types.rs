@@ -8,6 +8,7 @@
 //! `tighten_type_of_initializing_formals`, and the variance checker
 //! `unsafe_variance`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
@@ -318,12 +319,11 @@ fn declaration_type_variables(c: &Check<'_>, decl: u32) -> Option<u32> {
     c.unit
         .ast
         .parent(decl)
-        .map(|wrapper| {
+        .and_then(|wrapper| {
             c.collect_direct(wrapper)
                 .into_iter()
                 .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
         })
-        .flatten()
         .or_else(|| {
             c.collect_direct(decl)
                 .into_iter()
@@ -745,13 +745,12 @@ pub(crate) mod library_private_types_in_public_api {
                         }
                     }
                 }
-                NodeKind::Type => {
+                NodeKind::Type
                     if on_clause_kind
                         && c.unit.ast.parent(row) == Some(decl)
-                        && implements_before.is_none_or(|token| c.head_token(row) < token)
-                    {
-                        check_type(c, row);
-                    }
+                        && implements_before.is_none_or(|token| c.head_token(row) < token) =>
+                {
+                    check_type(c, row);
                 }
                 _ => {}
             }
@@ -1008,10 +1007,10 @@ pub(crate) mod library_private_types_in_public_api {
             }
             _ => None,
         };
-        if let Some(field_type) = field_type {
-            if c.lexeme(c.head_token(field_type)).starts_with('_') {
-                c.report(crate::rules::utf16_token_span(c, name_token), &[]);
-            }
+        if let Some(field_type) = field_type
+            && c.lexeme(c.head_token(field_type)).starts_with('_')
+        {
+            c.report(crate::rules::utf16_token_span(c, name_token), &[]);
         }
     }
 
@@ -1245,10 +1244,11 @@ pub(crate) mod library_private_types_in_public_api {
         // :164-171) spells its return type between `typedef` and the name,
         // ahead of the declaration's own row — read as the row the typedef
         // follows.
-        if old_style && !aliased {
-            if let Some(return_type) = type_row_before_name(c, typedef, name) {
-                check_type(c, return_type);
-            }
+        if old_style
+            && !aliased
+            && let Some(return_type) = type_row_before_name(c, typedef, name)
+        {
+            check_type(c, return_type);
         }
     }
 
@@ -1330,10 +1330,6 @@ pub(crate) mod library_private_types_in_public_api {
     /// own type-parameter bounds, and its parameters. The nested faces
     /// carry the same `Type`/`VoidType`, `TypeVariables`, and
     /// `FormalParameters` direct children the declaration faces read.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "u32 is the substrate's token-space width (utf16 offsets, spans)"
-    )]
     fn check_type(c: &mut Check<'_>, type_node: u32) {
         if c.kind(type_node) == NodeKind::FunctionType {
             let kids = c
@@ -5106,7 +5102,7 @@ pub(crate) mod always_specify_types {
         // already is. The run filters the access/send markers, leaving
         // the semantic pieces — its first row is the receiver-most.
         let callee = if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() {
-            slice::access_run(c, &kids[..head + 1]).into_iter().next()
+            slice::access_run(c, &kids[..=head]).into_iter().next()
         } else {
             Some(kids[head])
         };
@@ -5195,7 +5191,7 @@ pub(crate) mod always_specify_types {
 
     /// The `visitNamedType` face on a bare invocation callee (:117-132):
     /// `C()`, `new C()` of a generic type with no written type arguments
-    /// — the analyzer's `ConstructorName.type` NamedType — reports
+    /// — the analyzer's `ConstructorName.type` `NamedType` — reports
     /// add-type at the callee's identifier. The callee identifier row
     /// tiles before the `Arguments` row inside the creation.
     fn creation(c: &mut Check<'_>) {
@@ -6629,7 +6625,7 @@ pub(crate) fn leak_formal_rows(c: &Check<'_>, owner: u32) -> Vec<u32> {
         match c.kind(kid) {
             NodeKind::FormalParameter => rows.push(kid),
             NodeKind::FormalParameters | NodeKind::OptionalFormalParameters => {
-                stack.extend(c.collect_direct(kid))
+                stack.extend(c.collect_direct(kid));
             }
             _ => {}
         }
@@ -6639,7 +6635,7 @@ pub(crate) fn leak_formal_rows(c: &Check<'_>, owner: u32) -> Vec<u32> {
 }
 
 /// Whether a primary-constructor formal declares its field — the
-/// `isDeclaring` face (`finalOrVarKeyword != null`, element_builder.dart
+/// `isDeclaring` face (`finalOrVarKeyword != null`, `element_builder.dart`
 /// :2091): a `var`/`final` keyword heads the formal. `const` never declares
 /// (the parser's `VAR_FINAL_OR_CONST` bit covers it, so the keyword lexeme
 /// decides); a `this.`/`super.` initializing formal and a plain formal
@@ -7429,7 +7425,7 @@ mod wave1_types_tests {
         let f = Fixture::parse("List<String> x = [];\n");
         let lints = f.run(&one_rule("always_specify_types"));
         assert_eq!(lints.len(), 1, "{lints:?}");
-        let open = f.source.find("[").unwrap() as u32;
+        let open = f.source.find('[').unwrap() as u32;
         assert_eq!(lints[0].range, open..open + 1, "{lints:?}");
     }
 
@@ -7898,7 +7894,7 @@ mod wave1_types_tests {
     /// declaring-formal face and the field face in one file — both
     /// unclosed subscriptions report. The upstream gate
     /// (`element is FieldFormalParameterElement && element.isDeclaring`,
-    /// leak_detector_visitor.dart:99) admits only the `var`/`final`
+    /// `leak_detector_visitor.dart:99`) admits only the `var`/`final`
     /// declaring forms — a plain `String? p` formal and a `this.p`
     /// initializing formal are not declaring and stay silent.
     #[test]
@@ -8036,7 +8032,7 @@ mod wave1_types_tests {
     /// `listen` in a method and never canceled reports at its declaration,
     /// private or public; the released twin (a `cancel()` anywhere in the
     /// unit) stays silent. The keyword-anchored tiling (`late` heads the
-    /// VariablesDeclaration row, members.rs `decl_head`) puts the written
+    /// `VariablesDeclaration` row, members.rs `decl_head`) puts the written
     /// type INSIDE the declaration row — the lookup reads it there.
     #[test]
     fn cancel_subscriptions_late_field_reports() {

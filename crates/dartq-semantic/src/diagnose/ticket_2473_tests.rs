@@ -17,6 +17,7 @@
 //! beside the `on` constraints (the oracle's `MixinMemberScope` resolves
 //! a bare name through both).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

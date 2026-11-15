@@ -45,6 +45,7 @@
 //! rig never binds the prefix the fixture writes, and its prelude lands
 //! ahead of the import directive).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, report_ops_core_prefixed};
 use super::*;
 

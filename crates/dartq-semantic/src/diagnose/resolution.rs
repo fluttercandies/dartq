@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::scopes_bodies::PATTERN_ARM_SCOPE_BASE;
 use super::*;
 use dartq_scanner::{Keyword, TokenKind};
@@ -624,23 +626,22 @@ impl<'a> Engine<'a> {
                 }
                 let pool = self.boundary.pool();
                 let shape = pool.record_shape(shape);
-                let ty = match shape.named.iter().find(|(name, _)| *name == field) {
-                    Some(&(_, ty)) => ty,
-                    None => {
-                        // Positional getters are `$1`, `$2`, … (1-based
-                        // decimal, no sign and no leading zero — `$01` is not
-                        // a field getter).
-                        let index = self
-                            .strings
-                            .resolve(field)
-                            .strip_prefix('$')
-                            .filter(|digits| {
-                                !digits.starts_with('0')
-                                    && digits.bytes().all(|b| b.is_ascii_digit())
-                            })
-                            .and_then(|digits| digits.parse::<usize>().ok())?;
-                        *shape.positional.get(index.checked_sub(1)?)?
-                    }
+                let ty = if let Some(&(_, ty)) = shape.named.iter().find(|(name, _)| *name == field)
+                {
+                    ty
+                } else {
+                    // Positional getters are `$1`, `$2`, … (1-based
+                    // decimal, no sign and no leading zero — `$01` is not
+                    // a field getter).
+                    let index = self
+                        .strings
+                        .resolve(field)
+                        .strip_prefix('$')
+                        .filter(|digits| {
+                            !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit())
+                        })
+                        .and_then(|digits| digits.parse::<usize>().ok())?;
+                    *shape.positional.get(index.checked_sub(1)?)?
                 };
                 drop(pool);
                 // A field spelled through an alias reads as the aliased
@@ -942,9 +943,7 @@ impl<'a> Engine<'a> {
                     (*name, self.tree_ty(&subst_tree(tree, &subst)), *required)
                 })
                 .collect(),
-            return_ty: ret
-                .map(|tree| self.tree_ty(&subst_tree(&tree, &subst)))
-                .unwrap_or(Ty::Dynamic),
+            return_ty: ret.map_or(Ty::Dynamic, |tree| self.tree_ty(&subst_tree(&tree, &subst))),
         };
         Some(Box::new(sig))
     }
@@ -1080,7 +1079,7 @@ impl<'a> Engine<'a> {
     /// (`class Box<T extends A> { T slot; }`) answers `T`, NEVER its bound.
     /// The oracle checks the write against the parameter itself (upstream
     /// Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-    /// assignment_expression_resolver.dart:361 —
+    /// `assignment_expression_resolver.dart:361` —
     /// `_checkForInvalidAssignment(node.writeType!, ...)`), and a bare type
     /// variable admits no interface source at all — not even a subtype of
     /// its own bound, since the "Left Type Variable Bound" leg needs the
@@ -1310,19 +1309,16 @@ impl<'a> Engine<'a> {
         // The read's spelling: the variable family reads the fact row's own
         // token, the property family the interned member name (the flow
         // layer's `'<prop>'` id).
-        let name = match fact {
-            FlowFact::NonPromotedPropertyRead { name, .. } => {
-                let spelling = flow.name_lexeme(*name);
-                self.strings.intern(spelling)
-            }
-            _ => {
-                let text = self
-                    .tokens
-                    .get(span.id as usize)
-                    .map(|token| &self.source[token.byte_range()])
-                    .unwrap_or_default();
-                self.strings.intern(text)
-            }
+        let name = if let FlowFact::NonPromotedPropertyRead { name, .. } = fact {
+            let spelling = flow.name_lexeme(*name);
+            self.strings.intern(spelling)
+        } else {
+            let text = self
+                .tokens
+                .get(span.id as usize)
+                .map(|token| &self.source[token.byte_range()])
+                .unwrap_or_default();
+            self.strings.intern(text)
         };
         self.non_promotions.push((
             span.range.offset,
@@ -1535,7 +1531,7 @@ impl<'a> Engine<'a> {
 
     /// The ONE eligibility verdict every promotion path shares — the
     /// official `isPropertyPromotable` conjunction (upstream Dart SDK
-    /// source, pkg/_fe_analyzer_shared/lib/src/field_promotability.dart
+    /// source, pkg/_`fe_analyzer_shared/lib/src/field_promotability.dart`
     /// `addField`/`addGetter`; `flow_analysis.dart`'s `isPropertyPromotable`
     /// delegate). [`Engine::promotable_field_entry`] gates every promotion
     /// substitution on it, and [`Engine::property_non_promotability`]
@@ -1683,30 +1679,27 @@ impl<'a> Engine<'a> {
         // creation reshape carries is the LEAF — the container dispatch
         // itself goes through the prefix-aware lookup.
         let spelling = self.strings.resolve(head);
-        let (leaf, container) = match spelling.split_once('.') {
-            Some((prefix, leaf)) => {
-                let leaf = self.intern(leaf);
-                let (container, _) = prefixed_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    self.lib,
-                    self.intern(prefix),
-                    leaf,
-                )?;
-                (leaf, container)
-            }
-            None => {
-                let (container, _) = resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    self.lib,
-                    self.file,
-                    head,
-                )?;
-                (head, container)
-            }
+        let (leaf, container) = if let Some((prefix, leaf)) = spelling.split_once('.') {
+            let leaf = self.intern(leaf);
+            let (container, _) = prefixed_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.intern(prefix),
+                leaf,
+            )?;
+            (leaf, container)
+        } else {
+            let (container, _) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                head,
+            )?;
+            (head, container)
         };
         Some((leaf, container.kind))
     }
@@ -1735,14 +1728,14 @@ impl<'a> Engine<'a> {
                 };
                 return match walk {
                     Walk::Found(entry) if entry.kind == MemberKind::Method => Some(match entry {
-                        Projected::Own(e) => match e.formals.as_deref() {
-                            Some(formals) => std::borrow::Cow::Borrowed(formals),
-                            None => return None,
-                        },
-                        Projected::Foreign(e) => match e.formals.as_deref() {
-                            Some(formals) => std::borrow::Cow::Owned(formals.to_owned()),
-                            None => return None,
-                        },
+                        Projected::Own(e) => {
+                            let formals = e.formals.as_deref()?;
+                            std::borrow::Cow::Borrowed(formals)
+                        }
+                        Projected::Foreign(e) => {
+                            let formals = e.formals.as_deref()?;
+                            std::borrow::Cow::Owned(formals.to_owned())
+                        }
                     }),
                     _ => None,
                 };
@@ -1881,22 +1874,19 @@ impl<'a> Engine<'a> {
                 // keeps the declared table byte-identical.
                 let env = recv_ty.and_then(|ty| self.member_recv_env(ty, container, &entry));
                 if let Some(env) = env {
-                    return match entry.formals.as_deref() {
-                        Some(formals) => Some(std::borrow::Cow::Owned(
-                            self.substitute_formals(formals, &env),
-                        )),
-                        None => None,
-                    };
+                    return entry.formals.as_deref().map(|formals| {
+                        std::borrow::Cow::Owned(self.substitute_formals(formals, &env))
+                    });
                 }
                 match entry {
                     Projected::Own(e) => match e.formals.as_deref() {
                         Some(formals) => Some(std::borrow::Cow::Borrowed(formals)),
                         None => None,
                     },
-                    Projected::Foreign(e) => match e.formals.as_deref() {
-                        Some(formals) => Some(std::borrow::Cow::Owned(formals.to_owned())),
-                        None => None,
-                    },
+                    Projected::Foreign(e) => e
+                        .formals
+                        .as_deref()
+                        .map(|formals| std::borrow::Cow::Owned(formals.to_owned())),
                 }
             }
             _ => None,
@@ -1908,11 +1898,11 @@ impl<'a> Engine<'a> {
     /// onto the declaring container's parameters — `Box<int> b` hands
     /// `b.set`'s formal the `int` face the oracle's instantiated member
     /// reads (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart —
+    /// `pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart` —
     /// the member lookup runs on the receiver's resolved type, whose type
     /// arguments instantiate the result's signature). `None` keeps the
     /// declared face: a bare head writes no arguments, an arity-mismatched
-    /// spelling is the InvalidType recovery's face to keep raw, and a
+    /// spelling is the `InvalidType` recovery's face to keep raw, and a
     /// foreign container exposes only a parameter count — the name-forced
     /// rule the super-face instantiation keeps (one declared parameter, one
     /// written argument, one free parameter spelling in the member's
@@ -1965,17 +1955,7 @@ impl<'a> Engine<'a> {
                     self.file,
                     container,
                 )?;
-                if !found.type_param_names.is_empty() {
-                    if found.type_param_names.len() != written.len() {
-                        return None;
-                    }
-                    found
-                        .type_param_names
-                        .iter()
-                        .copied()
-                        .zip(written)
-                        .collect()
-                } else {
+                if found.type_param_names.is_empty() {
                     // A pre-field persisted payload spells none — the legacy
                     // name-forced rule binds when the member's own signature
                     // spells exactly the declaring parameter set, in first-seen
@@ -1999,6 +1979,16 @@ impl<'a> Engine<'a> {
                         return None;
                     }
                     free.into_iter().zip(written).collect()
+                } else {
+                    if found.type_param_names.len() != written.len() {
+                        return None;
+                    }
+                    found
+                        .type_param_names
+                        .iter()
+                        .copied()
+                        .zip(written)
+                        .collect()
                 }
             };
         map.retain(|(param, _)| !entry.type_param_names.contains(param));
@@ -3107,8 +3097,9 @@ impl<'a> Engine<'a> {
         };
         matches!(
             token.kind,
-            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::New)
-                | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Const)
+            dartq_scanner::TokenKind::Keyword(
+                dartq_scanner::Keyword::New | dartq_scanner::Keyword::Const
+            )
         )
     }
 
@@ -3162,14 +3153,14 @@ impl<'a> Engine<'a> {
     ///   `_hiddenElements` hides every guarded-pattern variable while the
     ///   pattern visits), and a provably non-constant operand reports
     ///   `non_constant_relational_pattern_expression`
-    ///   (`_evaluateAndReportError`, resolver_visitor.dart
+    ///   (`_evaluateAndReportError`, `resolver_visitor.dart`
     ///   `visitRelationalPattern` — `final a` fires, `const a` and
     ///   literals stay silent).
     /// * **Guard write** (`when a = 1`): an unqualified write to the
     ///   guarded pattern's own variable inside the `when` clause reports
     ///   `pattern_variable_assignment_inside_guard`
     ///   (`isVisitingWhenClause` + `UnqualifiedNameAssignmentTarget`,
-    ///   error_verifier.dart `_checkForPatternVariableAssignmentInsideGuard`
+    ///   `error_verifier.dart` `_checkForPatternVariableAssignmentInsideGuard`
     ///   — nested closures keep the flag, member targets and plain reads
     ///   stay silent).
     /// * **Shared case scope** (`case int a: case num a: a;`): a body read
@@ -3178,7 +3169,7 @@ impl<'a> Engine<'a> {
     ///   reason split — absent in some heads (`not_all_cases`), a label or
     ///   `default` member in the group (`has_label`), mismatched type or
     ///   finality (`differentFinalityOrType`), `_SharedCaseScope.finish` in
-    ///   variable_bindings.dart reporting at each `variable.references`
+    ///   `variable_bindings.dart` reporting at each `variable.references`
     ///   read.
     fn check_pattern_scope_faces(
         &mut self,
@@ -3371,7 +3362,7 @@ impl<'a> Engine<'a> {
             .filter(|t| matches!(t.kind, TokenKind::PlusPlus | TokenKind::MinusMinus));
         let anchor = postfix.map_or(range, |t| SourceRange {
             offset: range.offset,
-            length: t.utf16_offset + t.byte_len as u32 - range.offset,
+            length: t.utf16_offset + t.byte_len - range.offset,
         });
         let nonconst = self_read
             || matches!(
@@ -3500,11 +3491,11 @@ impl<'a> Engine<'a> {
     fn curly_is_statement_block(&self, open: usize) -> bool {
         let toks = self.tokens.as_slice();
         match toks.get(open.wrapping_sub(1)).map(|t| t.kind) {
-            Some(TokenKind::Colon)
-            | Some(TokenKind::Function)
-            | Some(TokenKind::Keyword(
-                Keyword::Else | Keyword::Try | Keyword::Finally | Keyword::Do,
-            )) => true,
+            Some(
+                TokenKind::Colon
+                | TokenKind::Function
+                | TokenKind::Keyword(Keyword::Else | Keyword::Try | Keyword::Finally | Keyword::Do),
+            ) => true,
             Some(TokenKind::CloseParen) => {
                 // `) {` — walk the `)`'s `(` backward and read the token
                 // in front of it: a control keyword makes the block a
@@ -3516,7 +3507,7 @@ impl<'a> Engine<'a> {
                     j -= 1;
                     match toks[j].kind {
                         TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                            inner += 1
+                            inner += 1;
                         }
                         TokenKind::OpenParen => {
                             if inner == 0 {
@@ -3620,13 +3611,12 @@ impl<'a> Engine<'a> {
         // The read hits a name the group declares: present in at least one
         // head's variable set.
         let mut present = 0usize;
-        let mut declared = false;
         for head in &heads {
             if head.vars.iter().any(|(n, ..)| *n == name) {
                 present += 1;
             }
         }
-        declared = present > 0;
+        let declared = present > 0;
         if !declared {
             return;
         }
@@ -3771,7 +3761,7 @@ impl<'a> Engine<'a> {
             for scope in &self.label_scopes {
                 for (_, lrange, _) in &scope.labels {
                     if lrange.offset < last {
-                        for head in heads.iter_mut() {
+                        for head in &mut heads {
                             head.label_or_default = true;
                         }
                     }
@@ -4130,7 +4120,7 @@ impl<'a> Engine<'a> {
             };
         let bytes = self.source.as_bytes();
         let mut at = self.byte_of(name_end);
-        while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
         }
         // A plain declarator init only: `var x = <expr>`.
@@ -4138,7 +4128,7 @@ impl<'a> Engine<'a> {
             return bound;
         }
         at += 1;
-        while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
         }
         // An explicit `const` rides the literal (`var x = const {1};`).
@@ -4147,7 +4137,7 @@ impl<'a> Engine<'a> {
             .is_some_and(|rest| rest.starts_with(b"const"))
         {
             at += 5;
-            while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+            while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
                 at += 1;
             }
         }
@@ -4371,7 +4361,7 @@ impl<'a> Engine<'a> {
                 }
             })
             .collect();
-        if leaves.iter().any(|leaf| leaf.is_none()) {
+        if leaves.iter().any(std::option::Option::is_none) {
             return Ty::Dynamic;
         }
         self.init_leaf_least_from(leaves.into_iter().flatten().collect())
@@ -4380,7 +4370,7 @@ impl<'a> Engine<'a> {
     /// One element segment's leaf contribution: a control-flow `if`
     /// element joins its branch leaves through the SAME
     /// [`Self::init_leaf_least_from`] fold (`typed_literal_resolver.dart`
-    /// `_computeElementType`'s IfElementImpl arm —
+    /// `_computeElementType`'s `IfElementImpl` arm —
     /// `leastUpperBound(thenType, elseType)`, a missing `else` keeping
     /// the then leaf), every other segment its completion row. The
     /// branches recurse through this walk (a nested spread contributes
@@ -4517,7 +4507,7 @@ impl<'a> Engine<'a> {
     /// top-level colon splits the sides, an `if`-led control-flow element
     /// splits its BRANCH entries first
     /// (`typed_literal_resolver.dart` `_computeElementType`'s
-    /// IfElementImpl arm — each branch is a full map entry, so
+    /// `IfElementImpl` arm — each branch is a full map entry, so
     /// `{if (c) 1: 'a' else 'k': 'b'}` joins the two keys), a colonless
     /// map spread donates its `Map<K, V>` arguments to the per-slot
     /// folds, and any other colonless leaf (a non-map spread, a malformed
@@ -4531,7 +4521,7 @@ impl<'a> Engine<'a> {
             self.init_entry_segment_tys(bytes, s, e, &mut keys, &mut values);
         }
         let fold = |tys: Vec<Option<Ty>>| -> Ty {
-            if tys.iter().any(|ty| ty.is_none()) {
+            if tys.iter().any(std::option::Option::is_none) {
                 return Ty::Dynamic;
             }
             self.init_leaf_least_from(tys.into_iter().flatten().collect())
@@ -4570,15 +4560,12 @@ impl<'a> Engine<'a> {
                 values.push(self.init_element_leaf_ty(bytes, colon + 1, e));
             }
             None if bytes.get(s..).is_some_and(|rest| rest.starts_with(b"...")) => {
-                match self.init_spread_map_entry_tys(bytes, s, e) {
-                    Some((k, v)) => {
-                        keys.push(Some(k));
-                        values.push(Some(v));
-                    }
-                    None => {
-                        keys.push(None);
-                        values.push(None);
-                    }
+                if let Some((k, v)) = self.init_spread_map_entry_tys(bytes, s, e) {
+                    keys.push(Some(k));
+                    values.push(Some(v));
+                } else {
+                    keys.push(None);
+                    values.push(None);
                 }
             }
             None => {
@@ -4787,19 +4774,18 @@ impl<'a> Engine<'a> {
             if args != ArgListId::EMPTY {
                 return None;
             }
-            match self.alias_clause_hop(name, self.file, self.lib) {
-                Some(handle) => heads.push(handle),
-                None => {
-                    let (_, owner) = resolve_container(
-                        self.graph,
-                        self.namespaces,
-                        self.index,
-                        self.lib,
-                        self.file,
-                        name,
-                    )?;
-                    heads.push((owner, name));
-                }
+            if let Some(handle) = self.alias_clause_hop(name, self.file, self.lib) {
+                heads.push(handle)
+            } else {
+                let (_, owner) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    name,
+                )?;
+                heads.push((owner, name));
             }
         }
         let alias_hop =
@@ -4872,7 +4858,7 @@ impl<'a> Engine<'a> {
             return Ty::UNKNOWN;
         };
         let mut after = paren_close + 1;
-        while bytes.get(after).is_some_and(|b| b.is_ascii_whitespace()) {
+        while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
             after += 1;
         }
         // The body's kind: a `{` block keeps the `dynamic` return column
@@ -5168,7 +5154,7 @@ impl<'a> Engine<'a> {
             let kind = self.tokens.get(id as usize).map(|t| t.kind);
             match kind {
                 Some(kind) if kind.is_begin_group() => depth += 1,
-                Some(kind) if kind.matching_opens().first().is_some() => {
+                Some(kind) if !kind.matching_opens().is_empty() => {
                     depth = depth.saturating_sub(1);
                 }
                 Some(dartq_scanner::TokenKind::Comma) if depth == 0 => boundaries.push(id),
@@ -5223,8 +5209,7 @@ impl<'a> Engine<'a> {
             // diagnostic_factory.dart:105-124). Unlike the type-annotation
             // twin there is NO wildcard exemption — a literal's named `_`
             // always counts.
-            let mut used: std::collections::HashMap<&str, SourceRange> =
-                std::collections::HashMap::new();
+            let mut used: FxHashMap<&str, SourceRange> = FxHashMap::default();
             for &(label_id, name) in &named_labels {
                 let Some(label) = self.tokens.get(label_id as usize) else {
                     continue;
@@ -5285,12 +5270,10 @@ impl<'a> Engine<'a> {
             let (lo, hi) = (
                 self.tokens
                     .get(window.0 as usize)
-                    .map(|t| t.utf16_offset)
-                    .unwrap_or(0),
+                    .map_or(0, |t| t.utf16_offset),
                 self.tokens
                     .get(window.1 as usize)
-                    .map(|t| t.utf16_offset)
-                    .unwrap_or(u32::MAX),
+                    .map_or(u32::MAX, |t| t.utf16_offset),
             );
             let field_rows: Vec<&Row> = rows
                 .iter()
@@ -5343,7 +5326,7 @@ impl<'a> Engine<'a> {
             if index > 0 {
                 text.push_str(", ");
             }
-            text.push_str(&ty.render(&self.strings, &self.boundary.pool()));
+            text.push_str(&ty.render(self.strings, &self.boundary.pool()));
         }
         if fields.len() == 1 {
             text.push(',');
@@ -5388,7 +5371,7 @@ impl<'a> Engine<'a> {
     /// `unknown` that silences the enclosing single-row check. The oracle
     /// still types the expression `bool` and runs the return matrix on it
     /// (`return_of_invalid_type` bool->int,
-    /// keyword_named_class_methods_2.dart:184).
+    /// `keyword_named_class_methods_2.dart:184`).
     ///
     /// The dropped residue keeps its push-time faces: a suppressed miss
     /// still feeds the names table exactly as its pass-2 resolve would (the
@@ -5457,7 +5440,7 @@ impl<'a> Engine<'a> {
     /// `code` reports the operand's unresolved head; `non_type_code` reports
     /// a resolved non-type head (`as` collapses both to `cast_to_non_type`,
     /// `is` splits `type_test_with_undefined_name`/`type_test_with_non_type`
-    /// — named_type_resolver.dart's `_isTypeInAsExpression` /
+    /// — `named_type_resolver.dart`'s `_isTypeInAsExpression` /
     /// `_isTypeInIsExpression` arms run before the `element != null`
     /// `not_a_type` tail, :621-647).
     pub(crate) fn emit_operand_type_miss(
@@ -5508,11 +5491,11 @@ impl<'a> Engine<'a> {
                 self.emit_corrected(SemanticCode::NonTypeAsTypeArgument, *range, &name_text);
             }
         }
-        if let Some((name, range)) = head_hit {
-            if !self.guard.ignore(None, name) {
-                let name_text = self.strings.resolve(name).to_string();
-                self.emit(code, range, &name_text, "");
-            }
+        if let Some((name, range)) = head_hit
+            && !self.guard.ignore(None, name)
+        {
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit(code, range, &name_text, "");
         }
         if let Some((name, range)) = non_type_head
             && let Some(non_type_code) = non_type_code
@@ -5596,7 +5579,7 @@ impl<'a> Engine<'a> {
     /// container is in scope, unknown otherwise (top-level recovery). The
     /// declaration-context faces ride the push: an invalid context reports
     /// `invalid_reference_to_this` / `super_in_invalid_context` at the
-    /// keyword (type_analyzer.dart's `isThisAccessible` /
+    /// keyword (`type_analyzer.dart`'s `isThisAccessible` /
     /// element_resolver.dart:360-369), before the row's uses decide.
     /// Exception: at an initializer item's head the keyword is a bare token
     /// of the folded initializer node (`ConstructorFieldInitializer`,
@@ -5989,7 +5972,16 @@ impl<'a> Engine<'a> {
                 }
                 let prefix = tp.prefix;
                 let hit = self.prefixed_hit(prefix, name);
-                if !hit {
+                if hit {
+                    // The prefixed type resolved: the prefix scope lookup
+                    // credits the import (`ImportsTracking` — the `is`
+                    // exclusion is the used-elements visitor's, not the
+                    // tracker's).
+                    self.import_used.insert(name);
+                    if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
+                        self.used_names.insert(name);
+                    }
+                } else {
                     // The local-prefix face snapshots here: a head naming a
                     // local or parameter element is not an import prefix, and
                     // the frame stack answering that question exists only at
@@ -6010,8 +6002,7 @@ impl<'a> Engine<'a> {
                         let name_text = self.strings.resolve(name);
                         let joined = format!("{prefix_text}.{name_text}");
                         let joined = self.strings.intern(&joined);
-                        let head_range =
-                            self.pending_prefixed.map(|(head, _)| head).unwrap_or(range);
+                        let head_range = self.pending_prefixed.map_or(range, |(head, _)| head);
                         self.push_row(Row {
                             name: joined,
                             range: SourceRange {
@@ -6063,8 +6054,7 @@ impl<'a> Engine<'a> {
                                 ty: Ty::UNKNOWN,
                             });
                         } else {
-                            let head_range =
-                                self.pending_prefixed.map(|(head, _)| head).unwrap_or(range);
+                            let head_range = self.pending_prefixed.map_or(range, |(head, _)| head);
                             let qualified = SourceRange {
                                 offset: head_range.offset,
                                 length: range.end() - head_range.offset,
@@ -6088,15 +6078,6 @@ impl<'a> Engine<'a> {
                                 ty: Ty::UNKNOWN,
                             });
                         }
-                    }
-                } else {
-                    // The prefixed type resolved: the prefix scope lookup
-                    // credits the import (`ImportsTracking` — the `is`
-                    // exclusion is the used-elements visitor's, not the
-                    // tracker's).
-                    self.import_used.insert(name);
-                    if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
-                        self.used_names.insert(name);
                     }
                 }
             }
@@ -6486,7 +6467,7 @@ impl<'a> Engine<'a> {
 
     /// Rewrites a qualified creation head's miss (`prefix.C` of `new
     /// prefix.C.new()`): a three-segment reference resolves its head as a
-    /// prefixed NamedType — the official importPrefix face reports
+    /// prefixed `NamedType` — the official importPrefix face reports
     /// `undefined_identifier` over the written `prefix.C` span, never the
     /// creation-head type-miss a bare head carries (`new Missing()` keeps
     /// `creation_with_non_type`). The head row converts in place and the
@@ -6581,9 +6562,7 @@ impl<'a> Engine<'a> {
                 .index
                 .get(file)
                 .and_then(|f| f.decl(class_name))
-                .map_or(true, |decl| {
-                    type_resolution_of(decl.kind) == TypeResolution::Type
-                }),
+                .is_none_or(|decl| type_resolution_of(decl.kind) == TypeResolution::Type),
             // Multiply-defined → `InvalidType` with no report; a prefix
             // entry cannot nest inside a prefix scope.
             dartq_resolution::Lookup::Ambiguous(_)

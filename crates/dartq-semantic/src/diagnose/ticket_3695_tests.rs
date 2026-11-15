@@ -18,6 +18,7 @@
 //! reports ONE `uncheckedMethodInvocationOfNullableValue` at `-` beside
 //! the operand's `use_of_void_result`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops};
 

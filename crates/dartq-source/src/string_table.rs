@@ -1,5 +1,6 @@
 //! Strings interned to small stable integers.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -200,8 +201,12 @@ thread_local! {
 /// The `(bucket, offset)` of slot `index`.
 fn slot_of(index: u32) -> (usize, usize) {
     let biased = u64::from(index) + (1 << FIRST_BUCKET_BITS);
-    let bucket = 63 - biased.leading_zeros() - FIRST_BUCKET_BITS;
+    let bucket = biased.ilog2() - FIRST_BUCKET_BITS;
     let offset = biased - (1 << (bucket + FIRST_BUCKET_BITS));
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bucket and offset are bounded by the string table size class design"
+    )]
     (bucket as usize, offset as usize)
 }
 
@@ -312,6 +317,10 @@ impl StringTable {
     fn store(&self, index: u32, word: usize) {
         let (bucket, offset) = slot_of(index);
         let slots = self.slots[bucket].get_or_init(|| {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "bucket is bounded by FIRST_BUCKET_BITS plus log2 of table size"
+            )]
             (0..(1_usize << (bucket as u32 + FIRST_BUCKET_BITS)))
                 .map(|_| AtomicUsize::new(0))
                 .collect()
@@ -340,26 +349,25 @@ impl StringTable {
         let shard_index = (hash >> 58) as usize % SHARDS;
         let shard = &self.shards[shard_index].0;
         let hit = shard.read().get_key_value(s).map(|(&text, &id)| (text, id));
-        let (text, id) = match hit {
-            Some(found) => found,
-            None => {
-                let mut map = shard.write();
-                if let Some((&text, &id)) = map.get_key_value(s) {
-                    // A concurrent worker minted it while we upgraded.
-                    (text, id)
-                } else {
-                    let index = self.next.fetch_add(1, Ordering::Relaxed);
-                    assert!(index != u32::MAX, "more than u32::MAX strings interned");
-                    let id = StringId(index);
-                    // The slot is written before the id is published
-                    // through the map: every holder of the id obtained it
-                    // under this lock (or from its own thread's front), so
-                    // the slot read in `resolve` observes the write.
-                    let (word, text) = self.arena_put(s);
-                    self.store(index, word);
-                    map.insert(text, id);
-                    (text, id)
-                }
+        let (text, id) = if let Some(found) = hit {
+            found
+        } else {
+            let mut map = shard.write();
+            if let Some((&text, &id)) = map.get_key_value(s) {
+                // A concurrent worker minted it while we upgraded.
+                (text, id)
+            } else {
+                let index = self.next.fetch_add(1, Ordering::Relaxed);
+                assert!(index != u32::MAX, "more than u32::MAX strings interned");
+                let id = StringId(index);
+                // The slot is written before the id is published
+                // through the map: every holder of the id obtained it
+                // under this lock (or from its own thread's front), so
+                // the slot read in `resolve` observes the write.
+                let (word, text) = self.arena_put(s);
+                self.store(index, word);
+                map.insert(text, id);
+                (text, id)
             }
         };
         self.front_put(text, id);

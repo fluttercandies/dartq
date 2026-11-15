@@ -1,6 +1,7 @@
 //! Expression events: references, tests, boolean/null-aware branching,
 //! assignments, and collection elements.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_parser::TokenSpan;
 use dartq_source::SourceRange;
 
@@ -466,14 +467,13 @@ impl Interp<'_> {
                 // inside a `?.`-opened-dead chain polls nothing — the member
                 // name owns the official's first dead node (`null?.m(1)`
                 // rows `m(1)`).
-                if self.for_header_depth > self.header_cond_depth || self.dead.is_none() {
-                    if !self
+                if (self.for_header_depth > self.header_cond_depth || self.dead.is_none())
+                    && !self
                         .null_shorts
                         .last()
                         .is_some_and(|short| short.dead_at_open)
-                    {
-                        self.dead_code(*span);
-                    }
+                {
+                    self.dead_code(*span);
                 }
                 // The literal's static type is `bool` (official
                 // `literalBool`'s recorded type — the `matchedType` an
@@ -485,14 +485,10 @@ impl Interp<'_> {
                 // unknown face never could; without the interned id (a
                 // direct-constructed interp) the face stays unknown — the
                 // under-report posture, unchanged.
-                let ty = self
-                    .closed
-                    .bool_name
-                    .map(|id| Ty {
-                        base: crate::ty::Base::Name(id),
-                        nullable: false,
-                    })
-                    .unwrap_or(Ty::UNKNOWN);
+                let ty = self.closed.bool_name.map_or(Ty::UNKNOWN, |id| Ty {
+                    base: crate::ty::Base::Name(id),
+                    nullable: false,
+                });
                 let mut expr = Expr::trivial(ty);
                 expr.bool_value = Some(*value);
                 // A boolean literal can never evaluate to null — the same
@@ -519,14 +515,13 @@ impl Interp<'_> {
                 // inside a `?.`-opened-dead chain polls nothing — the
                 // member name owns the official's first dead node
                 // (`null?.m(1)` rows `m(1)`).
-                if self.for_header_depth > self.header_cond_depth || self.dead.is_none() {
-                    if !self
+                if (self.for_header_depth > self.header_cond_depth || self.dead.is_none())
+                    && !self
                         .null_shorts
                         .last()
                         .is_some_and(|short| short.dead_at_open)
-                    {
-                        self.dead_code(*span);
-                    }
+                {
+                    self.dead_code(*span);
                 }
                 // The literal's static type is `int` — the same
                 // `matchedType` face `Ev::Bool` spells `bool` for
@@ -536,14 +531,10 @@ impl Interp<'_> {
                 // flow_analysis.dart:3982-4098). Without the interned id
                 // (a direct-constructed interp) the face stays unknown —
                 // the under-report posture, unchanged.
-                let ty = self
-                    .closed
-                    .int_name
-                    .map(|id| Ty {
-                        base: crate::ty::Base::Name(id),
-                        nullable: false,
-                    })
-                    .unwrap_or(Ty::UNKNOWN);
+                let ty = self.closed.int_name.map_or(Ty::UNKNOWN, |id| Ty {
+                    base: crate::ty::Base::Name(id),
+                    nullable: false,
+                });
                 let mut expr = Expr::trivial(ty);
                 // An integer literal can never evaluate to null — the
                 // same guaranteed-non-null face `type.isNonNullable`
@@ -556,25 +547,20 @@ impl Interp<'_> {
                 // outside a header it also fires to OPEN the interval
                 // (`dead.is_none()`, the dead collection-element face),
                 // gated the same way inside a `?.`-opened-dead chain.
-                if self.for_header_depth > self.header_cond_depth || self.dead.is_none() {
-                    if !self
+                if (self.for_header_depth > self.header_cond_depth || self.dead.is_none())
+                    && !self
                         .null_shorts
                         .last()
                         .is_some_and(|short| short.dead_at_open)
-                    {
-                        self.dead_code(*span);
-                    }
+                {
+                    self.dead_code(*span);
                 }
                 // `Ev::Int`'s `double` twin (`num? d = 1.5` promotes `d`
                 // to `num`).
-                let ty = self
-                    .closed
-                    .double_name
-                    .map(|id| Ty {
-                        base: crate::ty::Base::Name(id),
-                        nullable: false,
-                    })
-                    .unwrap_or(Ty::UNKNOWN);
+                let ty = self.closed.double_name.map_or(Ty::UNKNOWN, |id| Ty {
+                    base: crate::ty::Base::Name(id),
+                    nullable: false,
+                });
                 let mut expr = Expr::trivial(ty);
                 expr.non_null_literal = true;
                 self.exprs.push(expr);
@@ -1182,7 +1168,7 @@ impl Interp<'_> {
                     // face is unknowable here: keep the widened form rather
                     // than stamping the LHS's bottom onto the result.
                     if !rhs_dead_entry
-                        && !(rhs_literal && result_ty != Ty::NEVER)
+                        && (!rhs_literal || result_ty == Ty::NEVER)
                         && self.classify(result_ty) == Classification::NonNullable
                         && self.classify(right.ty) != Classification::NonNullable
                     {
@@ -1707,10 +1693,9 @@ impl Interp<'_> {
                     // type's head token.
                     if operand.ty == Ty::NEVER
                         && matches!(self.stack.last(), Some(Frame::Cond { .. }))
+                        && let Some(Frame::Cond { never_cast, .. }) = self.stack.last_mut()
                     {
-                        if let Some(Frame::Cond { never_cast, .. }) = self.stack.last_mut() {
-                            *never_cast = true;
-                        }
+                        *never_cast = true;
                     }
                     // Official `asExpression_end`
                     // (flow_analysis.dart:6451-6477): a cast whose operand
@@ -2744,7 +2729,7 @@ impl Interp<'_> {
                     // node at the argument list — `Ev::ArgumentsBegin`
                     // anchors at `(` below.
                 } else if !self.stmt_began_dead
-                    && !self.exit_at.is_some_and(|at| at >= member.range.offset)
+                    && self.exit_at.is_none_or(|at| at < member.range.offset)
                 {
                     // A `?.` whose access path was dead at open has TWO
                     // official anchor faces, and the flow layer owns only
@@ -2844,7 +2829,9 @@ impl Interp<'_> {
                 // `x.m() != null` test must not promote the `(x, m)` slot).
                 if let (Some(field), Some(receiver)) = (
                     member_value.name,
-                    self.exprs.last().and_then(|e| e.prop_receiver()),
+                    self.exprs
+                        .last()
+                        .and_then(super::interp::Expr::prop_receiver),
                 ) {
                     let slot = self.prop_slot(receiver, field);
                     let promoted = self.prop_promoted(receiver, slot);
@@ -3036,7 +3023,7 @@ impl Interp<'_> {
                 if !post_send_tile
                     && self
                         .ops
-                        .is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
+                        .is_bottom(self.exprs.last().map_or(Ty::UNKNOWN, |e| e.ty))
                 {
                     // The same pre-exit capture the `Ident` arm keeps: a
                     // member read rooted in an identifier (`a.f`, `this.f`,
@@ -3282,7 +3269,7 @@ impl Interp<'_> {
                     // `Ev::Exit` for the resolved sends it tracks; this
                     // face covers the ones only the flow layer re-typed
                     // (a staged `Never` return adopted above).
-                    if self.ops.is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
+                    if self.ops.is_bottom(self.exprs.last().map_or(Ty::UNKNOWN, |e| e.ty))
                         && let Ev::Send { end, .. } | Ev::SendNoArgs { end } = ev
                         // The compound write's own operator send (#3997):
                         // upstream's `_resolveOperator` early-returns
@@ -3389,7 +3376,7 @@ impl Interp<'_> {
                             | Ev::IndexAccess { .. }
                             | Ev::Exit { .. }
                     )
-                ) && !self.exit_at.is_some_and(|at| at > open.range.offset)
+                ) && self.exit_at.is_none_or(|at| at <= open.range.offset)
                 {
                     self.dead_code(*open);
                 }
@@ -3435,11 +3422,11 @@ impl Interp<'_> {
                         if region.iter().any(|ev| matches!(ev, Ev::Throw)) {
                             return None;
                         }
-                        region.iter().find_map(|ev| ev.span())
+                        region.iter().find_map(super::ev::Ev::span)
                     });
                 if let Some(arg_span) = arg_span
                     && !self.reachable()
-                    && !self.exit_at.is_some_and(|at| at >= arg_span.range.offset)
+                    && self.exit_at.is_none_or(|at| at < arg_span.range.offset)
                     && !self
                         .null_shorts
                         .last()
@@ -3612,7 +3599,7 @@ impl Interp<'_> {
                 // (`(previous, next)` deciding a switch) reads it, and
                 // the collection-element strip below must not erase it.
                 self.flush_null_shorts_above(self.consumer_base(*count));
-                self.literal_value_keep_ty(*count)
+                self.literal_value_keep_ty(*count);
             }
             Ev::ListLitEnd { count, args } => {
                 // The literal's elements are complete expressions: rejoin
@@ -3626,7 +3613,7 @@ impl Interp<'_> {
                 // typed_literal_resolver.dart:68-107): `var l = <int>[]`'s
                 // static type is `List<int>`, the `matchedType` an
                 // initializer or assignment write promotes through.
-                self.literal_value(*count, self.closed.list_name, *args)
+                self.literal_value(*count, self.closed.list_name, *args);
             }
             Ev::SetOrMapLitEnd {
                 count,
@@ -3644,7 +3631,7 @@ impl Interp<'_> {
                 } else {
                     self.closed.map_name
                 };
-                self.literal_value(*count, name, *args)
+                self.literal_value(*count, name, *args);
             }
             Ev::MapEntryEnd => {
                 // The entry's key and value are complete expressions:
@@ -3679,14 +3666,14 @@ impl Interp<'_> {
                     let receiver = self
                         .exprs
                         .last()
-                        .map(|e| (e.reference, e.ty, e.args, e.non_null_literal))
-                        .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false));
+                        .map_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false), |e| {
+                            (e.reference, e.ty, e.args, e.non_null_literal)
+                        });
                     let recv_offset = self
                         .exprs
                         .last()
                         .and_then(|e| e.read_span)
-                        .map(|span| span.range.offset)
-                        .unwrap_or(0);
+                        .map_or(0, |span| span.range.offset);
                     self.null_short_begin(receiver, recv_offset);
                     // The head's `?..` context ends at the cascade's own
                     // `CascadeEnd` — upstream's direct
@@ -3739,11 +3726,13 @@ impl Interp<'_> {
                         events.get(i.wrapping_add(1)),
                         Some(Ev::Send { .. } | Ev::SendNoArgs { .. } | Ev::ArgumentsBegin { .. })
                     );
-                    if head_dead && !head_unassigned && !self.stmt_began_dead && !recovered_section
+                    if head_dead
+                        && !head_unassigned
+                        && !self.stmt_began_dead
+                        && !recovered_section
+                        && let Some(Ev::ParenBegin { span }) = events.get(i.wrapping_sub(1))
                     {
-                        if let Some(Ev::ParenBegin { span }) = events.get(i.wrapping_sub(1)) {
-                            self.dead_code(*span);
-                        }
+                        self.dead_code(*span);
                     }
                     // The target's `ReadType` row re-spells the promoted
                     // face: upstream `cascadeReceiver` reads the target's
@@ -3828,7 +3817,7 @@ impl Interp<'_> {
                 let target_recv = exprs_base
                     .checked_sub(1)
                     .and_then(|idx| self.exprs.get(idx))
-                    .and_then(|e| e.prop_receiver());
+                    .and_then(super::interp::Expr::prop_receiver);
                 if let (Some((field, span)), Some(receiver)) = (head_face, target_recv) {
                     let slot = self.prop_slot(receiver, field);
                     let promoted = self.prop_promoted(receiver, slot);
@@ -3980,14 +3969,10 @@ impl Interp<'_> {
                 // Object` makes the declared non-null form a type of
                 // interest). Without the interned id the face stays
                 // unknown — the under-report posture.
-                let ty = self
-                    .closed
-                    .string_name
-                    .map(|id| Ty {
-                        base: crate::ty::Base::Name(id),
-                        nullable: false,
-                    })
-                    .unwrap_or(Ty::UNKNOWN);
+                let ty = self.closed.string_name.map_or(Ty::UNKNOWN, |id| Ty {
+                    base: crate::ty::Base::Name(id),
+                    nullable: false,
+                });
                 // A string literal can never evaluate to null — the same
                 // guaranteed-non-null face the leaf literals carry.
                 let mut expr = Expr::trivial(ty);
@@ -4205,7 +4190,7 @@ impl Interp<'_> {
                 {
                     self.dead_arm_row(then_start, *then_end, then_dead_entry);
                 }
-                if let Some(Frame::Branch { branch, .. }) | Some(Frame::If { branch, .. }) =
+                if let Some(Frame::Branch { branch, .. } | Frame::If { branch, .. }) =
                     self.stack.last()
                 {
                     // The else-element begins under the condition-false
@@ -4383,12 +4368,10 @@ impl Interp<'_> {
         if let Some(head) = self.exprs.last_mut() {
             head.literal = true;
             head.non_null_literal = true;
-            head.ty = name
-                .map(|id| Ty {
-                    base: crate::ty::Base::Name(id),
-                    nullable: false,
-                })
-                .unwrap_or(Ty::UNKNOWN);
+            head.ty = name.map_or(Ty::UNKNOWN, |id| Ty {
+                base: crate::ty::Base::Name(id),
+                nullable: false,
+            });
             head.args = args;
         }
     }
@@ -4560,7 +4543,7 @@ impl Interp<'_> {
 
     /// Whether an operand's type test is guaranteed to
     /// fail (official `isExpression_end`'s first arm — upstream Dart
-    /// SDK source, pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+    /// SDK source, pkg/_`fe_analyzer_shared/lib/src/flow_analysis`/
     /// flow_analysis.dart:7184-7189 — `isBottomType(checkedType)` or
     /// `_isTypeCheckGuaranteedToFailWithSoundNullSafety`
     /// (:9133-9140) over `_typesAreDisjointDueToNullability`

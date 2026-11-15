@@ -25,6 +25,7 @@
 //! operator itself, the body expression fires between begin and end, and
 //! `endAnonymousMethodInvocation` carries the `=>` and the body's last token.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ParserFeatures;
 use crate::listener::{IdentifierContext, ParserListener, Token};
 use crate::tests::collector::scan_ok;
@@ -195,9 +196,7 @@ fn assert_anon_member_shape(
         }
     );
     assert!(
-        events
-            .iter()
-            .any(|ev| *ev == Ev::Ident(receiver.0, receiver.1)),
+        events.contains(&Ev::Ident(receiver.0, receiver.1)),
         "the receiver must be pushed before the member opens \
          (`AstBuilder.endAnonymousMethodInvocation` pops it, ast_builder.dart:921): {events:?}"
     );

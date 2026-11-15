@@ -18,6 +18,7 @@
 //! --format=machine` (3.13.7) semantics: a promoted operand re-types the
 //! composite node exactly as upstream's live flow state does.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 
@@ -40,14 +41,14 @@ fn rows_of(report: &FileReport, code: &str) -> Vec<(u32, u32, String)> {
 /// starved identically to the binary operand's.
 #[test]
 fn conditional_promoted_arm_recomputes_lub() {
-    let source = r#"
+    let source = r"
 void f(Object? o, bool b) {
   if (o is int) {
     int x = b ? o : 1;
     x = x;
   }
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         rows_of(&report, "invalid_assignment"),
@@ -68,14 +69,14 @@ void f(Object? o, bool b) {
 /// inner's unpromoted `num`.
 #[test]
 fn nested_binary_promoted_inner_propagates() {
-    let source = r#"
+    let source = r"
 void f(num n) {
   if (n is int) {
     int x = n + 1 + 2;
     x = x;
   }
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         rows_of(&report, "invalid_assignment"),
@@ -95,14 +96,14 @@ void f(num n) {
 /// blanket suppress). Oracle: one row.
 #[test]
 fn promoted_binary_still_reports_real_mismatch() {
-    let source = r#"
+    let source = r"
 void f(num n) {
   if (n is int) {
     double x = n + 1;
     x = x;
   }
 }
-"#;
+";
     let report = report_ops(source);
     let found = rows_of(&report, "invalid_assignment");
     assert_eq!(found.len(), 1, "{:#?}", report.diagnostics);
@@ -131,24 +132,24 @@ fn pending_records_do_not_leak_across_units() {
     // confirm each stays silent — the second run reuses the same rayon
     // thread's thread-local, so a non-draining first pass would corrupt it.
     let first = report_ops(
-        r#"
+        r"
 void f(num n) {
   if (n is int) {
     int x = n + 1;
     x = x;
   }
 }
-"#,
+",
     );
     let second = report_ops(
-        r#"
+        r"
 void g(num n) {
   if (n is int) {
     int y = n + 2;
     y = y;
   }
 }
-"#,
+",
     );
     assert_eq!(rows_of(&first, "invalid_assignment"), vec![]);
     assert_eq!(rows_of(&second, "invalid_assignment"), vec![]);

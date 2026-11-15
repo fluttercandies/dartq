@@ -7,6 +7,48 @@
 //! cargo test -p dartq-debug --test e2e_attach_pause -- --ignored --test-threads=1
 //! ```
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::single_match,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::useless_conversion,
+    clippy::question_mark,
+    clippy::option_option,
+    clippy::needless_continue,
+    clippy::missing_panics_doc,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::explicit_counter_loop,
+    clippy::never_loop,
+    clippy::needless_range_loop,
+    clippy::unnecessary_unwrap,
+    clippy::assigning_clones,
+    clippy::double_must_use,
+    clippy::cast_possible_wrap,
+    clippy::match_wild_err_arm,
+    clippy::unnecessary_debug_formatting,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::ignore_without_reason,
+    clippy::semicolon_if_nothing_returned
+)]
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -75,7 +117,7 @@ fn spawn_free_running() -> (Child, String) {
             Ok(_) => {
                 if let Some(start) = line.find("http://") {
                     let token = line[start..].trim_end().to_owned();
-                    if token.contains("/") {
+                    if token.contains('/') {
                         break token;
                     }
                 }

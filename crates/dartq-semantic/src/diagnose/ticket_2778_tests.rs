@@ -20,6 +20,7 @@
 //!   verdict reads the enclosing container's `this` face and anchors at
 //!   the keyword.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -42,15 +43,15 @@ fn anchor(fixture: &str, needle: &str) -> u32 {
 // —— the whole-expression span ——————————————————————————————————————
 
 /// `null is! Null` reports constant-false over the whole is-expression:
-/// the oracle row is `2:9|13` (test_null_isNot_Null — the operand `null`
+/// the oracle row is `2:9|13` (`test_null_isNot_Null` — the operand `null`
 /// starts the span, the checked `Null` ends it), not the bare operand.
 #[test]
 fn null_is_not_null_spans_the_whole_expression() {
     let source = "var b = null is! Null;\n";
-    let report = report_ops(&source);
+    let report = report_ops(source);
     assert_eq!(
         exact_rows(&report, "unnecessary_type_check"),
-        vec![(anchor(&source, "null is"), 13)],
+        vec![(anchor(source, "null is"), 13)],
         "{:?}",
         report.diagnostics
     );
@@ -61,16 +62,16 @@ fn null_is_not_null_spans_the_whole_expression() {
 }
 
 /// `a is int?` over `int? a` reports constant-true over the whole
-/// is-expression: the oracle row is `3:3|9` (test_typeNullable_is_same),
+/// is-expression: the oracle row is `3:3|9` (`test_typeNullable_is_same`),
 /// and the `is!` polarity carries the complement message at `3:3|10`
-/// (test_typeNullable_isNot_same, 'false').
+/// (`test_typeNullable_isNot_same`, 'false').
 #[test]
 fn nullable_same_type_spans_whole_expression_both_polarities() {
     let fixture = "void f(int? a) {\n  a is int?;\n}\nvoid g(int? a) {\n  a is! int?;\n}\n";
     let source = fixture;
-    let report = report_ops(&source);
-    let first = anchor(&source, "a is int?");
-    let second = anchor(&source, "a is! int?");
+    let report = report_ops(source);
+    let first = anchor(source, "a is int?");
+    let second = anchor(source, "a is! int?");
     assert_eq!(
         exact_rows(&report, "unnecessary_type_check"),
         vec![(first, 9), (second, 10)],
@@ -87,10 +88,10 @@ fn nullable_same_type_spans_whole_expression_both_polarities() {
 fn generic_checked_type_spans_through_the_arguments() {
     let fixture = "void f(Iterable<int> o1) {\n  if (o1 is Iterable<int>) {}\n}\n";
     let source = fixture;
-    let report = report_ops(&source);
+    let report = report_ops(source);
     assert_eq!(
         exact_rows(&report, "unnecessary_type_check"),
-        vec![(anchor(&source, "o1 is"), 19)],
+        vec![(anchor(source, "o1 is"), 19)],
         "{:?}",
         report.diagnostics
     );
@@ -101,11 +102,11 @@ fn generic_checked_type_spans_through_the_arguments() {
 /// `num? a; a is int?` is informative: `num? <: int?` needs the
 /// supertype graph (subtype.dart's interface rule), and the assignment
 /// face's nullable-target Right Top must not answer it — the oracle's
-/// row set for test_typeNullable_is_subtype is empty.
+/// row set for `test_typeNullable_is_subtype` is empty.
 #[test]
 fn unrelated_nullable_head_pair_stays_silent() {
     let source = "void f(num? a) {\n  a is int?;\n}\n";
-    let report = report_ops(&source);
+    let report = report_ops(source);
     assert!(
         exact_rows(&report, "unnecessary_type_check").is_empty(),
         "{:?}",
@@ -120,7 +121,7 @@ fn unrelated_nullable_head_pair_stays_silent() {
 fn nullable_object_operand_stays_silent() {
     let fixture = "void f(Object? o1) {\n  if (o1 is Iterable<int>?) {}\n}\n";
     let source = fixture;
-    let report = report_ops(&source);
+    let report = report_ops(source);
     assert!(
         exact_rows(&report, "unnecessary_type_check").is_empty(),
         "{:?}",
@@ -134,7 +135,7 @@ fn nullable_object_operand_stays_silent() {
 #[test]
 fn dynamic_operand_against_named_target_stays_silent() {
     let source = "void f(dynamic x) {\n  if (x is int?) {}\n}\n";
-    let report = report_ops(&source);
+    let report = report_ops(source);
     assert!(
         exact_rows(&report, "unnecessary_type_check").is_empty(),
         "{:?}",
@@ -143,24 +144,24 @@ fn dynamic_operand_against_named_target_stays_silent() {
 }
 
 /// The non-subtype plain pair stays informative (upstream
-/// test_typeNonNullable_isNot_subtype has no marker — the oracle is
+/// `test_typeNonNullable_isNot_subtype` has no marker — the oracle is
 /// silent), and the true subtype direction keeps reporting
-/// (test_typeNonNullable_is_supertype's marker: `int a; a is! num` is
+/// (`test_typeNonNullable_is_supertype`'s marker: `int a; a is! num` is
 /// constant-false over the whole node).
 #[test]
 fn core_numeric_edges_decide_both_directions() {
     let silent = "void f(num a) {\n  a is! int;\n}\n";
-    let report = report_ops(&silent);
+    let report = report_ops(silent);
     assert!(
         exact_rows(&report, "unnecessary_type_check").is_empty(),
         "{:?}",
         report.diagnostics
     );
     let source = "void f(int a) {\n  a is! num;\n}\n";
-    let report = report_ops(&source);
+    let report = report_ops(source);
     assert_eq!(
         exact_rows(&report, "unnecessary_type_check"),
-        vec![(anchor(&source, "a is"), 9)],
+        vec![(anchor(source, "a is"), 9)],
         "{:?}",
         report.diagnostics
     );
@@ -169,14 +170,14 @@ fn core_numeric_edges_decide_both_directions() {
 // —— `is dynamic` —————————————————————————————————————————————————————
 
 /// `a is dynamic` is constant-true whatever the operand: the oracle row
-/// is `3:3|12` (test_type_is_dynamic) with the always-true message.
+/// is `3:3|12` (`test_type_is_dynamic`) with the always-true message.
 #[test]
 fn is_dynamic_reports_over_the_whole_expression() {
     let source = "void f(Object? a) {\n  a is dynamic;\n}\n";
-    let report = report_ops(&source);
+    let report = report_ops(source);
     assert_eq!(
         exact_rows(&report, "unnecessary_type_check"),
-        vec![(anchor(&source, "a is"), 12)],
+        vec![(anchor(source, "a is"), 12)],
         "{:?}",
         report.diagnostics
     );
@@ -184,7 +185,7 @@ fn is_dynamic_reports_over_the_whole_expression() {
 
 // —— the keyword operand ——————————————————————————————————————————————
 
-/// `this is C` inside `C` is constant-true (this_not_promoted_test's
+/// `this is C` inside `C` is constant-true (`this_not_promoted_test`'s
 /// `isSameType` guard carries the oracle row): the keyword is the
 /// operand — typed by the enclosing container — and the row anchors at
 /// `this`, spanning the whole expression.
@@ -192,10 +193,10 @@ fn is_dynamic_reports_over_the_whole_expression() {
 fn this_operand_folds_and_anchors_at_the_keyword() {
     let fixture = "class C {\n  void f() {\n    if (this is C) {\n      1;\n    }\n  }\n}\n";
     let source = fixture;
-    let report = report_ops(&source);
+    let report = report_ops(source);
     assert_eq!(
         exact_rows(&report, "unnecessary_type_check"),
-        vec![(anchor(&source, "this is"), 9)],
+        vec![(anchor(source, "this is"), 9)],
         "{:?}",
         report.diagnostics
     );
@@ -209,10 +210,10 @@ fn extension_this_reads_the_on_type() {
     let fixture =
         "extension E on int {\n  void f() {\n    if (this is int) {\n      1;\n    }\n  }\n}\n";
     let source = fixture;
-    let report = report_ops(&source);
+    let report = report_ops(source);
     assert_eq!(
         exact_rows(&report, "unnecessary_type_check"),
-        vec![(anchor(&source, "this is"), 11)],
+        vec![(anchor(source, "this is"), 11)],
         "{:?}",
         report.diagnostics
     );

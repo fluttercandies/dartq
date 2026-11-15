@@ -1075,7 +1075,7 @@ fn unnecessary_lambdas_signature_gate_faces() {
 /// arm (:108-111, "We must assume is valid here"): a callee the
 /// model resolves to no function type — a local function, an
 /// unresolved spelling, the untyped-formal forward onto one. The
-/// FunctionType path (:112-150) over the undecided `None` verdict —
+/// `FunctionType` path (:112-150) over the undecided `None` verdict —
 /// the inferred channel: an untyped, `dynamic`, or parameterized
 /// formal the context types upstream, a generic callee's
 /// instantiation, distinct named types — rides the required-positional
@@ -1211,7 +1211,7 @@ fn unnecessary_lambdas_report_spans_the_body() {
 /// (`isFinalNode(node.target)` :283 under `isFinal` :326-335): a
 /// `final` local's method fires, a `final` FIELD's method fires,
 /// and a `final` parameter of an ENCLOSING lambda fires (the
-/// VariableElement arm — `isFinal && !isLate`), while a plain
+/// `VariableElement` arm — `isFinal && !isLate`), while a plain
 /// parameter stays silent.
 #[test]
 fn unnecessary_lambdas_receiver_finality_faces() {
@@ -1308,10 +1308,10 @@ fn unnecessary_lambdas_named_argument_context_gate() {
 /// recovered classic-`for` header reports every effect-free segment. The
 /// oracle's parser recovery splices a synthetic `;` after the first
 /// segment (upstream Dart SDK source,
-/// pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart,
+/// pkg/_`fe_analyzer_shared/lib/src/parser/parser_impl.dart`,
 /// `parseForLoopPartsRest` → `ensureSemicolon`, :10344-10349) and the
 /// trailing comma list parses as the updater list, so the upstream walk
-/// (pkg/linter/lib/src/rules/unnecessary_statements.dart :209-217) reads
+/// (`pkg/linter/lib/src/rules/unnecessary_statements.dart` :209-217) reads
 /// the first segment off `initialization` and each later segment off
 /// `updaters` — dartq's `check_for` window split (content end at the
 /// spliced separator, rows from the separator payload tokens) lands the

@@ -39,6 +39,8 @@
 //!    `augment` member never claims at all (:307-309). The collector's
 //!    name-keyed cross-declaration scope merge mis-served both.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{assert_silent, report_ops, report_ops_wildcards};
 
 fn dup_messages(report: &crate::diagnose::FileReport) -> Vec<String> {

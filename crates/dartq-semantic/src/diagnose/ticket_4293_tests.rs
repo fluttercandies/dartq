@@ -17,6 +17,7 @@
 //! Oracle provenance: `dart analyze` 3.13.7 over the exact fixtures (the
 //! expected rows below mirror the probe verbatim).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

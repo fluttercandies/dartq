@@ -26,6 +26,7 @@
 //! by `apply_pattern_exit` :1542-1562), outside this lane's scope — see the
 //! residual routing in the ticket report.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

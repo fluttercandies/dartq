@@ -22,6 +22,7 @@
 //! mirror the oracle — lives here, and each universe supplies its own
 //! lattice operations.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// The lattice operations the solve needs, supplied per type universe.
 pub trait InferenceLattice {
     /// The type representation.
@@ -74,6 +75,7 @@ pub struct MergedTypeConstraint<T> {
 
 impl<T> MergedTypeConstraint<T> {
     /// A fresh, unconstrained store.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             lower: None,
@@ -157,10 +159,10 @@ fn choose_type_from_constraint<T: Copy, L: InferenceLattice<Ty = T>>(
     grounded: bool,
     contravariant: bool,
 ) -> T {
-    let (first, second) = if !contravariant {
-        (constraint.lower, constraint.upper)
-    } else {
+    let (first, second) = if contravariant {
         (constraint.upper, constraint.lower)
+    } else {
+        (constraint.lower, constraint.upper)
     };
     // Prefer the known bound, if any (:1021-1027 / :1043-1049).
     if let Some(bound) = first

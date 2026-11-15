@@ -1,5 +1,6 @@
 //! Number form matrix and the full string form matrix (raw/triple-quoted/nested interpolation/escapes/unterminated).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::{assert_codes, assert_kinds, scan_src};
 use crate::{Keyword, TokenKind as K};
 use dartq_source::byte_offset_to_utf16;
@@ -28,7 +29,7 @@ fn int_separator_errors() {
     // the e/./end checkpoints).
     let r = scan_src("1__2");
     assert_kinds(&r, &[K::Int]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     // `1_000_` also reports as a trailing separator.
     let r = scan_src("1_000_");
     assert_codes(&r, &["unexpected_separator_in_number"]);
@@ -81,7 +82,7 @@ fn one_dot_is_int_plus_period() {
     // `1x` = INT + IDENTIFIER, no diagnostic (official behavior).
     let r = scan_src("1x");
     assert_kinds(&r, &[K::Int, K::Identifier]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     // `0x1g` = HEX + IDENTIFIER.
     assert_kinds(&scan_src("0x1g"), &[K::Hexadecimal, K::Identifier]);
 }
@@ -107,7 +108,7 @@ fn raw_strings() {
     let r = scan_src("r'a\\nb'");
     assert_kinds(&r, &[K::String]);
     assert_eq!(r.tokens.first().byte_len, 7); // all 7 bytes of r'a\nb'
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]
@@ -129,7 +130,7 @@ fn escape_sequences() {
     let src = r#"'\n\r\t\b\f\v\x41\u0041\u{1F600}\\\'\"\$'"#;
     let r = scan_src(src);
     assert_kinds(&r, &[K::String]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]
@@ -357,7 +358,7 @@ fn interpolation_nested_expression() {
             K::String,                        // y'
         ],
     );
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     let t = &r.tokens;
     assert_eq!(t.matching_end(1), Some(7)); // outer ${ → the final }
     assert_eq!(t.matching_end(3), Some(5)); // inner ${ → inner }
@@ -380,7 +381,7 @@ fn interpolation_with_function_call() {
             K::String,
         ],
     );
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]
@@ -601,11 +602,11 @@ fn raw_multiline_dollar_is_content() {
     let r = scan_src(src);
     assert_kinds(&r, &[K::String]);
     assert_eq!(r.tokens.first().byte_range(), 0..src.len());
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     let src = "r\"\"\"${x}\"\"\"";
     let r = scan_src(src);
     assert_kinds(&r, &[K::String]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]
@@ -626,7 +627,7 @@ fn adjacent_strings_inside_interpolation() {
             K::String,                        // d'
         ],
     );
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]
@@ -771,7 +772,7 @@ fn deep_nested_wellformed_interpolation() {
     src.push('a');
     src.push_str(&"}\"".repeat(1_000));
     let r = scan_src(&src);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     let slice = r.tokens.as_slice();
     // Per level: prefix STRING + `${` + `}` + suffix STRING; plus the
     // innermost identifier and Eof.

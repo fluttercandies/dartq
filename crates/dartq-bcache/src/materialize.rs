@@ -1,18 +1,18 @@
 //! CAS entry → project-tree materialization: turn a store hit into a
-//! native flutter_tools skip.
+//! native `flutter_tools` skip.
 //!
 //! A cached flutter build entry is replayed into the target worktree's
 //! `.dart_tool/flutter_build/<hash-dir>/` so that flutter's
 //! content-hash validation finds every target up-to-date and never
-//! invokes frontend_server. The `flutter test` face replays its kernel
+//! invokes `frontend_server`. The `flutter test` face replays its kernel
 //! cache into the fixed-path `<buildDir>/test_cache/` instead —
-//! frontend_server's initialize-from-dill validation is the equivalent
+//! `frontend_server`'s initialize-from-dill validation is the equivalent
 //! correctness net there, and because that validation resolves the
 //! dill's embedded `file://` URIs, a replay into a DIFFERENT tree
 //! rewrites them through [`dill_rewrite`] (a same-tree hit keeps the
 //! verbatim clone). Payload blobs are placed with
 //! copy-on-write clones (measured on APFS: 4.4 GB in 0.379 s; plain
-//! copies are orders slower), never hardlinks — flutter_tools rewrites
+//! copies are orders slower), never hardlinks — `flutter_tools` rewrites
 //! some outputs in place and a hardlink would corrupt the shared
 //! store. The skip only survives if the bookkeeping files
 //! (stamp/`.filecache`/depfile/outputs) carry the TARGET tree's
@@ -45,12 +45,12 @@
 //! Crash atomicity: individual file writes are rename-atomic (write to
 //! a temp sibling, rename into place), so no reader ever sees a
 //! half-written file. A crash mid-materialize leaves a partial hash
-//! dir, which is safe by construction — flutter_tools validates
+//! dir, which is safe by construction — `flutter_tools` validates
 //! content hashes, never mtimes, and treats wrong-content output as a
 //! miss and rebuilds. No staging dance is built on top.
 //!
 //! The content hashes flutter validates live in each hash dir's
-//! FileStore record, `.filecache` (flutter_tools 3.47.1
+//! `FileStore` record, `.filecache` (`flutter_tools` 3.47.1
 //! `build_system/file_store.dart`: `{"version":2,"files":[{"path",
 //! "hash"}]}`, the md5 of every tracked input and output by absolute
 //! path). A cross-tree replay rewrites bytes flutter tracks there — a
@@ -60,6 +60,7 @@
 //! rewritten dill as changed output and recompile the kernel on every
 //! fresh-tree hit (see [`patch_file_store`]).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -152,12 +153,12 @@ pub struct MaterializeReport {
     pub dill_rewrites: u64,
     /// Test kernel-cache dills placed verbatim because the URI rewriter
     /// refused them (version gate, non-ASCII match, unknown layout):
-    /// frontend_server's initialize-from-dill validation re-resolves
+    /// `frontend_server`'s initialize-from-dill validation re-resolves
     /// their URIs, at the cost of a recompile.
     pub dill_rewrite_refused: u64,
     /// Payload dills (`app.dill`, `kernel_blob.bin`) the URI rewriter
     /// refused, left out of the tree. Verbatim, such a dill would carry
-    /// the ingest tree's URIs past flutter's FileStore validation (its
+    /// the ingest tree's URIs past flutter's `FileStore` validation (its
     /// md5 is the recorded one) into this tree's artifacts; missing, it
     /// makes flutter rerun the target that produces it.
     pub dill_omitted: u64,
@@ -400,7 +401,7 @@ pub fn materialize(
 struct Run {
     report: MaterializeReport,
     /// Whether byte-changing placements must report their md5: set
-    /// while a FileStore record this run places is still pending.
+    /// while a `FileStore` record this run places is still pending.
     want_md5: bool,
     /// Kernel dills this run rewrote, by source blob: the placed path
     /// and its md5 (when wanted). A payload replayed twice — `app.dill`
@@ -414,7 +415,7 @@ struct Run {
 /// which exists by construction — anything else is a malformed or
 /// foreign plan best placed verbatim).
 fn usable_root(root: &Path) -> bool {
-    root.as_os_str().len() > 0 && root.is_absolute() && fs::canonicalize(root).is_ok()
+    !root.as_os_str().is_empty() && root.is_absolute() && fs::canonicalize(root).is_ok()
 }
 
 /// A copy of `plan` with every rewrite stripped: all files verbatim,
@@ -517,7 +518,7 @@ fn verify_missing_blobs(
 /// by [`materialize`]'s upfront pass — into its materialized dir and
 /// reports it with the identity it landed under, plus the md5 of the
 /// landed bytes when the run wants it ([`Run::want_md5`]) and they are
-/// not the blob's: the hash a FileStore record must carry for them.
+/// not the blob's: the hash a `FileStore` record must carry for them.
 /// `None` when the file is deliberately left out (a refused payload
 /// dill, see [`MaterializeReport::dill_omitted`]).
 fn materialize_one(
@@ -578,26 +579,23 @@ fn materialize_one(
             let mut to = b"file://".to_vec();
             to.extend_from_slice(plan.new_root.as_os_str().as_encoded_bytes());
             to.push(b'/');
-            match dill_rewrite::rewrite_file(&src, &tmp, &from, &to) {
-                Ok(_) => {
-                    run.report.dill_rewrites += 1;
-                    placed = true;
-                    verbatim = false;
-                    fresh_dill = true;
+            if dill_rewrite::rewrite_file(&src, &tmp, &from, &to).is_ok() {
+                run.report.dill_rewrites += 1;
+                placed = true;
+                verbatim = false;
+                fresh_dill = true;
+            } else {
+                let _ = fs::remove_file(&tmp);
+                let payload = file
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(crate::ingest_scan::is_payload_dill);
+                if payload {
+                    run.report.dill_omitted += 1;
+                    return Ok(None);
                 }
-                Err(_) => {
-                    let _ = fs::remove_file(&tmp);
-                    let payload = file
-                        .path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(crate::ingest_scan::is_payload_dill);
-                    if payload {
-                        run.report.dill_omitted += 1;
-                        return Ok(None);
-                    }
-                    run.report.dill_rewrite_refused += 1;
-                }
+                run.report.dill_rewrite_refused += 1;
             }
         }
     }
@@ -694,8 +692,8 @@ fn materialize_one(
     Ok(Some((placed_file, md5)))
 }
 
-/// flutter_tools' FileStore record — `.filecache`, format version 2
-/// (flutter_tools 3.47.1 `build_system/file_store.dart`, `FileStorage`
+/// `flutter_tools`' `FileStore` record — `.filecache`, format version 2
+/// (`flutter_tools` 3.47.1 `build_system/file_store.dart`, `FileStorage`
 /// / `FileHash`): every tracked input and output by path, with the md5
 /// of its bytes as last hashed. Field order is flutter's own.
 #[derive(Serialize, Deserialize)]
@@ -710,19 +708,19 @@ struct FileHash {
     hash: String,
 }
 
-/// The FileStore record's name in a build dir (`FileStore.kFileCache`).
+/// The `FileStore` record's name in a build dir (`FileStore.kFileCache`).
 const FILE_STORE: &str = ".filecache";
 
-/// The one FileStore format this module patches (`FileStore._kVersion`).
+/// The one `FileStore` format this module patches (`FileStore._kVersion`).
 const FILE_STORE_VERSION: u32 = 2;
 
 fn is_file_store(path: &Path) -> bool {
     path == Path::new(FILE_STORE)
 }
 
-/// The hook-result files flutter_tools rewrites on every run of their
+/// The hook-result files `flutter_tools` rewrites on every run of their
 /// target with fresh `build_start`/`build_end` timestamps
-/// (`DartHooksResult.toJson`, isolated/native_assets/dart_hook_result.dart):
+/// (`DartHooksResult.toJson`, `isolated/native_assets/dart_hook_result.dart)`:
 /// `link_hooks_result.json` (3.47, `LinkHooks.resultFilename`) and
 /// `dart_build_result.json` (3.38–3.44, `DartBuild.dartHookResultFilename`;
 /// on earlier lines the same name carries no timestamps and
@@ -749,7 +747,7 @@ pub(crate) fn has_content_identity(relative: &Path) -> bool {
 
 /// The normalized identity of a bookkeeping file whose bytes move on
 /// every flutter run without its content moving (see
-/// [`PlacedFile::content`]): the FileStore record up to its order and
+/// [`PlacedFile::content`]): the `FileStore` record up to its order and
 /// its hook-result md5s ([`file_store_content`]), a hook result up to
 /// its timestamps ([`hook_result_content`]). `None` for every other
 /// file, and for bytes that do not parse as the expected format — those
@@ -766,7 +764,7 @@ pub(crate) fn content_identity(relative: &Path, bytes: &[u8]) -> Option<BlobId> 
 
 /// A hook result's identity without its timestamps: the blake3 of the
 /// JSON object re-encoded with `build_start`/`build_end` removed, every
-/// other key in flutter's own order (the workspace's serde_json keeps
+/// other key in flutter's own order (the workspace's `serde_json` keeps
 /// insertion order). `None` unless the bytes are an object carrying both
 /// timestamps as strings — a result without them has nothing volatile
 /// and keeps byte identity.
@@ -774,7 +772,7 @@ pub(crate) fn content_identity(relative: &Path, bytes: &[u8]) -> Option<BlobId> 
 /// Dropping the timestamps is sound for the replay: flutter only reads
 /// them back as the "modified since" bounds of
 /// `FlutterHookResult.hasAnyModifiedFiles` and `isOutputDirty`
-/// (flutter_tools lib/src/asset.dart), so an entry that keeps an OLDER
+/// (`flutter_tools` lib/src/asset.dart), so an entry that keeps an OLDER
 /// rendering of an otherwise equal result can only make flutter see more
 /// files as modified — a rebuild, never a wrong skip.
 fn hook_result_content(bytes: &[u8]) -> Option<BlobId> {
@@ -793,10 +791,10 @@ fn hook_result_content(bytes: &[u8]) -> Option<BlobId> {
     Some(BlobId(*hasher.finalize().as_bytes()))
 }
 
-/// The order-free identity of a FileStore record's content: the blake3
+/// The order-free identity of a `FileStore` record's content: the blake3
 /// of its `(path, hash)` records in sorted order, each field
-/// length-prefixed. flutter_tools persists the record from a Dart
-/// `HashMap` (`FileStore.persist`, file_store.dart), whose iteration
+/// length-prefixed. `flutter_tools` persists the record from a Dart
+/// `HashMap` (`FileStore.persist`, `file_store.dart`), whose iteration
 /// order follows the hash codes of the recorded paths: the same records
 /// under another tree's root land in another order (measured on an apk
 /// replay: 825 identical records, different order), so the bytes of an
@@ -840,7 +838,7 @@ pub(crate) fn file_store_content(bytes: &[u8]) -> Option<BlobId> {
 }
 
 /// Streamed md5 of a placed file as lowercase hex — the digest a
-/// FileStore record holds (`Digest.toString()` of package:crypto's
+/// `FileStore` record holds (`Digest.toString()` of package:crypto's
 /// md5). A 1 MiB buffer keeps a ~100 MB dill from ever loading whole.
 fn file_md5_hex(path: &Path) -> std::io::Result<String> {
     use md5::{Digest, Md5};
@@ -858,13 +856,13 @@ fn file_md5_hex(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Re-aims the md5 records of a FileStore record this run placed at
+/// Re-aims the md5 records of a `FileStore` record this run placed at
 /// the bytes this run rewrote, keyed by the paths `rewritten` names.
 ///
-/// flutter_tools 3.47.1 `Node.computeChanges` (build_system.dart)
+/// `flutter_tools` 3.47.1 `Node.computeChanges` (`build_system.dart`)
 /// diffs every tracked input and output through
 /// `FileStore.diffFileList` — `_hashFile` md5s the file and marks it
-/// dirty on any mismatch with the record (file_store.dart) — and reruns
+/// dirty on any mismatch with the record (`file_store.dart`) — and reruns
 /// the target. The record replays the INGEST tree's md5s, so without
 /// this patch every byte-changing placement reads as changed output:
 /// the cross-tree dill rewrite alone reran `kernel_snapshot_program`
@@ -1131,10 +1129,10 @@ fn set_executable(path: &Path) -> Result<()> {
 /// keeps two shims materializing into one tree (a terminal and an IDE —
 /// audit A14) from clobbering each other's temp before the rename.
 fn tmp_sibling(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .map(|n| format!(".{}.{}.dartq-tmp", n.to_string_lossy(), std::process::id()))
-        .unwrap_or_else(|| format!(".{}.dartq-tmp", std::process::id()));
+    let name = path.file_name().map_or_else(
+        || format!(".{}.dartq-tmp", std::process::id()),
+        |n| format!(".{}.{}.dartq-tmp", n.to_string_lossy(), std::process::id()),
+    );
     path.with_file_name(name)
 }
 
@@ -1969,7 +1967,7 @@ mod tests {
     }
 
     /// A payload dill the rewriter refuses never lands cross-tree: its
-    /// recorded md5 would pass flutter's FileStore validation with the
+    /// recorded md5 would pass flutter's `FileStore` validation with the
     /// ingest tree's URIs inside, so it is left out (counted) and
     /// flutter reruns the target that produces it. The dir's other
     /// files still land; a same-root replay places it verbatim.
@@ -2522,8 +2520,8 @@ mod tests {
         );
     }
 
-    /// flutter_tools' FileStore check, as `Node.computeChanges` runs it
-    /// (build_system.dart → file_store.dart `_hashFile`): every record's
+    /// `flutter_tools`' `FileStore` check, as `Node.computeChanges` runs it
+    /// (`build_system.dart` → `file_store.dart` `_hashFile`): every record's
     /// file is md5-hashed — a relative path against the project dir, as
     /// flutter resolves it against its cwd — and any digest that differs
     /// from the record (or a missing file) is a dirty target. Returns the
@@ -2856,7 +2854,7 @@ mod tests {
     }
 
     /// #4136: a hook result's identity drops exactly its two timestamps,
-    /// and the FileStore record's drops exactly the hook results' md5s;
+    /// and the `FileStore` record's drops exactly the hook results' md5s;
     /// every other byte of content still counts, and anything that is
     /// not the expected shape keeps byte identity only.
     #[test]

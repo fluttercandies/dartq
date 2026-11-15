@@ -5,7 +5,7 @@
 //! reports `checkPatternNeverMatchesValueType` from that node
 //! (`DartPatternImpl.resolvePattern`, upstream Dart SDK source,
 //! pkg/analyzer/lib/src/dart/ast/ast.dart:4138/8564/24753/27989/35197 and
-//! pkg/analyzer/lib/src/dart/resolver/list_pattern_resolver.dart:45); a
+//! `pkg/analyzer/lib/src/dart/resolver/list_pattern_resolver.dart:45`); a
 //! logical operand keeps its enclosing pattern's matched type
 //! (`analyzeLogicalOrPattern`/`analyzeLogicalAndPattern` dispatch both
 //! operands with `flow.getMatchedValueType()`, upstream
@@ -24,6 +24,7 @@
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs`
 //! is a live-lane file out of this ticket's write scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 

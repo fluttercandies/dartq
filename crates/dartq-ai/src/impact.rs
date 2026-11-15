@@ -43,6 +43,7 @@
 //! added or removed declaration fires, and so does a stable name whose
 //! canonical face moved — the name-presence proxy is retired.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};

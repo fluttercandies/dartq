@@ -117,7 +117,7 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     /// keys on this: the redirecting-initializer head recovery re-reads
     /// `<synthetic> = this …` through the expression engine, and the nested
     /// `this = …` that formation builds is an artifact no oracle row tracks
-    /// (`C() : this = 0;` — expected_token + missing_assignment_in_initializer,
+    /// (`C() : this = 0;` — `expected_token` + `missing_assignment_in_initializer`,
     /// never the selector), while every real target keeps the row. Each
     /// assignment arm writes its own operator's realness before the right
     /// recursion and clears it afterwards, so the field reads the immediate
@@ -143,7 +143,7 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     pub(crate) statement_expr_begin: Option<TokenId>,
     /// The parsed-shape assignability of the operand most recently completed
     /// at postfix precedence — the official `reportErrorIfSuper`-family
-    /// operand test (`_isAssignable`, ast_builder.dart:6607: only
+    /// operand test (`_isAssignable`, `ast_builder.dart:6607`: only
     /// `Identifier`, `PropertyAccess`, `IndexExpression` qualify;
     /// `PrefixExpression`, `MethodInvocation`, `FunctionReference`,
     /// `DotShorthandPropertyAccess` and every other shape do not). The
@@ -173,7 +173,7 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     pub(crate) unmatched_reported: Vec<u32>,
     /// Identical `(lexeme, offset)` unmatched-group rows collapse to one
     /// (the official translation's rows dedupe downstream — oracle
-    /// two_unclosed_curly: two `}`-groups parked at EOF surface as a single
+    /// `two_unclosed_curly`: two `}`-groups parked at EOF surface as a single
     /// row; every row carries length 1, so the offset finishes the key).
     /// Keyed `&'static str` — closer lexemes are fixed.
     pub(crate) unmatched_seen: Vec<(&'static str, u32)>,
@@ -222,11 +222,11 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     pub(crate) synthetic_formals: bool,
     /// The member dispatch's scan-face name candidate: the token the type
     /// scan's `skipType` landed on (official `beforeName = typeInfo.skipType`,
-    /// parser_impl.dart:4245), paired with whether it is name-shaped. Set by
+    /// `parser_impl.dart:4245`), paired with whether it is name-shaped. Set by
     /// `parse_class_member_impl` before the member dispatch, consumed by
     /// `parse_method` after its return-type re-parse to bound the recovered
     /// group's overshoot (the official `assert(token.next == name)` invariant,
-    /// parser_impl.dart:5875).
+    /// `parser_impl.dart:5875`).
     pub(crate) member_scan_name: Option<(TokenSpan, bool)>,
     /// Set while an extension type's representation formals parse; the
     /// accumulated shape drives the representation-field error codes
@@ -678,7 +678,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
     /// The `constructor-tearoffs` gate's `new` face (`enabledIn: 2.15`): the
     /// parser rewrites a `.`-headed `new` to an identifier wherever the
     /// context allows it, and the analyzer's `handleNewAsIdentifier`
-    /// (ast_builder.dart:4984) reports `experiment_not_enabled` at that
+    /// (`ast_builder.dart:4984`) reports `experiment_not_enabled` at that
     /// token when the feature is off. Call it at every rewrite point.
     pub(crate) fn report_constructor_tearoff_new(&mut self, at: TokenSpan) {
         if !self.features.constructor_tearoffs_enabled {
@@ -689,7 +689,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
         }
     }
 
-    /// The `constructor-tearoffs` gate's type-argument face (ast_builder.dart:5602):
+    /// The `constructor-tearoffs` gate's type-argument face (`ast_builder.dart:5602)`:
     /// a standalone `<...>` application on a non-invoked receiver reports
     /// `experiment_not_enabled` over the whole group (`leftBracket` through
     /// `rightBracket`) when the feature is off.
@@ -708,7 +708,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
     }
 
     /// The `null-aware-elements` gate (`enabledIn: 3.8`): a `?` element
-    /// (`handleNullAwareElement`, ast_builder.dart:5119) or a map entry's
+    /// (`handleNullAwareElement`, `ast_builder.dart:5119`) or a map entry's
     /// `?key`/`?value` marker (`handleLiteralMapEntry`, :4771) reports
     /// `experiment_not_enabled` once per entry, at the key marker when both
     /// are present (`nullAwareKeyToken ?? nullAwareValueToken`) and the

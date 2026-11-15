@@ -48,6 +48,7 @@
 //! on-demand disk read respectively. This is the #4217 seam: at cockpit's
 //! closure scale the retained source text alone accounted for ≈52 MB.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -752,7 +753,7 @@ fn dump_dep_units(state: &EngineState) {
 /// excluded, deps keep them deliberately unresolved), the declaration
 /// capture's name/kind/span rows, the resolved targets (mapped back to
 /// their canonical paths), the settled version, and the content id. Dead
-/// columns (diagnostics, api_signature, doc_imports) are deliberately
+/// columns (diagnostics, `api_signature`, `doc_imports`) are deliberately
 /// absent — the interface-only tier never produces them.
 ///
 /// Interned ids resolve to their text before hashing: parallel string
@@ -801,7 +802,7 @@ fn dep_unit_faces(state: &EngineState) -> (Vec<(PathBuf, String)>, String) {
                     field(&clause.to_le_bytes());
                 }
                 field(directive.name.as_deref().unwrap_or("").as_bytes());
-                for configuration in directive.configurations.iter() {
+                for configuration in &directive.configurations {
                     field(configuration.dotted_name.as_bytes());
                     field(configuration.value.as_deref().unwrap_or("").as_bytes());
                     field(configuration.uri.as_bytes());
@@ -821,7 +822,7 @@ fn dep_unit_faces(state: &EngineState) -> (Vec<(PathBuf, String)>, String) {
             }
         });
         let targets = component_digest(3, |field| {
-            for target in unit.targets.iter() {
+            for target in &unit.targets {
                 match target {
                     ResolvedTarget::Missing => field(b"m"),
                     ResolvedTarget::External => field(b"e"),
@@ -833,7 +834,7 @@ fn dep_unit_faces(state: &EngineState) -> (Vec<(PathBuf, String)>, String) {
                             .as_os_str()
                             .as_encoded_bytes(),
                     ),
-                };
+                }
             }
         });
         let stamp = component_digest(4, |field| {
@@ -1307,7 +1308,7 @@ fn walk_reach(
                     continue;
                 };
                 edges.push((file.index(), target.index()));
-                if resolver.file_table().path(target).is_some_and(&walked)
+                if resolver.file_table().path(target).is_some_and(walked)
                     && mark(&mut visited, target)
                 {
                     next.push(target);

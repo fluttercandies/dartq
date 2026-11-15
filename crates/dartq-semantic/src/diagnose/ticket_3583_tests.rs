@@ -46,7 +46,7 @@
 //! `is_augment` filter), and the invalid-`augment` shape never folds at
 //! all (a plain `class` head takes the claim arm, not the fragment arm).
 //! The own-scope arm reads the engine's flat declaration sites instead:
-//! `note_decl_site` (unused_finalization.rs) sets `DeclSite::is_augment`
+//! `note_decl_site` (`unused_finalization.rs`) sets `DeclSite::is_augment`
 //! from the constructor latch only, so a method/field site never carries
 //! the member's own `augment` keyword even though the listener already
 //! latches it (`open_exec_augment` at the method head, `group_augment` at
@@ -59,6 +59,7 @@
 //! the keyword inside an `augment` body is an introduction that still
 //! claims and still reports.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{report_ops, report_ops_experiments_with};
 use dartq_language::Feature;
@@ -199,7 +200,7 @@ fn enum_factory_constructor_name_is_not_an_instance_member() {
 /// (oracle a1: `augmentation_without_declaration` only).
 ///
 /// Member decl sites now carry their own `augment` keyword —
-/// `note_decl_site` (unused_finalization.rs) sets `DeclSite::is_augment`
+/// `note_decl_site` (`unused_finalization.rs`) sets `DeclSite::is_augment`
 /// from the member latches and the own-scope claim side filters
 /// augmentation fragments out of `instance_names`
 /// (`check_conflicting_static_and_instance`, overrides.rs) — so this

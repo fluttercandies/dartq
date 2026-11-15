@@ -7,7 +7,7 @@
 //! * **Initializer promotion** — `num? n = 1` promotes `n` to `num` at the
 //!   reads that follow (official `_tryPromoteToTypeOfInterest` on the
 //!   declaration's own initialize write,
-//!   pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:7583,
+//!   pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:7583`,
 //!   :3982-4098), and a later write demotes it again
 //!   (`_demoteViaAssignment`, :4888-4928).
 //! * **`T & B` intersection promotion** — `if (i is! int) throw;` over
@@ -27,6 +27,9 @@
 //! the strict promotion gate the resolved seam applies
 //! (`crate::ty::TypeOps::try_promote_to_typed`), so the pins run a small
 //! closure-of-edges stand-in for it.
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
@@ -141,10 +144,10 @@ impl TypeOps for HierarchyOps {
 /// back-end can name them); `ops`, when given, is mounted as the replay's
 /// back-end (`None` = the name-level default). Returns the interned ids and
 /// the taken facts.
-fn analyze<'t>(
+fn analyze(
     source: &'static str,
     intern: &[&str],
-    ops: Option<&'t HierarchyOps>,
+    ops: Option<&HierarchyOps>,
 ) -> (Vec<u32>, Vec<FlowFact>) {
     let result = dartq_scanner::scan(
         source,

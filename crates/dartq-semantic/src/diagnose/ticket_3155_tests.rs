@@ -3,6 +3,7 @@
 //! Each test embeds the conformance trigger and asserts the oracle row on
 //! `lib/test.dart`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, RigImport, report_ops_imports, rows};
 

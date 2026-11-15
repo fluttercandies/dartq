@@ -21,6 +21,7 @@
 //!   `exit_at` boundary — the argument was live when the official's
 //!   pre-order poll ran, so the next statement anchors.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ev::Ev;
 use crate::facts::FlowFact;
 use crate::interp::Interp;
@@ -70,7 +71,7 @@ fn dead_ranges(events: &[Ev]) -> Vec<(u32, u32)> {
 /// leaves `(` as the first dead node (official `AnonymousMethodInvocation`
 /// re-anchor, dead_code_verifier.dart:317-318).
 ///
-/// Oracle (FunctionExpressionInvocationTest_test_never): `(1 + 2);` —
+/// Oracle (`FunctionExpressionInvocationTest_test_never)`: `(1 + 2);` —
 /// offset 25, length 8.
 #[test]
 fn dead_generic_instantiation_callee_anchors_at_paren() {
@@ -189,7 +190,7 @@ fn dead_index_callee_anchors_at_paren() {
 /// `checkUnreachableNode` arm: the operand's own span IS the extent),
 /// the statement's close extending the row through `;`.
 ///
-/// Oracle (MethodInvocationResolutionTest_test_clamp_int_never_int):
+/// Oracle (`MethodInvocationResolutionTest_test_clamp_int_never_int)`:
 /// `c);` — offset 40, length 3 (offsets mirror the corpus source
 /// `f(int a, Never b, int c) {\n  a.clamp(b, c);\n}`).
 #[test]
@@ -321,7 +322,7 @@ fn began_dead_statement_keeps_wrapper_anchor() {
 /// never polled upstream (resolver.dart:3619), so the argument list's
 /// `(` owns the row.
 ///
-/// Oracle (MethodInvocationResolutionTest_test_clamp_never_int_int):
+/// Oracle (`MethodInvocationResolutionTest_test_clamp_never_int_int)`:
 /// `(b, c);` — offset 32, length 7.
 #[test]
 fn dead_receiver_member_call_anchors_at_paren() {

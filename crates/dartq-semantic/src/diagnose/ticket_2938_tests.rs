@@ -6,6 +6,7 @@
 //! origin texts). The oracle outputs below were captured verbatim from
 //! `dart analyze` runs of the same shapes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -30,14 +31,14 @@ fn at(source: &str, needle: &str) -> u32 {
 /// prints in the unsatisfied block.
 #[test]
 fn infer_creation_single_argument_origin() {
-    let source = r#"
+    let source = r"
 void main() {
   var c = C((double x) => 0);
 }
 class C<T> {
   C(T Function(T) f);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = infer_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", report.diagnostics);
@@ -91,12 +92,12 @@ class C2<T> {
 /// the visible row.
 #[test]
 fn infer_preliminary_fixed_parameter_never_reports() {
-    let source = r#"
+    let source = r"
 void main() {
   String v = id2(3);
 }
 T id2<T>(T x) => x;
-"#;
+";
     let report = report_ops(source);
     assert!(infer_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
@@ -105,17 +106,17 @@ T id2<T>(T x) => x;
 /// (`inferFunctionTypeInstantiation` + `constrainGenericFunctionInContext`):
 /// `h(f)` where `f` is `T Function<T extends num>(T, T)` infers `T := num`
 /// against `int Function(int, double)`, fails `num <: int`, and reports
-/// at the ARGUMENT — with the FunctionContext origin spelling the
+/// at the ARGUMENT — with the `FunctionContext` origin spelling the
 /// tear-off's written signature.
 #[test]
 fn infer_generic_tearoff_function_context() {
-    let source = r#"
+    let source = r"
 T f<T extends num>(T a, T b) => a;
 void main() {
   var x = h(f);
 }
 int h(int Function(int, double) t) => 0;
-"#;
+";
     let report = report_ops(source);
     let rows = infer_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", report.diagnostics);
@@ -138,7 +139,7 @@ int h(int Function(int, double) t) => 0;
 /// carries no "Tried to infer" intro.
 ///
 /// Ignored pending the `exec_bounds` capture regression: `f`'s window
-/// never pairs under the in-flight listener/type_capture edits (the
+/// never pairs under the in-flight `listener/type_capture` edits (the
 /// `#2516` `top_level_decl` fallback supplies the parameter NAMES but no
 /// declaration-bound source exists for a top-level function whose window
 /// missed). The gate, the schema closure, and the instantiated-form emit
@@ -147,13 +148,13 @@ int h(int Function(int, double) t) => 0;
 #[ignore = "exec_bounds capture regressed under in-flight foreign lanes; \
             f's declared Func1<T1,T1> bound never pairs"]
 fn infer_bound_gate_instantiated_form() {
-    let source = r#"
+    let source = r"
 typedef Func1<T1, T2> = T1 Function(T2);
 void main() {
   var x = f(3);
 }
 T2 f<T2 extends Func1<T1, T1>, T1>(T2 a) => throw 0;
-"#;
+";
     let report = report_ops(source);
     let rows = infer_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", report.diagnostics);
@@ -177,13 +178,13 @@ T2 f<T2 extends Func1<T1, T1>, T1>(T2 a) => throw 0;
 /// spells the whole completed argument vector.
 #[test]
 fn infer_recursive_bound_instantiated_form() {
-    let source = r#"
+    let source = r"
 class A<T> { A(T x); }
 void foo<X extends Y, Y extends A<X>>() {}
 void main() {
   foo();
 }
-"#;
+";
     let report = report_ops(source);
     let rows = infer_rows(&report);
     assert!(
@@ -193,27 +194,26 @@ void main() {
                 && msg.contains("instantiated from 'A<X>'")
                 && msg.contains("using type arguments [A<Object?>, A<Object?>]")
         }),
-        "{:?}",
-        rows
+        "{rows:?}"
     );
 }
 
 /// The downward-context inference (oracle-verbatim): `F<int,num> h =
-/// g(42)` — the ReturnType round merges `T <: int` (return, covariant)
+/// g(42)` — the `ReturnType` round merges `T <: int` (return, covariant)
 /// with `num <: T` (formal, contravariant) BEFORE the argument
 /// constraint; the preliminary solve fixes `T := num`, the `int <: T`
 /// argument constraint drops (`_typesInferredSoFar`), `num <: int`
-/// fails, and only the ReturnType origin prints — no satisfied block,
+/// fails, and only the `ReturnType` origin prints — no satisfied block,
 /// no Argument line.
 #[test]
 fn infer_return_context_origin_only() {
-    let source = r#"
+    let source = r"
 typedef F<T1, T2> = T1 Function(T2);
 void main() {
   F<int, num> h = g(42);
 }
 T Function(T) g<T>(T t) => (x) => x;
-"#;
+";
     let report = report_ops(source);
     let rows = infer_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", report.diagnostics);
@@ -234,7 +234,7 @@ T Function(T) g<T>(T t) => (x) => x;
 /// a bounded parameter, and a satisfied same-shape solve never report.
 #[test]
 fn infer_silence_controls() {
-    let source = r#"
+    let source = r"
 class A {}
 class NotA {}
 class C2<T extends A> {
@@ -252,7 +252,7 @@ T id2<T>(T x) => x;
 void later() {
   var ok = id2(3);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(infer_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }

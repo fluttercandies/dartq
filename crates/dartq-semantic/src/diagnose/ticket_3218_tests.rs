@@ -38,6 +38,7 @@
 //! non-subtypable SDK spelling (`int`/`String`/`Null`/`bool`/`double`/
 //! `num`/`Record`/`Enum`/`FutureOr`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, report_ops, report_ops_imports, rows};
 use crate::diagnose::types::FileReport;
 

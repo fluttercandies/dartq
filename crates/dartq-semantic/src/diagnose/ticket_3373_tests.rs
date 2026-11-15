@@ -20,6 +20,7 @@
 //! * `mixin_application_not_implemented_interface` — the `with` entry's
 //!   name token (`.at(mixinName.name)`, error_verifier.dart:6076-6116).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 

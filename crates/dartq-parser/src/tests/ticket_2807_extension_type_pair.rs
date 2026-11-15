@@ -4,7 +4,7 @@
 //! Every expected row is the 3.13.7 oracle face from the conformance report
 //! (`target/conformance/report.tsv`), with the decision points mirrored from
 //! the pinned SDK (upstream Dart SDK source, pkg/analyzer +
-//! pkg/_fe_analyzer_shared):
+//! pkg/_`fe_analyzer_shared)`:
 //!
 //! * `missing_primary_constructor` is the shared parser's, anchored on the
 //!   last consumed token of the name/type-parameter chain and gated on
@@ -23,9 +23,10 @@
 //!   (:5433-5439).
 //! * The verifier runs whenever the constructor head parsed — augmentations
 //!   included (ast_builder.dart:6484-6496) — but never on a headless
-//!   augmentation (its namePart stays a NameWithTypeParameters, so the
+//!   augmentation (its namePart stays a `NameWithTypeParameters`, so the
 //!   check returns before the empty-list arm).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 use crate::ParserFeatures;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -44,8 +45,8 @@ fn pre_feature_features() -> ParserFeatures {
     )))
 }
 
-/// `extension type E {}` (oracle ExtensionTypeDeclarationParserTest
-/// test_primaryConstructor_missing 2|14 + 2|18|0): the pair anchors on the
+/// `extension type E {}` (oracle `ExtensionTypeDeclarationParserTest`
+/// `test_primaryConstructor_missing` 2|14 + 2|18|0): the pair anchors on the
 /// name and on the zero-length synthetic `(` slot at the body token.
 #[test]
 fn no_head_pair_anchors_on_name_and_synthetic_slot() {
@@ -56,7 +57,7 @@ fn no_head_pair_anchors_on_name_and_synthetic_slot() {
 
 /// Behind type parameters the synthesized slot sits at the token after the
 /// NAME — the `<` — not after the parameter list (oracle
-/// parser-fe no_primary_constructor 4|19|0 vs 4|23), and
+/// parser-fe `no_primary_constructor` 4|19|0 vs 4|23), and
 /// `missing_primary_constructor` anchors on the closing `>` (the parser
 /// pointer at the head check, oracle 4|18|1).
 #[test]
@@ -73,7 +74,7 @@ fn no_head_behind_type_parameters_anchors_before_them() {
 }
 
 /// The `implements` follower is the synthesized slot's host token (oracle
-/// no_primary_constructor 2|20|0): same column as the old token-width face,
+/// `no_primary_constructor` 2|20|0): same column as the old token-width face,
 /// zero length.
 #[test]
 fn no_head_before_implements_anchors_on_the_clause_keyword() {
@@ -83,7 +84,7 @@ fn no_head_before_implements_anchors_on_the_clause_keyword() {
 
 /// A missing declaration name leaves the synthetic name's follower as the
 /// slot: the `<` of the type parameters (oracle Extension-methods
-/// syntax_t06 20|15|0), with `missing_primary_constructor` on the `>`
+/// `syntax_t06` 20|15|0), with `missing_primary_constructor` on the `>`
 /// (oracle 20|17|1).
 #[test]
 fn no_head_with_missing_name_anchors_on_the_type_parameter_opener() {
@@ -93,7 +94,7 @@ fn no_head_with_missing_name_anchors_on_the_type_parameter_opener() {
 }
 
 /// `extension type E.n {}`: the `.name` head synthesized its empty list at
-/// the `.` (oracle extension_type_primary_constructor_error 13|20|0 for
+/// the `.` (oracle `extension_type_primary_constructor_error` 13|20|0 for
 /// `E<T>.named`), and the parser's `missing_primary_constructor_parameters`
 /// stays on the constructor name (oracle 13|21|5).
 #[test]
@@ -109,7 +110,7 @@ fn named_head_without_formals_anchors_on_the_period() {
 }
 
 /// `extension type E.() {}`: a PARSED empty list anchors on the real `)`
-/// with the token's width (oracle extension_type_primary_constructor_error
+/// with the token's width (oracle `extension_type_primary_constructor_error`
 /// 4|19|1).
 #[test]
 fn named_head_with_empty_formals_anchors_on_the_real_close_paren() {
@@ -118,7 +119,7 @@ fn named_head_with_empty_formals_anchors_on_the_real_close_paren() {
 }
 
 /// Initializing formals anchor on the keyword itself, typed or bare
-/// (oracle regress_53625 53|24|4 `this` behind `int`, 57|20|4 bare;
+/// (oracle `regress_53625` 53|24|4 `this` behind `int`, 57|20|4 bare;
 /// 62|24|5 `super`).
 #[test]
 fn initializing_formals_anchor_on_the_keyword() {
@@ -141,7 +142,7 @@ fn initializing_formals_anchor_on_the_keyword() {
 
 /// The function-typed suffix (feature off) anchors on the formal's FIRST
 /// token — the modifier — never the list's `(` (oracle
-/// declaring_parameter_pre_feature 41|19|3 `var`, 42|19|5 `final`).
+/// `declaring_parameter_pre_feature` 41|19|3 `var`, 42|19|5 `final`).
 #[test]
 fn function_typed_formal_anchors_on_the_formal_begin() {
     let rows = rows_with("extension type E(var f()) {}\n", pre_feature_features());
@@ -173,7 +174,7 @@ fn headless_augmentation_reports_neither_face() {
 
 /// A parsed `.name` head on an augmentation keeps the verifier face — the
 /// constructor parsed, so the shape checks run (oracle Augmentations
-/// extension_types_A01_t02 19|27|0) — while the parser's
+/// `extension_types_A01_t02` 19|27|0) — while the parser's
 /// `missing_primary_constructor_parameters` stays intro-only.
 #[test]
 fn augmentation_named_head_keeps_the_verifier_face() {
@@ -188,7 +189,7 @@ fn augmentation_named_head_keeps_the_verifier_face() {
 
 /// A parsed formal list on an augmentation keeps the verifier face too: the
 /// initializing-formal anchor fires ungated (the AST builder keeps the
-/// PrimaryConstructorDeclaration, ast_builder.dart:6484-6496).
+/// `PrimaryConstructorDeclaration`, ast_builder.dart:6484-6496).
 #[test]
 fn augmentation_formals_keep_the_verifier_face() {
     let rows = rows_with("augment extension type E(this.x) {}\n", latest_features());

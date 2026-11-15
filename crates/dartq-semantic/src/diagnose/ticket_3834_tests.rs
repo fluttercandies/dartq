@@ -36,6 +36,7 @@
 //! (`on String`) declares the member for ITS receivers only, so it never
 //! suppresses the literal's row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

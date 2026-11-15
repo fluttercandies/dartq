@@ -22,6 +22,7 @@
 //! `Object`/`Enum` signatures when the element index carries no such
 //! container.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{assert_silent, code_names, report_ops};
 
 /// The codes of one fixture's report, in source order.

@@ -37,6 +37,7 @@
 //! `.../test_while_statement_condition_assert#0`,
 //! `.../try_statement/TryStatementTest/test_try_statement_catch_identifierComma_assert#0`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 
 fn rows_with(source: &'static str) -> Vec<(String, u32, u32)> {

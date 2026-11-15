@@ -17,6 +17,7 @@
 //! expanded pair, and `typed_literal_resolver.dart` types the literal
 //! against the context's own element type (`_fromContextType`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::async_return_tests::{code_names, report};
 
 /// The rig declares every spelled head (`builtin_types` carries only

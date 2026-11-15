@@ -37,6 +37,7 @@
 //!   `collector.rs`/`resolution.rs` (`resolve_bare`'s `type_params` arm;
 //!   upstream a wildcard `_` declaration introduces no element).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, report_ops_augment_intro_experiments};
 
 /// Absolute offset of `needle`'s first byte in a `report_ops` fixture (the

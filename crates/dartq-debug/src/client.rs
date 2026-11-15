@@ -9,6 +9,7 @@
 //! (`runtime/vm/service/service.md` in the upstream Dart SDK) — the
 //! request/response/event envelope is JSON-RPC 2.0 with named params.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -198,19 +199,18 @@ impl VmClient {
                 Err(error) => connect_error = Some(error),
             }
         }
-        let stream = match stream {
-            Some(stream) => stream,
-            None => {
-                let spent = matches!(connect_error, Some(ref error)
-                    if error.kind() == io::ErrorKind::TimedOut);
-                return Err(if spent || connect_error.is_none() {
-                    Error::Timeout(format!(
-                        "connect to {ws_uri}: no tcp connection within {timeout:?}"
-                    ))
-                } else {
-                    Error::Io(connect_error.expect("checked above"))
-                });
-            }
+        let stream = if let Some(stream) = stream {
+            stream
+        } else {
+            let spent = matches!(connect_error, Some(ref error)
+                if error.kind() == io::ErrorKind::TimedOut);
+            return Err(if spent || connect_error.is_none() {
+                Error::Timeout(format!(
+                    "connect to {ws_uri}: no tcp connection within {timeout:?}"
+                ))
+            } else {
+                Error::Io(connect_error.expect("checked above"))
+            });
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -391,6 +391,7 @@ impl VmClient {
     }
 
     /// Drains buffered events in arrival order. Non-blocking.
+    #[must_use]
     pub fn drain_events(&self) -> Vec<StreamEvent> {
         self.events.try_iter().collect()
     }
@@ -459,6 +460,7 @@ impl VmClient {
     /// Stream events dropped because the bounded feed was full — a
     /// consumer that fell behind sees the gap here rather than losing
     /// events silently.
+    #[must_use]
     pub fn dropped_events(&self) -> u64 {
         self.shared.dropped_events.load(Ordering::Relaxed)
     }
@@ -468,12 +470,14 @@ impl VmClient {
     /// dropped. A consumer that drains the feed *after* reading the
     /// mark has seen every delivered event below it, so any remaining
     /// hole below the mark is an exact drop.
+    #[must_use]
     pub fn settled_events(&self) -> u64 {
         self.shared.settled_events.load(Ordering::Acquire)
     }
 
     /// Inbound frames discarded as malformed (not JSON, or a
     /// `streamNotify` whose event violates the protocol shape).
+    #[must_use]
     pub fn malformed_frames(&self) -> u64 {
         self.shared.malformed_frames.load(Ordering::Relaxed)
     }

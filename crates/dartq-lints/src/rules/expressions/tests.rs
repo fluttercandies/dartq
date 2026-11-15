@@ -751,7 +751,7 @@ fn if_null_production_report_start_riders() {
     );
 }
 
-/// prefer_null_aware_operators shares the same report-start anchor: the
+/// `prefer_null_aware_operators` shares the same report-start anchor: the
 /// conditional reports from the condition operand's head, not from the
 /// binary's covered start.
 #[test]
@@ -764,7 +764,7 @@ fn null_aware_production_report_start_rider() {
 }
 
 /// The whole-container faces report from the left operand's first
-/// token: `x ??= null` opens at `x` (unnecessary_null_aware_assignments)
+/// token: `x ??= null` opens at `x` (`unnecessary_null_aware_assignments`)
 /// and `a.b + dyn` opens at `a` — never at the operator token the
 /// container row anchors on.
 #[test]
@@ -3169,7 +3169,7 @@ fn js_rounded_ints_exact_literals_pass() {
 /// position-blind upstream (:160-186). The variable-declaration
 /// subtype gate (:273-279) is skipped: the callee is an unresolved
 /// `print` (the unindexed dart:core name), so the no-signature face
-/// reports and the FunctionExpressionInvocation arm carries no
+/// reports and the `FunctionExpressionInvocation` arm carries no
 /// context gate at all.
 #[test]
 fn unnecessary_lambdas_initializer_faces() {
@@ -3364,7 +3364,7 @@ fn prefer_null_aware_method_calls_resolution_faces() {
     assert!(run_semantic(source, "prefer_null_aware_method_calls", None).is_empty());
 }
 
-/// The unnecessary_parenthesis imported-extension face: the accessor
+/// The `unnecessary_parenthesis` imported-extension face: the accessor
 /// resolving through an import to a nullable-on-type extension keeps
 /// the parens (the upstream resolver sees imported libraries,
 /// unnecessary_parenthesis.dart:120-124); the same shape resolving to
@@ -3398,9 +3398,9 @@ fn semantic_query_coordinates_are_utf16() {
     assert_eq!(run_semantic(source, "await_only_futures", None).len(), 1);
 }
 
-/// The prefer_contains constant-identifier bound: `kLen` reads its
+/// The `prefer_contains` constant-identifier bound: `kLen` reads its
 /// const initializer (the upstream `getIntValue` identifier face,
-/// prefer_contains.dart over ast.dart `_getIntValue`) and the bound
+/// `prefer_contains.dart` over ast.dart `_getIntValue`) and the bound
 /// works like the literal.
 #[test]
 fn prefer_contains_const_identifier_bound() {
@@ -3413,7 +3413,7 @@ fn prefer_contains_const_identifier_bound() {
     assert_eq!(run_semantic(source, "prefer_contains", None).len(), 1);
 }
 
-/// The prefer_contains receiver gate: a receiver resolvable as a
+/// The `prefer_contains` receiver gate: a receiver resolvable as a
 /// same-file non-iterable class stays silent (the official
 /// `parentType` check).
 #[test]
@@ -3441,7 +3441,7 @@ fn avoid_double_and_int_checks_typedef_alias() {
     assert!(run_semantic(source, "avoid_double_and_int_checks", None).is_empty());
 }
 
-/// The avoid_function_literals_in_foreach_calls receiver gate: an
+/// The `avoid_function_literals_in_foreach_calls` receiver gate: an
 /// `Iterable` receiver reports, a same-file non-iterable receiver
 /// stays silent (the official `implementsIterable` bail).
 #[test]
@@ -3455,7 +3455,7 @@ fn foreach_calls_iterable_gate() {
     assert!(run_semantic(source, "avoid_function_literals_in_foreach_calls", None).is_empty());
 }
 
-/// The await_only_futures bridge type face: awaiting a non-`Future`
+/// The `await_only_futures` bridge type face: awaiting a non-`Future`
 /// value reports; awaiting a `Future` stays silent.
 #[test]
 fn await_only_futures_static_type_gate() {
@@ -3465,7 +3465,7 @@ fn await_only_futures_static_type_gate() {
     assert!(run_semantic(source, "await_only_futures", None).is_empty());
 }
 
-/// The implicit_call_tearoffs faces: a written function-type target
+/// The `implicit_call_tearoffs` faces: a written function-type target
 /// and an operand whose type names a same-file class with an instance
 /// `call` method reports; an operand without `call` stays silent.
 #[test]
@@ -3480,7 +3480,7 @@ fn implicit_call_tearoffs_call_member_gate() {
     assert!(run_semantic(source, "implicit_call_tearoffs", None).is_empty());
 }
 
-/// The no_literal_bool_comparisons member faces: `this.flag == true`
+/// The `no_literal_bool_comparisons` member faces: `this.flag == true`
 /// over a same-class `bool` member reports; a non-literal operand
 /// stays silent.
 #[test]
@@ -3492,7 +3492,7 @@ fn no_literal_bool_comparisons_this_member_face() {
     );
 }
 
-/// The null_check_on_nullable_type_parameter context faces: a method
+/// The `null_check_on_nullable_type_parameter` context faces: a method
 /// return carries no expected type (the official
 /// `thisOrAncestorOfType<FunctionExpression>` miss — the declaration
 /// wraps its function expression only for functions), while an
@@ -3541,7 +3541,7 @@ fn null_check_pattern_matched_type_face() {
     );
 }
 
-/// The null_closures faces: a `this.`-field receiver reads the
+/// The `null_closures` faces: a `this.`-field receiver reads the
 /// field's written type (`List` puts `map`'s slot 0 in the table);
 /// a cross-file user class named like a core type resolves through
 /// the bridge and the written-name fallback stays silent.
@@ -3555,7 +3555,7 @@ fn null_closures_this_receiver_and_user_container() {
     assert!(run_semantic(source, "null_closures", Some((kit, None))).is_empty());
 }
 
-/// The prefer_is_empty receiver gate: an `Iterable`/`Map`/`String`
+/// The `prefer_is_empty` receiver gate: an `Iterable`/`Map`/`String`
 /// receiver reports; a same-file class with a plain `length` getter
 /// stays silent (the official `type == null` bail closes the opaque
 /// presumption for a resolvable non-core receiver).
@@ -3567,7 +3567,7 @@ fn prefer_is_empty_receiver_gate() {
     assert!(run_semantic(source, "prefer_is_empty", None).is_empty());
 }
 
-/// The prefer_is_not_empty member gate: a receiver whose type
+/// The `prefer_is_not_empty` member gate: a receiver whose type
 /// provides `isEmpty` but no `isNotEmpty` stays silent (the official
 /// `isNotEmpty`-provision check). The upstream registers a prefix
 /// visitor only (`addPrefixExpression`, :31-56) — `x.isEmpty ==
@@ -3594,7 +3594,7 @@ fn prefer_is_not_empty_member_gate() {
     );
 }
 
-/// The unrelated_type_equality_checks faces: two unrelated same-file
+/// The `unrelated_type_equality_checks` faces: two unrelated same-file
 /// classes report; sibling classes sharing a non-`Object` supertype
 /// are comparable (the official supertype walk) and stay silent.
 #[test]
@@ -3608,7 +3608,7 @@ fn unrelated_type_equality_checks_supertype_face() {
     assert!(run_semantic(source, "unrelated_type_equality_checks", None).is_empty());
 }
 
-/// The void_checks assignment faces: a bare target resolves
+/// The `void_checks` assignment faces: a bare target resolves
 /// shadow-correct (the local `int v` shadows the `void` field — the
 /// official `writeType` face), a `this.`-target reports over the
 /// field's written type.
@@ -3620,7 +3620,7 @@ fn void_checks_assignment_target_resolution() {
     assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
 }
 
-/// The void_checks return face: only a `FutureOr<void>` written
+/// The `void_checks` return face: only a `FutureOr<void>` written
 /// return type ever reports (:142-146 silents every plain-`void`
 /// return — `dynamic` is void-acceptable and everything else
 /// early-silents). `null` is acceptable, the scalars are not.
@@ -3634,7 +3634,7 @@ fn void_checks_future_or_void_return() {
     assert!(run_semantic(source, "void_checks", None).is_empty());
 }
 
-/// The void_checks argument faces: a `void` formal through the
+/// The `void_checks` argument faces: a `void` formal through the
 /// bridge signature and through the resolved constructor formals
 /// reports a decidable non-acceptable value at the argument;
 /// `null` and a non-`void` formal stay silent.
@@ -3653,7 +3653,7 @@ fn void_checks_void_formal_arguments() {
     assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
 }
 
-/// The void_checks assignment value face over the bridge: a callee
+/// The `void_checks` assignment value face over the bridge: a callee
 /// return type decides where the scalar faces stay silent, and the
 /// acceptability cut splits on the target — `FutureOr` is not
 /// void-acceptable upstream (`isTypeAcceptableWhenExpectingVoid`
@@ -3673,7 +3673,7 @@ fn void_checks_assignment_bridge_value_face() {
     assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
 }
 
-/// The null_check_on_nullable_type_parameter operand face through the
+/// The `null_check_on_nullable_type_parameter` operand face through the
 /// same-file binding walk: a local written `T?` is a nullable type
 /// parameter operand (the field-face-only read under-reported it); a
 /// class-typed local stays silent.
@@ -3688,7 +3688,7 @@ fn null_check_binding_operand_face() {
     assert!(run_semantic(source, "null_check_on_nullable_type_parameter", None).is_empty());
 }
 
-/// The unrelated_type_equality_checks pattern face
+/// The `unrelated_type_equality_checks` pattern face
 /// (`visitRelationalPattern`): a relational pattern whose operand
 /// type and matched value type are unrelated reports at the pattern;
 /// a related operand stays silent.
@@ -3709,7 +3709,7 @@ fn unrelated_type_equality_pattern_face() {
     assert!(run_semantic(source, "unrelated_type_equality_checks", None).is_empty());
 }
 
-/// The await_only_futures collection-literal faces: a literal
+/// The `await_only_futures` collection-literal faces: a literal
 /// collection is never a `Future` (`await []`, a typed list, a map)
 /// — the official reports the inferred type.
 #[test]
@@ -3816,7 +3816,7 @@ fn await_only_futures_map_nested_literal_key() {
     );
 }
 
-/// The null_closures computed-receiver face: a bare send's callee
+/// The `null_closures` computed-receiver face: a bare send's callee
 /// return type resolves the receiver's core class (`g().map(null)`
 /// reaches the `Iterable.map` entry through the send face).
 #[test]
@@ -3827,7 +3827,7 @@ fn null_closures_computed_receiver() {
     assert!(run_semantic(source, "null_closures", None).is_empty());
 }
 
-/// The implicit_call_tearoffs return and argument faces: a written
+/// The `implicit_call_tearoffs` return and argument faces: a written
 /// function-type return with a `call`-carrying operand reports at the
 /// returned expression, a same-file top-level callee's function-typed
 /// formal reports at the argument value, and an operand without
@@ -3849,7 +3849,7 @@ fn implicit_call_tearoffs_return_and_argument_faces() {
     assert!(run_semantic(source, "implicit_call_tearoffs", None).is_empty());
 }
 
-/// The implicit_call_tearoffs bare-`Function` context and creation
+/// The `implicit_call_tearoffs` bare-`Function` context and creation
 /// operand: `Function p = C()` reports when `Function` resolves to
 /// the core type and the creation's container carries `call`.
 #[test]

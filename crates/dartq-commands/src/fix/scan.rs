@@ -1,4 +1,4 @@
-use super::*;
+use super::{Keyword, SourceRange, TokenKind, TokenTable, utf16_offset_to_byte, word_shape};
 
 /// The UTF-16 length of a string slice (the edits' currency).
 pub(crate) fn utf16_count(slice: &str) -> u32 {
@@ -524,7 +524,7 @@ pub(crate) fn token_at(tokens: &TokenTable, offset: u32) -> Option<usize> {
     let mut lo = 0usize;
     let mut hi = tokens.as_slice().len();
     while lo < hi {
-        let mid = (lo + hi) / 2;
+        let mid = usize::midpoint(lo, hi);
         if tokens.get(mid)?.utf16_offset < offset {
             lo = mid + 1;
         } else {

@@ -490,7 +490,7 @@ fn super_operator_forwards(c: &Check<'_>, node: u32, op: &str) -> bool {
     // `other` operand is a `Send` tear-off group whose name is the
     // leading `Identifier` ([`access_run`] peels the group markers).
     if let [only] = faces.as_slice() {
-        for &row in rows.iter() {
+        for &row in &rows {
             if c.kind(row) != NodeKind::BinaryExpression {
                 continue;
             }
@@ -792,8 +792,8 @@ mod oracle_corpus_pins {
     ///
     /// 39 single-file cases pinned (7 oracle rows).
     /// Not representable in a single-source fixture (aux files or packages):
-    /// `UnnecessaryOverridesTest/test_class_augmentation_method_withoutOverride_noSuper#0` (multi_file).
-    /// `UnnecessaryOverridesTest/test_class_augmentation_method_withoutOverride_noSuper#1` (multi_file).
+    /// `UnnecessaryOverridesTest/test_class_augmentation_method_withoutOverride_noSuper#0` (`multi_file`).
+    /// `UnnecessaryOverridesTest/test_class_augmentation_method_withoutOverride_noSuper#1` (`multi_file`).
     /// `UnnecessaryOverridesTest/test_enum_field#0` (known deviation: the inherited `runtimeType` needs dart:core resolution).
     /// `UnnecessaryOverridesTest/test_enum_method#0` (known deviation: the inherited `toString` needs dart:core resolution).
     /// `UnnecessaryOverridesTest/test_method_expressionFunctionBody_namedParameters#0` (known deviation: the named-argument forward is not matched).
@@ -803,8 +803,8 @@ mod oracle_corpus_pins {
         // (case, source, oracle rows as (line, column, length)).
         let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_binaryOperator_expressionFunctionBody#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_binaryOperator_expressionFunctionBody#0",
+                r"
 class A {
   int operator +(int other) => 0;
 }
@@ -812,12 +812,12 @@ class C extends A {
   @override
   int operator +(int other) => super + other;
 }
-"#,
+",
                 &[(7, 16, 1)],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_getter_expressionFunctionBody_otherTarget#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_getter_expressionFunctionBody_otherTarget#0",
+                r"
 class A {
   int get x => 7;
 }
@@ -826,12 +826,12 @@ class C extends A {
   @override
   int get x => a.x;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_getter_expressionFunctionBody_superCall#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_getter_expressionFunctionBody_superCall#0",
+                r"
 class A {
   int get x => 0;
 }
@@ -839,12 +839,12 @@ class C extends A {
   @override
   int get x => super.x;
 }
-"#,
+",
                 &[(7, 11, 1)],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_getter_returnTypeChanged#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_getter_returnTypeChanged#0",
+                r"
 class A {
   num get g => 0;
 }
@@ -852,12 +852,12 @@ class C extends A {
   @override
   int get g => super.g as int;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_blockBody#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_blockBody#0",
+                r"
 class A {
   void m() {}
 }
@@ -867,12 +867,12 @@ class C extends A {
     super.m();
   }
 }
-"#,
+",
                 &[(7, 8, 1)],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_blockBody_noSuper#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_blockBody_noSuper#0",
+                r"
 class A {
   void m() {}
 }
@@ -882,11 +882,11 @@ class C extends A {
     m();
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_blockBody_otherStatements#0"#,
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_blockBody_otherStatements#0",
                 r#"
 class A {
   int m(int a) => 0;
@@ -902,8 +902,8 @@ class C extends A {
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_differentDocumentation#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_differentDocumentation#0",
+                r"
 class C {
   num get g => 7;
 }
@@ -912,12 +912,12 @@ class E extends C {
   @override
   num get g => super.g;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_expressionFunctionBody_everythingTheSame#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_expressionFunctionBody_everythingTheSame#0",
+                r"
 class A {
   int m(int a, int b) => 0;
 }
@@ -925,12 +925,12 @@ class C extends A {
   @override
   int m(int a, int b) => super.m(a, b);
 }
-"#,
+",
                 &[(7, 7, 1)],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_expressionFunctionBody_mismatchedAguments#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_expressionFunctionBody_mismatchedAguments#0",
+                r"
 class A {
   int m(int a, int b) => 0;
 }
@@ -938,12 +938,12 @@ class C extends A {
   @override
   int m(int a, int b) => super.m(b, a);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_expressionFunctionBody_namedParameters_mismatchedArguments#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_expressionFunctionBody_namedParameters_mismatchedArguments#0",
+                r"
 class A {
   int m({int a = 0, int b = 0}) => 0;
 }
@@ -951,12 +951,12 @@ class C extends A {
   @override
   int m({int a = 0, int b = 0}) => super.m(b: a, a: b);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_hasOtherAnnotations#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_hasOtherAnnotations#0",
+                r"
 class A {
   int m() => 7;
 }
@@ -968,12 +968,12 @@ class C extends A {
 class MyAnnotation {
   const MyAnnotation();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_ok_commentsInBody#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_ok_commentsInBody#0",
+                r"
 class A {
   void a() { }
 }
@@ -985,12 +985,12 @@ class B extends A {
     super.a();
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_ok_expressionStatement_commentsInBody#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_ok_expressionStatement_commentsInBody#0",
+                r"
 class A {
   void a() { }
 }
@@ -1001,12 +1001,12 @@ class B extends A {
     // There's something we want to document here.
     super.a();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_ok_returnExpression_commentsInBody#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_ok_returnExpression_commentsInBody#0",
+                r"
 class A {
   @override
   String toString() {
@@ -1014,12 +1014,12 @@ class A {
     return super.toString();
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterAdditional_named#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterAdditional_named#0",
+                r"
 class A {
   num m(int v) => 7;
 }
@@ -1027,12 +1027,12 @@ class C extends A {
   @override
   num m(int v, {int v2 = 1}) => super.m(v);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterAdditional_positional#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterAdditional_positional#0",
+                r"
 class A {
   num m(int v) => 7;
 }
@@ -1040,12 +1040,12 @@ class C extends A {
   @override
   num m(int v, [int v2 = 1]) => super.m(v);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterCovariance#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterCovariance#0",
+                r"
 class A {
   num m(num v) => 7;
 }
@@ -1053,12 +1053,12 @@ class C extends A {
   @override
   num m(covariant int v) => super.m(v);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterDefaultChanged#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterDefaultChanged#0",
+                r"
 class A {
   num m({int v = 0}) => 7;
 }
@@ -1066,12 +1066,12 @@ class C extends A {
   @override
   num m({int v = 10}) => super.m(v: v);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterRenamed#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterRenamed#0",
+                r"
 class A {
   num m(int v) => 7;
 }
@@ -1079,12 +1079,12 @@ class C extends A {
   @override
   num m(int v2) => super.m(v2);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterTypeChanged#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterTypeChanged#0",
+                r"
 class A {
   num m(int v) => 0;
 }
@@ -1092,12 +1092,12 @@ class C extends A {
   @override
   num m(num v) => super.m(v as int);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterTypeChanged_named#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterTypeChanged_named#0",
+                r"
 class A {
   num m({int v = 20}) => 0;
 }
@@ -1105,12 +1105,12 @@ class C extends A {
   @override
   num m({num v = 20}) => super.m(v: v as int);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterTypeChanged_optionalPositional#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterTypeChanged_optionalPositional#0",
+                r"
 class A {
   num m([int v = 20]) => 0;
 }
@@ -1118,12 +1118,12 @@ class C extends A {
   @override
   num m([num v = 20]) => super.m(v as int);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_protectedBecomesPublic#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_protectedBecomesPublic#0",
+                r"
 import 'package:meta/meta.dart';
 class A {
   @protected
@@ -1133,12 +1133,12 @@ class C extends A {
   @override
   num m(int v) => super.m(v);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_returnTypeChanged#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_returnTypeChanged#0",
+                r"
 class A {
   num m(int v) => 0;
 }
@@ -1146,23 +1146,23 @@ class C extends A {
   @override
   int m(int v) => super.m(v) as int;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_noSuchMethod#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_noSuchMethod#0",
+                r"
 class A {}
 class C implements A {
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_operator_parameterRenamed#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_operator_parameterRenamed#0",
+                r"
 class A {
   num operator +(int other) => 7;
 }
@@ -1170,12 +1170,12 @@ class C extends A {
   @override
   num operator +(int other2) => super + other2;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_operator_returnTypeChanged#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_operator_returnTypeChanged#0",
+                r"
 class A {
   num operator +(int other) => 0;
 }
@@ -1183,12 +1183,12 @@ class C extends A {
   @override
   int operator +(int other) => super + other as int;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_blockBody_superCall#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_blockBody_superCall#0",
+                r"
 class A {
   set x(other) {}
 }
@@ -1198,12 +1198,12 @@ class C extends A {
     super.x = other;
   }
 }
-"#,
+",
                 &[(7, 7, 1)],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_expressionFunctionBody_otherTarget#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_expressionFunctionBody_otherTarget#0",
+                r"
 class A {
   set x(int value) {}
 }
@@ -1212,12 +1212,12 @@ class C extends A {
   @override
   set x(int value) => a.x = value;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_parameterRenamed#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_parameterRenamed#0",
+                r"
 class A {
   set s(num v) {}
 }
@@ -1225,12 +1225,12 @@ class C extends A {
   @override
   set s(num v2) => super.s = v2 as int;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_parameterTypeChanged#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_parameterTypeChanged#0",
+                r"
 class A {
   set s(int v) {}
 }
@@ -1238,12 +1238,12 @@ class C extends A {
   @override
   set s(num v) => super.s = v as int;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_unaryOperator_expressionFunctionBody#0"#,
-                r#"
+                r"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_unaryOperator_expressionFunctionBody#0",
+                r"
 class A {
   A operator ~() => A();
 }
@@ -1251,12 +1251,12 @@ class C extends A {
   @override
   A operator ~() => ~super;
 }
-"#,
+",
                 &[(7, 14, 1)],
             ),
             (
-                r#"lints/unnecessary_overrides/doc_bad_0"#,
-                r#"class C {
+                r"lints/unnecessary_overrides/doc_bad_0",
+                r"class C {
   int m(int x) => x;
 }
 
@@ -1264,23 +1264,23 @@ class D extends C {
   @override
   int m(int x) => super.m(x);
 }
-"#,
+",
                 &[(7, 7, 1)],
             ),
             (
-                r#"lints/unnecessary_overrides/doc_bad_1"#,
-                r#"class A extends B {
+                r"lints/unnecessary_overrides/doc_bad_1",
+                r"class A extends B {
   @override
   void foo() {
     super.foo();
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/doc_good_0"#,
-                r#"class C {
+                r"lints/unnecessary_overrides/doc_good_0",
+                r"class C {
   int m(int x) => x;
 }
 
@@ -1288,12 +1288,12 @@ class D extends C {
   @override
   int m(int x) => super.m(x) + 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/doc_good_1"#,
-                r#"import 'package:meta/meta.dart';
+                r"lints/unnecessary_overrides/doc_good_1",
+                r"import 'package:meta/meta.dart';
 
 class C {
   int m(int x) => x;
@@ -1304,28 +1304,28 @@ class D extends C {
   @override
   int m(int x) => super.m(x);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/doc_good_2"#,
-                r#"class C {
+                r"lints/unnecessary_overrides/doc_good_2",
+                r"class C {
   int m(int x) => x;
 }
 
 class D extends C {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unnecessary_overrides/doc_good_3"#,
-                r#"class A extends B {
+                r"lints/unnecessary_overrides/doc_good_3",
+                r"class A extends B {
   @override
   void foo() {
     doSomethingElse();
   }
 }
-"#,
+",
                 &[],
             ),
         ];

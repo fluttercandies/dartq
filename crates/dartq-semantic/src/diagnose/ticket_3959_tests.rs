@@ -31,13 +31,14 @@
 //! `typedef OptT<T> = void Function([T])` RHS arms its declaration type
 //! all-required and the substituted use inherits that shape until that
 //! relay lands; the same relay is absent from the clause-tree sinks
-//! (clause_capture.rs). The bare-alias override face and the
+//! (`clause_capture.rs`). The bare-alias override face and the
 //! trailing-typedef arity face additionally read `function_shape_sig`'s
 //! all-required `FnVarSig` rebuild in assignability.rs — the invocation
 //! arity row a trailing `typedef int Ot([int c])` callable fabricates
 //! (`f()` over an optional-positional callable, oracle silent) rides
 //! that rebuild, not this ticket's fallback claim.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 use super::*;
 

@@ -11,7 +11,7 @@
 //! 1. the comment is split into content lines (the `///` marker plus one
 //!    space, or the `/**`/`*`/`*/` block decorations, are stripped; offsets
 //!    track the stripped content),
-//! 2. lines inside fenced ``` code blocks and inside indented code blocks
+//! 2. lines inside fenced code blocks (triple backticks) and inside indented code blocks
 //!    (≥ 4 leading spaces after an empty line) are never doc imports,
 //! 3. a doc import line starts (after whitespace) with the literal
 //!    `@docImport ` — trailing space included, case sensitive; the rest of
@@ -23,6 +23,7 @@
 //! `@docImport` on any other declaration's comment is not validated by the
 //! oracle; callers therefore extract only from the one directive comment.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_source::SourceRange;
 
 /// The literal that opens a doc import line (trailing space included).
@@ -86,6 +87,10 @@ pub fn doc_imports(comment: DocComment<'_>) -> Vec<DocImportDirective> {
 /// The content lines of a `///` comment: the marker plus one following space
 /// is stripped per line (ASCII, so the UTF-16 delta equals the byte count).
 /// Non-`///` lexemes are skipped, mirroring the oracle's token walk.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "strip is 3 or 4, always fits u32"
+)]
 fn line_comment_lines<'a>(lexemes: &[CommentLexeme<'a>]) -> Vec<Line<'a>> {
     lexemes
         .iter()
@@ -114,42 +119,44 @@ fn block_comment_lines(text: &str, utf16: u32) -> Vec<Line<'_>> {
         end -= 2;
     }
     lines.push(line_at(text, utf16, 0, end));
-    while !single_line {
-        // The remaining text is exactly the end marker: no content line.
-        if text.ends_with("*/") && end == text.len() - 2 {
-            return lines;
-        }
-        let mut start = end + 1;
-        if start >= text.len() {
-            return lines;
-        }
-        while is_whitespace(bytes[start]) {
-            start += 1;
+    if !single_line {
+        loop {
+            // The remaining text is exactly the end marker: no content line.
+            if text.ends_with("*/") && end == text.len() - 2 {
+                return lines;
+            }
+            let mut start = end + 1;
             if start >= text.len() {
                 return lines;
             }
+            while is_whitespace(bytes[start]) {
+                start += 1;
+                if start >= text.len() {
+                    return lines;
+                }
+            }
+            end = line_end(bytes, start);
+            let ends_comment = end == text.len() && text.ends_with("*/");
+            if ends_comment {
+                end -= 2;
+            }
+            if text[start..].starts_with("* ") {
+                start += 2;
+            } else if end == start + 1 && bytes[start] == b'*' {
+                start += 1;
+            }
+            if ends_comment && start == end {
+                return lines;
+            }
+            lines.push(line_at(text, utf16, start, end));
         }
-        end = line_end(bytes, start);
-        let ends_comment = end == text.len() && text.ends_with("*/");
-        if ends_comment {
-            end -= 2;
-        }
-        if text[start..].starts_with("* ") {
-            start += 2;
-        } else if end == start + 1 && bytes[start] == b'*' {
-            start += 1;
-        }
-        if ends_comment && start == end {
-            return lines;
-        }
-        lines.push(line_at(text, utf16, start, end));
     }
     lines
 }
 
 /// One content line over `text[start..end]`, with the UTF-16 offset of
 /// `start`.
-fn line_at<'a>(text: &'a str, utf16: u32, start: usize, end: usize) -> Line<'a> {
+fn line_at(text: &str, utf16: u32, start: usize, end: usize) -> Line<'_> {
     Line {
         utf16: utf16 + utf16_len(&text[..start]),
         text: &text[start..end],
@@ -179,6 +186,10 @@ fn read_whitespace(text: &str) -> usize {
 }
 
 /// UTF-16 length of `text`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "len_utf16 returns 1 or 2, always fits u32"
+)]
 fn utf16_len(text: &str) -> u32 {
     text.chars().map(|ch| ch.len_utf16() as u32).sum()
 }
@@ -261,10 +272,13 @@ fn parse_doc_import(line: &Line<'_>, whitespace: usize) -> Option<DocImportDirec
     };
     let mut value = String::new();
     let mut literal = scan.next_literal()?;
-    let mut span = literal_span(line, whitespace, literal.start, literal.end);
+    let mut lit_span = literal_span(line, whitespace, literal.start, literal.end);
     if literal.interpolated {
         // No stringValue: the directive resolves no URI.
-        return Some(DocImportDirective { uri: None, span });
+        return Some(DocImportDirective {
+            uri: None,
+            span: lit_span,
+        });
     }
     value.push_str(&literal.value);
     let start = literal.start;
@@ -273,9 +287,12 @@ fn parse_doc_import(line: &Line<'_>, whitespace: usize) -> Option<DocImportDirec
     while let Some(skip) = adjacent_start(&rest[end..]) {
         scan.pos = end + skip;
         literal = scan.next_literal()?;
-        span = literal_span(line, whitespace, literal.start, literal.end);
+        lit_span = literal_span(line, whitespace, literal.start, literal.end);
         if literal.interpolated {
-            return Some(DocImportDirective { uri: None, span });
+            return Some(DocImportDirective {
+                uri: None,
+                span: lit_span,
+            });
         }
         value.push_str(&literal.value);
         end = literal.end;
@@ -327,9 +344,7 @@ impl StringScan<'_> {
         if raw {
             self.pos += 1;
         }
-        let Some(&quote) = bytes.get(self.pos) else {
-            return None;
-        };
+        let &quote = bytes.get(self.pos)?;
         if quote != b'\'' && quote != b'"' {
             return None;
         }
@@ -486,7 +501,7 @@ fn escape_code(text: &str, start: usize, letter: char) -> (Option<u32>, usize) {
         }
         // A run too large for a code point decodes to the replacement char.
         let code = Some(match u32::from_str_radix(digits, 16) {
-            Ok(code) if code <= 0x10FFFF => code,
+            Ok(code) if code <= 0x10_FFFF => code,
             _ => 0xFFFD,
         });
         return (code, close + 1);
@@ -520,6 +535,7 @@ fn literal_span(line: &Line<'_>, whitespace: usize, start: usize, end: usize) ->
 }
 
 #[cfg(test)]
+#[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
     use crate::codes::ResolutionCode;
@@ -532,6 +548,10 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A `///` doc comment over the given lines, starting at the file start.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "len_utf16 returns 1 or 2, always fits u32"
+    )]
     fn line_comment(lines: &[&str]) -> Vec<DocImportDirective> {
         let lexemes: Vec<CommentLexeme<'_>> = lines
             .iter()

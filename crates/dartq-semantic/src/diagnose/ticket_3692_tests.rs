@@ -34,7 +34,7 @@
 //! The class-site variant shares a second, earlier blocker: a class
 //! whose clause nests a signature group (`class C<X extends void
 //! Function<U extends B>()>`) never registers its window at all —
-//! `Engine::close_type_variables` (type_capture.rs) latches the flat
+//! `Engine::close_type_variables` (`type_capture.rs`) latches the flat
 //! `tv_window` into `pending_tv` unconditionally, so the nested group's
 //! close consumes the window and the enclosing group's close clobbers
 //! `pending_tv` to `None`; `note_container_type_variables` then returns
@@ -52,6 +52,7 @@
 //! `'F' doesn't conform to the bound 'void Function<U extends B>()' of
 //! the type parameter 'T'.` anchored at the written argument.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops, rows};
 
 /// The oracle-verbatim mismatch case: a `void Function<T extends A>()`

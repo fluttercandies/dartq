@@ -5,6 +5,7 @@
 //! the id-keyed order these pins replaced flipped the export stream run
 //! to run (`s1=top, s2=Foo` in one run, `s1=Foo, s2=top` in the next).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::capture::{DeclKind, FileCapture, capture};
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_scanner::{ScanConfig, scan};
@@ -65,13 +66,15 @@ fn row_surface(captured: &FileCapture, strings: &StringTable) -> RowSurface {
         .decls()
         .iter()
         .map(|row| {
-            let container = (row.container != crate::DeclRow::NONE)
-                .then(|| {
+            let container = if row.container == crate::DeclRow::NONE {
+                String::default()
+            } else {
+                {
                     strings
                         .resolve(captured.index.row(row.container).name)
                         .to_owned()
-                })
-                .unwrap_or_default();
+                }
+            };
             (
                 strings.resolve(row.name).to_owned(),
                 row.kind,

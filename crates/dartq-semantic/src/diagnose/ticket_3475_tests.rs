@@ -18,7 +18,7 @@
 //!
 //! Upstream Dart SDK source: pkg/analyzer/lib/src/dart/element/type.dart
 //! (`instantiateTypeFormalsToBounds`) and
-//! pkg/analyzer/lib/src/generated/display_string_builder.dart (the
+//! `pkg/analyzer/lib/src/generated/display_string_builder.dart` (the
 //! `FunctionType`/`RecordType`/interface display forms). One function —
 //! [`super::assignability`]'s `display_filled_ty` behind `ty_display` —
 //! owns the fill for every message slot; the emission sites
@@ -51,6 +51,7 @@
 //! for completeness; they are exercised the moment the capture carries
 //! those shapes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 
 /// The `type_argument_not_matching_bounds` messages of `report`, in source

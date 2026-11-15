@@ -12,6 +12,7 @@
 //! Every pin asserts the exact ROW COUNT — presence alone cannot catch the
 //! multiplication.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::test_rig::report_ops_experiments_with;
 use super::{Diagnostic, FileReport};
@@ -67,7 +68,7 @@ fn repeated_name_reports_per_declaration_not_per_name() {
     let mut offsets: Vec<u32> = rows.iter().map(|d| d.range.offset).collect();
     offsets.sort_unstable();
     offsets.dedup();
-    assert_eq!(offsets.len(), 80, "distinct anchors: {:?}", offsets);
+    assert_eq!(offsets.len(), 80, "distinct anchors: {offsets:?}");
 }
 
 /// Two DIFFERENT classes each carrying the bad clause — the pin that proves

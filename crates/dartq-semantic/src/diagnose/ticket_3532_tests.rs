@@ -32,6 +32,7 @@
 //! `lj` read `List<List<int>>` (the spread operand's whole type as the
 //! leaf), a false error.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops};
 
 /// The `(code, offset, len)` rows of `fixture`'s `argument_type_not_assignable`

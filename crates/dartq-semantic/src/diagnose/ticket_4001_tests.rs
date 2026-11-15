@@ -24,6 +24,7 @@
 //! emitted for the wrong reason (unresolved rather than a known non-class)
 //! and the class face (`implements Future<int>`) diverged instead.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// The unindexed-declaring-file face: `Future` resolves through the
@@ -34,7 +35,7 @@ use super::test_rig::{code_names, report_ops};
 #[test]
 fn unindexed_declaring_file_clause_head_is_clause_legal() {
     let report = report_ops(
-        r#"
+        r"
 class SubFuture implements Future<int> {
   SubFuture();
 }
@@ -42,7 +43,7 @@ class SubFuture implements Future<int> {
 void f(SubFuture x) {
   x.hashCode;
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(
@@ -57,7 +58,7 @@ void f(SubFuture x) {
 #[test]
 fn indexed_non_class_clause_heads_still_report() {
     let report = report_ops(
-        r#"
+        r"
 enum Color { red }
 
 mixin Wheel {}
@@ -65,7 +66,7 @@ mixin Wheel {}
 class Paint implements Color {}
 
 class Cart extends Wheel {}
-"#,
+",
     );
     let names = code_names(&report);
     assert!(

@@ -19,6 +19,8 @@
 //! `_checkForUnnecessaryNullAware` decides on the continuation face, not
 //! the shorted row face).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use crate::diagnose::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// Every diagnostic's `(name, offset, length)` triple in source order.
@@ -30,7 +32,7 @@ fn triples(report: &crate::diagnose::FileReport) -> Vec<(&'static str, u32, u32)
         .collect()
 }
 
-/// —— `?.` member access ————————————————————————————————————————————
+// —— `?.` member access ————————————————————————————————————————————
 
 /// `a?.b` over a nullable receiver resolves `B?` — the declaration
 /// `B x = a?.b` reports `invalid_assignment` at `x`'s declarator (the
@@ -96,7 +98,7 @@ fn ticket_2272_question_dot_invoked_member_lifts_result() {
     );
 }
 
-/// —— `?..` cascade ————————————————————————————————————————————————
+// —— `?..` cascade ————————————————————————————————————————————————
 ///
 /// `a?..m()` returns the cascade TARGET's type (`static_type_analyzer`'s
 /// `visitCascadeExpression` — `node.target.typeOrThrow`): `A? a` cascaded
@@ -179,7 +181,7 @@ fn ticket_2272_question_dot_inside_cascade_spells_access() {
     );
 }
 
-/// —— `?[` index ———————————————————————————————————————————————————
+// —— `?[` index ———————————————————————————————————————————————————
 ///
 /// `a?[0]` is the nullable element type — `Map`'s `V?` `[]` stays `V?`,
 /// `List<E>`'s `E` `[]` lifts to `E?`: `E x = l?[0]` reports.
@@ -282,7 +284,7 @@ fn ticket_2272_question_bracket_nullable_element_keeps_unchecked() {
     );
 }
 
-/// —— non-nullable control ——————————————————————————————————————————
+// —— non-nullable control ——————————————————————————————————————————
 ///
 /// `a.b` (plain access, no null-aware operator) binds `B` — `B x = a.b`
 /// stays silent: the pins above observe the lift, this row proves the

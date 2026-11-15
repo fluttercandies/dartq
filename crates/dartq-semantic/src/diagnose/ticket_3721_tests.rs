@@ -4,7 +4,7 @@
 //! * `checkPatternNeverMatchesValueType`'s Map kind (upstream Dart SDK
 //!   source, `resolveMapPattern` at pkg/analyzer/lib/src/generated/
 //!   resolver.dart:1599-1640 fed by `analyzeMapPattern`,
-//!   pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart:
+//!   pkg/_`fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart`:
 //!   1257-1295): a `case {...}` over a matched face that cannot be a `Map`
 //!   reports `pattern_never_matches_value_type` at the whole `{...}` node
 //!   with `Map<Object?, Object?>` as the required type. The emit site
@@ -20,6 +20,7 @@
 //!   their parameter type testing under `makeNullable` while the message
 //!   keeps the declared spelling (resolver.dart:1703-1711, 1742-1744).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 
@@ -37,7 +38,7 @@ fn at(fixture: &str, context: &str, needle: &str) -> u32 {
     prelude_len() + fixture[..upto].chars().map(char::len_utf16).sum::<usize>() as u32
 }
 
-fn rows_of<'a>(report: &'a FileReport, code: &str) -> Vec<(u32, u32, String)> {
+fn rows_of(report: &FileReport, code: &str) -> Vec<(u32, u32, String)> {
     report
         .diagnostics
         .iter()

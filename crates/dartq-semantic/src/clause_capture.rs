@@ -30,6 +30,7 @@
 //! the fixed point's SCC step, which the consumer cannot run without the
 //! written bound trees.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use rustc_hash::FxHashMap;
 
 use crate::bounds::TypeTree;
@@ -140,7 +141,7 @@ struct CaptureListener<'src, 'tab> {
     pending_head: Option<(StringId, SourceRange)>,
 }
 
-impl<'src, 'tab> CaptureListener<'src, 'tab> {
+impl CaptureListener<'_, '_> {
     fn name_of(&self, token: Token) -> Option<StringId> {
         self.tokens
             .get(token.id as usize)
@@ -343,7 +344,10 @@ impl ParserListener for CaptureListener<'_, '_> {
         // `[` latches the required/optional boundary on the function
         // level; `{` leaves every positional formal required (the sink
         // guards on the opener itself).
-        let opener = self.tokens.get(token.id as usize).map(|t| t.byte_range());
+        let opener = self
+            .tokens
+            .get(token.id as usize)
+            .map(dartq_scanner::Token::byte_range);
         let Some(range) = opener else {
             return;
         };

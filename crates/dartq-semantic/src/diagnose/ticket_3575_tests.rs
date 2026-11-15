@@ -39,6 +39,7 @@
 //!   substituted argument printed `X??` — substitution replaces the
 //!   parameter wholesale, so `X?` over `X := X?` prints `X?`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 
 /// The `type_argument_not_matching_bounds` messages of `report`, in source

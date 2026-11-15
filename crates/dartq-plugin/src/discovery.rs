@@ -34,6 +34,7 @@
 //! never panics and never aborts the scan, because one broken plugin must
 //! not hide the others.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 
 use dartq_pub::{PackageConfig, normalize};

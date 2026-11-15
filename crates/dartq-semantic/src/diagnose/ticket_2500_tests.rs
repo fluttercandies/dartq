@@ -10,6 +10,8 @@
 //! the member. The `.where` spelling itself is foreign; the fixture
 //! below mirrors the shape with a same-file inherited generic member.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -29,7 +31,7 @@ fn unused_rows(report: &FileReport) -> Vec<String> {
 /// the member and `_hidden` never reports `unused_element`.
 #[test]
 fn rebind_inherited_member_formal_spares_member() {
-    let source = r#"
+    let source = r"
 class Ann {
   int get _hidden => 0;
 }
@@ -41,7 +43,7 @@ void main() {
   NodeList<Ann> xs = NodeList<Ann>();
   xs.where((e) => e._hidden > 0);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = unused_rows(&report);
     assert!(
@@ -61,7 +63,7 @@ void main() {
 /// verdict — no spurious re-bind from the wrong slot.
 #[test]
 fn rebind_unmatched_slot_stays_silent() {
-    let source = r#"
+    let source = r"
 class Ann {
   int get _hidden => 0;
 }
@@ -73,7 +75,7 @@ void main() {
   NodeList<Ann> xs = NodeList<Ann>();
   xs.each((e, i) => e._hidden + i);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = unused_rows(&report);
     assert!(
@@ -95,7 +97,7 @@ void main() {
 /// pin guards against the re-bind emitting something bogus.
 #[test]
 fn rebind_scalar_formal_binds_element() {
-    let source = r#"
+    let source = r"
 class Itr<E> {
   void each(void t(E e)) {}
 }
@@ -103,7 +105,7 @@ void main() {
   Itr<int> xs = Itr<int>();
   xs.each((e) => e + 1);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         !report

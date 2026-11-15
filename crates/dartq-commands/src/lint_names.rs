@@ -21,6 +21,7 @@
 //! Version-pinned data like the engine's `known_error_codes::NAMES`;
 //! sorted, lowercase — membership is a binary search over the lowercased
 //! key.
+#![allow(clippy::semicolon_if_nothing_returned)]
 pub(crate) const NAMES: &[&str] = &[
     "always_declare_return_types",
     "always_put_control_body_on_new_line",

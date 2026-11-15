@@ -1,7 +1,7 @@
 //! The #3779 pins: `use_of_void_result` on `??`'s LEFT operand anchors the
 //! operand's use-site span, never the raw row (upstream
 //! `visitBinaryExpression` → `checkForUseOfVoidResult(node.leftOperand)`,
-//! error_verifier.dart:482 → error_detection_helpers.dart:245-258). The
+//! `error_verifier.dart:482` → error_detection_helpers.dart:245-258). The
 //! `end_if_null` seam emitted `left.range` verbatim, so every shape whose
 //! row is narrower than the operand's expression face under-spanned:
 //!
@@ -32,6 +32,7 @@
 //!   group, parens included.
 //! - A bare void leaf (`x ?? d`) still reports at the leaf's own span.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{report_ops, rows};
 
 /// The oracle's `useOfVoidResult` message spelling (messages.yaml:19638).
@@ -113,6 +114,6 @@ fn ticket_3779_if_null_left_paren_conditional_anchors_group() {
 fn ticket_3779_if_null_left_bare_void_still_flagged() {
     let fixture = "void v() {}\nvoid main() {\n  void x = v();\n  x ?? 499;\n}";
     let report = report_ops(fixture);
-    let at = fixture.rfind("x").unwrap();
+    let at = fixture.rfind('x').unwrap();
     assert_void_rows(&report, fixture, &[(at, 1)]);
 }

@@ -9,11 +9,11 @@
 //! inserted synthetic just as on a parsed name. Two port arms handed a
 //! synthetic to `first_name` without the event: the top-level head-scan's
 //! `Some(synthetic_name)` (`var = 42;` — the `<unnamed>` top-level variable
-//! element exists upstream, e.g. ErrorParserTest's
-//! test_expectedExecutable_topLevel_afterVoid `unused_element` row) and the
+//! element exists upstream, e.g. `ErrorParserTest`'s
+//! `test_expectedExecutable_topLevel_afterVoid` `unused_element` row) and the
 //! member-level junk-name insert (the `recoverFromInvalidMember` →
 //! `parseFields` fallback — `class C { void ; }` carries the
-//! FieldDeclaration event upstream). Both now fire `handle_identifier(span,
+//! `FieldDeclaration` event upstream). Both now fire `handle_identifier(span,
 //! context)` where `context` is the slot's own resolution
 //! (parser_impl.dart:4447-4449: `topLevelVariableDeclaration` for
 //! `DeclarationKind.TopLevel`, `fieldDeclaration` otherwise).
@@ -24,11 +24,11 @@
 //! runs on whatever the dispatch left at the name slot — a junk token under
 //! a method follower (`void 5() {}` — cursor on `5`, follower `(` at
 //! look(1)) routes to the tail's consume-in-doubt branch. (b) The #2915
-//! Face-A census (report_pre_wave5_1030_0828.tsv) carries the nameless
+//! Face-A census (`report_pre_wave5_1030_0828.tsv`) carries the nameless
 //! top-level-executable element face — `unused_element` on `<unnamed>`,
 //! e.g. `parser/generated/error_parser/ErrorParserTest/
 //! test_expectedExecutable_topLevel_afterVoid#0` (missing-side). Upstream
-//! fires the event on the synthetic unconditionally (parser_impl.dart:4038),
+//! fires the event on the synthetic unconditionally (`parser_impl.dart:4038`),
 //! so the context joins the gate.
 //!
 //! Same-invariant residual fixed alongside: the built-in declaration-head
@@ -39,12 +39,15 @@
 //! (identifier_context_impl.dart:1321-1332) feeds the same unconditional
 //! :4038 fire.
 //!
-//! Pinned: TLV on the top-level head-scan synthetic, FieldDeclaration on
+//! Pinned: TLV on the top-level head-scan synthetic, `FieldDeclaration` on
 //! the member-level silent insert, TLF on the tail, TLV on the
 //! built-in-head arm, and the named-declaration order-stability controls.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, setup};
-use crate::parser::Parser;
 
 /// Whether a ZERO-length identifier event fired in `context` at `target`'s
 /// offset inside `needle` (same shape as the #2932 gate: recovery synthetics
@@ -89,9 +92,9 @@ fn code_count(c: &Collector, code: &str) -> usize {
 
 /// `var = 42;` at top level: the head-scan inserts the synthetic name in
 /// front of `=` and reports `missing_identifier`; the hand-in now fires
-/// TopLevelVariableDeclaration on it (parser_impl.dart:4109 unconditional
+/// `TopLevelVariableDeclaration` on it (`parser_impl.dart:4109` unconditional
 /// — upstream the `<unnamed>` field element exists, cf. the census's
-/// unused_element `<unnamed>` face). Exactly one `missing_identifier` row:
+/// `unused_element` `<unnamed>` face). Exactly one `missing_identifier` row:
 /// the slot does not re-report.
 #[test]
 fn top_level_head_scan_synthetic_fires_tlv_event() {
@@ -111,7 +114,7 @@ fn top_level_head_scan_synthetic_fires_tlv_event() {
 /// `class C { void ; }`: a committed type followed by junk at the member
 /// name slot routes through `recoverFromInvalidMember` → `parseFields`,
 /// and `parse_fields`'s `None if` arm inserts the synthetic itself. The
-/// same :4109 unconditional fire carries the FieldDeclaration event on it.
+/// same :4109 unconditional fire carries the `FieldDeclaration` event on it.
 #[test]
 fn member_junk_name_insert_fires_field_event() {
     let source = "class C { void ; }";
@@ -140,7 +143,7 @@ fn named_top_level_variable_event_unchanged() {
 }
 
 /// `class C { static int x; }`: the named member control — exactly one
-/// FieldDeclaration event on the real name.
+/// `FieldDeclaration` event on the real name.
 #[test]
 fn named_field_event_unchanged() {
     let source = "class C { static int x; }";
@@ -157,11 +160,11 @@ fn named_field_event_unchanged() {
 /// `void f ! () {}`: the `!`-after-name recovery still routes to the
 /// method path (the dispatch's BANG skip reads past the real name's `!`
 /// to `(`), `parse_top_level_method`'s ensure fires
-/// TopLevelFunctionDeclaration on the real name, and
+/// `TopLevelFunctionDeclaration` on the real name, and
 /// `parse_method_type_var` reports the `!` itself — the tail arm the
 /// #2941 gate audit cited remains reachable through this shape (the
 /// junk-name variant `void 5() {}` reroutes to the fields path under
-/// #2942's follower fix — see gate_2942).
+/// #2942's follower fix — see `gate_2942`).
 #[test]
 fn nameless_top_level_function_fires_name_event() {
     let source = "void f ! () {}";
@@ -195,9 +198,9 @@ fn named_top_level_function_event_unchanged() {
 /// `int mixin M {}` at top level: `mixin` reads as the next declaration's
 /// head (the follower is not `=`/`,`/`;`), so the field slot takes the
 /// spliced synthetic and `mixin` reparses as the mixin head. The arm now
-/// fires TopLevelVariableDeclaration on it — the same unconditional fire
+/// fires `TopLevelVariableDeclaration` on it — the same unconditional fire
 /// the template's returned identifier carries upstream
-/// (identifier_context_impl.dart:1321-1332 → parser_impl.dart:4038).
+/// (identifier_context_impl.dart:1321-1332 → `parser_impl.dart:4038`).
 #[test]
 fn builtin_head_synthetic_fires_tlv_event() {
     let source = "int mixin M {}";

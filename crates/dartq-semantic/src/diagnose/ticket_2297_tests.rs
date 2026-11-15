@@ -15,6 +15,7 @@
 //! unbounded parameter never exhausts, and a circular bound chain
 //! exhausts the walk's recursion budget into `false`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;
@@ -203,7 +204,7 @@ int f<T extends U, U extends T>(T v) {
 /// `Object?` bound (subtype.dart:313), which is not always exhaustive
 /// — the trailing statement stays live and the declared `int` return
 /// still reports `body_might_complete_normally` (oracle
-/// implicit_bound2: silent — coverage is complete there; this cell
+/// `implicit_bound2`: silent — coverage is complete there; this cell
 /// pins the boundary's own answer through the missing-default shape).
 #[test]
 fn unbounded_type_param_keeps_the_unmatched_path_live() {
@@ -228,7 +229,7 @@ int f<T>(T v) {
 
 /// `Object` vs a `bool` constant: `bool <: Object` through the
 /// implicit superclass edge — no
-/// `constant_pattern_never_matches_value_type` (oracle obj_true:
+/// `constant_pattern_never_matches_value_type` (oracle `obj_true`:
 /// silent). The name-level world answers the same for the String and
 /// enum-constant faces.
 #[test]
@@ -268,7 +269,7 @@ void f(Object o) {
 
 /// `bool` vs an enum constant: `St` and `bool` share no subtype edge,
 /// so the constant can never equal the matched value (oracle
-/// bool_enum: `constant_pattern_never_matches_value_type` at the
+/// `bool_enum`: `constant_pattern_never_matches_value_type` at the
 /// constant — the `named_sub` implicit-`Object` edge serves
 /// `can_be_equal`'s positive arm, not a fabricated `St <: bool`). The
 /// stub-less rig also reports `bool`'s `undefined_class` and the dead

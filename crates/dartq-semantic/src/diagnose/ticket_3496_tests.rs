@@ -29,6 +29,7 @@
 //! Message text is the oracle's `undefined_method` template
 //! (`The method '{0}' isn't defined for the type '{1}'.`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 
 /// The `undefined_method` messages of `report`, in source order.

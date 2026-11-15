@@ -22,6 +22,7 @@
 //! trim), so `--verbosity` parses for grammar parity and every tier emits
 //! the same bytes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 

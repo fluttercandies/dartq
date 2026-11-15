@@ -14,6 +14,7 @@
 //! return/formal checks): equal parameter counts, positionally unified
 //! parameters, each written bound `isEqualTo` the other side's.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops, rows};
 
 /// 1.2 — an α-equivalent pair through a parameterized alias: the oracle

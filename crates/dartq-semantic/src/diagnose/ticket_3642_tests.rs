@@ -11,6 +11,7 @@
 //!   `covariant` marker suppresses exactly the induced-setter/formal
 //!   contravariant face (error_verifier.dart:7583-7588/:7633-7635).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::super::test_rig::{report_ops, report_ops_experiments_with, rows};
 use dartq_language::Feature;
 
@@ -124,7 +125,7 @@ fn function_typed_field_fires_at_its_name() {
 
 /// A `covariant` non-final field emits only the getter-side row: the
 /// induced setter's parameter rides the field's `isExplicitlyCovariant`
-/// mark (element_builder.dart:504), so upstream's
+/// mark (`element_builder.dart:504`), so upstream's
 /// `node.covariantKeyword == null` clause suppresses the setter check
 /// (error_verifier.dart:7583-7588). Without the exemption the face
 /// over-reports a second row at the same anchor.

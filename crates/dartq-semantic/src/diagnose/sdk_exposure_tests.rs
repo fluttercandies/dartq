@@ -4,6 +4,7 @@
 //!
 //! Oracle provenance (`dart analyze` 3.13.1): every shape is silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// `RegExp('x').allMatches(text)` inside a field initializer's closure:

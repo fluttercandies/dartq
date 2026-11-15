@@ -3,6 +3,7 @@
 //! performance axis). Automatically skipped unless `DARTQ_SDK_CHECKOUT` is
 //! set to a dart-lang/sdk checkout.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::PathBuf;
 
 use super::{config, file_id};

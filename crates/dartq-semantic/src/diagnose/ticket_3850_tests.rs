@@ -14,6 +14,7 @@
 //! verdict's `fold_alias_verdict` still reads the identical unfolded
 //! type.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 /// Renders one returned tree through the snapshot's written-argument

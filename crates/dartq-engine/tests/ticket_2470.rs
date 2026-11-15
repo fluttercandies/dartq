@@ -23,6 +23,30 @@
 //! issues while the raw-`List` receiver's `undefined_getter` stands — and
 //! the equally-bounded twins stay ambiguous.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::path::Path;
@@ -36,7 +60,7 @@ use common::Fixture;
 /// exactly one of the two receiver shapes (the #2442 `amb4` probe
 /// verbatim). The oracle stays silent on both reads: `T extends
 /// AccessorFragment` rejects `InducingFragment` and vice versa.
-const BOUNDED_PAIR: &str = r#"class Fragment {}
+const BOUNDED_PAIR: &str = r"class Fragment {}
 class AccessorFragment extends Fragment {}
 class InducingFragment extends Fragment {}
 extension AccessorExt<T extends AccessorFragment> on List<T> {
@@ -51,13 +75,13 @@ void useAccessors(List<AccessorFragment> xs) {
 void useInducing(List<InducingFragment> xs) {
   xs.withOrigin;
 }
-"#;
+";
 
 /// The same pair plus a raw `List` receiver: `List` instantiates to
 /// `List<dynamic>` and `dynamic` fails every concrete bound — both faces
 /// drop, no extension applies, the access reports `undefined_getter`
 /// (the /tmp/probe2431 b.dart :38 verdict, verbatim).
-const RAW_RECEIVER: &str = r#"class Fragment {}
+const RAW_RECEIVER: &str = r"class Fragment {}
 class AccessorFragment extends Fragment {}
 class InducingFragment extends Fragment {}
 extension AccessorExt<T extends AccessorFragment> on List<T> {
@@ -69,14 +93,14 @@ extension InducingExt<T extends InducingFragment> on List<T> {
 void useRaw(List xs) {
   xs.withOrigin;
 }
-"#;
+";
 
 /// The over-domination guard: two faces bounded by the SAME type project
 /// to identical instantiate-to-bounds types — mutually unordered, the
 /// access stays ambiguous (the specificity step orders only a strict
 /// projection subtype; the #2431 `equally_bounded_twin_faces_stay_
 /// ambiguous` shape carried through the engine path).
-const EQUAL_BOUNDS: &str = r#"class Num {}
+const EQUAL_BOUNDS: &str = r"class Num {}
 extension B1<T extends Num> on List<T> {
   int get probe => 1;
 }
@@ -84,7 +108,7 @@ extension B2<T extends Num> on List<T> {
   int get probe => 2;
 }
 int use(List<Num> xs) => xs.probe;
-"#;
+";
 
 /// A formal default carrying type references (`= const <String, String>{}`)
 /// must not leak its literal's type arguments into the armed slot: without
@@ -95,10 +119,10 @@ int use(List<Num> xs) => xs.probe;
 /// starved-mux failure mode. The element model itself carries the
 /// observable (`Formal.ty`), so this pin reads the facts directly rather
 /// than waiting on a downstream diagnostic.
-const DEFAULT_LITERAL: &str = r#"int pick([Map<String, String> m = const <String, String>{}]) {
+const DEFAULT_LITERAL: &str = r"int pick([Map<String, String> m = const <String, String>{}]) {
   return m.length;
 }
-"#;
+";
 
 /// The code names reported for the file whose path ends with `tail`,
 /// sorted and deduped.

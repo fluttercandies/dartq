@@ -127,12 +127,11 @@ fn face_factory(c: &mut Check<'_>, container: u32, node: u32) {
         .unit
         .ast
         .parent(container)
-        .map(|wrapper| {
+        .and_then(|wrapper| {
             c.collect_direct(wrapper)
                 .into_iter()
                 .find(|&kid| c.kind(kid) == NodeKind::Identifier)
         })
-        .flatten()
         .map(|row| c.lexeme(c.head_token(row)));
     // `C` / `C.named` / `prefix.C` — the prefixed and cross-file
     // shapes under-report.
@@ -382,10 +381,10 @@ fn initializer_entries_able(c: &Check<'_>, container: u32, node: u32) -> bool {
         // the value's tail segment with its terminator, it is not a
         // genuine assignment expression.
         let mut value = &kids[name_send + 1..];
-        if let Some((last, rest)) = value.split_last() {
-            if c.kind(*last) == NodeKind::Assignment {
-                value = rest;
-            }
+        if let Some((last, rest)) = value.split_last()
+            && c.kind(*last) == NodeKind::Assignment
+        {
+            value = rest;
         }
         for kid in value {
             match c.kind(*kid) {

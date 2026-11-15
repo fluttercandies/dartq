@@ -4,7 +4,7 @@
 //! # Root causes fixed
 //!
 //! * **Implicit supertype.** `enclosingClass.supertype` (upstream
-//!   error_verifier.dart:6086) is `Enum` for an enum declaration, `Object`
+//!   `error_verifier.dart:6086`) is `Enum` for an enum declaration, `Object`
 //!   for a class with no `extends` — not "no superclass at all". The old
 //!   arm treated a missing `extends` as unsatisfiable-by-supertype and
 //!   reported `Object doesn't implement X` for `M on X` applied to `enum E`
@@ -31,6 +31,7 @@
 //! (error_verifier.dart:6076-6116) — `superType` is the resolved
 //! `enclosingClass.supertype`; satisfaction is `isSubtypeOf(superType,
 //! constraint)` then a probe of each previous mixin.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, RigImport, report_ops, report_ops_imports};

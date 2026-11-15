@@ -4,6 +4,7 @@
 //! results are cached by content under `target/conformance/oracle-cache/`,
 //! so reruns only analyze changed cases.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::materialize;
 use crate::rows::{Expected, Row};
 use crate::runner::{self, Runner};
@@ -170,11 +171,11 @@ pub fn oracle_command(args: &OracleArgs) -> i32 {
 
     // A filtered run merges into the tracked file; a full run rewrites it
     // from the corpus (stale rows for deleted cases drop out).
-    if args.filter.is_some() {
-        if let Ok(text) = std::fs::read_to_string(&args.out_path) {
-            for (id, cell) in parse_expected_tsv(&text) {
-                expected.entry(id).or_insert(cell);
-            }
+    if args.filter.is_some()
+        && let Ok(text) = std::fs::read_to_string(&args.out_path)
+    {
+        for (id, cell) in parse_expected_tsv(&text) {
+            expected.entry(id).or_insert(cell);
         }
     }
     let mut text = String::new();

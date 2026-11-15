@@ -23,6 +23,7 @@
 //! the whole-unit view (`Flow::take_facts`) is unchanged — the post-parse
 //! consumer keeps working.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 #[cfg(test)]
 mod tests {
     use crate::facts::FlowFact;

@@ -15,6 +15,7 @@
 //! on trees and `display_written_argument` keeps the alias head through
 //! the per-position top/bottom flip — against the oracle's exact texts.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 
@@ -95,7 +96,7 @@ fn dependent_parameter_grounds_through_the_cycle_member() {
 }
 
 /// Clause sites forbid the super-bounded pass upstream
-/// (`_shouldAllowSuperBoundedTypes`, type_arguments_verifier.dart:
+/// (`_shouldAllowSuperBoundedTypes`, `type_arguments_verifier.dart`:
 /// 737-748), so `class C extends G` reports the regular pass's grounded
 /// `dynamic` leaf — `'A<dynamic>'` against `'A<A<dynamic>>'` — the same
 /// written spelling the inverted pass flips to `Never`.

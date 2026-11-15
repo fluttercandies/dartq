@@ -6,6 +6,7 @@
 //! `=>` (lints-doc `)` drift tail). Every pinned span is the frozen oracle
 //! row (conformance/expected.tsv, the cluster's expected face list).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::ScanConfig;
 
 use super::collector::{Collector, latest_features};
@@ -13,7 +14,7 @@ use crate::ParserFeatures;
 use crate::parser::Parser;
 
 /// Parses `source` and returns the scanner+parser rows as
-/// `(code, start, end)` sorted by offset (gate_bi_name_faces harness shape).
+/// `(code, start, end)` sorted by offset (`gate_bi_name_faces` harness shape).
 fn rows_with(features: ParserFeatures, source: &'static str) -> Vec<(String, u32, u32)> {
     let config = ScanConfig {
         enable_triple_shift: true,
@@ -82,7 +83,7 @@ fn assert_faces(source: &'static str, expected: &[(&str, u32, u32)]) {
 /// empty annotation becomes metadata of an empty variable declaration, and
 /// the ensureSemicolon row anchors on the `@`
 /// (findPreviousNonZeroLengthToken over the two zero-width synthetics;
-/// oracle partial_code/annotation local_ampersand_assert).
+/// oracle `partial_code/annotation` `local_ampersand_assert`).
 #[test]
 fn annotation_local_reserved_keyword_semicolon_anchor() {
     assert_faces(
@@ -96,7 +97,7 @@ fn annotation_local_reserved_keyword_semicolon_anchor() {
 
 /// `@ var x;`: the annotation carries the empty name and `var x` stays the
 /// declaration — one `missing_identifier` row, no semicolon row (oracle
-/// local_ampersand_localVariable: the variables declaration absorbs the
+/// `local_ampersand_localVariable`: the variables declaration absorbs the
 /// annotation).
 #[test]
 fn annotation_local_var_keeps_declaration() {
@@ -106,8 +107,8 @@ fn annotation_local_var_keeps_declaration() {
     );
 }
 
-/// Class-member metadata with a reserved head: same MetadataReference arm
-/// (oracle classMember_ampersand_methodVoid — `missing_identifier` on
+/// Class-member metadata with a reserved head: same `MetadataReference` arm
+/// (oracle `classMember_ampersand_methodVoid` — `missing_identifier` on
 /// `void`).
 #[test]
 fn annotation_class_member_reserved_keyword() {
@@ -119,10 +120,10 @@ fn annotation_class_member_reserved_keyword() {
 
 // —— configured-import family ————————————————————————————————————————————
 
-/// `as` + reserved declaration head: the ImportPrefixDeclaration insert
+/// `as` + reserved declaration head: the `ImportPrefixDeclaration` insert
 /// splices a synthetic prefix, the `;` row anchors on `as`, and the class
-/// parses at top level (ImportPrefixIdentifierContext branch 3,
-/// identifier_context_impl.dart:706-716; oracle import_directive as_class).
+/// parses at top level (`ImportPrefixIdentifierContext` branch 3,
+/// identifier_context_impl.dart:706-716; oracle `import_directive` `as_class`).
 #[test]
 fn import_prefix_reserved_head() {
     assert_faces(
@@ -136,7 +137,7 @@ fn import_prefix_reserved_head() {
 
 /// The built-in top-level heads take the same insert (branch 3 precedes the
 /// branch-2 built-in-prefix face when the follower does not continue the
-/// clause; oracle import_directive as_setter — `missing_identifier` on
+/// clause; oracle `import_directive` `as_setter` — `missing_identifier` on
 /// `set`).
 #[test]
 fn import_prefix_builtin_head() {
@@ -150,7 +151,7 @@ fn import_prefix_builtin_head() {
 }
 
 /// Combinator + reserved head (the #2786 Combinator arm, locked here for
-/// the directive shape; oracle import_directive show_class).
+/// the directive shape; oracle `import_directive` `show_class`).
 #[test]
 fn import_combinator_reserved_head() {
     assert_faces(
@@ -167,7 +168,7 @@ fn import_combinator_reserved_head() {
 /// `await for (… in <statement-keyword fragment> …)` with an unclosed `(`:
 /// the for-in tail has NO stall row — the iterable takes the recovered
 /// identifier face and the `)` row anchors there (ensureCloseParen's
-/// moveSynthetic; oracle for_each_statement await_in_break).
+/// moveSynthetic; oracle `for_each_statement` `await_in_break`).
 #[test]
 fn for_in_await_iterable_recovery_no_stall() {
     assert_faces(
@@ -182,7 +183,7 @@ fn for_in_await_iterable_recovery_no_stall() {
 /// `for (var a in {} }`: the set literal is the iterable; the body's
 /// synthetic-identifier expression statement walks the `;` anchor back over
 /// the relocated synthetic `)` to the literal's closer (oracle
-/// for_each_statement in_block).
+/// `for_each_statement` `in_block`).
 #[test]
 fn for_in_block_iterable_semicolon_anchor() {
     assert_faces(
@@ -220,9 +221,9 @@ fn for_rest_stall_survives() {
 // —— lints-doc `)` drift tail —————————————————————————————————————————————
 
 /// A `(`-headed parameter followed by `=>`: the name-less `(`-suffix face
-/// (parser_impl.dart:2233 OPEN_PAREN arm) fires behind the arrow too — the
+/// (`parser_impl.dart:2233` `OPEN_PAREN` arm) fires behind the arrow too — the
 /// `missing_identifier` anchors on the `(` and the parameter list's `)` row
-/// anchors on `=>` (oracle lints/avoid_final_parameters doc_bad_4).
+/// anchors on `=>` (oracle `lints/avoid_final_parameters` `doc_bad_4`).
 #[test]
 fn lambda_parameter_nameless_paren_face() {
     assert_faces(

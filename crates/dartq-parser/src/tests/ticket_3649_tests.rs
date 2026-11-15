@@ -4,6 +4,7 @@
 //! `pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart` recovery order
 //! and `pkg/analyzer/lib/src/fasta/ast_builder.dart` report anchors).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -177,7 +178,7 @@ fn prefix_increment_of_assignable_operand_silent() {
 }
 
 /// `for (;; super)` — each updater expression runs
-/// `reportErrorIfSuper(update)` (ast_builder.dart:4348): a bare `super`
+/// `reportErrorIfSuper(update)` (`ast_builder.dart:4348)`: a bare `super`
 /// updater reports `missingAssignableSelector` at the `super` token
 /// (oracle `update_super` `4:14|5`). A wrapped `super` (`super.x`,
 /// `super + 1`) fails the bare-expression probe and stays silent.

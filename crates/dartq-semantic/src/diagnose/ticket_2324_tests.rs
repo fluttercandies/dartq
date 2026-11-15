@@ -22,6 +22,7 @@
 //! the shared unchecked code where the `undefined_*` family or silence
 //! used to stand.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -94,7 +95,7 @@ fn code_names(report: &FileReport) -> Vec<&'static str> {
         .collect::<Vec<_>>()
 }
 
-/// `region?.offset ?? 0` (the archive corpus's xz_decoder.dart shape): the
+/// `region?.offset ?? 0` (the archive corpus's `xz_decoder.dart` shape): the
 /// `?.`-merged read keeps the null union, so the right operand is reachable
 /// and no dead row reports even though the field itself is non-nullable.
 #[test]
@@ -455,7 +456,7 @@ fn nullable_formal_absorbs_arg_nullability() {
 /// A bare `this` argument carries the enclosing extension's on-type —
 /// `extension on M2?` contributes `M2?`, whose nullability the formal's
 /// `?` absorbs, so the callback formal stays silent on member uses
-/// (manifest_id.dart:150/157's `writeOptionalObject(this, (it) =>
+/// (`manifest_id.dart:150/157`'s `writeOptionalObject(this, (it) =>
 /// it.write(writer))`).
 #[test]
 fn extension_this_arg_solves_on_type() {
@@ -478,7 +479,7 @@ fn extension_this_arg_solves_on_type() {
 /// `dynamic` the under-report posture used to carry. The concrete bind
 /// is oracle-true (probed 3.15: the analyzer's `T := A` types the
 /// callback formal `A`, so `B x = a;` reports `invalid_assignment`)
-/// and feeds the call's downstream nesting — bundle_writer.dart's
+/// and feeds the call's downstream nesting — `bundle_writer.dart`'s
 /// `writeOptionalObject(info, (info) { writeMap(info, …) })` types the
 /// inner map's key/value from the OUTER formal's class, which a
 /// `dynamic` bind starves into the unchecked/argument-type false

@@ -3,7 +3,7 @@
 //! capture) then flattens, never the unflattened row.
 //!
 //! Oracle contract (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart
+//! `pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart`
 //! + `type_analyzer.dart` `analyzeAwaitExpression`): `x op= await e` types
 //! the `op` invocation by the operand's `flatten(T)` face — `int += await
 //! Future<int>` resolves `int.+`'s signature and the write-back `int`
@@ -13,6 +13,7 @@
 //! Probed against `dart analyze` 3.13.7 (the pinned oracle at
 //! `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops, rows};
 use crate::diagnose::types::FileReport;
 
@@ -403,7 +404,7 @@ fn assert_return_invalid_rows(report: &FileReport, fixture: &str, expected: &[(u
     );
 }
 
-/// `return await g();` reports the whole AwaitExpression — the `await`
+/// `return await g();` reports the whole `AwaitExpression` — the `await`
 /// keyword through the operand's closing `)`, never the operand alone and
 /// never one column short of it (`reportTypeError`,
 /// return_type_verifier.dart:155-205 anchors `.at(expression)`).

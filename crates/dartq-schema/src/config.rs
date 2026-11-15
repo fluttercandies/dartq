@@ -13,6 +13,7 @@
 //! editor tooling and for the drift pins below: a field that moves here
 //! first, then in the reader, in the same release.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

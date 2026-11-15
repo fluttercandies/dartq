@@ -27,6 +27,7 @@
 //! Oracle provenance: `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze` —
 //! each pin asserts the oracle's exact (code, offset, length, message).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_augment, rows};
 use super::*;
 
@@ -192,7 +193,7 @@ fn augment_with_base_declaration_stays_silent() {
     assert_eq!(family, 0, "{:#?}", rows(&report));
 }
 
-/// The bare top-level reference (the ToSourceVisitor `SimpleIdentifier`
+/// The bare top-level reference (the `ToSourceVisitor` `SimpleIdentifier`
 /// case): `foo` is undefined — the row anchors at the name.
 #[test]
 fn undefined_identifier_toplevel_reference() {

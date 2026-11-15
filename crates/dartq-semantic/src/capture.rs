@@ -23,6 +23,7 @@
 //! their own capture levels and the completed nodes fold into typed
 //! columns.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_source::{SourceRange, StringId};
 
 /// One written type: the head name, the `?` flag, the explicit type
@@ -453,7 +454,7 @@ impl TreeSink {
     /// resolves to no spelling, so no leaf landed) still holds a field
     /// slot upstream — push the hole node so the arity stays honest
     /// (`(int, ,)` binds `(int, InvalidType)`, matching the analyzer's
-    /// InvalidType splice). `head` = `StringId::NONE` marks the hole; the
+    /// `InvalidType` splice). `head` = `StringId::NONE` marks the hole; the
     /// conversion maps it to [`crate::model::Ty::Unknown`].
     pub(crate) fn record_entry_end(&mut self, mark: usize, range: SourceRange) {
         if let Some(level) = self.stack.last_mut()

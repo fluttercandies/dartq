@@ -16,6 +16,7 @@
 //! over the `dead_code` fixtures `/tmp`-rooted in #3096, re-expressed as the
 //! exact source text each row covers.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ticket_3096_tests::dead_of;
 
 /// Oracle `5:5|7`: the or-pattern head `int() || 0` covers every `int`, so

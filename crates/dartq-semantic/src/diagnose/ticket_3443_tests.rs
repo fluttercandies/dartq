@@ -36,6 +36,7 @@
 //! Oracle provenance: `/tmp/probe3443/*.dart` against `dart analyze`
 //! 3.13.1 (`--format=machine`) — every fold below carries its machine row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 use crate::diagnose::FileReport;
 
@@ -75,7 +76,7 @@ fn t3443_is_list_missing_deads_the_else() {
                       \x20 }\n\
                       }";
     let (dead, report) = dead(source);
-    let else_start = at(&source, "else");
+    let else_start = at(source, "else");
     assert_eq!(
         dead.len(),
         1,
@@ -89,11 +90,11 @@ fn t3443_is_list_missing_deads_the_else() {
     );
     let names = code_names(&report);
     assert!(
-        names.iter().any(|n| *n == "non_type_as_type_argument"),
+        names.contains(&"non_type_as_type_argument"),
         "the argument miss reports its own code: {names:?}"
     );
     assert!(
-        names.iter().any(|n| *n == "unnecessary_type_check"),
+        names.contains(&"unnecessary_type_check"),
         "the constant-true test reports the check: {names:?}"
     );
 }
@@ -110,7 +111,7 @@ fn t3443_is_not_list_missing_deads_the_then() {
                       \x20 }\n\
                       }";
     let (dead, report) = dead(source);
-    let else_start = at(&source, "else");
+    let else_start = at(source, "else");
     assert_eq!(
         dead.len(),
         1,
@@ -170,7 +171,7 @@ fn t3443_nested_argument_tree_folds() {
                       \x20 }\n\
                       }";
     let (dead, report) = dead(source);
-    let else_start = at(&source, "else");
+    let else_start = at(source, "else");
     assert_eq!(
         dead.len(),
         1,
@@ -206,9 +207,7 @@ fn t3443_unrelated_registered_head_keeps_both_arms() {
         rows(&report)
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|n| *n == "non_type_as_type_argument"),
+        code_names(&report).contains(&"non_type_as_type_argument"),
         "the argument miss still reports its own code: {:#?}",
         rows(&report)
     );
@@ -228,7 +227,7 @@ fn t3443_registered_box_argument_face_folds() {
                       \x20 }\n\
                       }";
     let (dead, report) = dead(source);
-    let else_start = at(&source, "else");
+    let else_start = at(source, "else");
     assert_eq!(
         dead.len(),
         1,
@@ -262,9 +261,7 @@ fn t3443_wrong_resolved_argument_folds_nothing() {
         rows(&report)
     );
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|n| *n == "unnecessary_type_check"),
+        !code_names(&report).contains(&"unnecessary_type_check"),
         "no constant verdict rides a live test: {:#?}",
         rows(&report)
     );
@@ -283,7 +280,7 @@ fn t3443_undefined_head_fold_unchanged() {
                       \x20 }\n\
                       }";
     let (dead, report) = dead(source);
-    let else_start = at(&source, "else");
+    let else_start = at(source, "else");
     assert_eq!(
         dead.len(),
         1,
@@ -296,9 +293,7 @@ fn t3443_undefined_head_fold_unchanged() {
         rows(&report)
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|n| *n == "type_test_with_undefined_name"),
+        code_names(&report).contains(&"type_test_with_undefined_name"),
         "the head miss reports its own code: {:#?}",
         rows(&report)
     );

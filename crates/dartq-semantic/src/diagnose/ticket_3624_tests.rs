@@ -8,7 +8,7 @@
 //! and a dead `if` branch reported no element-code row.
 //!
 //! The fixes mirror upstream `_ConstLiteralVerifier.verify`
-//! (constant_verifier.dart) and `_buildListConstant`/`_buildMapConstant`/
+//! (`constant_verifier.dart`) and `_buildListConstant`/`_buildMapConstant`/
 //! `_buildSetConstant` (evaluation.dart):
 //!
 //! - `const_eval.rs` stages the control elements as structured `Expr`
@@ -34,6 +34,7 @@
 //! the corpus span; anchors locate with `source.find` — no hand-counted
 //! offsets. Registered through `diagnose/tests.rs`'s `#[path]` block.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops_bare};
 use super::*;
 
@@ -53,7 +54,7 @@ fn oracle_rows<'a>(report: &FileReport, source: &'a str) -> Vec<(&'static str, u
             )
         })
         .collect();
-    rows.sort();
+    rows.sort_unstable();
     rows
 }
 
@@ -286,7 +287,7 @@ fn non_bool_if_condition_faults_at_the_condition() {
 }
 
 /// `const x = throw 'e'`: the oracle anchors the failure at the whole
-/// `throw expr` node — the const_init row spans the `throw` keyword
+/// `throw expr` node — the `const_init` row spans the `throw` keyword
 /// through the operand's end, not the keyword alone.
 #[test]
 fn throw_anchors_the_whole_throw_expression() {

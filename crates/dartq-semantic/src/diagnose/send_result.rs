@@ -8,6 +8,7 @@
 //! for the member walks, and every result-position read routes through
 //! here.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 impl Engine<'_> {

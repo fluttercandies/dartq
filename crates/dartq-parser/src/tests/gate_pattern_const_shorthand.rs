@@ -27,6 +27,7 @@
 //! Oracle ground truth: dart 3.13.1, package pinned `sdk: ^3.9.0`,
 //! `dart analyze --format=machine` `EXPERIMENT_NOT_ENABLED` rows per face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, scan_ok};
 use crate::ParserFeatures;
 use dartq_language::{FeatureSet, LanguageVersion};

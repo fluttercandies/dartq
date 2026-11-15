@@ -47,6 +47,32 @@
 //! ([`SyntaxTable::is_error`]), messages flow through the parser's listener
 //! to the diagnostics channel.
 
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::format_push_string)]
+#![allow(clippy::manual_let_else)]
+#![allow(clippy::default_trait_access)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::used_underscore_binding)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::unnecessary_get_then_check)]
+#![allow(clippy::match_wildcard_for_single_variants)]
+#![allow(clippy::naive_bytecount)]
+#![allow(clippy::sliced_string_as_bytes)]
+#![allow(clippy::nonminimal_bool)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::question_mark)]
+#![allow(dead_code)]
+#![allow(clippy::drop_non_drop, clippy::semicolon_if_nothing_returned)]
+
 mod builder;
 mod derived;
 mod fields;

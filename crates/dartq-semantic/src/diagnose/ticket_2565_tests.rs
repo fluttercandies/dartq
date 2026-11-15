@@ -17,6 +17,7 @@
 //! The rig declares no imports, so every pin spells custom types only
 //! (`ticket_2564_tests` carries the same rule).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

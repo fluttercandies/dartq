@@ -3,6 +3,7 @@
 //! conformance failures (param_null_to_object_test, expression_A01_t01,
 //! named_constructor_A06_t01).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;
@@ -136,7 +137,7 @@ fn generic_type_literal_is_type_fires() {
     );
 }
 
-/// Top-level function tear-off vs typedef spelling — the function_type
+/// Top-level function tear-off vs typedef spelling — the `function_type`
 /// family shape (`f2 is F2<int>`), prefixed generic leaves.
 #[test]
 fn top_level_fn_prefixed_sig_is_typedef_fires() {
@@ -186,7 +187,7 @@ fn local_fn_null_is_same_signature_in_static_arg_fires() {
 }
 
 /// `f is int Function(Null)` inside a call argument — the dominant
-/// conformance shape (param_null_to_object).
+/// conformance shape (`param_null_to_object`).
 #[test]
 fn local_fn_null_is_same_signature_in_call_arg_fires() {
     let report = unit_report(
@@ -287,7 +288,7 @@ fn prefix_report(main: &str, prefix_name: &str, lib_src: &str) -> FileReport {
 
 /// `typedef F = core.List<core.int> Function({core.List<core.int> x})`
 /// against `f: core.List<core.int> Function({core.List<core.int> x})` —
-/// the function_type family's dominant miss (`f2 is F2<int>`): the
+/// the `function_type` family's dominant miss (`f2 is F2<int>`): the
 /// typedef RHS's `core.`-prefixed leaves must subtype-match the operand's
 /// identically spelled signature.
 ///
@@ -318,7 +319,7 @@ fn prefixed_typedef_fold_is_same_signature_fires() {
 /// isolates whether a local function's tear-off read carries a deferred
 /// read-type row at all (the deferred channel's entry condition).
 ///
-/// Blocked on #3087 (listener/resolved_ops): a local function's tear-off
+/// Blocked on #3087 (`listener/resolved_ops)`: a local function's tear-off
 /// read stages no `read_types` row, so the deferred channel never reaches
 /// the site — the operand's declared signature is invisible post-walk and
 /// pass-1's operand face stays silent on the `m is FN<T>` family.
@@ -406,7 +407,7 @@ fn prefixed_typedef_bare_rhs_fold_fires() {
     assert_eq!(utc.len(), 2, "{:?}", report.diagnostics);
 }
 
-/// `var l = <dynamic>[A()]; var o = l[0]; o is A` — the inheritance_chain
+/// `var l = <dynamic>[A()]; var o = l[0]; o is A` — the `inheritance_chain`
 /// extra-emit shape. `o` is `dynamic`; `dynamic <: A` is false upstream, so
 /// the verdict must stay silent.
 #[test]

@@ -25,6 +25,7 @@
 //! hand-mirrors the yaml's `enabledIn`; version comparison stays in
 //! `FeatureSet::for_language_version`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::listener::ExperimentalFlag;
 use dartq_language::{Feature, FeatureSet};
 
@@ -77,7 +78,7 @@ pub struct ParserFeatures {
     /// The sound-flow-analysis posture (`enabledIn: 3.9.0`, expired — the
     /// analyzer wires it as `soundFlowAnalysisEnabled:
     /// featureSet.isEnabled(Feature.sound_flow_analysis)`,
-    /// type_analyzer_options.dart:20). No grammar face: the flow-analysis
+    /// `type_analyzer_options.dart:20`). No grammar face: the flow-analysis
     /// replay reads it through the fold's `ParserFeatures` — a pre-3.9
     /// unit (a `// @dart = 3.8` library) analyzes with the sound-only
     /// folds (nullability-disjoint test/cast failures, trivially
@@ -87,7 +88,7 @@ pub struct ParserFeatures {
     /// `records` (`enabledIn: 3.0.0`): record literals and record types.
     /// When off, the analyzer's `AstBuilder` reports
     /// `experiment_not_enabled` at the record's `(` and degrades the node
-    /// (`endRecordLiteral` ast_builder.dart:2786, `endRecordType`
+    /// (`endRecordLiteral` `ast_builder.dart:2786`, `endRecordType`
     /// :2831) — the parse continues on the parenthesized shape.
     pub records_enabled: bool,
     /// `class-modifiers` (`enabledIn: 3.0.0`): the `base`/`interface`/
@@ -105,7 +106,7 @@ pub struct ParserFeatures {
     /// The scanner always lexes the separators; the analyzer's
     /// `handleLiteral{Int,Double}WithSeparators` report
     /// `experiment_not_enabled` at the literal token when off
-    /// (ast_builder.dart:4680/:4719).
+    /// (`ast_builder.dart:4680/:4719`).
     pub digit_separators_enabled: bool,
     /// `triple-shift` (`enabledIn: 2.14.0`): the lexical gate decides in
     /// the scanner (`>>>` as one token; the module docs' division of
@@ -118,48 +119,48 @@ pub struct ParserFeatures {
     /// `constructor-tearoffs` (`enabledIn: 2.15.0`): `new` rewritten to an
     /// identifier (`A.new`) and a standalone explicit type-argument
     /// application (`f<int>`). When off, `handleNewAsIdentifier`
-    /// (ast_builder.dart:4984) and `handleTypeArgumentApplication`
-    /// (ast_builder.dart:5602) each report `experiment_not_enabled` — the
+    /// (`ast_builder.dart:4984`) and `handleTypeArgumentApplication`
+    /// (`ast_builder.dart:5602`) each report `experiment_not_enabled` — the
     /// first at the `new`, the second over the `<...>` group.
     pub constructor_tearoffs_enabled: bool,
     /// `named-arguments-anywhere` (`enabledIn: 2.17.0`): a positional
     /// argument after a named one. When off, `endArguments`
-    /// (ast_builder.dart:970) reports `positional_after_named_argument`
+    /// (`ast_builder.dart:970`) reports `positional_after_named_argument`
     /// over the positional's expression.
     pub named_arguments_anywhere_enabled: bool,
     /// `super-parameters` (`enabledIn: 2.17.0`): a `super.x` formal
-    /// parameter. When off, `endFormalParameter` (ast_builder.dart:1789)
+    /// parameter. When off, `endFormalParameter` (`ast_builder.dart:1789`)
     /// reports `experiment_not_enabled` at the `super` keyword.
     pub super_parameters_enabled: bool,
     /// `enhanced-enums` (`enabledIn: 2.17.0`): enum constants with
     /// arguments or a named/generic constructor selector
-    /// (`handleEnumElement`, ast_builder.dart:4035), a `;` closing the
+    /// (`handleEnumElement`, `ast_builder.dart:4035`), a `;` closing the
     /// constant list (`handleEnumElements`, :4094) and a header with a
     /// with-clause, implements-clause or type parameters
     /// (`handleEnumHeader`, :4131) each report `experiment_not_enabled`
     /// when off — one row, anchored on the first present construct.
     pub enhanced_enums_enabled: bool,
     /// `generic-metadata` (`enabledIn: 2.14.0`): type arguments on an
-    /// annotation. When off, `endMetadata` (ast_builder.dart:2423) reports
+    /// annotation. When off, `endMetadata` (`ast_builder.dart:2423`) reports
     /// `experiment_not_enabled` at the group's `<`.
     pub generic_metadata_enabled: bool,
     /// `nonfunction-type-aliases` (`enabledIn: 2.13.0`): a `typedef X = T;`
     /// whose right-hand type is not a function type. When off,
-    /// `endGenericTypeAlias` (ast_builder.dart:3373) reports
+    /// `endGenericTypeAlias` (`ast_builder.dart:3373`) reports
     /// `experiment_not_enabled` at the `=`.
     pub nonfunction_type_aliases_enabled: bool,
     /// `inline-class` (`enabledIn: 3.3.0`): the `extension type`
     /// declaration. When off, `endExtensionTypeDeclaration`
-    /// (ast_builder.dart:1607) reports `experiment_not_enabled` at the
+    /// (`ast_builder.dart:1607`) reports `experiment_not_enabled` at the
     /// `type` keyword.
     pub inline_class_enabled: bool,
     /// `unnamed-libraries` (`enabledIn: 2.19.0`): a bare `library;`
-    /// directive. When off, `endLibraryName` (ast_builder.dart:2281)
+    /// directive. When off, `endLibraryName` (`ast_builder.dart:2281`)
     /// reports `experiment_not_enabled` at the `library` keyword.
     pub unnamed_libraries_enabled: bool,
     /// `null-aware-elements` (`enabledIn: 3.8.0`): `?e` elements,
     /// `?k: v`/`k: ?v` map entries. When off, `handleNullAwareElement`
-    /// (ast_builder.dart:5119) and `handleLiteralMapEntry` (:4771) report
+    /// (`ast_builder.dart:5119`) and `handleLiteralMapEntry` (:4771) report
     /// `experiment_not_enabled` at the `?` and drop the marker.
     pub null_aware_elements_enabled: bool,
 }

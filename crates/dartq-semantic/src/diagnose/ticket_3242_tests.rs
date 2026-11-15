@@ -8,7 +8,7 @@
 //! Dart SDK source, pkg/analyzer/lib/src/generated/resolver.dart:1632-1637).
 //! A record pattern's required type is the record over its WRITTEN fields
 //! with every slot `Object?` (`analyzeRecordPattern`,
-//! pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart:
+//! pkg/_`fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart`:
 //! 1841-1855), and against a record right only an `Object`/`Record`
 //! interface left can match — a function left never does
 //! (pkg/analyzer/lib/src/dart/element/type_system.dart:269-285). An object
@@ -18,6 +18,7 @@
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs` is
 //! a live-lane file out of this ticket's write scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 

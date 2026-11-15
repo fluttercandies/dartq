@@ -6,6 +6,7 @@
 //! `_checkForMixinInWithClause` resolves the type's ELEMENT). Every
 //! expectation is a verbatim oracle 3.13.7 row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::pins::report;
 
 /// The `class_used_as_mixin` rows of `report`, as (offset, length) pairs.

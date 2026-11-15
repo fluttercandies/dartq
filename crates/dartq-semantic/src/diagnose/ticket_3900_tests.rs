@@ -43,6 +43,7 @@
 //!   the `engine_core.rs`/`listener.rs` pair: the write's static type read
 //!   drops the dynamic-bearing written group, not a `resolution.rs` face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops_experiments_with};
 
 /// The fixture's rows of one code, in source order.

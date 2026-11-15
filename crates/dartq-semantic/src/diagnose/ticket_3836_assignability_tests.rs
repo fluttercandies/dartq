@@ -29,6 +29,7 @@
 //! decided by the argument face's own verdict staging (a face outside this
 //! module), not by the pair walk these pins cover.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

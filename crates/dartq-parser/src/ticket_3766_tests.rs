@@ -28,6 +28,7 @@
 //!   `_checkIfRecordTypeParenthesisAreRecovered`,
 //!   type_info_impl.dart:882-945) so `x<y, (o as int)>` stays a comparison.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;

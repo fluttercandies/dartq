@@ -30,6 +30,7 @@
 //! These pins lock the oracle-verified defaults so the fixed point cannot
 //! regress while those faces are fixed elsewhere.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
 use crate::instantiate_to_bound::instantiate_type_formals_to_bounds;
 use crate::table::TypeTable;
@@ -65,7 +66,7 @@ fn facts_with(p: TypeParamId, bound: TypeId) -> ParamFactsTable {
 /// it), so the Phi substitution maps `X -> dynamic`, giving the default
 /// `FutureOr<A<dynamic>>` with `malbounded = true`. Oracle-verified: the
 /// co19 case types the raw `A?` as `A<FutureOr<A<dynamic>>>?`
-/// (class_FutureOr_l1_t02, `invalid_assignment` rows naming
+/// (`class_FutureOr_l1_t02`, `invalid_assignment` rows naming
 /// `F<A<FutureOr<A<dynamic>>>?>`).
 #[test]
 fn future_or_headed_self_cycle_defaults_to_phi_future_or_a_dynamic() {

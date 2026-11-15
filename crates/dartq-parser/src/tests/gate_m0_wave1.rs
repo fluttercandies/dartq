@@ -25,6 +25,7 @@
 //!   when a type was committed (`parser_impl.dart:2221-2264`), so
 //!   `f((Enum, Enum) r)` keeps its record-type parameter.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::setup;
 
 /// Sorted diagnostic-code multiset of one whole-unit parse.
@@ -121,8 +122,8 @@ fn keyword_named_top_level_methods_report_once_and_consume() {
 /// identifier_context_impl.dart:50-118). Reserved words carry the
 /// built-in-name row too: the verifier gate is `isKeyword && isPseudo !=
 /// true` (error_verifier.dart:846-849, :3372 — oracle machine rows on
-/// `class assert {}`: EXPECTED_IDENTIFIER_BUT_GOT_KEYWORD 1|7|6 +
-/// BUILT_IN_IDENTIFIER_IN_DECLARATION 1|7|6).
+/// `class assert {}`: `EXPECTED_IDENTIFIER_BUT_GOT_KEYWORD` 1|7|6 +
+/// `BUILT_IN_IDENTIFIER_IN_DECLARATION` 1|7|6).
 #[test]
 fn keyword_named_classes_report_and_consume() {
     assert_codes(

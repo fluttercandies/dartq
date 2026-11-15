@@ -33,6 +33,7 @@
 //! `diagnostics/*_outside_of_library` and co19 Class-modifiers corpora plus
 //! the /tmp/ol3161 probe pairs.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, RigImport, report_ops, report_ops_imports, rows};
 
 /// The absolute fixture offset of `needle` (the prelude the rig prepends

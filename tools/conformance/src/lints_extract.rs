@@ -12,6 +12,7 @@
 //! of the case bytes: markup (`[!` / `!]`) is stripped before storage, the
 //! same way the official `TestCode.parse` produces the analyzed text.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::case::Case;
 use crate::dart::{find_call, is_ident_start, match_paren, parse_args, parse_string_expression};
 use crate::markers::camel_to_snake;
@@ -206,19 +207,19 @@ fn class_env(content: &str, decl: &Declaration) -> Env {
             }
             "testPackageLanguageVersion" => {
                 let mut pos = 0usize;
-                if let Some(d) = parse_string_expression(expr, &mut pos) {
-                    if !d.interpolated {
-                        language = Some(d.value);
-                    }
+                if let Some(d) = parse_string_expression(expr, &mut pos)
+                    && !d.interpolated
+                {
+                    language = Some(d.value);
                 }
             }
             _ => {
                 // Path getters (`String get libFile => '$testPackageLibPath/
                 // file.dart';`) become named paths of the environment.
-                if let Some(path) = resolve_path_text(expr, &path_env) {
-                    if !path_env.iter().any(|(n, _)| n == &member.name) {
-                        path_env.push((member.name.clone(), path));
-                    }
+                if let Some(path) = resolve_path_text(expr, &path_env)
+                    && !path_env.iter().any(|(n, _)| n == &member.name)
+                {
+                    path_env.push((member.name.clone(), path));
                 }
             }
         }
@@ -230,7 +231,7 @@ fn class_env(content: &str, decl: &Declaration) -> Env {
         experiments: experiments.unwrap_or_else(|| {
             setup::DEFAULT_EXPERIMENTS
                 .iter()
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .collect()
         }),
         language,
@@ -263,15 +264,15 @@ fn extract_declaration(
     out: &mut LintExtraction,
 ) {
     let mut env = class_env(content, decl);
-    if let Some(set_up) = decl.members.iter().find(|m| m.name == "setUp") {
-        if let Some((start, end)) = set_up.body {
-            interpret_calls(&content[start..end], &mut env, &mut |reason| {
-                out.skips.push(Skip {
-                    id: format!("lints/{rule}/{}", decl.name),
-                    reason,
-                })
+    if let Some(set_up) = decl.members.iter().find(|m| m.name == "setUp")
+        && let Some((start, end)) = set_up.body
+    {
+        interpret_calls(&content[start..end], &mut env, &mut |reason| {
+            out.skips.push(Skip {
+                id: format!("lints/{rule}/{}", decl.name),
+                reason,
             });
-        }
+        });
     }
     for member in &decl.members {
         let Some((start, end)) = member.body else {
@@ -381,8 +382,7 @@ fn assigned_ident(prefix: &str) -> Option<String> {
     let tail = prefix.trim_end();
     let start = tail
         .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .map(|i| i + 1)
-        .unwrap_or(0);
+        .map_or(0, |i| i + 1);
     let ident = &tail[start..];
     if ident.is_empty() || !is_bare_ident(ident) {
         return None;
@@ -398,7 +398,7 @@ fn assigned_ident(prefix: &str) -> Option<String> {
 fn literal_arg(arg: &str) -> Option<String> {
     let mut pos = 0usize;
     let d = parse_string_expression(arg, &mut pos)?;
-    (pos == arg.len()).then(|| d.value)
+    (pos == arg.len()).then_some(d.value)
 }
 
 /// Interprets the modeled setup calls of one body in offset order, updating
@@ -419,10 +419,10 @@ fn interpret_calls(body: &str, env: &mut Env, note: &mut dyn FnMut(String)) {
             "writeTestPackageConfig" => {
                 // The builders used here carry no mock packages beyond the
                 // getters; a non-empty cascade cannot be modeled.
-                if let Some(arg) = args.iter().find(|a| a.label.is_none()) {
-                    if arg.expr.contains("..add(") {
-                        note("setup_package_config".into());
-                    }
+                if let Some(arg) = args.iter().find(|a| a.label.is_none())
+                    && arg.expr.contains("..add(")
+                {
+                    note("setup_package_config".into());
                 }
             }
             "newAnalysisOptionsYamlFile" => {
@@ -506,10 +506,10 @@ fn interpret_new_file(
     } else {
         content
     };
-    if let Some(ident) = assigned_ident(prefix) {
-        if !env.bindings.iter().any(|(n, _)| n == &ident) {
-            env.bindings.push((ident, section.clone()));
-        }
+    if let Some(ident) = assigned_ident(prefix)
+        && !env.bindings.iter().any(|(n, _)| n == &ident)
+    {
+        env.bindings.push((ident, section.clone()));
     }
     env.files.push((section, content));
 }
@@ -709,16 +709,16 @@ fn strings_in(expr: &str) -> Vec<String> {
     let mut pos = 0usize;
     while pos < expr.len() {
         let rest = &expr[pos..];
-        match rest.find(|c: char| c == '\'' || c == '"') {
+        match rest.find(['\'', '"']) {
             Some(at) => {
                 pos += at;
                 let mut consumed = 0usize;
-                if let Some(d) = parse_string_expression(&expr[pos..], &mut consumed) {
-                    if consumed > 0 {
-                        out.push(d.value);
-                        pos += consumed;
-                        continue;
-                    }
+                if let Some(d) = parse_string_expression(&expr[pos..], &mut consumed)
+                    && consumed > 0
+                {
+                    out.push(d.value);
+                    pos += consumed;
+                    continue;
                 }
                 pos += 1;
             }
@@ -900,7 +900,7 @@ fn read_block(lines: &[&str], start: usize, key_indent: usize) -> (String, usize
         collected.push(line[indent.min(bi)..].to_string());
         i += 1;
     }
-    while collected.last().is_some_and(|l| l.is_empty()) {
+    while collected.last().is_some_and(std::string::String::is_empty) {
         collected.pop();
     }
     (collected.join("\n"), i)
@@ -1024,7 +1024,7 @@ fn snippets_of(parts: &[(DocSection, DocBlock)], want: DocSection) -> Vec<Snippe
 }
 
 fn skip_block(lines: &mut std::iter::Peekable<std::str::Lines<'_>>) {
-    while let Some(l) = lines.next() {
+    for l in lines.by_ref() {
         if l.starts_with("```") {
             return;
         }
@@ -1091,8 +1091,7 @@ pub fn extract_docs(yaml: &str, origin: &str) -> LintExtraction {
         let rule = entry
             .shared_name
             .as_deref()
-            .map(camel_to_snake)
-            .unwrap_or_else(|| camel_to_snake(&entry.key));
+            .map_or_else(|| camel_to_snake(&entry.key), camel_to_snake);
         if entry.removed_in.is_some() {
             out.skips.push(Skip {
                 id: format!("lints/{rule}/"),
@@ -1157,11 +1156,14 @@ pub fn extract_docs(yaml: &str, origin: &str) -> LintExtraction {
                     id,
                     source: format!("{origin}#{key}"),
                     language: snippet.language_version.clone(),
-                    packages: DOC_PACKAGES.iter().map(|s| s.to_string()).collect(),
+                    packages: DOC_PACKAGES
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
                     aux_packages: Vec::new(),
                     options: Some(setup::analysis_options_content(
                         &snippet.experiments,
-                        &[rule.to_string()],
+                        std::slice::from_ref(rule),
                         false,
                         false,
                         false,
@@ -1192,7 +1194,7 @@ mod tests {
     /// The upstream `use_test_throws_matchers_test.dart` shape: a
     /// `PackageConfigFileBuilder` registration plus companion files whose
     /// path local the extractor does not model.
-    const TEST_API_FILE: &str = r#"
+    const TEST_API_FILE: &str = r"
 @reflectiveTest
 class UseTestThrowsMatchersTest extends LintRuleTest {
   @override
@@ -1231,7 +1233,7 @@ void f() {
 ''');
   }
 }
-"#;
+";
 
     #[test]
     fn config_registered_test_api_backs_the_case() {
@@ -1270,7 +1272,7 @@ void f() {
 
     #[test]
     fn extracts_cases_with_getters_and_companions() {
-        let src = r#"
+        let src = r"
 import '../rule_test_support.dart';
 
 @reflectiveTest
@@ -1297,7 +1299,7 @@ void f() {}
 ''');
   }
 }
-"#;
+";
         let out = extract_file("avoid_print_test.dart", src);
         assert_eq!(out.cases.len(), 2, "{:?}", out.skips);
         let first = &out.cases[0];
@@ -1325,7 +1327,7 @@ void f() {}
 
     #[test]
     fn default_experiments_match_official_harness() {
-        let src = r#"
+        let src = r"
 class T extends LintRuleTest {
   String get lintRule => 'avoid_print';
 
@@ -1333,7 +1335,7 @@ class T extends LintRuleTest {
     await assertNoDiagnostics('var x = 1;');
   }
 }
-"#;
+";
         let out = extract_file("avoid_print_test.dart", src);
         assert_eq!(out.cases.len(), 1, "{:?}", out.skips);
         let options = out.cases[0].options.as_ref().expect("options");
@@ -1345,7 +1347,7 @@ class T extends LintRuleTest {
 
     #[test]
     fn setup_and_in_file_asserts() {
-        let src = r#"
+        let src = r"
 class T extends LintRuleTest {
   String get lintRule => 'avoid_catches_without_on_clauses';
 
@@ -1367,7 +1369,7 @@ void f() {}
     await assertNoDiagnostics(code);
   }
 }
-"#;
+";
         let out = extract_file("some_rule_test.dart", src);
         assert_eq!(out.cases.len(), 1, "{:?}", out.skips);
         let case = &out.cases[0];
@@ -1383,7 +1385,7 @@ void f() {}
 
     #[test]
     fn test_dir_and_hook_sinks() {
-        let src = r#"
+        let src = r"
 class T extends LintRuleTest {
   String get lintRule => 'avoid_print';
 
@@ -1397,7 +1399,7 @@ void main() { [!print!]('x'); }
     await assertNoDiagnosticsInHook('build.dart', 'void f() {}');
   }
 }
-"#;
+";
         let out = extract_file("avoid_print_test.dart", src);
         assert_eq!(out.cases.len(), 2, "{:?}", out.skips);
         assert_eq!(out.cases[0].files[0].0, "bin/bin.dart");

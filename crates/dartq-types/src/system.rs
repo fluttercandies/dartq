@@ -11,6 +11,7 @@
 //! ([`TypeSystem::with_param_facts`]): the left-type-variable-bound rule
 //! is armed exactly when the caller binds the snapshot.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 
@@ -715,6 +716,10 @@ impl<'a> TypeSystem<'a> {
     /// edges with live substitution — `None` when `target` is not a
     /// supertype of `from`. Iterative with a visited set; claims a pooled
     /// walk unit like [`TypeSystem::interface_subtype`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the type hierarchy is in an inconsistent state.
     pub fn as_instance_of(&self, from: TypeId, target: TypeDeclId) -> Option<TypeId> {
         let TypeKind::Interface {
             decl: from_decl,
@@ -975,6 +980,7 @@ impl<'a> TypeSystem<'a> {
     /// `_isSubtypeOf` consults reflexivity, so identical pairs beyond the
     /// limit answer `false` too, and internal recursion re-enters per level
     /// exactly like the oracle's `isSubtypeOf` calls.
+    #[expect(clippy::too_many_lines, reason = "the subtype matrix walk")]
     fn subtype_impl(&self, t0: TypeId, t1: TypeId) -> bool {
         // 0a Reflexivity (subtype.dart:264-266). Interned ids make this a
         // structural comparison in O(1).

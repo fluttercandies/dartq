@@ -29,6 +29,7 @@
 //! anchored at the RHS `0` (line 9 column 21, lexeme width 1); the
 //! write-target, named-face, and backward fixtures probe the same way.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops, report_ops_bare, rows};
 use crate::diagnose::FileReport;
 use dartq_diagnostics::Diagnostic;
@@ -57,7 +58,7 @@ fn dead_code_rows(report: &FileReport) -> Vec<&Diagnostic> {
 /// live (the read itself is evaluated on the non-null path — no row).
 #[test]
 fn forward_never_getter_kills_the_index_write() {
-    let source = r#"class C {
+    let source = r"class C {
   C operator [](Object? i) => this;
   void operator []=(Object? i, Object? v) {}
   void method(Object? v) {}
@@ -71,7 +72,7 @@ void main() {
 }
 
 Never get unreachable => throw 'x';
-"#;
+";
     let report = report_ops_bare(source);
     let hits = dead_code_rows(&report);
     assert_eq!(hits.len(), 1, "{:#?}", rows(&report));
@@ -91,7 +92,7 @@ Never get unreachable => throw 'x';
 /// when the recorder's own resolution hits).
 #[test]
 fn backward_never_getter_twin_converges_identically() {
-    let source = r#"class C {
+    let source = r"class C {
   C operator [](Object? i) => this;
   void operator []=(Object? i, Object? v) {}
 }
@@ -102,7 +103,7 @@ void main() {
   C? c = null;
   c?[unreachable] = 0;
 }
-"#;
+";
     let report = report_ops_bare(source);
     let hits = dead_code_rows(&report);
     assert_eq!(hits.len(), 1, "{:#?}", rows(&report));
@@ -126,11 +127,11 @@ void main() {
 /// change; the oracle stays silent) owned by the resolution layer's
 /// write-target face, which answers the getter's spelling for a plain `=`
 /// target instead of the setter's. That residual is out of this lane's
-/// scope; this pin freezes the oracle-matching dead_code set of the
+/// scope; this pin freezes the oracle-matching `dead_code` set of the
 /// unpoisoned shape.
 #[test]
 fn forward_never_write_target_exits_nothing() {
-    let source = r#"class C {
+    let source = r"class C {
   C operator [](Object? i) => this;
   void operator []=(Object? i, Object? v) {}
 }
@@ -142,7 +143,7 @@ void main() {
 }
 
 Never get unreachable => throw 'x';
-"#;
+";
     let report = report_ops_bare(source);
     let hits = dead_code_rows(&report);
     assert_eq!(hits.len(), 1, "{:#?}", rows(&report));
@@ -162,7 +163,7 @@ Never get unreachable => throw 'x';
 /// reachability (no exit on a non-bottom face).
 #[test]
 fn forward_named_getter_read_stays_live() {
-    let source = r#"class C {
+    let source = r"class C {
   C operator [](Object? i) => this;
   void operator []=(Object? i, Object? v) {}
 }
@@ -174,7 +175,7 @@ void main() {
 }
 
 int get nonNever => 1;
-"#;
+";
     let report = report_ops(source);
     assert_silent(&report);
 }

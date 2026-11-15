@@ -51,6 +51,7 @@
 //! the last daemon's death — probes it before any server starts and
 //! serves a stamp-set hit with no spawn at all.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -152,7 +153,7 @@ pub(crate) fn face_header(meta: &crate::face::FaceMeta, bytes: usize) -> Option<
 /// How long a server start waits for host memory before the request fails
 /// (with the holders named, and no per-run retry: a per-run analysis
 /// would wait for the same memory).
-const MEMORY_WAIT: Duration = Duration::from_secs(30 * 60);
+const MEMORY_WAIT: Duration = Duration::from_mins(30);
 
 /// How long the worker waits for one request line: the ask arrives with
 /// the connection, so anything past a few seconds is a peer that will
@@ -575,7 +576,7 @@ impl Host {
     /// Primes the standby at daemon start: the spawn overlaps the asking
     /// client's connect and the first freshness walk, and that client is
     /// the standby's first borrower — the spawn is never wasted. A
-    /// PerRun SDK never primes (there is nothing to serve); a failed
+    /// `PerRun` SDK never primes (there is nothing to serve); a failed
     /// prime costs one spawn and nothing more — the next ask spawns
     /// fresh (`warm-miss`).
     fn prime(&mut self) {
@@ -631,7 +632,7 @@ impl Host {
     /// rootless standby stands up on a slotless lease, and the daemon
     /// lives on for the warm TTL (refreshed by every ask). `false` when
     /// Tier 2 cannot be entered — warm off, a standby already live
-    /// (Tier 2's own TTL expiry is Tier 3), a PerRun SDK, or no lease
+    /// (Tier 2's own TTL expiry is Tier 3), a `PerRun` SDK, or no lease
     /// and no spawn to be had — and the caller exits as the idle daemon
     /// always did.
     fn enter_tier2(&mut self) -> bool {
@@ -652,8 +653,7 @@ impl Host {
             return false;
         };
         std::fs::read_to_string(launch.sdk.root.join("version"))
-            .map(|text| Version::parse(&text) == Some(launch.sdk.version))
-            .unwrap_or(false)
+            .is_ok_and(|text| Version::parse(&text) == Some(launch.sdk.version))
     }
 
     /// The pooled daemon's answer to a join: admit the roots — every
@@ -766,42 +766,38 @@ impl Host {
         match self.analyze_result(client) {
             Ok(()) => {
                 let server = self.server.as_ref().expect("a live server");
-                match face {
-                    Some(face) => {
-                        // A degenerate ask naming no aims and no scope
-                        // reports nothing — never the pooled superset:
-                        // the clean face is the writer's render over no
-                        // rows.
-                        if owned.is_empty() {
-                            let render = (self.renderer)(&[], face);
-                            let Some(mut wire) = face_header(&render.meta, render.bytes.len())
-                            else {
-                                return Reply::Answer(Answer::NotServed);
-                            };
-                            wire.extend_from_slice(&render.bytes);
-                            let line: Arc<[u8]> = wire.into();
-                            self.record_persist(&owned, Some(face), &line);
-                            return Reply::Line(line);
-                        }
-                        match server.render_face(&owned, face, self.renderer) {
-                            Some(line) => {
-                                self.record_persist(&owned, Some(face), &line);
-                                Reply::Line(line)
-                            }
-                            None => Reply::Answer(Answer::NotServed),
-                        }
+                if let Some(face) = face {
+                    // A degenerate ask naming no aims and no scope
+                    // reports nothing — never the pooled superset:
+                    // the clean face is the writer's render over no
+                    // rows.
+                    if owned.is_empty() {
+                        let render = (self.renderer)(&[], face);
+                        let Some(mut wire) = face_header(&render.meta, render.bytes.len()) else {
+                            return Reply::Answer(Answer::NotServed);
+                        };
+                        wire.extend_from_slice(&render.bytes);
+                        let line: Arc<[u8]> = wire.into();
+                        self.record_persist(&owned, Some(face), &line);
+                        return Reply::Line(line);
                     }
-                    None => {
-                        if owned.is_empty() {
-                            return Reply::Answer(Answer::Report(Report::default()));
+                    match server.render_face(&owned, face, self.renderer) {
+                        Some(line) => {
+                            self.record_persist(&owned, Some(face), &line);
+                            Reply::Line(line)
                         }
-                        match server.render(&owned) {
-                            Some(line) => {
-                                self.record_persist(&owned, None, &line);
-                                Reply::Line(line)
-                            }
-                            None => Reply::Answer(Answer::NotServed),
+                        None => Reply::Answer(Answer::NotServed),
+                    }
+                } else {
+                    if owned.is_empty() {
+                        return Reply::Answer(Answer::Report(Report::default()));
+                    }
+                    match server.render(&owned) {
+                        Some(line) => {
+                            self.record_persist(&owned, None, &line);
+                            Reply::Line(line)
                         }
+                        None => Reply::Answer(Answer::NotServed),
                     }
                 }
             }
@@ -1015,8 +1011,7 @@ impl Host {
         let diff = if cold_freshness_skip(self.server.is_some(), self.freshness.primed()) {
             Diff::default()
         } else {
-            let diff = self.freshness.check(&roots);
-            diff
+            self.freshness.check(&roots)
         };
         // The sizing figure rides the walk the oracle already paid.
         self.source_bytes = self.freshness.dart_bytes().or(self.source_bytes);
@@ -1233,12 +1228,7 @@ impl Host {
     /// standby (`warm-fault`) and falls to a fresh spawn; a budget or
     /// yield surfaces as the fresh start's own fault would.
     fn start_by_adoption(&mut self, launch: &Launch, client: &UnixStream) -> Result<(), Fault> {
-        let lease = match self.lease_slot(client) {
-            Ok(lease) => lease,
-            // The gate wait failed: the request yields as a fresh start's
-            // would, and the standby stays for the next ask.
-            Err(fault) => return Err(fault),
-        };
+        let lease = self.lease_slot(client)?;
         let standby = self.standby.take().expect("the admit checked a standby");
         let pid = standby.pid();
         // The standby's slotless booking leaves with it; the serving lease
@@ -1380,7 +1370,7 @@ impl Host {
 /// next request and evicts another — the pool thrash; a join that needs a
 /// hot root's place is refused instead, and the worktree's own daemon
 /// serves it.
-const POOL_HOT: Duration = Duration::from_secs(5 * 60);
+const POOL_HOT: Duration = Duration::from_mins(5);
 
 /// The standby lease's booking: a fixed small figure above a rootless
 /// server's measured tree (~37 MB) — never a slot, never an unsized
@@ -2119,7 +2109,7 @@ mod tests {
         // A base an hour ahead keeps every `now - age` representable on a
         // freshly booted host.
         let now = Instant::now() + Duration::from_secs(3600);
-        let at = |seconds: u64| now - Duration::from_secs(seconds);
+        let at = |seconds: u64| now.checked_sub(Duration::from_secs(seconds)).unwrap();
         let roots = |names: &[&str]| {
             names
                 .iter()
@@ -2162,7 +2152,7 @@ mod tests {
     #[test]
     fn a_hot_set_refuses_the_join_and_stays_served() {
         let now = Instant::now() + Duration::from_secs(3600);
-        let at = |seconds: u64| now - Duration::from_secs(seconds);
+        let at = |seconds: u64| now.checked_sub(Duration::from_secs(seconds)).unwrap();
         let hot: Vec<(PathBuf, Instant)> = vec![
             (PathBuf::from("/w/primary"), at(30)),
             (PathBuf::from("/w/a"), at(10)),
@@ -2231,13 +2221,13 @@ mod tests {
         let common = main.join(".git").canonicalize().expect("common dir");
         let key = |roots: &[PathBuf]| repo_key(roots);
         assert_eq!(
-            key(&[main.clone()]),
+            key(std::slice::from_ref(&main)),
             Some(format!("{}:", common.display())),
             "the main worktree's top"
         );
         assert_eq!(
-            key(&[linked.clone()]),
-            key(&[main.clone()]),
+            key(std::slice::from_ref(&linked)),
+            key(std::slice::from_ref(&main)),
             "a linked sibling"
         );
         let sub = Path::new("pkgs").join("a");
@@ -2259,7 +2249,7 @@ mod tests {
         .expect("submodule .git");
         assert_ne!(
             key(&[submodule]),
-            key(&[main.clone()]),
+            key(std::slice::from_ref(&main)),
             "its own common dir"
         );
 
@@ -2515,7 +2505,7 @@ mod tests {
         };
         assert_eq!(
             warm_config_with(&spec(0, 0), None, None),
-            (false, Duration::from_secs(900)),
+            (false, Duration::from_mins(15)),
             "an old spec behaves as the default: warm off, 900 s"
         );
         assert_eq!(
@@ -2525,12 +2515,12 @@ mod tests {
         );
         assert_eq!(
             warm_config_with(&spec(0, 0), Some("0"), None),
-            (false, Duration::from_secs(900)),
+            (false, Duration::from_mins(15)),
             "the env's off arm"
         );
         assert_eq!(
             warm_config_with(&spec(0, 0), Some("1"), None),
-            (true, Duration::from_secs(900)),
+            (true, Duration::from_mins(15)),
             "the env's on arm is the config-less opt-in"
         );
         assert_eq!(
@@ -2540,7 +2530,7 @@ mod tests {
         );
         assert_eq!(
             warm_config_with(&spec(0, 0), Some("not-a-number"), Some("")),
-            (false, Duration::from_secs(900)),
+            (false, Duration::from_mins(15)),
             "a garbage override fails open to the default"
         );
         assert_eq!(
@@ -2573,7 +2563,7 @@ mod tests {
 
     /// The idle tiering transition: warm on with a servable SDK and no
     /// standby yet enters Tier 2; a live standby (its TTL expiring) is
-    /// Tier 3's exit, and warm off or a PerRun SDK never tier.
+    /// Tier 3's exit, and warm off or a `PerRun` SDK never tier.
     #[test]
     fn tier_two_needs_warm_a_servable_sdk_and_no_standby_yet() {
         assert!(enters_tier2(true, false, true), "the Tier-2 entry");

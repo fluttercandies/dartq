@@ -5,11 +5,12 @@
 //! `Unit<T>` answers `Unit<MetricUnits>`, never the raw `Unit<T>` schema
 //! nor the unknown the same-file `container_params` snapshot's miss used
 //! to leak. The env-key producer is `object_pattern_binder_ty`'s
-//! parameter-name lookup (row_resolution.rs): same-file heads ride the
+//! parameter-name lookup (`row_resolution.rs)`: same-file heads ride the
 //! `container_params` snapshot registry, foreign heads fall back to the
 //! declaring unit's `type_param_names` via `foreign_container_params`.
 //! Every expectation is a verbatim oracle 3.13.7 row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, report_ops_imports};
 
 /// A `patterns_lib`-style foreign library: generic `Shape`/`Unit` heads

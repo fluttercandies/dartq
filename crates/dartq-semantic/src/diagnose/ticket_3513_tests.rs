@@ -23,6 +23,7 @@
 //! `DeprecatedMemberUse_PackageConfigWorkspaceTest` family, and
 //! `deprecated_member_use_verifier.dart`'s `isInSamePackage` bail.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::library::ElementIndex;
 use crate::model::MicroKind;
@@ -220,7 +221,7 @@ fn dmu_path_dependency_variable_read_in_condition() {
 }
 
 /// The silent control: the SAME-PACKAGE read never reports under this code
-/// — `isInSamePackage` bails the reporter (deprecated_member_use_verifier
+/// — `isInSamePackage` bails the reporter (`deprecated_member_use_verifier`
 /// .dart:46) and the `deprecated_member_use_from_same_package` variant owns
 /// the report, which is a dartq-lints face and deliberately not implemented
 /// here.

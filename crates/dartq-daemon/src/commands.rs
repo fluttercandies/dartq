@@ -133,6 +133,7 @@
 //! subprocess bridges honor the same variable as their own override — the
 //! `formatting` module's contract).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -169,7 +170,7 @@ pub(crate) const SCHEMA_VERSION: u32 = dartq_commands::SCHEMA_VERSION;
 /// execute off the main loop at their drain (the session module's
 /// fix-dispatch notes).
 ///
-/// `pub` so the drift gate (tests/rpc_schema.rs) can pin the served request
+/// `pub` so the drift gate (`tests/rpc_schema.rs`) can pin the served request
 /// set itself, not a parallel copy: the schema test asserts this table IS
 /// the dispatchable request family, in both directions.
 pub const METHODS: [&str; 17] = [
@@ -618,7 +619,7 @@ struct CompletionParams {
 #[derive(Deserialize)]
 struct TargetParams {
     path: PathBuf,
-    /// The `--symbol` narrowing list (#2666): the snake_case plural array
+    /// The `--symbol` narrowing list (#2666): the `snake_case` plural array
     /// the MCP face already forwards — absent is the file-level posture.
     #[serde(default)]
     symbols: Vec<String>,
@@ -1587,15 +1588,16 @@ pub(crate) struct PackageStamp {
 
 impl PackageStamp {
     /// Stamps the package config at `path` as it sits on disk right now;
-    /// `None` when there is none (the assembly's BasicWorkspace floor).
+    /// `None` when there is none (the assembly's `BasicWorkspace` floor).
     pub(crate) fn read(path: PathBuf) -> Option<Self> {
         let meta = std::fs::metadata(&path).ok()?;
         let mtime_ns = meta
             .modified()
             .ok()
             .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |since| {
+                u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+            });
         Some(Self {
             path,
             mtime_ns,

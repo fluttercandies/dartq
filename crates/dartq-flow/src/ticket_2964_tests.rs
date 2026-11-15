@@ -24,6 +24,9 @@
 //! result): each asserts the row exists where the consumer needs it and
 //! carries the nullability the oracle's verdict reads.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, TokenTable};
@@ -84,8 +87,7 @@ fn top_level_nullable_function_read_carries_the_nullable_face() {
     let ty = rows
         .iter()
         .find(|(offset, _)| *offset == read)
-        .map(|(_, ty)| *ty)
-        .unwrap_or_else(|| panic!("no read row at {read}: {rows:?}"));
+        .map_or_else(|| panic!("no read row at {read}: {rows:?}"), |(_, ty)| *ty);
     // The bare `Function` head spells `Name("Function")` — `Base::Function`
     // is the signature-less `T Function(...)` form's face.
     assert_eq!(
@@ -115,8 +117,7 @@ fn null_aware_receiver_read_type_row_keeps_the_declared_face() {
     let ty = rows
         .iter()
         .find(|(offset, _)| *offset == read)
-        .map(|(_, ty)| *ty)
-        .unwrap_or_else(|| panic!("no read row at {read}: {rows:?}"));
+        .map_or_else(|| panic!("no read row at {read}: {rows:?}"), |(_, ty)| *ty);
     assert_eq!(
         ty,
         Ty {
@@ -148,11 +149,10 @@ fn non_nullable_local_read_carries_the_declared_non_null_face() {
     let read = source.find("x?.").unwrap() as u32;
     let read_ty = facts
         .iter()
-        .filter_map(|fact| match fact {
+        .find_map(|fact| match fact {
             FlowFact::ReadType { span, ty, .. } if span.range.offset == read => Some(*ty),
             _ => None,
         })
-        .next()
         .unwrap_or_else(|| panic!("no read row at {read}: {facts:?}"));
     assert_eq!(
         read_ty,
@@ -184,11 +184,10 @@ fn null_check_promoted_receiver_read_reports_the_non_null_face() {
     let read = source.rfind("x?.").unwrap() as u32;
     let ty = facts
         .iter()
-        .filter_map(|fact| match fact {
+        .find_map(|fact| match fact {
             FlowFact::PromotedRead { span, ty, .. } if span.range.offset == read => Some(*ty),
             _ => None,
         })
-        .next()
         .unwrap_or_else(|| panic!("no promoted read at {read}: {facts:?}"));
     assert_eq!(
         ty,
@@ -235,11 +234,10 @@ fn if_null_write_with_nullable_rhs_keeps_the_read_unpromoted() {
     let read = source.rfind("x +").unwrap() as u32;
     let read_ty = facts
         .iter()
-        .filter_map(|fact| match fact {
+        .find_map(|fact| match fact {
             FlowFact::ReadType { span, ty, .. } if span.range.offset == read => Some(*ty),
             _ => None,
         })
-        .next()
         .unwrap_or_else(|| panic!("no read row at {read}: {facts:?}"));
     assert_eq!(
         read_ty,
@@ -272,11 +270,10 @@ fn if_null_write_with_non_null_rhs_promotes_the_read() {
     let read = source.rfind("x +").unwrap() as u32;
     let ty = facts
         .iter()
-        .filter_map(|fact| match fact {
+        .find_map(|fact| match fact {
             FlowFact::PromotedRead { span, ty, .. } if span.range.offset == read => Some(*ty),
             _ => None,
         })
-        .next()
         .unwrap_or_else(|| panic!("no promoted read at {read}: {facts:?}"));
     assert_eq!(
         ty,

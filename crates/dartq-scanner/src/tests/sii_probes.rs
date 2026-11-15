@@ -15,6 +15,7 @@
 //! (`expected_token` / `unused_element`) are the dartq-parser's post-parse
 //! report over these same shapes — out of scanner scope.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::{assert_kinds, scan_src};
 use crate::ScanResult;
 use crate::TokenKind as K;
@@ -124,7 +125,7 @@ fn sii_1020e348_empty_interp_no_call() {
     assert_eq!(r.tokens.get(3).unwrap().byte_range(), 8..9);
     assert_eq!(r.tokens.get(6).unwrap().byte_range(), 12..13);
     // The `${` matched the real `}`; the `(`-less `)` never scans as a token.
-    assert!(r.tokens.unmatched_groups().is_empty());
+    assert_eq!(r.tokens.unmatched_groups(), []);
 }
 
 /// `27b489d9` — `'${`: EOF right after the `${` (oracle 1:4 = the break);
@@ -180,7 +181,7 @@ fn sii_2cac8d56_deep_close_after_content() {
 /// deep-match decision exists at the `)`, which after the close is string
 /// content, not a code-mode closer — and the body resumes at the `)`,
 /// breaking on the line feed: the unterminated pin lands on the last content
-/// unit (endOffset - 1 = 7; live probe UNTERMINATED_STRING_LITERAL 1|8|1,
+/// unit (endOffset - 1 = 7; live probe `UNTERMINATED_STRING_LITERAL` 1|8|1,
 /// captured corpus rows agree — no `expected_token '}'` row). The resumed
 /// segment carries the `)` (official `SyntheticStringToken` over [7, 8)),
 /// and the still-open `(` parks at eof as the parser-side
@@ -218,7 +219,7 @@ fn sii_38a8f893_close_then_paren() {
 }
 
 /// `42295fda` — `'$\n`: the bare `$` takes the identifier form (oracle
-/// missing_identifier 1:3 = one unit past the `$`), then the line break
+/// `missing_identifier` 1:3 = one unit past the `$`), then the line break
 /// terminates the body (oracle unterminated 1:2). The final segment is the
 /// empty [2, 2): upstream `unterminatedString` spans `[start, stringOffset)`
 /// (upstream Dart SDK source,
@@ -251,17 +252,17 @@ fn sii_42295fda_bare_dollar() {
     assert_eq!(r.tokens.get(3).unwrap().byte_range(), 2..2);
     assert_eq!(r.diagnostics[1].message, "Unterminated string literal.");
     // `$id` interpolation is not a group: nothing unmatched.
-    assert!(r.tokens.unmatched_groups().is_empty());
+    assert_eq!(r.tokens.unmatched_groups(), []);
 }
 
 /// `$` directly at EOF (the 42295fda family without the line break): the
-/// missing_identifier pin stays at the position after the `$` — the eof
+/// `missing_identifier` pin stays at the position after the `$` — the eof
 /// position — and keeps `length: 1`: the official translation reports one
 /// virtual UTF-16 unit past the text (upstream Dart SDK source,
 /// `pkg/analyzer/lib/src/dart/scanner/translate_error_token.dart` — the
 /// synthetic identifier follows the error in-stream, `_isAtEnd` never backs
 /// the pin off, and a missing token at the eof boundary still carries
-/// `length: 1`; live probe MISSING_IDENTIFIER 1|3|1 on `'$`). The conversion
+/// `length: 1`; live probe `MISSING_IDENTIFIER` 1|3|1 on `'$`). The conversion
 /// walk admits a target exactly one past the source end for this shape.
 #[test]
 fn sii_dollar_eof_missing_identifier_pin() {
@@ -390,7 +391,7 @@ fn sii_91fc4830_empty_interp_body_after() {
         ],
     );
     assert_eq!(r.tokens.get(6).unwrap().byte_range(), 12..15);
-    assert!(r.tokens.unmatched_groups().is_empty());
+    assert_eq!(r.tokens.unmatched_groups(), []);
 }
 
 /// `9bb24279` — `'${}`: the interpolation closes, the body resumes at the
@@ -412,7 +413,7 @@ fn sii_9bb24279_empty_interp_bare() {
     );
     assert_eq!(r.tokens.get(3).unwrap().byte_range(), 4..4);
     assert_eq!(r.tokens.matching_end(1), Some(2));
-    assert!(r.tokens.unmatched_groups().is_empty());
+    assert_eq!(r.tokens.unmatched_groups(), []);
 }
 
 /// `cdb0d429` — `var s = '${x}abc`: the interpolation expression carries the
@@ -436,7 +437,7 @@ fn sii_cdb0d429_nonempty_interp_body_after() {
         ],
     );
     assert_eq!(r.tokens.get(7).unwrap().byte_range(), 13..16);
-    assert!(r.tokens.unmatched_groups().is_empty());
+    assert_eq!(r.tokens.unmatched_groups(), []);
 }
 
 /// `d6ee108c` — `f('${)`: the `)` deep-matches the `(` below the open `${`
@@ -466,7 +467,7 @@ fn sii_d6ee108c_deep_close_paren() {
 }
 
 /// `dd217615` — `f('$${')`: the first `$` takes the identifier form (oracle
-/// missing_identifier 1:5), the second opens a `${` whose nested string
+/// `missing_identifier` 1:5), the second opens a `${` whose nested string
 /// breaks on the line feed (oracle 1:8; segment `')`), the suspended outer
 /// body reports at the eof cascade (oracle 1:9), and the `(` plus the open
 /// `${` close with eof-synthetic closers (the parser's `expected_token`

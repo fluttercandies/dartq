@@ -13,7 +13,7 @@
 //!   METHOD-variant text at the operator token (`unary-`, `~`): the
 //!   `PrefixExpression` parent picks the method-invocation face
 //!   (type_property_resolver.dart:128-148, reached through
-//!   prefix_expression_resolver.dart's `_resolve1`).
+//!   `prefix_expression_resolver.dart`'s `_resolve1`).
 //! * `use_of_nullable_value_test.dart`
 //!   `test_prefixExpression_minus_nullable` — `-this` inside
 //!   `extension E on A?` reports the same method face at `-` (`this`'s
@@ -34,6 +34,7 @@
 //! reports the `unary-` method face (the existing void arm's own row —
 //! the pin proves no double row lands at the anchor).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops};
 

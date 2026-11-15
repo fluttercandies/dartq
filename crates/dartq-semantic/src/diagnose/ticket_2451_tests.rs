@@ -21,6 +21,8 @@
 //! missing-member read collapses to the same unchecked row (never
 //! `undefined_getter`).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

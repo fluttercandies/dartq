@@ -14,6 +14,7 @@
 //! otherwise carry (`TypeParameter` bounds, `TypeArgumentList` members)
 //! keep the pass.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

@@ -13,6 +13,7 @@
 //! effective-options channel (the extracted corpus pairs the two, with the
 //! directive carrying the merged options), so it wins when both are present.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::case::{self, Case};
 use crate::markers;
 use crate::setup;
@@ -69,7 +70,7 @@ pub fn effective_options(options: Option<&str>) -> String {
     }
 }
 
-/// The package_config `languageVersion` of a case.
+/// The `package_config` `languageVersion` of a case.
 pub fn language_version(case: &Case) -> &str {
     case.language.as_deref().unwrap_or("3.13")
 }
@@ -320,7 +321,7 @@ fn materialize_one(
         let path = root.join(rel);
         let parent = path.parent().expect("section path has a parent");
         std::fs::create_dir_all(parent)
-            .and_then(|_| std::fs::write(&path, content))
+            .and_then(|()| std::fs::write(&path, content))
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     }
     for (name, files) in &inline_aux {
@@ -328,7 +329,7 @@ fn materialize_one(
             let path = root.join(".aux").join(name).join(rel);
             let parent = path.parent().expect("aux file path has a parent");
             std::fs::create_dir_all(parent)
-                .and_then(|_| std::fs::write(&path, content))
+                .and_then(|()| std::fs::write(&path, content))
                 .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         }
     }
@@ -424,7 +425,7 @@ fn collect_files(dir: &Path, rel: &Path, out: &mut Vec<(String, PathBuf)>) {
     }
 }
 
-/// The oracle cache key: blake3(case bytes + mocks tree hash + sdk_revision)
+/// The oracle cache key: blake3(case bytes + mocks tree hash + `sdk_revision`)
 /// — a case re-analyzes exactly when any input changed.
 pub fn cache_key(case_bytes_hash: &str, mocks_hash: &str, sdk_revision: &str) -> String {
     let mut hasher = Hasher::new();

@@ -1,15 +1,17 @@
+#![allow(unused_imports)]
+
 use super::engine_core::flatten_ty;
 use super::*;
 
-/// The #2487 pin's instruction-count faces for the bounded
-/// assignment-target scan (`assignment_target_index`'s `cfg(test)`
-/// twin): the predicate visits the bounded reverse scan spent across
-/// every call (the new walk's total), and the widest post-operator tail
-/// any call saw (`rows_len - bound` — every row the old `.rev().find`
-/// would have walked past before reaching the prefix). Thread-local, not
-/// a process global: the harness runs sibling tests on other threads
-/// inside one reset→read window, and every engine run increments — a
-/// shared counter would bill their scans to this pin.
+// The #2487 pin's instruction-count faces for the bounded
+// assignment-target scan (`assignment_target_index`'s `cfg(test)`
+// twin): the predicate visits the bounded reverse scan spent across
+// every call (the new walk's total), and the widest post-operator tail
+// any call saw (`rows_len - bound` — every row the old `.rev().find`
+// would have walked past before reaching the prefix). Thread-local, not
+// a process global: the harness runs sibling tests on other threads
+// inside one reset→read window, and every engine run increments — a
+// shared counter would bill their scans to this pin.
 #[cfg(test)]
 thread_local! {
     static ASSIGNMENT_TARGET_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -524,7 +526,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The typed list literal's element check (`listLiteral`'s resolution,
-    /// type_analyzer.dart's element loop): each element's static type must
+    /// `type_analyzer.dart`'s element loop): each element's static type must
     /// be assignable to the written element type —
     /// `list_element_type_not_assignable` at the failing element. Untyped
     /// literals infer, an unresolvable element type leaves the row to its
@@ -729,26 +731,24 @@ impl<'a> Engine<'a> {
             // leaked case-scope binder arm reports only its
             // `undefined_identifier`, never a list-element row).
             let control = trimmed.starts_with("if") || trimmed.starts_with("for");
-            if control {
-                if let Some(open) = seg_text.find('(') {
-                    let mut depth = 0usize;
-                    let bytes_head = seg_text.as_bytes();
-                    let mut j = open;
-                    while j < bytes_head.len() {
-                        match bytes_head[j] {
-                            b'(' => depth += 1,
-                            b')' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
+            if control && let Some(open) = seg_text.find('(') {
+                let mut depth = 0usize;
+                let bytes_head = seg_text.as_bytes();
+                let mut j = open;
+                while j < bytes_head.len() {
+                    match bytes_head[j] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
                             }
-                            _ => {}
                         }
-                        j += 1;
+                        _ => {}
                     }
-                    window_start = start as u32 + j as u32 + 1;
+                    j += 1;
                 }
+                window_start = start as u32 + j as u32 + 1;
             }
             // The element expression's own row: the outermost row spanning
             // the trimmed window exactly — an inner row (`{k: f()}`'s `f`
@@ -844,62 +844,59 @@ impl<'a> Engine<'a> {
                             .find(|row| exact(row))
                     })
                     .cloned();
-                match row {
-                    Some(row) => {
-                        let mut ty = self.operand_static_ty(&row);
-                        if ty == Ty::UNKNOWN {
-                            // A for-in body element whose loop variable's
-                            // element type only the pass-2 pre-pass derives
-                            // (`local_init_rows` — the iterable literal's
-                            // row was still opaque at `)` close): the
-                            // element check fires at parse time, before that
-                            // pass exists, so the literal channel answers
-                            // the same face itself.
-                            ty = self.for_in_literal_element_ty(&row).unwrap_or(Ty::UNKNOWN);
-                        }
-                        if ty == Ty::UNKNOWN {
-                            continue;
-                        }
-                        (
-                            ty,
-                            row.range,
-                            self.is_int_literal_row(&row),
-                            matches!(row.shape, RowShape::Record(_)),
-                        )
+                if let Some(row) = row {
+                    let mut ty = self.operand_static_ty(&row);
+                    if ty == Ty::UNKNOWN {
+                        // A for-in body element whose loop variable's
+                        // element type only the pass-2 pre-pass derives
+                        // (`local_init_rows` — the iterable literal's
+                        // row was still opaque at `)` close): the
+                        // element check fires at parse time, before that
+                        // pass exists, so the literal channel answers
+                        // the same face itself.
+                        ty = self.for_in_literal_element_ty(&row).unwrap_or(Ty::UNKNOWN);
                     }
-                    None => {
-                        // No single row spans the window (a composite
-                        // operand the row model leaves unfolded): keep the
-                        // legacy last-typed-row posture — the element's
-                        // inner row is the best face available. A control
-                        // segment's multi-arm body never folds to one row,
-                        // so the leaf grab stays off it entirely.
-                        if control {
-                            continue;
-                        }
-                        let stop16 = e16;
-                        let Some((row_ty, row_range, row_lit, row_record)) = self
-                            .rows
-                            .iter()
-                            .rev()
-                            .find(|row| {
-                                row.ty != Ty::UNKNOWN
-                                    && row.range.offset >= s16
-                                    && row.range.end() <= stop16
-                            })
-                            .map(|row| {
-                                (
-                                    row.ty,
-                                    row.range,
-                                    self.is_int_literal_row(row),
-                                    matches!(row.shape, RowShape::Record(_)),
-                                )
-                            })
-                        else {
-                            continue;
-                        };
-                        (row_ty, row_range, row_lit, row_record)
+                    if ty == Ty::UNKNOWN {
+                        continue;
                     }
+                    (
+                        ty,
+                        row.range,
+                        self.is_int_literal_row(&row),
+                        matches!(row.shape, RowShape::Record(_)),
+                    )
+                } else {
+                    // No single row spans the window (a composite
+                    // operand the row model leaves unfolded): keep the
+                    // legacy last-typed-row posture — the element's
+                    // inner row is the best face available. A control
+                    // segment's multi-arm body never folds to one row,
+                    // so the leaf grab stays off it entirely.
+                    if control {
+                        continue;
+                    }
+                    let stop16 = e16;
+                    let Some((row_ty, row_range, row_lit, row_record)) = self
+                        .rows
+                        .iter()
+                        .rev()
+                        .find(|row| {
+                            row.ty != Ty::UNKNOWN
+                                && row.range.offset >= s16
+                                && row.range.end() <= stop16
+                        })
+                        .map(|row| {
+                            (
+                                row.ty,
+                                row.range,
+                                self.is_int_literal_row(row),
+                                matches!(row.shape, RowShape::Record(_)),
+                            )
+                        })
+                    else {
+                        continue;
+                    };
+                    (row_ty, row_range, row_lit, row_record)
                 }
             };
             if spread {
@@ -1868,9 +1865,7 @@ impl<'a> Engine<'a> {
                         ..
                     },
                 ) => {
-                    if from_name != to_name {
-                        true
-                    } else {
+                    if from_name == to_name {
                         let pool = self.boundary.pool();
                         let (from_args, to_args) = (pool.get(from_args), pool.get(to_args));
                         from_args.len() == to_args.len()
@@ -1887,6 +1882,8 @@ impl<'a> Engine<'a> {
                                             && !matches!(b, Ty::Unknown)
                                     }
                                 })
+                    } else {
+                        true
                     }
                 }
                 _ => false,
@@ -1936,7 +1933,7 @@ impl<'a> Engine<'a> {
     /// answers yes). Both interned faces answer — the `Ty::Named` written
     /// spelling and the canonical [`Ty::Never`] variant (a `throw`'s row
     /// rewrite, a normalized promotion staging, or the resolved seam's
-    /// `TypeKind::Never` fold, resolved_ops.rs:6606).
+    /// `TypeKind::Never` fold, `resolved_ops.rs:6606`).
     pub(crate) fn is_never_ty(&self, ty: Ty) -> bool {
         match ty {
             Ty::Never => true,
@@ -2210,7 +2207,7 @@ impl<'a> Engine<'a> {
                         } else {
                             self.walk_members(container, row.name)
                         };
-                        let recv = recv.clone();
+                        let recv = *recv;
                         // The declaring container of the found member (the
                         // climb's origin): an inherited accessor (`first`
                         // declared on `ListMixin<E>`) instantiates against
@@ -2519,7 +2516,7 @@ impl<'a> Engine<'a> {
     fn object_instance_read_ty(&self, row: &Row) -> Ty {
         let Some((_, head)) = OBJECT_GETTER_RETURNS
             .iter()
-            .find(|(member, _)| *member == &self.strings.resolve(row.name)[..])
+            .find(|(member, _)| *member == self.strings.resolve(row.name))
         else {
             return Ty::UNKNOWN;
         };
@@ -2755,10 +2752,9 @@ impl<'a> Engine<'a> {
                 if let RowShape::Bare(BareInfo::Plain {
                     ty: Ty::Named { name, .. },
                 }) = &row.shape
+                    && let Some(sig) = self.alias_fn_sig(*name)
                 {
-                    if let Some(sig) = self.alias_fn_sig(*name) {
-                        return sig.return_ty;
-                    }
+                    return sig.return_ty;
                 }
                 // An implicit-call local (`spec(context)` over a local
                 // promoted to a class carrying `call`): the invocation's
@@ -2908,71 +2904,64 @@ impl<'a> Engine<'a> {
         // under `Map<String, Object?>`) seeds the container's parameters
         // from the receiver's written arguments downstream, and a bare
         // container name alone would leave `V` free.
-        let (container, local_recv_ty) = match container {
-            Some(head) => (head, None),
-            None => {
-                let Some(found) = (|| {
-                    let index = self
-                        .rows
-                        .partition_point(|probe| probe.range.offset < row.range.offset);
-                    let receiver = self.rows.get(index.checked_sub(1)?)?;
-                    (receiver.range.end() <= row.range.offset).then(|| {
-                        // An UNQUALIFIED implicit-this receiver (`_reader
-                        // .readEnum(...)`, the callee row still the pre-merge
-                        // selector at this send-close read): the bare scope
-                        // resolves the receiver name to the enclosing
-                        // container's member, whose WRITTEN declared type heads
-                        // the container the member walk resolves on — and only
-                        // when the walk finds the callee there (a foreign or
-                        // stub head walks nowhere). Locals resolve to non-member
-                        // targets and qualified receivers
-                        // (`_sourceTable.$primaryKey`, a chain-computed face)
-                        // keep the bare-name path (the SDK static head,
-                        // `RangeError.checkValidRange`).
-                        if !receiver.qualified {
-                            match self.resolve_bare(receiver.name) {
-                                (_, RefTarget::Member { container }) => {
-                                    if let Ty::Named { name, .. } =
-                                        self.member_declared_ty(container, receiver.name)
-                                        && matches!(
-                                            self.walk_members(name, row.name),
-                                            Walk::Found(_)
-                                        )
-                                    {
-                                        return (name, None);
-                                    }
+        let (container, local_recv_ty) = if let Some(head) = container {
+            (head, None)
+        } else {
+            let Some(found) = (|| {
+                let index = self
+                    .rows
+                    .partition_point(|probe| probe.range.offset < row.range.offset);
+                let receiver = self.rows.get(index.checked_sub(1)?)?;
+                (receiver.range.end() <= row.range.offset).then(|| {
+                    // An UNQUALIFIED implicit-this receiver (`_reader
+                    // .readEnum(...)`, the callee row still the pre-merge
+                    // selector at this send-close read): the bare scope
+                    // resolves the receiver name to the enclosing
+                    // container's member, whose WRITTEN declared type heads
+                    // the container the member walk resolves on — and only
+                    // when the walk finds the callee there (a foreign or
+                    // stub head walks nowhere). Locals resolve to non-member
+                    // targets and qualified receivers
+                    // (`_sourceTable.$primaryKey`, a chain-computed face)
+                    // keep the bare-name path (the SDK static head,
+                    // `RangeError.checkValidRange`).
+                    if !receiver.qualified {
+                        match self.resolve_bare(receiver.name) {
+                            (_, RefTarget::Member { container }) => {
+                                if let Ty::Named { name, .. } =
+                                    self.member_declared_ty(container, receiver.name)
+                                    && matches!(self.walk_members(name, row.name), Walk::Found(_))
+                                {
+                                    return (name, None);
                                 }
-                                // A LOCAL receiver (`o.m()` where `o` is a parameter
-                                // or local typed `C`): the bare scope resolves the
-                                // name to the local, whose declared type heads the
-                                // container the member walk resolves on — the same
-                                // face the merged `Receiver::Typed` arm answers
-                                // post-merge, re-derived here for the pre-merge
-                                // callee selector row `consume_send` reads. The
-                                // full type (arguments included) rides along so
-                                // `instantiate_call_return` seeds the container's
-                                // parameters exactly like the merged arm.
-                                (_, RefTarget::Local) => {
-                                    let ty = self.receiver_static_ty(receiver);
-                                    if let named @ Ty::Named { name, .. } = self.fold_alias_ty(ty)
-                                        && matches!(
-                                            self.walk_members(name, row.name),
-                                            Walk::Found(_)
-                                        )
-                                    {
-                                        return (name, Some(named));
-                                    }
-                                }
-                                _ => {}
                             }
+                            // A LOCAL receiver (`o.m()` where `o` is a parameter
+                            // or local typed `C`): the bare scope resolves the
+                            // name to the local, whose declared type heads the
+                            // container the member walk resolves on — the same
+                            // face the merged `Receiver::Typed` arm answers
+                            // post-merge, re-derived here for the pre-merge
+                            // callee selector row `consume_send` reads. The
+                            // full type (arguments included) rides along so
+                            // `instantiate_call_return` seeds the container's
+                            // parameters exactly like the merged arm.
+                            (_, RefTarget::Local) => {
+                                let ty = self.receiver_static_ty(receiver);
+                                if let named @ Ty::Named { name, .. } = self.fold_alias_ty(ty)
+                                    && matches!(self.walk_members(name, row.name), Walk::Found(_))
+                                {
+                                    return (name, Some(named));
+                                }
+                            }
+                            _ => {}
                         }
-                        (receiver.name, None)
-                    })
-                })() else {
-                    return Ty::UNKNOWN;
-                };
-                found
-            }
+                    }
+                    (receiver.name, None)
+                })
+            })() else {
+                return Ty::UNKNOWN;
+            };
+            found
         };
 
         // `C.name(...)` on a class head: a named constructor outranks any
@@ -3089,7 +3078,7 @@ impl<'a> Engine<'a> {
                     )
                     && let Some((_, head)) = OBJECT_INSTANCE_RETURNS
                         .iter()
-                        .find(|(member, _)| *member == &self.strings.resolve(row.name)[..])
+                        .find(|(member, _)| *member == self.strings.resolve(row.name))
                 {
                     return Ty::named(self.intern(head));
                 }
@@ -3110,7 +3099,7 @@ impl<'a> Engine<'a> {
                 } = &row.shape
                     && let Some((_, head)) = OBJECT_INSTANCE_RETURNS
                         .iter()
-                        .find(|(member, _)| *member == &self.strings.resolve(row.name)[..])
+                        .find(|(member, _)| *member == self.strings.resolve(row.name))
                     && let Some(declared) = self.member_recv_tys.get(&row.range.offset)
                     && !matches!(
                         self.fold_alias_ty(*declared),
@@ -3156,8 +3145,7 @@ impl<'a> Engine<'a> {
                 CORE_STATIC_RETURNS
                     .iter()
                     .find(|(recv, member, _)| {
-                        *member == &self.strings.resolve(row.name)[..]
-                            && self.intern(recv) == container
+                        *member == self.strings.resolve(row.name) && self.intern(recv) == container
                     })
                     .map_or(Ty::UNKNOWN, |(_, _, head)| {
                         let name = self.intern(head);
@@ -3439,10 +3427,10 @@ impl<'a> Engine<'a> {
                 // and stay silent. The bare `super` row pushes with
                 // `ty: UNKNOWN`, so only the asserted form takes this arm.
                 Receiver::Super { container, .. } => {
-                    if row.ty != Ty::UNKNOWN {
-                        row.ty
-                    } else {
+                    if row.ty == Ty::UNKNOWN {
                         Ty::named(*container)
+                    } else {
+                        row.ty
                     }
                 }
                 Receiver::Typed { ty, .. } => *ty,
@@ -3688,11 +3676,10 @@ impl<'a> Engine<'a> {
                 Receiver::Typed { type_name, ty, .. } => Some((*type_name, Some(*ty))),
                 _ => None,
             },
-            RowShape::Bare(BareInfo::Plain { ty, .. }) => match self.resolve_bare(row.name).1 {
-                RefTarget::Member { container } => {
+            RowShape::Bare(BareInfo::Plain { ty, .. }) => {
+                if let RefTarget::Member { container } = self.resolve_bare(row.name).1 {
                     Some((container, (*ty != Ty::UNKNOWN).then_some(*ty)))
-                }
-                _ => {
+                } else {
                     // The snapshot payload first (the plain local read),
                     // then the row's own face — an invoked callee row
                     // (`f()[0] = v`) carries the send's RESULT face there,
@@ -3715,7 +3702,7 @@ impl<'a> Engine<'a> {
                         _ => None,
                     }
                 }
-            },
+            }
             // A folded call result (`f()[0] = v`): the row's own ty is the
             // send's static type — its head is the walk root, the full face
             // the substitution env (the bare-binding convention).
@@ -3740,7 +3727,8 @@ impl<'a> Engine<'a> {
         let Some((container, recv_ty)) = self.index_container_recv(row) else {
             return Ty::UNKNOWN;
         };
-        let read = match self.walk_members(container, self.intern("[]")) {
+
+        match self.walk_members(container, self.intern("[]")) {
             Walk::Found(entry) => {
                 let declaring = self.member_faces.last_origin().unwrap_or(container);
                 let recv = recv_ty.unwrap_or_else(|| Ty::named(container));
@@ -3760,8 +3748,7 @@ impl<'a> Engine<'a> {
                 }
                 _ => Ty::UNKNOWN,
             },
-        };
-        read
+        }
     }
 
     /// The top row index when it can be an invocation callee.
@@ -3958,11 +3945,10 @@ impl<'a> Engine<'a> {
         };
         entry
             .and_then(|entry| self.member_recv_env(recv_ty, container, &entry))
-            .map(|env| {
+            .map_or(declared, |env| {
                 let keys: FxHashMap<StringId, Ty> = env.into_iter().collect();
                 self.substitute_ty(declared, &keys)
             })
-            .unwrap_or(declared)
     }
 
     /// A top-level name's write face (`getWriteType` over the library's
@@ -4057,7 +4043,7 @@ impl<'a> Engine<'a> {
     /// The whole-expression span of a staged assignability check (the
     /// oracle's `.at(right)` / `.at(expression)` anchor — upstream Dart SDK
     /// source, pkg/analyzer/lib/src/dart/resolver/
-    /// assignment_expression_resolver.dart:167-178, return_type_verifier.dart
+    /// assignment_expression_resolver.dart:167-178, `return_type_verifier.dart`
     /// `:150-206`): the staged row's range covers the operand's own row —
     /// a callee, a bare read, a merged member — while the official node is
     /// the full `Expression` (an `await e`, a `new C()`, a `x as T`, a
@@ -4173,13 +4159,12 @@ impl<'a> Engine<'a> {
             .cast_rewrites
             .iter()
             .find(|(cast, _)| cast.offset <= range.offset && range.end() <= cast.end())
+            && span.end() <= cast_span.end()
         {
-            if span.end() <= cast_span.end() {
-                span = SourceRange {
-                    offset: span.offset.min(cast_span.offset),
-                    length: cast_span.end() - span.offset.min(cast_span.offset),
-                };
-            }
+            span = SourceRange {
+                offset: span.offset.min(cast_span.offset),
+                length: cast_span.end() - span.offset.min(cast_span.offset),
+            };
         }
         loop {
             let at = toks.partition_point(|t| t.utf16_offset < span.end());
@@ -4193,7 +4178,7 @@ impl<'a> Engine<'a> {
                 // groups jump whole through the precomputed pairing, so
                 // `List<int>`, `void Function(int)`, and `Map<K, V>` never
                 // stop the walk early.
-                TK::Keyword(Kw::As) | TK::Keyword(Kw::Is) => {
+                TK::Keyword(Kw::As | Kw::Is) => {
                     let mut end = at + 1;
                     if toks.get(end).is_some_and(|t| t.kind == TK::Bang) {
                         end += 1;
@@ -4245,7 +4230,7 @@ impl<'a> Engine<'a> {
                             _ => break,
                         }
                     }
-                    if last >= at + 1 {
+                    if last > at {
                         let last_tok = toks[last];
                         span = SourceRange {
                             offset: span.offset,
@@ -4575,14 +4560,14 @@ impl<'a> Engine<'a> {
         // The function family: a bare `Function` head is the supertype of
         // every function type — the pair collapses onto it (the FUNCTION
         // rule's `is_bare_function_id` arm, least_upper_bound.dart:611-635).
-        if self.is_bare_function_head(left) || self.is_bare_function_head(right) {
-            if matches!(left, Ty::Function { .. }) || matches!(right, Ty::Function { .. }) {
-                return if self.is_bare_function_head(left) {
-                    left
-                } else {
-                    right
-                };
-            }
+        if (self.is_bare_function_head(left) || self.is_bare_function_head(right))
+            && (matches!(left, Ty::Function { .. }) || matches!(right, Ty::Function { .. }))
+        {
+            return if self.is_bare_function_head(left) {
+                left
+            } else {
+                right
+            };
         }
         match (left, right) {
             (
@@ -5490,7 +5475,10 @@ impl<'a> Engine<'a> {
         if verdict == Some(true) {
             self.check_imprecise_int_literal(from, to, literal, rhs_row.range);
         }
-        if verdict == Some(false) && stashed.is_some() && !in_initializer {
+        if verdict == Some(false)
+            && !in_initializer
+            && let Some((_, from_sig, to_sig)) = stashed
+        {
             // The stashed-signature rejection is final at the check: the
             // from side is a concrete function shape (never a promotable
             // read — the promotable twin keys on Unknown/Dynamic
@@ -5503,7 +5491,6 @@ impl<'a> Engine<'a> {
                 .invocation_span(range)
                 .or_else(|| self.property_access_span(range))
                 .unwrap_or(range);
-            let (_, from_sig, to_sig) = stashed.expect("checked above");
             let (from_text, to_text) =
                 (self.fn_sig_display(&from_sig), self.fn_sig_display(&to_sig));
             self.emit_non_promotion(
@@ -5560,7 +5547,7 @@ impl<'a> Engine<'a> {
     /// the same numeric refinement the binary fold runs, so
     /// `int total; total += <invalid receiver read>` answers `double` and
     /// reports "A value of type 'double' can't be assigned to a variable
-    /// of type 'int'" (probed 3.13.1, the manifest_ast.dart census row).
+    /// of type 'int'" (probed 3.13.1, the `manifest_ast.dart` census row).
     /// The target's read type resolves the operator; a `dynamic` or
     /// unknown read, an operator that does not resolve, an invalid
     /// computed type, and `void` sides stay silent. `??=` is the if-null
@@ -5790,7 +5777,7 @@ impl<'a> Engine<'a> {
 
     /// The `?e` element's value type when `e` is a compound assignment
     /// (`?x += 1` — the oracle's `node.value2.staticType` is the
-    /// AssignmentExpression's resolved-operator result, `int?`, not the RHS
+    /// `AssignmentExpression`'s resolved-operator result, `int?`, not the RHS
     /// literal's `int` the tail row carries). `handle_null_aware_element`
     /// consults this before the last-row fallback: a still-unfolded
     /// compound leaves its operand and RHS as two rows with the `op=` token
@@ -5955,7 +5942,9 @@ impl<'a> Engine<'a> {
             let rhs_range = row.range;
             self.check_imprecise_int_literal(from, to, literal, rhs_range);
         }
-        if verdict == Some(false) && stashed.is_some() {
+        if verdict == Some(false)
+            && let Some((_, from_sig, to_sig)) = stashed
+        {
             // The stashed-signature rejection is final at the check (see
             // [`Self::check_assignment`]'s direct-emit arm) — the
             // teardown's re-decision on the interned Tys alone carries no
@@ -5971,7 +5960,6 @@ impl<'a> Engine<'a> {
                     .or_else(|| self.property_access_span(row.range))
                     .unwrap_or(row.range)
             };
-            let (_, from_sig, to_sig) = stashed.expect("checked above");
             let (from_text, to_text) =
                 (self.fn_sig_display(&from_sig), self.fn_sig_display(&to_sig));
             self.emit_non_promotion(
@@ -6002,8 +5990,8 @@ impl<'a> Engine<'a> {
     /// static type is `Null` is `dynamic` (upstream Dart SDK source,
     /// pkg/analyzer/lib/src/generated/resolver.dart
     /// `variableTypeFromInitializerType`, applied to a local by
-    /// pkg/analyzer/lib/src/dart/resolver/variable_declaration_resolver.dart;
-    /// pkg/analyzer/lib/src/summary2/top_level_inference.dart `_refineType`
+    /// `pkg/analyzer/lib/src/dart/resolver/variable_declaration_resolver.dart`;
+    /// `pkg/analyzer/lib/src/summary2/top_level_inference.dart` `_refineType`
     /// for a top-level variable or a field): `var x = null; x = 'hi';` writes
     /// into `dynamic` and stays silent. The initializer's close bound the raw
     /// `Null` into the declarator's slot just before this check — a local's
@@ -6083,7 +6071,7 @@ impl<'a> Engine<'a> {
 
     /// The untyped collection literal's own static type against the
     /// declared context `to` (#3424; upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver.dart).
+    /// `pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver.dart`).
     /// The downward constraint `L<E> <: K` over the literal's head `L`
     /// (`setupGenericTypeInference`, `K` the context's `futureOrBase`)
     /// matches exactly when `K` is a top face or one of `L`'s own
@@ -6225,7 +6213,7 @@ impl<'a> Engine<'a> {
             .decide_subtype(name, map)
             .or_else(|| core_hit(map).then_some(true));
         match (iterable_side, map_side) {
-            (Some(true), Some(true)) | (Some(false), _) | (None, Some(true)) => Some(false),
+            (Some(true) | None, Some(true)) | (Some(false), _) => Some(false),
             (Some(true), _) => Some(true),
             (None, _) => None,
         }
@@ -6234,7 +6222,7 @@ impl<'a> Engine<'a> {
     /// The default-value assignability face (`invalid_assignment`,
     /// upstream `handleValuedFormalParameter`'s
     /// `checkForInvalidAssignment(defaultValue, paramType)` —
-    /// error_verifier.dart: a `= e` default inside a formal list asks the
+    /// `error_verifier.dart`: a `= e` default inside a formal list asks the
     /// expression's static type against the formal's written `to`). The
     /// expression's result row is the window's tail (the same
     /// [`Self::rhs_result_row`] discipline — `f({int x = C().s})` reads
@@ -6386,7 +6374,7 @@ impl<'a> Engine<'a> {
     /// type: a use with arguments instantiates the alias's right-hand
     /// type, the arguments substituted into it bounds included (upstream
     /// Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-    /// named_type_resolver.dart `_instantiateElement` →
+    /// `named_type_resolver.dart` `_instantiateElement` →
     /// `TypeAliasElementImpl.instantiateImpl`). The stash is the only
     /// face carrying parameters WITH bounds (#2834's junction), so the
     /// assignment pair's `relateTypeParameters` equality rule decides
@@ -6628,8 +6616,7 @@ impl<'a> Engine<'a> {
             .find(|(cast, _)| {
                 cast.offset <= operand_range.offset && operand_range.end() <= cast.end()
             })
-            .map(|(_, ty)| *ty)
-            .unwrap_or(from);
+            .map_or(from, |(_, ty)| *ty);
         // The invalid-source twin: a written value type whose head resolves
         // to no type is `InvalidType` — assignable to everything, so the
         // return matrix never asks (probed 3.47.1: `return parent;` with
@@ -6833,7 +6820,7 @@ impl<'a> Engine<'a> {
 
     /// The generator value-return's anchor (the parser's
     /// `handleInvalidStatement(begin, generatorReturnsValue)` —
-    /// parser_impl.dart:6628/:6855): `begin` is the `=>` FUNCTION token
+    /// `parser_impl.dart:6628/:6855)`: `begin` is the `=>` FUNCTION token
     /// for an arrow body, the `return` keyword for a statement — both sit
     /// ahead of the expression's span after whitespace. Neither spelled
     /// keeps the expression's own span.
@@ -7082,12 +7069,11 @@ impl<'a> Engine<'a> {
         // Function(num)` is the reported face). `None` keeps that
         // fallback open; `Some(false)` would wrongly hard-reject a pair
         // the bounds face still assigns.
-        for (param, bound) in from.params.iter() {
-            if let (Some(bound_ty), Some(solved)) = (*bound, bindings.get(param)) {
-                match self.assignable(*solved, bound_ty, false) {
-                    Some(false) => return None,
-                    Some(true) | None => {}
-                }
+        for (param, bound) in &from.params {
+            if let (Some(bound_ty), Some(solved)) = (*bound, bindings.get(param))
+                && let Some(false) = self.assignable(*solved, bound_ty, false)
+            {
+                return None;
             }
         }
         // The substituted signature re-runs the subtype checks: return
@@ -7393,7 +7379,7 @@ impl<'a> Engine<'a> {
                 .index
                 .get(file)
                 .and_then(|f| f.decl(name))
-                .map_or(true, |decl| Self::decl_is_type(decl.kind)),
+                .is_none_or(|decl| Self::decl_is_type(decl.kind)),
             // A bare prefix is not a type; an ambiguous set resolves to the
             // oracle's `MultiplyDefinedElement` — `InvalidType`.
             ScopedHit::Found(NamespaceEntry::Prefix) | ScopedHit::Ambiguous(_) => false,
@@ -7419,7 +7405,7 @@ impl<'a> Engine<'a> {
                 .index
                 .get(owner)
                 .and_then(|f| f.decl(name))
-                .map_or(true, |decl| Self::decl_is_type(decl.kind)),
+                .is_none_or(|decl| Self::decl_is_type(decl.kind)),
             ScopedHit::Found(NamespaceEntry::Prefix) | ScopedHit::Ambiguous(_) => false,
             ScopedHit::NotFound => false,
         }
@@ -7569,7 +7555,7 @@ impl<'a> Engine<'a> {
 
     /// The `async` body's return verdict matrix (`rtv.dart:258-289`): the
     /// declared `T` reads through [`future_value_ty`] (`T_v`), the
-    /// expression's `S` through the recursive `flatten` (type_system.dart
+    /// expression's `S` through the recursive `flatten` (`type_system.dart`
     /// :425-471, [`flatten_ty`]) — the two projections are deliberately
     /// different shapes. (a) a `void` `T_v` accepts `void`/`dynamic`/`Null`
     /// `flatten_S` (:258-264); (b) a `void` `flatten_S` accepts
@@ -7653,8 +7639,7 @@ impl<'a> Engine<'a> {
             .iter()
             .skip(mark)
             .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
-            .filter(|row| !self.interpolation_child_rows.contains(&row.range.offset))
-            .next_back()
+            .rfind(|row| !self.interpolation_child_rows.contains(&row.range.offset))
             .cloned()?;
         let ty = if row.ty == Ty::Never {
             // The throw retype (`handle_throw_expression`): the
@@ -7838,8 +7823,7 @@ impl<'a> Engine<'a> {
                 .iter()
                 .skip(mark)
                 .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
-                .filter(|row| !self.interpolation_child_rows.contains(&row.range.offset))
-                .next_back();
+                .rfind(|row| !self.interpolation_child_rows.contains(&row.range.offset));
             tail.and_then(|row| self.collection_operand_ty(row))
                 .unwrap_or(ty)
         } else {
@@ -8013,8 +7997,7 @@ impl<'a> Engine<'a> {
                 .iter()
                 .rev()
                 .find(|row| row.range == range)
-                .map(|row| self.use_site_range(row))
-                .unwrap_or(range);
+                .map_or(range, |row| self.use_site_range(row));
             self.emit(SemanticCode::UseOfVoidResult, range, "", "");
             return;
         }
@@ -9228,8 +9211,8 @@ impl<'a> Engine<'a> {
         } else {
             (sub, sup)
         };
-        let v = self.assignable(sub, sup, false);
-        v
+
+        self.assignable(sub, sup, false)
     }
 
     /// Whether a signature carries the unresolved face (`Ty::Unknown`,
@@ -9278,7 +9261,7 @@ impl<'a> Engine<'a> {
             match ty {
                 Ty::Function { shape, .. } => {
                     let shape = pool.function_shape(shape);
-                    for (name, bound) in shape.type_params_named.iter() {
+                    for (name, bound) in &shape.type_params_named {
                         if *name != StringId::NONE {
                             quantified.insert(*name);
                         }
@@ -9782,7 +9765,7 @@ impl<'a> Engine<'a> {
 
     /// A parameterized-alias use's substituted right-hand type
     /// (`StrMap<int>` reads `Map<String, int>` — the oracle's
-    /// `_instantiateElement` face, named_type_resolver.dart): the
+    /// `_instantiateElement` face, `named_type_resolver.dart)`: the
     /// declaration's parameter spellings zip against the written
     /// arguments and substitute through the captured RHS. `None` when
     /// the head resolves to no parameterized alias, the declaration
@@ -9939,7 +9922,7 @@ impl<'a> Engine<'a> {
                     self.file,
                     name,
                 )
-                .map_or(true, |(decl, _)| decl.type_params == 0),
+                .is_none_or(|(decl, _)| decl.type_params == 0),
                 _ => true,
             };
             if identity_safe {
@@ -11016,7 +10999,9 @@ impl<'a> Engine<'a> {
             let pool = self.boundary.pool();
             (pool.get(from).to_vec(), pool.get(to).to_vec())
         };
-        let (from, to) = if from.len() != to.len() {
+        let (from, to) = if from.len() == to.len() {
+            (from, to)
+        } else {
             // The raw-type arm (#2838): exactly one side EMPTY. A
             // written-vs-written mismatch stays the `wrong_number`
             // family's, and a fill that misses the written count (a
@@ -11036,8 +11021,6 @@ impl<'a> Engine<'a> {
             } else {
                 (written, filled)
             }
-        } else {
-            (from, to)
         };
         if from.len() != to.len() {
             return None;
@@ -11198,7 +11181,7 @@ impl<'a> Engine<'a> {
             let pool = self.boundary.pool();
             pool.get(to_args).to_vec()
         };
-        if grounded.len() != written.len() || grounded.iter().any(|ty| *ty == Ty::Unknown) {
+        if grounded.len() != written.len() || grounded.contains(&Ty::Unknown) {
             return None;
         }
         // No pool guard across the ask (`covariant_args` re-interns).
@@ -11229,7 +11212,7 @@ impl<'a> Engine<'a> {
                 Ty::Named {
                     name,
                     args: leaf_args,
-                    nullable,
+                    nullable: _,
                 } if leaf_args == ArgListId::EMPTY && self.spells_keyword_dynamic(name) => {
                     rebuilt.push(Ty::Dynamic);
                     changed = true;
@@ -11588,7 +11571,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The `integer_literal_imprecise_as_double` face (`_checkForOutOfRange`'s
-    /// double arm, error_verifier.dart:6789 — the informal spec at
+    /// double arm, `error_verifier.dart:6789` — the informal spec at
     /// dart-lang/language#4): an integer literal whose conversion
     /// ([`Self::assignable`]'s literal arm, `analyzeIntLiteral`'s
     /// `convertToDouble`) just typed the value `double` must be exactly
@@ -11754,13 +11737,13 @@ impl<'a> Engine<'a> {
     }
 
     /// The annotation name's resolution order (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/summary2/metadata_resolver.dart — member
+    /// `pkg/analyzer/lib/src/summary2/metadata_resolver.dart` — member
     /// metadata resolves inside the container's body scope while head
     /// metadata resolves before that scope opens;
     /// pkg/analyzer/lib/src/dart/element/scope.dart — `InstanceScope` holds
     /// only the container's own members and `ExtensionScope` every own
     /// extension member, neither climbs the supertype chain;
-    /// pkg/analyzer/lib/src/dart/resolver/annotation_resolver.dart — the
+    /// `pkg/analyzer/lib/src/dart/resolver/annotation_resolver.dart` — the
     /// annotation expression resolves like any constant-context expression
     /// and the lookup failure is that resolution's report): locals, the
     /// container's type parameters, the own-container member face (own
@@ -12095,19 +12078,19 @@ impl<'a> Engine<'a> {
         {
             return AnnotationVerdict::Silent;
         }
-        if let Some(entry) = container.members.get(&sel) {
-            if entry.is_static {
-                return match entry.kind {
-                    MemberKind::Field | MemberKind::Getter => {
-                        if entry.is_const {
-                            AnnotationVerdict::Silent
-                        } else {
-                            AnnotationVerdict::Invalid
-                        }
+        if let Some(entry) = container.members.get(&sel)
+            && entry.is_static
+        {
+            return match entry.kind {
+                MemberKind::Field | MemberKind::Getter => {
+                    if entry.is_const {
+                        AnnotationVerdict::Silent
+                    } else {
+                        AnnotationVerdict::Invalid
                     }
-                    MemberKind::Method | MemberKind::Setter => AnnotationVerdict::Invalid,
-                };
-            }
+                }
+                MemberKind::Method | MemberKind::Setter => AnnotationVerdict::Invalid,
+            };
         }
         // Recovery — `getter ??= getNamedConstructor(sel)`: a named
         // constructor answers and `visitAnnotation` asks its question.
@@ -12290,16 +12273,15 @@ impl<'a> Engine<'a> {
             match sel {
                 None => AnnotationVerdict::Invalid,
                 Some(sel) => {
-                    if let Some(entry) = container.members.get(&sel) {
-                        if entry.is_static
-                            && matches!(entry.kind, MemberKind::Field | MemberKind::Getter)
-                        {
-                            return if entry.is_const {
-                                AnnotationVerdict::Silent
-                            } else {
-                                AnnotationVerdict::Invalid
-                            };
-                        }
+                    if let Some(entry) = container.members.get(&sel)
+                        && entry.is_static
+                        && matches!(entry.kind, MemberKind::Field | MemberKind::Getter)
+                    {
+                        return if entry.is_const {
+                            AnnotationVerdict::Silent
+                        } else {
+                            AnnotationVerdict::Invalid
+                        };
                     }
                     if self.annotation_named_ctor_exists(aliased_head, container, owner, sel) {
                         return AnnotationVerdict::Silent;
@@ -12309,47 +12291,6 @@ impl<'a> Engine<'a> {
             }
         }
     }
-
-    /// `ExtensionElement` arm (`_extensionGetter`): the selector names an
-    /// own static const field/getter; a bare `@Ext` or any other member
-    /// reports `invalidAnnotation`.
-    fn annotation_extension_verdict(
-        &self,
-        head: StringId,
-        rest: Option<&str>,
-    ) -> AnnotationVerdict {
-        let Some(sel) = rest else {
-            return AnnotationVerdict::Invalid;
-        };
-        let sel = self.strings.intern(sel.split('.').next().unwrap_or(sel));
-        let Some((container, _)) = resolve_container(
-            self.graph,
-            self.namespaces,
-            self.index,
-            self.lib,
-            self.file,
-            head,
-        ) else {
-            return AnnotationVerdict::Invalid;
-        };
-        match container.members.get(&sel) {
-            Some(entry)
-                if entry.is_static
-                    && matches!(entry.kind, MemberKind::Field | MemberKind::Getter)
-                    && entry.is_const =>
-            {
-                AnnotationVerdict::Silent
-            }
-            _ => AnnotationVerdict::Invalid,
-        }
-    }
-
-    /// `PrefixElement` arm — `rest` is `sel` or `sel.ctor` (`name2`/`name3`):
-    /// a class leaf re-enters the interface arm, a type-alias leaf re-enters
-    /// the alias arm, a `PropertyAccessorElement`/`VariableElement` leaf asks
-    /// the const question, a missing leaf is `undefinedAnnotation` on the
-    /// leaf spelling, every other leaf and a bare `@p` report
-    /// `invalidAnnotation`.
     fn annotation_prefix_verdict(
         &self,
         head: StringId,
@@ -12545,7 +12486,7 @@ impl<'a> Engine<'a> {
     }
 }
 
-/// `TypeSystem::futureValueType` (analyzer source, type_system.dart
+/// `TypeSystem::futureValueType` (analyzer source, `type_system.dart`
 /// :502-529) at name level — the `async` return matrix's view of the
 /// declared return (`T_v`). NOT the recursive `flatten` shape: the `?`
 /// suffix strips first (:503-507), a `Future`/`FutureOr` head gives up
@@ -12712,9 +12653,7 @@ fn low_bits_zero(limbs: &[u32], k: u32) -> bool {
 /// digit, never an exponent). The 54-bit mantissa extraction keeps the
 /// oracle's single round-to-nearest-even step.
 fn nearest_valid_double(stripped: &str) -> String {
-    let value = literal_limbs(stripped)
-        .map(|limbs| limbs_to_f64(&limbs))
-        .unwrap_or(0.0);
+    let value = literal_limbs(stripped).map_or(0.0, |limbs| limbs_to_f64(&limbs));
     format!("{:.0}", f64::MAX.min(value))
 }
 
@@ -12911,7 +12850,7 @@ mod async_return_tests {
     }
 
     /// A bare `return;` in an async body reads `futureValueType(T)`
-    /// (return_type_verifier.dart `_checkReturnWithoutValue`:299-301):
+    /// (`return_type_verifier.dart` `_checkReturnWithoutValue`:299-301):
     /// `Future<int>` unwraps to `int`, a non-ok-set face, and reports
     /// `return_without_value` at the keyword; the `Future<void>` host
     /// keeps it silent (`T_v = void` joins the ok-set).
@@ -13398,13 +13337,6 @@ mod ticket_3424_tests;
 #[cfg(test)]
 #[path = "ticket_3472_tests.rs"]
 mod ticket_3472_tests;
-
-// The #3619 pins (the `?:`/`??` operand join's real least upper bound,
-// the if-null `T2'` callable coercion, and the await face's user-Future
-// flatten). Same `#[path]` registration as the pins above.
-#[cfg(test)]
-#[path = "ticket_3619_tests.rs"]
-mod ticket_3619_tests;
 
 // The #3836 pins (Left Bottom on the assignability face: a non-nullable
 // `Never` source subtypes every target, which the function rule's

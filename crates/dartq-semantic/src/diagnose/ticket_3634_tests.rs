@@ -17,6 +17,7 @@
 //!   `newType != previousType` step, which the sound-mode strict-subtype
 //!   gate refuses. Oracle: dart 3.13.7.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_bare};
 use crate::FileReport;
 

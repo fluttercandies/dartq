@@ -13,6 +13,7 @@
 //! `return T` / `int <: T` / `S <: T` family. The rig mounts `dart:core`
 //! so `Type` resolves as the real reified object head.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

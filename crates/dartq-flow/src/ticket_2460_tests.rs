@@ -1,12 +1,15 @@
 //! The #2460 flow-side pins: the generator-body promotion face the
 //! semantic consumer reads. The official `suspension`
 //! (upstream Dart SDK source,
-//! pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:7909-
+//! pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:7909`-
 //! 7950) demotes only when the suspension point sits inside a local
 //! function — `_enclosingFunctionExpressionInfoStack` must be non-empty —
 //! so a `sync*`/`async*` body's own `yield` carries the standing
 //! promotions across, and the read inside `yield x` after `x ??= C()`
 //! answers the promoted non-null type.
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::facts::FlowFact;
 
@@ -19,6 +22,7 @@ use dartq_scanner::{ScanConfig, TokenTable};
 
 /// Parses with the recorder attached and returns the promoted-read rows
 /// `(offset, ty, args)` (the `tests.rs` harness shape).
+#[allow(clippy::type_complexity)]
 fn promoted_read_rows(
     source: &str,
 ) -> (

@@ -42,6 +42,7 @@
 //! * **Observability** — [`Engine::warm_stats`] counts completed and
 //!   skipped items, cumulative per engine.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::PoisonError;
 
 use dartq_source::FileId;

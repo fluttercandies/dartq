@@ -26,6 +26,7 @@
 //!   `void f([int a = 0]); augment void f([int a]) {}` -> 0 rows (the
 //!   introduction's default settles it).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops_experiments_with};
 use dartq_language::Feature;

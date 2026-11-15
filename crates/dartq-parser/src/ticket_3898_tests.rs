@@ -26,6 +26,7 @@
 //!    at `class` and no `expected_type_name`; `parse_mixin_application_rest`
 //!    now queues both synthetics.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::parser::Parser;
 use crate::tests::collector::Collector;
 use dartq_language::FeatureSet;
@@ -67,7 +68,7 @@ fn rows(c: &Out) -> &[(String, u32, u32)] {
 }
 
 /// The message text paired with the `expected_type_name` row at `start`.
-fn type_name_text<'a>(c: &'a Out, start: u32) -> Option<&'a str> {
+fn type_name_text(c: &Out, start: u32) -> Option<&str> {
     c.errors
         .iter()
         .zip(c.texts.iter())

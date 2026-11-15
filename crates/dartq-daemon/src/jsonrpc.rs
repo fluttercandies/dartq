@@ -3,6 +3,7 @@
 //! parsing is hand-rolled because the `id`-vs-`method` discrimination and
 //! the `result`-XOR-`error` response shape are the whole logic.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde_json::{Value, json};
 
 /// JSON-RPC error codes.

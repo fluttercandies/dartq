@@ -14,6 +14,7 @@
 //! read face names `InvalidType` (probe: `var x = Undefined.new;` names
 //! `InvalidType`, `var x = Undefined.new();` names `<unknown>`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 
@@ -126,7 +127,7 @@ fn settled_chain_method_face_names_the_bare_head() {
 /// A function-typed receiver names `Function`, a record receiver names
 /// `<unknown>` (upstream `receiverClassName` — only an `InterfaceType` or
 /// `FunctionType` escapes the default,
-/// method_invocation_resolver.dart).
+/// `method_invocation_resolver.dart`).
 #[test]
 fn function_and_record_receivers_keep_their_shape_displays() {
     let report = report_ops(
@@ -167,7 +168,7 @@ fn static_container_miss_names_the_container() {
 /// receiver while the read face names `InvalidType` (oracle:
 /// `var x = C.new();` with `C` unresolved reports "The method 'new' isn't
 /// defined for the type '<unknown>'."; `var x = Undefined.new;` reports
-/// "The getter 'new' isn't defined for the type 'InvalidType'.").
+/// "The getter 'new' isn't defined for the type '`InvalidType`'.").
 #[test]
 fn new_selector_invocation_names_unknown_read_names_invalid_type() {
     let report = report_ops("void main() { var x = Missing.new(); }\n");

@@ -28,6 +28,7 @@
 //!   (library_analyzer.dart:1037-1058); a URI-form part-of reports the
 //!   enclosing/included canonical URIs through the same template.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_pub::{LockFile, Pubspec, build_graph};
 
@@ -176,7 +177,7 @@ fn interpolated_uris_report_at_the_whole_literal_and_never_resolve() {
 /// `import 'a.dart';` where `a.dart` is a part file (`part of 'test.dart';`)
 /// — `import_of_non_library` at the written literal. Oracle row:
 /// `ERROR|import_of_non_library|lib/test.dart|2:8|8|The imported library
-/// 'a.dart' can't have a part-of directive.` (library_analyzer.dart
+/// 'a.dart' can't have a part-of directive.` (`library_analyzer.dart`
 /// :728-732, `importedLibrarySource == null`; the part-file kind is the
 /// target's own `_updateKind` classification, file_state.dart:928-949).
 /// The part file's own analysis stays silent — its part-of URI only
@@ -207,7 +208,7 @@ fn import_of_a_part_file_reports_import_of_non_library() {
 /// export twin of the face above (library_analyzer.dart:910-955, the same
 /// `importedLibrarySource == null` decision on the export state). The
 /// deferred spelling rides the same face (oracle
-/// ImportOfNonLibraryTest/test_deferred): deferredness never gates it.
+/// `ImportOfNonLibraryTest/test_deferred)`: deferredness never gates it.
 #[test]
 fn export_of_a_part_file_reports_export_of_non_library() {
     const TEST: &str = "export 'a.dart';\nint f() => 1;\n";

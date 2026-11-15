@@ -1,4 +1,4 @@
-//! #3209 pins — bounds_conformance: the `isSubtypeOf`
+//! #3209 pins — `bounds_conformance`: the `isSubtypeOf`
 //! instantiate-to-bounds residual, the super-bounds conformance arm, and
 //! the generic-bound residual (F6-A+I+E+H+F3 folded into one
 //! mega-ticket).
@@ -31,6 +31,7 @@
 //! `None`. The written-target side and the written-`Function<Y extends
 //! B>` sides decide correctly.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

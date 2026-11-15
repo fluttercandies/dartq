@@ -4,6 +4,7 @@
 //! the variable rows, which anchor at the variable's own name), plus the
 //! resolved-shape silences and the multi-unit library walk.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_augment, rows};
 use super::*;
 
@@ -77,9 +78,9 @@ fn assert_aug_silent(report: &FileReport) {
 /// `errorToken`).
 #[test]
 fn without_declaration_class_anchors_at_the_augment_keyword() {
-    let src = r#"
+    let src = r"
 augment class A {}
-"#;
+";
     let report = report_ops(src);
     assert_aug_row(
         &report,
@@ -94,9 +95,9 @@ augment class A {}
 /// (upstream `visitTopLevelVariableDeclaration` passes `variable.name`).
 #[test]
 fn without_declaration_variable_anchors_at_the_name() {
-    let src = r#"
+    let src = r"
 augment int x = 0;
-"#;
+";
     let report = report_ops(src);
     assert_aug_row(
         &report,
@@ -111,10 +112,10 @@ augment int x = 0;
 /// `augmentationOfDifferentDeclarationKind.withArguments`).
 #[test]
 fn different_kind_row_names_both_kinds() {
-    let src = r#"
+    let src = r"
 class C {}
 augment mixin C {}
-"#;
+";
     let report = report_ops(src);
     assert_aug_row(
         &report,
@@ -129,11 +130,11 @@ augment mixin C {}
 /// `ClassFragmentImpl(isMixinApplication: true)`'s switch arm).
 #[test]
 fn mixin_application_class_refuses_augmentation() {
-    let src = r#"
+    let src = r"
 mixin M {}
 class C = Object with M;
 augment class C {}
-"#;
+";
     let report = report_ops(src);
     assert_aug_row(
         &report,
@@ -148,11 +149,11 @@ augment class C {}
 /// reports at the augmentation's own `extends` keyword.
 #[test]
 fn extends_clause_already_present_anchors_at_extends() {
-    let src = r#"
+    let src = r"
 class B {}
 class A extends B {}
 augment class A extends B {}
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -167,10 +168,10 @@ augment class A extends B {}
 /// An extra header modifier anchors at its own keyword.
 #[test]
 fn modifier_extra_anchors_at_the_modifier() {
-    let src = r#"
+    let src = r"
 class A {}
 augment base class A {}
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -185,10 +186,10 @@ augment base class A {}
 /// A missing header modifier anchors at the `augment` keyword.
 #[test]
 fn modifier_missing_anchors_at_the_augment_keyword() {
-    let src = r#"
+    let src = r"
 base class A {}
 augment class A {}
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -203,10 +204,10 @@ augment class A {}
 /// A surplus type parameter anchors at its own name.
 #[test]
 fn type_parameter_count_surplus_anchors_at_the_name() {
-    let src = r#"
+    let src = r"
 class A {}
 augment class A<T> {}
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -222,10 +223,10 @@ augment class A<T> {}
 /// declaration's own name.
 #[test]
 fn type_parameter_count_missing_list_anchors_at_the_name() {
-    let src = r#"
+    let src = r"
 class A<T> {}
 augment class A {}
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -239,10 +240,10 @@ augment class A {}
 
 #[test]
 fn type_parameter_name_mismatch_anchors_at_the_name() {
-    let src = r#"
+    let src = r"
 class A<T> {}
 augment class A<U> {}
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -258,10 +259,10 @@ augment class A<U> {}
 /// one-directional check) at the bound annotation.
 #[test]
 fn type_parameter_bound_mismatch_anchors_at_the_bound() {
-    let src = r#"
+    let src = r"
 class A<T> {}
 augment class A<T extends num> {}
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -277,10 +278,10 @@ augment class A<T extends num> {}
 /// return type (upstream `errorEntity: node.returnType ?? node.name`).
 #[test]
 fn return_type_mismatch_anchors_at_the_return_type() {
-    let src = r#"
+    let src = r"
 int f() => 0;
 augment String f() => '';
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -296,10 +297,10 @@ augment String f() => '';
 /// variable's own name (upstream `errorEntity: variable.name`).
 #[test]
 fn induced_getter_return_mismatch_anchors_at_the_name() {
-    let src = r#"
+    let src = r"
 int x = 0;
 augment String x = '';
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -316,10 +317,10 @@ augment String x = '';
 /// at the variable's name.
 #[test]
 fn final_intro_non_final_augmentation_reports_the_setter_row() {
-    let src = r#"
+    let src = r"
 final int x = 0;
 augment int x = 0;
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -335,14 +336,14 @@ augment int x = 0;
 /// own `augment` keyword.
 #[test]
 fn constructor_const_missing_anchors_at_the_member_augment_keyword() {
-    let src = r#"
+    let src = r"
 class C {
   const C();
 }
 augment class C {
   augment C();
 }
-"#;
+";
     let report = report_ops(src);
     let member_augment = at_abs(
         src,
@@ -364,14 +365,14 @@ augment class C {
 /// name (upstream `formalParameterAtPositionalIndex(firstRequired)`).
 #[test]
 fn required_count_surplus_anchors_at_the_surplus_name() {
-    let src = r#"
+    let src = r"
 class C {
   C(int a);
 }
 augment class C {
   augment C(int a, int b);
 }
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -387,14 +388,14 @@ augment class C {
 /// (the `leftDelimiter ??` fallback's entity arm).
 #[test]
 fn required_count_missing_anchors_at_the_right_paren() {
-    let src = r#"
+    let src = r"
 class C {
   C(int a);
 }
 augment class C {
   augment C();
 }
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -410,14 +411,14 @@ augment class C {
 /// the group's opening delimiter (upstream `leftDelimiter ?? ...`).
 #[test]
 fn optional_count_surplus_anchors_at_the_group_delimiter() {
-    let src = r#"
+    let src = r"
 class C {
   C(int a);
 }
 augment class C {
   augment C(int a, [int b]);
 }
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -431,14 +432,14 @@ augment class C {
 
 #[test]
 fn named_extra_anchors_at_the_parameter_name() {
-    let src = r#"
+    let src = r"
 class C {
   C(int a);
 }
 augment class C {
   augment C(int a, {int n});
 }
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -454,14 +455,14 @@ augment class C {
 /// `formalParameterList.rightParenthesis`).
 #[test]
 fn named_missing_anchors_at_the_right_paren() {
-    let src = r#"
+    let src = r"
 class C {
   C({int n});
 }
 augment class C {
   augment C();
 }
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -475,14 +476,14 @@ augment class C {
 
 #[test]
 fn covariant_extra_anchors_at_the_keyword() {
-    let src = r#"
+    let src = r"
 class C {
   C(int a);
 }
 augment class C {
   augment C(covariant int a);
 }
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -496,14 +497,14 @@ augment class C {
 
 #[test]
 fn covariant_missing_anchors_at_the_parameter_name() {
-    let src = r#"
+    let src = r"
 class C {
   C(covariant int a);
 }
 augment class C {
   augment C(int a);
 }
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -517,14 +518,14 @@ augment class C {
 
 #[test]
 fn formal_type_mismatch_anchors_at_the_written_type() {
-    let src = r#"
+    let src = r"
 class C {
   C(int a);
 }
 augment class C {
   augment C(String a);
 }
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -538,14 +539,14 @@ augment class C {
 
 #[test]
 fn positional_name_mismatch_anchors_at_the_name() {
-    let src = r#"
+    let src = r"
 class C {
   C(int p1);
 }
 augment class C {
   augment C(int p2);
 }
-"#;
+";
     let report = report_ops(src);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
@@ -561,10 +562,10 @@ augment class C {
 /// the `augment` keyword.
 #[test]
 fn typedef_augmentation_anchors_at_the_augment_keyword() {
-    let src = r#"
+    let src = r"
 class C {}
 augment typedef C = int;
-"#;
+";
     let report = report_ops(src);
     assert_aug_row(
         &report,
@@ -580,14 +581,14 @@ augment typedef C = int;
 /// `duplicate_constructor` pass skips augment sites).
 #[test]
 fn augment_constructor_suppresses_duplicate_constructor() {
-    let src = r#"
+    let src = r"
 class C {
   C();
 }
 augment class C {
   augment C() {}
 }
-"#;
+";
     let report = report_ops(src);
     assert!(
         duplicate_ctor_rows(&report).is_empty(),
@@ -601,12 +602,12 @@ augment class C {
 #[test]
 fn resolved_shape_identical_augmentation_is_silent() {
     let report = report_ops(
-        r#"
+        r"
 class A {}
 augment class A {}
 int f() => 0;
 augment int f() => 0;
-"#,
+",
     );
     assert_aug_silent(&report);
 }
@@ -616,13 +617,13 @@ augment int f() => 0;
 /// reports in its own unit.
 #[test]
 fn cross_unit_extends_clause_already_present_reports_in_the_augmenting_unit() {
-    let main = r#"
+    let main = r"
 class B {}
 class A extends B {}
-"#;
-    let aug = r#"
+";
+    let aug = r"
 augment class A extends B {}
-"#;
+";
     let report = report_ops_augment(main, aug);
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(

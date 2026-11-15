@@ -1,10 +1,14 @@
-use super::*;
+use super::{
+    BUILTIN_IGNORE_SOURCE, FixRole, LineIndex, RuleFix, SourceRange, Yaml, anchored_edit,
+    utf16_count,
+};
 
 /// The `// ignore: <code>` row for the diagnostic at `range`: spliced
 /// into the previous line's ignore comment when one is there (the new
 /// code first, the official insertion point), else inserted above the
 /// hit's line at the line's own indentation. The first line inserts at
 /// the file head.
+#[must_use]
 pub fn ignore_line_fix(
     code: &'static str,
     range: core::ops::Range<u32>,
@@ -54,6 +58,7 @@ pub fn ignore_line_fix(
 /// else inserted after the last blank line of the header (or before the
 /// first code line, its attached doc comments and annotations included)
 /// — the official `IgnoreDiagnosticInFile` walk over the line stream.
+#[must_use]
 pub fn ignore_file_fix(code: &'static str, text: &str, lines: &LineIndex) -> Option<RuleFix> {
     let starts = byte_line_starts(text);
     let comment = format!("// ignore_for_file: {code}");
@@ -209,6 +214,7 @@ pub(crate) fn is_ignore_for_file_comment(trimmed: &str) -> bool {
 /// `errors` mapping grows or re-spells the code key, a non-mapping
 /// document is replaced whole, and anything the surgery cannot prove
 /// (malformed YAML, a non-mapping `analyzer` or `errors`) drops.
+#[must_use]
 pub fn ignore_options_edit(code: &str, text: &str) -> Option<(u32, u32, String)> {
     let entry = format!("{code}: ignore");
     let Ok(Yaml::Mapping(root)) = serde_yaml::from_str::<Yaml>(text) else {
@@ -258,7 +264,7 @@ pub fn ignore_options_edit(code: &str, text: &str) -> Option<(u32, u32, String)>
                         let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
                         let colon = text[at..line_end].find(':')?;
                         return Some((
-                            u32::try_from(utf16_count(&text[..at + colon + 1])).ok()?,
+                            u32::try_from(utf16_count(&text[..=(at + colon)])).ok()?,
                             u32::try_from(utf16_count(&text[at + colon + 1..line_end])).ok()?,
                             " ignore".to_owned(),
                         ));

@@ -31,6 +31,9 @@
 //! through the resolved seam's spelled invalid face, never through the
 //! opaque marker.
 
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -66,13 +69,10 @@ fn scan_parse(source: &str) -> Vec<FlowFact> {
 /// read after the split rejoined reports nothing).
 fn promoted_at(source: &str, needle: &str) -> Option<crate::ty::Ty> {
     let offset = source.find(needle).unwrap() as u32;
-    scan_parse(source)
-        .into_iter()
-        .filter_map(|fact| match fact {
-            FlowFact::PromotedRead { span, ty, .. } if span.range.offset == offset => Some(ty),
-            _ => None,
-        })
-        .next()
+    scan_parse(source).into_iter().find_map(|fact| match fact {
+        FlowFact::PromotedRead { span, ty, .. } if span.range.offset == offset => Some(ty),
+        _ => None,
+    })
 }
 
 /// Positional argument: the `is` inside `f(o is int)` narrows `o` for a

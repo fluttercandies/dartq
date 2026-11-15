@@ -12,9 +12,10 @@
 //! * A Never-operand `as` cast inside a conditional arm
 //!   (`c ? x : ((throw 0) as int)`) anchors its tail row at the cast
 //!   TYPE, not the `as` keyword: the official's first dead node is the
-//!   type annotation node (`flowEnd(arm)`, type_analyzer.dart:2588/2616),
+//!   type annotation node (`flowEnd(arm)`, `type_analyzer.dart:2588/2616`),
 //!   so the row reads `int)`, never `as int)`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -67,13 +68,13 @@ fn dead_of(source: &str) -> Vec<String> {
 /// updater — `true; 1`, not the `) {}` fold.
 #[test]
 fn for_init_pattern_dead_region_trims_at_the_updater() {
-    let source = r#"
+    let source = r"
 void main() {
   for (var (i) = throw 0; true; 1) {}
   use(0);
 }
 void use(Object? x) {}
-"#;
+";
     assert_eq!(dead_of(source), ["true; 1"]);
 }
 
@@ -82,13 +83,13 @@ void use(Object? x) {}
 /// `ForInit` boundary marker).
 #[test]
 fn for_init_declaration_dead_region_trims_at_the_updater() {
-    let source = r#"
+    let source = r"
 void main() {
   for (var i = throw 0; true; 1) {}
   use(0);
 }
 void use(Object? x) {}
-"#;
+";
     assert_eq!(dead_of(source), ["true; 1"]);
 }
 
@@ -96,13 +97,13 @@ void use(Object? x) {}
 /// the marker is a partition, not a deadness signal.
 #[test]
 fn live_pattern_for_stays_silent() {
-    let source = r#"
+    let source = r"
 void main() {
   for (var (int i) = 0; i < 3; i++) {}
   use(1);
 }
 void use(Object? x) {}
-"#;
+";
     assert_eq!(dead_of(source), Vec::<String>::new());
 }
 
@@ -112,10 +113,10 @@ void use(Object? x) {}
 /// the annotation (`int;`), never at the `as` keyword (`as int;`).
 #[test]
 fn cast_tail_statement_anchors_at_the_type_annotation() {
-    let source = r#"
+    let source = r"
 Never doNotReturn() => throw 0;
 test() => doNotReturn() as int;
-"#;
+";
     assert_eq!(dead_of(source), ["int;"]);
 }
 
@@ -125,7 +126,7 @@ test() => doNotReturn() as int;
 /// the arm's own `flowEnd` row runs from it to the arm's end.
 #[test]
 fn conditional_arm_cast_tail_anchors_at_the_type_annotation() {
-    let source = r#"
+    let source = r"
 var condition = true;
 class C2 {}
 void main() {
@@ -135,7 +136,7 @@ void main() {
   use(z4);
 }
 void use(Object? x) {}
-"#;
+";
     assert_eq!(dead_of(source), ["int)", "C2)"]);
 }
 
@@ -143,7 +144,7 @@ void use(Object? x) {}
 /// type-anchored tail.
 #[test]
 fn conditional_then_arm_cast_tail_anchors_at_the_type_annotation() {
-    let source = r#"
+    let source = r"
 var condition = true;
 class C2 {}
 void main() {
@@ -151,7 +152,7 @@ void main() {
   use(z4);
 }
 void use(Object? x) {}
-"#;
+";
     assert_eq!(dead_of(source), ["C2)"]);
 }
 
@@ -159,12 +160,12 @@ void use(Object? x) {}
 /// dead-row anchor, not a cast face.
 #[test]
 fn live_conditional_arm_cast_stays_silent() {
-    let source = r#"
+    let source = r"
 void main(int x) {
   var z = x > 0 ? 1 : (2 as int);
   use(z);
 }
 void use(Object? x) {}
-"#;
+";
     assert_eq!(dead_of(source), Vec::<String>::new());
 }

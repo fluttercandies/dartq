@@ -31,6 +31,7 @@
 //!   escape is a backreference iff `N` does not exceed the pattern's total
 //!   capturing-group count (forward references parse).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;

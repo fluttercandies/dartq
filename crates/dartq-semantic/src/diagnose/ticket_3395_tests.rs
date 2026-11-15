@@ -25,6 +25,7 @@
 //!
 //! [`extension_application`]: crate::diagnose::row_resolution
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// An `on Object?` extension defines the member: the nullable receiver

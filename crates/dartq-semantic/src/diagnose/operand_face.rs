@@ -18,6 +18,7 @@
 //! engine cannot type is a [`OperandFace::Gap`] that suppresses the
 //! refinement (the under-report direction).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 /// A binary operand as the numeric refinement reads it.
@@ -32,7 +33,7 @@ pub(crate) enum OperandFace {
     Gap,
 }
 
-impl<'a> Engine<'a> {
+impl Engine<'_> {
     /// The refinement face of one operand row whose static type is `ty`
     /// (the caller's [`Self::equality_operand_ty`] answer).
     pub(crate) fn operand_face(&self, row: &Row, ty: Ty) -> OperandFace {
@@ -112,8 +113,7 @@ impl<'a> Engine<'a> {
                 if self
                     .refs
                     .binary_search_by(|r| r.range.offset.cmp(&span.offset))
-                    .ok()
-                    .is_some_and(|i| {
+                    .is_ok_and(|i| {
                         self.refs[i].range == span && self.refs[i].target == RefTarget::Missing
                     })
                 {
@@ -170,8 +170,8 @@ impl<'a> Engine<'a> {
     /// parent shape: a `BinaryExpression` parent picks the operator
     /// variant, a `PrefixExpression`/`MethodInvocation` parent the method
     /// variant (type_property_resolver.dart:128-148, reached through
-    /// prefix_expression_resolver.dart's `_resolve1` for `-`/`~` and
-    /// binary_expression_resolver.dart for the binary spellings). A
+    /// `prefix_expression_resolver.dart`'s `_resolve1` for `-`/`~` and
+    /// `binary_expression_resolver.dart` for the binary spellings). A
     /// `Null`-typed operand swaps to `invalid_use_of_null_value` on the
     /// same anchor.
     ///
@@ -716,7 +716,7 @@ impl<'a> Engine<'a> {
             .map(|ty| (ty, span))
     }
 
-    /// [`Self::unary_operand_ty`] gated on the operand's own InvalidType
+    /// [`Self::unary_operand_ty`] gated on the operand's own `InvalidType`
     /// faces — upstream's `isInvalidBounded` short-circuit
     /// (type_property_resolver.dart:87-94) runs BEFORE the `isNullable`
     /// tail, so an operand whose static type is `InvalidType` never
@@ -724,7 +724,7 @@ impl<'a> Engine<'a> {
     /// silence on `x + 1` where `x` is an undefined name (probed 3.13.7 —
     /// only `undefined_identifier` stands), on `x + bar(7)` where `x`'s
     /// declared type `X?` spells an unresolvable class (the `TypeUse`
-    /// verdict's `Missing`/`NonType` head = the InvalidType spelling),
+    /// verdict's `Missing`/`NonType` head = the `InvalidType` spelling),
     /// and on a chain `x.y + 1` whose receiver resolved to nothing (the
     /// member read types `InvalidType`, resolver never runs the lookup).
     /// The model spells the same faces three ways — the push-time
@@ -736,7 +736,7 @@ impl<'a> Engine<'a> {
     /// `x` is `InvalidType`, and a parameter's `X?` face reads nullable
     /// through the same unresolvable head). Each face suppresses here:
     /// `None` keeps the under-report posture for everything that is not
-    /// decidable as InvalidType.
+    /// decidable as `InvalidType`.
     pub(crate) fn checked_operand_ty(&self, tail: usize) -> Option<(Ty, SourceRange)> {
         let (ty, probe) = self.unary_operand_ty(tail)?;
         // The operand token's own `refs` miss: a bare read (`x`), a
@@ -748,10 +748,7 @@ impl<'a> Engine<'a> {
         if self
             .refs
             .binary_search_by(|r| r.range.offset.cmp(&probe.offset))
-            .ok()
-            .is_some_and(|i| {
-                self.refs[i].range == probe && self.refs[i].target == RefTarget::Missing
-            })
+            .is_ok_and(|i| self.refs[i].range == probe && self.refs[i].target == RefTarget::Missing)
         {
             return None;
         }
@@ -768,8 +765,7 @@ impl<'a> Engine<'a> {
             if self
                 .refs
                 .binary_search_by(|r| r.range.offset.cmp(&recv_span.offset))
-                .ok()
-                .is_some_and(|i| {
+                .is_ok_and(|i| {
                     self.refs[i].range == recv_span && self.refs[i].target == RefTarget::Missing
                 })
             {
@@ -985,7 +981,7 @@ impl<'a> Engine<'a> {
                 let name_len = self.strings.resolve(reference.name).len() as u32;
                 let bytes = self.source.as_bytes();
                 let mut at = self.byte_of(decl_offset + name_len);
-                while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+                while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
                     at += 1;
                 }
                 if bytes.get(at) == Some(&b'(') {
@@ -1113,8 +1109,7 @@ impl<'a> Engine<'a> {
         }
         self.refs
             .binary_search_by(|reference| reference.range.offset.cmp(&probe.offset))
-            .ok()
-            .is_some_and(|index| match self.refs[index].target {
+            .is_ok_and(|index| match self.refs[index].target {
                 RefTarget::Local
                 | RefTarget::Member { .. }
                 | RefTarget::Decl { .. }

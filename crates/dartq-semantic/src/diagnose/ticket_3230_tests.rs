@@ -22,6 +22,7 @@
 //! the module inside the `diagnose` subtree so
 //! `crate::diagnose::test_rig` resolves).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// The source offset of the fixture's LAST `needle`, as a report offset

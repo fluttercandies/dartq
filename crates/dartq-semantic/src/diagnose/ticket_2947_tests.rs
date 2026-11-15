@@ -27,6 +27,7 @@
 //! - `test_typeLiteral_class` — `var t = C<String>;` over `C<T extends
 //!   int>`: the bare type literal's NamedType checks bounds too.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 /// The `type_argument_not_matching_bounds` rows of `report` as

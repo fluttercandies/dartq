@@ -54,6 +54,7 @@
 //! `call`-getter and nullable-receiver rows each reporting
 //! `INVALID_ASSIGNMENT` at the whole right-hand expression.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops};
 

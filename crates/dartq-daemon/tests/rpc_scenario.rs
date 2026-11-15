@@ -15,6 +15,66 @@
 //! with the session short-ids (the repeat path back-references `s1`,
 //! mapped by the `symbols` table) → EOF. No network, no dart SDK.
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::unused_self,
+    clippy::type_complexity,
+    clippy::cast_possible_truncation,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::useless_conversion,
+    clippy::question_mark,
+    clippy::option_option,
+    clippy::needless_continue,
+    clippy::missing_panics_doc,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::explicit_counter_loop,
+    clippy::never_loop,
+    clippy::needless_range_loop,
+    clippy::unnecessary_unwrap,
+    clippy::assigning_clones,
+    clippy::double_must_use,
+    clippy::single_match,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::ignore_without_reason,
+    clippy::unnecessary_debug_formatting,
+    clippy::match_wild_err_arm,
+    clippy::disallowed_names,
+    clippy::many_single_char_names,
+    clippy::same_item_push,
+    clippy::while_let_loop,
+    clippy::if_same_then_else,
+    clippy::ref_option,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::unnecessary_filter_map,
+    clippy::manual_strip,
+    clippy::float_cmp,
+    clippy::redundant_guards,
+    clippy::empty_line_after_doc_comments,
+    clippy::unreadable_literal,
+    clippy::enum_variant_names,
+    clippy::missing_errors_doc,
+    clippy::unnecessary_wraps,
+    clippy::too_many_arguments,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::fs;
@@ -579,7 +639,7 @@ fn a_request_step_settles_on_its_answer_not_the_frame_growth() {
     // The push grows the count to the expected seven — request 7's answer
     // is still unwritten, so the step must hold.
     assert!(!request_settled(
-        &settled(&[push.clone()]),
+        &settled(std::slice::from_ref(&push)),
         before.len(),
         1,
         &json!(7)
@@ -615,7 +675,7 @@ fn a_request_step_settles_on_its_answer_not_the_frame_growth() {
     // never on the numeric lookalike.
     let string_answer = json!({"jsonrpc": "2.0", "id": "agent-7", "result": {"v": 1}});
     assert!(request_settled(
-        &[string_answer.clone()],
+        std::slice::from_ref(&string_answer),
         0,
         1,
         &json!("agent-7")

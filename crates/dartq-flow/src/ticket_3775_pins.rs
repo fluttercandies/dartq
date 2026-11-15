@@ -34,6 +34,9 @@
 //! the declared read's nullable face, and zero promotions for the
 //! non-nullable twin.
 
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

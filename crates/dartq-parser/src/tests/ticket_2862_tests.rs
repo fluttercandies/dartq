@@ -2,17 +2,18 @@
 //! name. The official class/mixin/extension-type and enum name templates
 //! consume such junk in doubt and splice the zero-width synthetic name at
 //! the FOLLOWER's offset (upstream Dart SDK source,
-//! pkg/_fe_analyzer_shared/lib/src/parser/identifier_context_impl.dart,
+//! pkg/_`fe_analyzer_shared/lib/src/parser/identifier_context_impl.dart`,
 //! branch 3 — `rewriter.insertSyntheticIdentifier(identifier)`), so every
 //! downstream header face anchors on the junk identifier through the
 //! zero-width-name `findNonZeroLengthToken` walk (util.dart:56) and the
 //! `ensureBlock` follower fallback. Every expected row below is the 3.13.7
 //! oracle face from the conformance corpus (Primary-constructors
-//! grammar_A06_t01: `class @meta C(var int v);` 29|7|1 + 29|8|4,
+//! `grammar_A06_t01`: `class @meta C(var int v);` 29|7|1 + 29|8|4,
 //! `mixin class @meta M();` 33|13|1 + 33|14|4,
 //! `enum @meta E(final int v) {` 37|6|1 + 37|7|4,
 //! `extension type @meta ET(int _) {}` 45|16|1 + 45|17|4/4|0).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 use crate::ParserFeatures;
 
@@ -99,7 +100,7 @@ fn enum_header_anchors_on_the_junk_identifier() {
 }
 
 /// Junk behind type parameters keeps the pinned face: `extension type<T> on
-/// C<T> {}` (oracle Extension-methods syntax_t06 20|17|1 + 20|15|0) — the
+/// C<T> {}` (oracle Extension-methods `syntax_t06` 20|17|1 + 20|15|0) — the
 /// `<` takes the insert-before keep-set branch, so `missing_primary_constructor`
 /// stays on the closing `>` and the representation slot on the `<`.
 #[test]

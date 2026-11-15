@@ -262,28 +262,28 @@ mod oracle_corpus_pins {
         // (case, source, oracle rows as (line, column, length)).
         let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullSuperFormalsTest/test_forLoop#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullSuperFormalsTest/test_forLoop#0",
+                r"
 void f() {
   for (var i = null; i != null; i++) {
   }
 }
-"#,
+",
                 &[(3, 12, 8)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullSuperFormalsTest/test_nullableStringInit#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullSuperFormalsTest/test_nullableStringInit#0",
+                r"
 class A {
   String? a;
   A({this.a = null});
 }
-"#,
+",
                 &[(4, 6, 13)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullSuperFormalsTest/test_superInit_2#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullSuperFormalsTest/test_superInit_2#0",
+                r"
 class A {
   String? a;
   A({this.a = null});
@@ -291,12 +291,12 @@ class A {
 class B extends A {
   B({super.a = null});
 }
-"#,
+",
                 &[(4, 6, 13), (7, 6, 14)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullSuperFormalsTest/test_superInit_nolint#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullSuperFormalsTest/test_superInit_nolint#0",
+                r"
 class A {
   String? a;
   A({this.a = ''});
@@ -305,202 +305,202 @@ class A {
 class B extends A {
   B({super.a = null});
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_fieldFormalParameter_inferredType#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_fieldFormalParameter_inferredType#0",
+                r"
 class C {
   int? i;
   C({this.i = null});
 }
-"#,
+",
                 &[(4, 6, 13)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_instanceField_inferredType_final#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_instanceField_inferredType_final#0",
+                r"
 class C {
   final i = null;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_instanceField_intType_noInitializer#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_instanceField_intType_noInitializer#0",
+                r"
 class C {
   int i;
   C(): i = 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_instanceField_nullableIntType#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_instanceField_nullableIntType#0",
+                r"
 class C {
   int? i = null;
   C(): i = 1;
 }
-"#,
+",
                 &[(3, 8, 8)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_invalidAssignment_field#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_invalidAssignment_field#0",
+                r"
 class X {
   int x = null;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_invalidAssignment_namedParameter#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_invalidAssignment_namedParameter#0",
+                r"
 class X {
   X({int a = null});
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_invalidAssignment_namedParameter_fieldFormal#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_invalidAssignment_namedParameter_fieldFormal#0",
+                r"
 class X {
   int x;
   X({this.x = null});
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_invalidAssignment_topLevelVariable#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_invalidAssignment_topLevelVariable#0",
+                r"
 int i = null;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_namedParameter_inferredType#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_namedParameter_inferredType#0",
+                r"
 foo({p = null}) {}
-"#,
+",
                 &[(2, 6, 8)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_namedParameter_inferredType_defaultValueIsInt#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_namedParameter_inferredType_defaultValueIsInt#0",
+                r"
 foo({p = 1}) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_namedParameter_inferredType_noDefaultValue#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_namedParameter_inferredType_noDefaultValue#0",
+                r"
 foo({p}) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_namedParameter_inferredType_var#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_namedParameter_inferredType_var#0",
+                r"
 // @dart = 3.10
 foo({var p = null}) {}
-"#,
+",
                 &[(3, 6, 12)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_optionalParameter_inferredType#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_optionalParameter_inferredType#0",
+                r"
 foo([p = null]) {}
-"#,
+",
                 &[(2, 6, 8)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_optionalParameter_inferredType_defaultValueIsInt#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_optionalParameter_inferredType_defaultValueIsInt#0",
+                r"
 foo([p = 1]) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_optionalParameter_inferredType_noDefaultValue#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_optionalParameter_inferredType_noDefaultValue#0",
+                r"
 foo([p]) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_optionalParameter_inferredType_var#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_optionalParameter_inferredType_var#0",
+                r"
 // @dart = 3.10
 foo([var p = null]) {}
-"#,
+",
                 &[(3, 6, 12)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_staticConstField_inferredType_final#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_staticConstField_inferredType_final#0",
+                r"
 class C {
   static const i = null;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_dynamic#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_dynamic#0",
+                r"
 dynamic i = null;
-"#,
+",
                 &[(2, 9, 8)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_inferredType#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_inferredType#0",
+                r"
 var i = null;
-"#,
+",
                 &[(2, 5, 8)],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_inferredType_const#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_inferredType_const#0",
+                r"
 const i = null;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_inferredType_final#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_inferredType_final#0",
+                r"
 final i = null;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_inferredType_initializeToInt#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_inferredType_initializeToInt#0",
+                r"
 var i = 1;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_inferredType_noInitialization#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_inferredType_noInitialization#0",
+                r"
 var i;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_nullableType#0"#,
-                r#"
+                r"lints/avoid_init_to_null/AvoidInitToNullTest/test_topLevelVariable_nullableType#0",
+                r"
 int? ii = null;
-"#,
+",
                 &[(2, 6, 9)],
             ),
             (
-                r#"lints/avoid_init_to_null/doc_bad_0"#,
-                r#"class C {
+                r"lints/avoid_init_to_null/doc_bad_0",
+                r"class C {
   int? f = null;
 
   void m() {
@@ -509,12 +509,12 @@ int? ii = null;
     }
   }
 }
-"#,
+",
                 &[(2, 8, 8)],
             ),
             (
-                r#"lints/avoid_init_to_null/doc_bad_1"#,
-                r#"Item? bestDeal(List<Item> cart) {
+                r"lints/avoid_init_to_null/doc_bad_1",
+                r"Item? bestDeal(List<Item> cart) {
   Item? bestItem = null;
 
   for (final item in cart) {
@@ -525,12 +525,12 @@ int? ii = null;
 
   return bestItem;
 }
-"#,
+",
                 &[(2, 9, 15)],
             ),
             (
-                r#"lints/avoid_init_to_null/doc_good_0"#,
-                r#"class C {
+                r"lints/avoid_init_to_null/doc_good_0",
+                r"class C {
   int? f;
 
   void m() {
@@ -539,12 +539,12 @@ int? ii = null;
     }
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/avoid_init_to_null/doc_good_1"#,
-                r#"Item? bestDeal(List<Item> cart) {
+                r"lints/avoid_init_to_null/doc_good_1",
+                r"Item? bestDeal(List<Item> cart) {
   Item? bestItem;
 
   for (final item in cart) {
@@ -555,7 +555,7 @@ int? ii = null;
 
   return bestItem;
 }
-"#,
+",
                 &[],
             ),
         ];

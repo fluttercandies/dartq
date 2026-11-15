@@ -4,6 +4,7 @@
 //! `non_constant_identifier_names`, `file_names`, and
 //! `matching_super_parameters`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
@@ -73,7 +74,7 @@ pub(crate) mod camel_case_types {
         check,
     );
 
-    /// The `augment` ModSet bit (bridge `mod_bits`).
+    /// The `augment` `ModSet` bit (bridge `mod_bits`).
     const AUGMENT_BIT: u16 = 1 << 1;
 
     fn check(c: &mut Check<'_>) {
@@ -3997,7 +3998,7 @@ pub(crate) mod sort_constructors_first {
         } else {
             start_entity
         };
-        let end = c.utf16_end_of_token(end_token).unwrap_or_else(|| start);
+        let end = c.utf16_end_of_token(end_token).unwrap_or(start);
         start..end
     }
 
@@ -4200,14 +4201,14 @@ pub(crate) mod matching_super_parameters {
         // same-file declaration, names verbatim. Anything the fallback
         // cannot see (non-existent ctor, non-same-file container) stays
         // silent (under-report).
-        let super_positionals: Vec<String> = match binding.exists.then(|| binding.formals).flatten()
-        {
-            Some(formals) => formals
-                .positional
-                .iter()
-                .map(|formal| analysis.strings().resolve(formal.name).to_string())
-                .collect(),
-            None => {
+        let super_positionals: Vec<String> =
+            if let Some(formals) = binding.exists.then_some(binding.formals).flatten() {
+                formals
+                    .positional
+                    .iter()
+                    .map(|formal| analysis.strings().resolve(formal.name).to_string())
+                    .collect()
+            } else {
                 let Some(names) = primary_super_positionals(
                     c,
                     analysis.strings().resolve(binding.container),
@@ -4216,8 +4217,7 @@ pub(crate) mod matching_super_parameters {
                     return;
                 };
                 names
-            }
-        };
+            };
         // More positional formals passed to super than it has — an error
         // upstream too (:84-88).
         if super_positionals.len() < ours.len() {
@@ -4559,7 +4559,7 @@ mod oracle_corpus_pins {
     /// rule's own rows are pinned.
     ///
     /// 26 single-file cases pinned (12 oracle rows), every mismatch collected before the single panic.
-    /// Cross-file residuals not representable in a single-source fixture (oracle rows on `lib/a.dart`): test_augmentationClass_lowerCase#0, test_augmentationEnum_lowerCase#0, test_augmentationExtensionType_lowerCase#0, test_augmentationMixin_lowerCase#0.
+    /// Cross-file residuals not representable in a single-source fixture (oracle rows on `lib/a.dart`): `test_augmentationClass_lowerCase#0`, `test_augmentationEnum_lowerCase#0`, `test_augmentationExtensionType_lowerCase#0`, `test_augmentationMixin_lowerCase#0`.
     #[test]
     fn camel_case_types_oracle_corpus_pins() {
         // (case, source, oracle rows as (line, column, length)).
@@ -4703,7 +4703,7 @@ mod oracle_corpus_pins {
     /// `(line, column, length)` for every rule row.
     ///
     /// 73 single-file cases pinned (36 oracle rows), every mismatch collected before the single panic.
-    /// Cross-file residuals not representable in a single-source fixture (oracle rows on `lib/a.dart`): test_augmentedConstructor#0, test_augmentedField#0, test_augmentedFunction#0, test_augmentedFunction_namedParam#0, test_augmentedFunction_positionalParam#0, test_augmentedGetter#0, test_augmentedMethod#0, test_augmentedMethod_namedParam#0, test_augmentedMethod_positionalParam#0, test_augmentedTopLevelVariable#0.
+    /// Cross-file residuals not representable in a single-source fixture (oracle rows on `lib/a.dart`): `test_augmentedConstructor#0`, `test_augmentedField#0`, `test_augmentedFunction#0`, `test_augmentedFunction_namedParam#0`, `test_augmentedFunction_positionalParam#0`, `test_augmentedGetter#0`, `test_augmentedMethod#0`, `test_augmentedMethod_namedParam#0`, `test_augmentedMethod_positionalParam#0`, `test_augmentedTopLevelVariable#0`.
     #[test]
     fn non_constant_identifier_names_oracle_corpus_pins() {
         // (case, source, oracle rows as (line, column, length)).

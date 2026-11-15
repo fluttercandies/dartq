@@ -5,23 +5,24 @@
 //!
 //! For `List<void Function<T 5 6>()>? x;` the type scan's face ends before
 //! the junk `Function` (the recovered group's `skipEnd` is the synthetic `>`
-//! at the junk head, `syntheticGt`, util.dart:270 + type_info_impl.dart:1421,
+//! at the junk head, `syntheticGt`, util.dart:270 + `type_info_impl.dart:1421`,
 //! so `skipType` (:738-740) lands the member-name position there,
-//! parser_impl.dart:4245). `parseMethod` then asserts its return-type parse
+//! `parser_impl.dart:4245`). `parseMethod` then asserts its return-type parse
 //! lands exactly before that name (`assert(token.next == name)`,
-//! parser_impl.dart:5875). dartq's return-type re-parse could overshoot the
+//! `parser_impl.dart:5875`). dartq's return-type re-parse could overshoot the
 //! landing by absorbing `Function <T 5 6> ()` into the type, which re-anchored
 //! the whole member cascade on `?` (9 rows vs the oracle's 5). The fix reads
 //! the scan-face landing after the re-parse: on overshoot the
 //! `missing_method_parameters` row re-anchors on the scan-designated name
 //! (official `parseGetterOrFormalParameters` recovery reports on the name,
-//! parser_impl.dart:1684, with the `findNonZeroLengthToken` anchor walk,
+//! `parser_impl.dart:1684`, with the `findNonZeroLengthToken` anchor walk,
 //! util.dart:56), and the body face reports `missing_function_body` on the
 //! follower of the absorbed `?` — official `ensureBlock` reports from the
 //! synthetic `{` spliced at the body position and `reportRecoverableError`
 //! re-anchors a synthetic token on the first real follower
-//! (parser_impl.dart:4939 + util.dart:56).
+//! (`parser_impl.dart:4939` + util.dart:56).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -80,8 +81,14 @@ fn direct_gft_face_has_no_overshoot() {
 /// only arms when the return-type re-parse runs past the scan-face landing).
 #[test]
 fn clean_nullable_compound_field_stays_silent() {
-    assert!(sorted_rows("class A {\n  List<void Function<T>()>? x;\n}\n").is_empty());
-    assert!(sorted_rows("class A {\n  Map<String, int>? x;\n}\n").is_empty());
+    assert_eq!(
+        sorted_rows("class A {\n  List<void Function<T>()>? x;\n}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
+    assert_eq!(
+        sorted_rows("class A {\n  Map<String, int>? x;\n}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
 }
 
 /// Aligned by #3077 (was a frozen 4-row residual at #3074 close): the
@@ -93,7 +100,7 @@ fn clean_nullable_compound_field_stays_silent() {
 /// nameless-method body face lands on `?`, the operator cluster
 /// (`missing_keyword_operator` + `invalid_operator` via
 /// `parseInvalidOperatorDeclaration`/`parseOperatorName`,
-/// parser_impl.dart:11204/:6288) re-enters there, and the `x` cascade
+/// `parser_impl.dart:11204/:6288`) re-enters there, and the `x` cascade
 /// closes.
 #[test]
 fn map_face_cascade_matches_oracle() {

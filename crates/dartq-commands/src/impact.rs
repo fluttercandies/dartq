@@ -43,6 +43,7 @@
 //!
 //! [`LibraryChange::hypothetical`]: dartq_ai::impact::LibraryChange::hypothetical
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -2572,8 +2573,8 @@ mod tests {
         // one, the faces scope it differently (affected set vs workspace).
         let (compat_report, _) =
             crate::compat::compat(&root, &target, &[root.join("sdks/old")]).expect("compat run");
-        assert_eq!(
-            compat_report.matrix[0].compatible, false,
+        assert!(
+            !compat_report.matrix[0].compatible,
             "the compat axis verdict matches the default row"
         );
 
@@ -2923,7 +2924,7 @@ mod tests {
             format!("{}:1", root.join("lib/client.dart").display()),
             format!("{}:6", target.display()),
         ] {
-            let error = impact(&mut engine, &target, &[spelling.clone()])
+            let error = impact(&mut engine, &target, std::slice::from_ref(&spelling))
                 .expect_err("a miss is the usage tier");
             assert!(
                 matches!(error, ImpactError::Usage(_)),

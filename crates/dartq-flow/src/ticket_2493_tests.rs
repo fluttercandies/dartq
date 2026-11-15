@@ -13,7 +13,7 @@
 //! pkg/analyzer/lib/src/dart/resolver/flow_analysis_visitor.dart:615-632
 //! classifies through the subtype question). The dead-code verifier records
 //! the interval at the selector name (`recordDeadIntervalAt(node,
-//! selector.name)`, type_analyzer.dart:3995) and reports it at the chain's
+//! selector.name)`, `type_analyzer.dart:3995`) and reports it at the chain's
 //! close — one row anchored at the member name, never at the `?.` operator.
 //!
 //! The field-vs-local trap: an INSTANCE FIELD read fires exactly one row
@@ -21,6 +21,9 @@
 //! `_verifyUnassignedVariable` never adds its operator-anchored row); a
 //! LOCAL declared without an initializer fires TWO rows (the unassigned
 //! face adds the `?.`-operator anchor). The field shape is the corpus row.
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
@@ -85,8 +88,8 @@ impl TypeOps for InvalidBoundOps {
 /// byte offsets stand in).
 fn dead_of_with(
     source: &'static str,
-    invalid: Option<&str>,
-    stage: impl FnOnce(&mut Flow, u32, u32),
+    invalid: Option<&'static str>,
+    stage: impl FnOnce(&mut Flow<'_>, u32, u32),
 ) -> Vec<String> {
     let result = dartq_scanner::scan(
         source,

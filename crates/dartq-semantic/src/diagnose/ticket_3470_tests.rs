@@ -10,6 +10,7 @@
 //! receiver-start through the closing `)`; a send resolving to a
 //! declared method or function keeps the callee's name token.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops, rows};
 
 /// The `use_of_void_result` spans of `fixture` in fixture-relative

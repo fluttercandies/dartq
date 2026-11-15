@@ -11,6 +11,7 @@
 //! (generic_inferrer.dart:535-538 through
 //! type_constraint.dart:263-300's "declared to extend ... producing").
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -57,15 +58,15 @@ fn at(source: &str, needle: &str) -> u32 {
 }
 
 /// The extends-clause argument face
-/// (TypeArgumentNotMatchingBoundsTest/test_extends_regressionInIssue18468Fix):
+/// (`TypeArgumentNotMatchingBoundsTest/test_extends_regressionInIssue18468Fix)`:
 /// `U` inside `extends X<U>` checks `X`'s `T extends Type` — the clause
 /// parent denies the super pass, so the violation reports plain.
 #[test]
 fn tab_clause_extends_argument() {
-    let source = r#"
+    let source = r"
 class X<T extends Type> {}
 class Y<U> extends X<U> {}
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -86,14 +87,14 @@ class Y<U> extends X<U> {}
 /// own parameters.
 #[test]
 fn tab_implements_with_on_clauses() {
-    let source = r#"
+    let source = r"
 class S {}
 class T {}
 class C<X extends S, Y extends T> {}
 mixin M<X extends S, Y extends T> {}
 class MA<X, Y> extends C<Y, X> with M<Y, X> {}
 class MB<X, Y> implements C<Y, X> {}
-"#;
+";
     let report = report_ops(source);
     let rows = bounds_rows(&report);
     // `C<Y, X>` at extends: `Y` vs `S`, `X` vs `T` — both fail.
@@ -121,7 +122,7 @@ class MB<X, Y> implements C<Y, X> {}
     assert_eq!(
         rows[2],
         (
-            at(source, "Y, X> {") + 0,
+            at(source, "Y, X> {"),
             1,
             "'Y' doesn't conform to the bound 'S' of the type parameter 'X'.".to_string()
         )
@@ -145,9 +146,9 @@ class MB<X, Y> implements C<Y, X> {}
 /// the report carries the inverted-type context row).
 #[test]
 fn tab_bound_internal_argument() {
-    let source = r#"
+    let source = r"
 class A<X extends A<X?>> {}
-"#;
+";
     let report = report_ops(source);
     let rows = bounds_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", report.diagnostics);
@@ -177,11 +178,11 @@ class A<X extends A<X?>> {}
 /// the raw-type context row (`:441-446`).
 #[test]
 fn tab_bare_clause_head_instantiated_to_bounds() {
-    let source = r#"
+    let source = r"
 class B<T> {}
 class A<T extends B<T>> {}
 class Test extends A {}
-"#;
+";
     let report = report_ops(source);
     let rows = bounds_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", report.diagnostics);
@@ -207,10 +208,10 @@ class Test extends A {}
 /// stays silent (`class A<T>` reads `A<dynamic>` — unbounded).
 #[test]
 fn tab_bare_clause_head_well_bounded_stays_silent() {
-    let source = r#"
+    let source = r"
 class A<T> {}
 class Test extends A {}
-"#;
+";
     let report = report_ops(source);
     assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
@@ -221,13 +222,13 @@ class Test extends A {}
 /// the report carries the inverted-type context row.
 #[test]
 fn tab_clause_nested_argument_checks_its_own_head() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends A> {}
 class X<T> {}
 class Y extends X<G<B>> {}
-"#;
+";
     let report = report_ops(source);
     let rows = bounds_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", report.diagnostics);
@@ -257,10 +258,10 @@ class Y extends X<G<B>> {}
 /// `A<X>`), the decl-scoped `bound(X) <: B` rule.
 #[test]
 fn tab_alias_rhs_named_side() {
-    let source = r#"
+    let source = r"
 class A<X extends A<X>> {}
 typedef B<X extends A<A<X>>> = A<X>;
-"#;
+";
     let report = report_ops(source);
     let rows = bounds_rows(&report);
     assert!(
@@ -269,8 +270,7 @@ typedef B<X extends A<A<X>>> = A<X>;
                 && *offset == at(source, "A<X>>> =")
                 && msg.contains("'A<X>' doesn't conform to the bound 'A<A<X>>'")
         }),
-        "the bound's own argument reports: {:?}",
-        rows
+        "the bound's own argument reports: {rows:?}"
     );
     let x_args: Vec<_> = rows
         .iter()
@@ -289,13 +289,13 @@ typedef B<X extends A<A<X>>> = A<X>;
 /// the verdict on the unmodelable half.
 #[test]
 fn tab_clause_family_stays_silent() {
-    let source = r#"
+    let source = r"
 class A {}
 class G<E extends A> {}
 class X<T> {}
 class Y extends X<G<A>> {}
 class Z<U extends A> extends X<G<U>> {}
-"#;
+";
     let report = report_ops(source);
     assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
@@ -305,12 +305,12 @@ class Z<U extends A> extends X<G<U>> {}
 /// report — the recursive walk adds no new rows on well-bounded sources.
 #[test]
 fn tab_satisfied_nested_and_bounded_args_silent() {
-    let source = r#"
+    let source = r"
 class num2 {}
 class A<X extends num> {}
 class B<Y extends num> extends A<Y> {}
 class C<Z> extends A<Z> {}
-"#;
+";
     // `A<Y>`: `Y extends num` — `Y <: num` through its own bound
     // (suppressed as unmodelable, the landed posture). `A<Z>`: `Z`
     // unbounded — `Z <: num` is false in the oracle too... but `Z` is an
@@ -328,19 +328,19 @@ class C<Z> extends A<Z> {}
     );
 }
 
-/// The could_not_infer message shape the raw-constructor inference face
+/// The `could_not_infer` message shape the raw-constructor inference face
 /// already emits (generic_inferrer.dart:535-538 +
 /// type_constraint.dart:263-300): `class B<X extends B<X>>` then a bare
 /// `B()` seeds `B<Object?>` against `B<B<Object?>>` and reports the
 /// "declared to extend ... producing" detail.
 #[test]
 fn i2b_could_not_infer_extends_clause_origin() {
-    let source = r#"
+    let source = r"
 class B<X extends B<X>> {}
 main() {
   B();
 }
-"#;
+";
     let report = report_ops(source);
     let rows = infer_rows(&report);
     assert!(
@@ -351,8 +351,7 @@ main() {
                     "Type parameter 'X' is declared to extend 'B<X>' producing 'B<B<Object?>>'",
                 )
         }),
-        "the declared-to-extend origin text: {:?}",
-        rows
+        "the declared-to-extend origin text: {rows:?}"
     );
 }
 
@@ -363,14 +362,14 @@ main() {
 /// parameter, spelling the alias's own type variables (#2841 posture).
 #[test]
 fn i2b_could_not_infer_alias_rhs_creation() {
-    let source = r#"
+    let source = r"
 class B<X extends B<X>> {}
 class C<X, Y> {}
 typedef A<X1 extends B<X2>, X2 extends B<X2>> = C<X1, X2>;
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(source);
     let rows = infer_rows(&report);
     assert!(
@@ -381,15 +380,13 @@ main() {
                     "Type parameter 'X1' is declared to extend 'B<X2>' producing 'B<B<Object?>>'",
                 )
         }),
-        "the alias X1 origin text: {:?}",
-        rows
+        "the alias X1 origin text: {rows:?}"
     );
     assert!(
         rows.iter().any(|(_, _, msg)| {
             msg.contains("Couldn't infer type parameter 'X2'")
                 && msg.contains("Tried to infer 'B<Object?>' for 'X2'")
         }),
-        "the alias X2 origin text: {:?}",
-        rows
+        "the alias X2 origin text: {rows:?}"
     );
 }

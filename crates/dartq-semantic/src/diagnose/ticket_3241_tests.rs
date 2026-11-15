@@ -37,6 +37,7 @@
 //! module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops_wildcards, rows};
 use crate::diagnose::types::FileReport;
 
@@ -170,7 +171,7 @@ void f(int _) {
 }
 
 /// A CLASS MEMBER named `_` is not a wildcard kind either
-/// (MethodDeclarationResolutionTest.test_wildCardMethod): the unused
+/// (`MethodDeclarationResolutionTest.test_wildCardMethod)`: the unused
 /// private method reports under both feature postures.
 #[test]
 fn underscore_method_reports_under_both_postures() {
@@ -268,7 +269,7 @@ String f(C c) {
 
 // —— C5: operator / index / `call` uses credit the extension member ————————
 
-/// UnusedElementTest.test_method_isUsed_privateExtension_indexOperator: an
+/// `UnusedElementTest.test_method_isUsed_privateExtension_indexOperator`: an
 /// index read over the extended type credits the extension's `[]`.
 #[test]
 fn extension_index_operator_use_credits_the_member() {
@@ -288,7 +289,7 @@ void main() {
     );
 }
 
-/// test_method_isUsed_privateExtension_indexEqOperator: an index write
+/// `test_method_isUsed_privateExtension_indexEqOperator`: an index write
 /// credits the extension's `[]=`.
 #[test]
 fn extension_index_write_credits_the_member() {
@@ -308,7 +309,7 @@ void main() {
     );
 }
 
-/// test_method_isUsed_privateExtension_operator_assignment: a compound
+/// `test_method_isUsed_privateExtension_operator_assignment`: a compound
 /// assignment over the extended type credits the binary operator.
 #[test]
 fn extension_compound_operator_use_credits_the_member() {
@@ -328,7 +329,7 @@ void f(String s) {
     );
 }
 
-/// test_method_isUsed_privateExtension_methodCall: invoking a value whose
+/// `test_method_isUsed_privateExtension_methodCall`: invoking a value whose
 /// extension declares `call` credits that member.
 #[test]
 fn extension_call_use_credits_the_member() {
@@ -372,7 +373,7 @@ void main() {
 
 // —— C4: an `extension on Function` applied to a function-valued receiver —
 
-/// FunctionReferenceResolutionTest.test_topLevelFunction_targetOfFunctionCall:
+/// `FunctionReferenceResolutionTest.test_topLevelFunction_targetOfFunctionCall`:
 /// `foo<int>.m()` instantiates the generic function and applies the
 /// `on Function` extension — the member is credited
 /// (`visitSimpleIdentifier`'s `ExtensionElement` arm, :341-348).
@@ -396,7 +397,7 @@ void bar() {
     );
 }
 
-/// test_function_extensionOnFunction: the tear-off read `foo.m<int>` over
+/// `test_function_extensionOnFunction`: the tear-off read `foo.m<int>` over
 /// a plain function reference applies the same face.
 #[test]
 fn extension_on_function_credits_a_plain_function_tearoff() {

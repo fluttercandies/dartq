@@ -16,6 +16,7 @@
 //! shared.dart:396-416 (`getAdditionalFieldType`) and :832-911
 //! (`createListSpace`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 
 /// The `code` rows of `report` as message texts, in source order.
@@ -32,7 +33,7 @@ fn rows_of(source: &str, code: &str) -> Vec<String> {
 
 /// `[]` alone spells no head/tail key, so `ListTypeStaticType.getSubtypes`
 /// splits `List<int>` into the single open `[...]` subtype (`maxSize` 0 —
-/// upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/exhaustiveness/
+/// upstream Dart SDK source, pkg/_`fe_analyzer_shared/lib/src/exhaustiveness`/
 /// types/list.dart:65-121). `[]` does not cover it, and the witness prints
 /// that subtype's own spelling (`witnessToDart`, same file).
 #[test]
@@ -50,7 +51,7 @@ fn empty_list_case_witnesses_the_open_rest() {
 }
 
 /// `[]` + `[_, ...]` covers every size: the oracle stays silent
-/// (exhaustiveness_list_A03_t01's exhaustive arm).
+/// (`exhaustiveness_list_A03_t01`'s exhaustive arm).
 #[test]
 fn empty_and_rest_cases_cover_every_size() {
     let rows = rows_of(
@@ -92,7 +93,7 @@ fn bare_rest_alone_covers() {
 
 /// A statement switch only demands exhaustiveness over an always-exhaustive
 /// scrutinee type (`mustBeExhaustive: isAlwaysExhaustive(...)`, upstream
-/// Dart SDK source, pkg/analyzer/lib/src/dart/constant/constant_verifier.dart
+/// Dart SDK source, `pkg/analyzer/lib/src/dart/constant/constant_verifier.dart`
 /// :498) — `bool`, `Null`, enums, sealed classes, and records/`FutureOr`
 /// of those (pkg/analyzer/lib/src/dart/element/type_system.dart:815-856).
 /// `List` is none of them: the `[]` gap stays unreported.
@@ -158,8 +159,8 @@ fn empty_case_after_rest_stays_live() {
 /// alone: `dead_code` follows flow-analysis reachability, and the first
 /// `[]` is refutable, so the second body stays reachable. The corpus shows
 /// the split — dead code only after an irrefutable head
-/// (language/patterns/switch_trivial_exhaustiveness_error_test, after
-/// `case _:`; language/patterns/flow_analysis/list_pattern_error_test,
+/// (`language/patterns/switch_trivial_exhaustiveness_error_test`, after
+/// `case _:`; `language/patterns/flow_analysis/list_pattern_error_test`,
 /// after `case [...]:`).
 #[test]
 fn duplicate_empty_case_body_stays_live() {

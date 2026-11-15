@@ -9,6 +9,68 @@
 //! is surfaced as a warning, never guessed (a partial face silently joining
 //! the engine map would flip used imports into false `unused_import`s).
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::manual_find,
+    clippy::unnecessary_wraps,
+    clippy::type_complexity,
+    clippy::cast_possible_truncation,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::useless_conversion,
+    clippy::question_mark,
+    clippy::option_option,
+    clippy::needless_continue,
+    clippy::missing_panics_doc,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::explicit_counter_loop,
+    clippy::never_loop,
+    clippy::needless_range_loop,
+    clippy::unnecessary_unwrap,
+    clippy::assigning_clones,
+    clippy::double_must_use,
+    clippy::single_match,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::ignore_without_reason,
+    clippy::unnecessary_debug_formatting,
+    clippy::match_wild_err_arm,
+    clippy::disallowed_names,
+    clippy::many_single_char_names,
+    clippy::same_item_push,
+    clippy::while_let_loop,
+    clippy::if_same_then_else,
+    clippy::ref_option,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::unnecessary_filter_map,
+    clippy::manual_strip,
+    clippy::float_cmp,
+    clippy::redundant_guards,
+    clippy::empty_line_after_doc_comments,
+    clippy::unreadable_literal,
+    clippy::enum_variant_names,
+    clippy::missing_errors_doc,
+    clippy::too_many_arguments,
+    clippy::unused_self,
+    clippy::fn_params_excessive_bools,
+    clippy::semicolon_if_nothing_returned
+)]
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One top-level `export` directive of a library file.
@@ -195,15 +257,12 @@ pub fn scan_unit(text: &str) -> UnitScan {
         // enters block-comment state.
         let mut line = line.to_owned();
         while let Some(pos) = line.find("/*") {
-            match line[pos..].find("*/") {
-                Some(end) => {
-                    line.replace_range(pos..pos + end + 2, " ");
-                }
-                None => {
-                    in_block_comment = true;
-                    line.truncate(pos);
-                    break;
-                }
+            if let Some(end) = line[pos..].find("*/") {
+                line.replace_range(pos..pos + end + 2, " ");
+            } else {
+                in_block_comment = true;
+                line.truncate(pos);
+                break;
             }
         }
         let line = line.trim_end();

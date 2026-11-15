@@ -10,7 +10,7 @@
 //! `this.augmentMember` from the introducing body both read as undefined.
 //! Upstream an `augment` head declares a FRAGMENT of the element its
 //! introduction declares (`element.firstFragment` is the introduction,
-//! upstream Dart SDK source, pkg/_fe_analyzer_shared augmentation handling),
+//! upstream Dart SDK source, pkg/_`fe_analyzer_shared` augmentation handling),
 //! so the element carries one member face — the union.
 //!
 //! # The pins
@@ -21,6 +21,7 @@
 //! declared in NEITHER still reports; ⑤ the merge is order-independent —
 //! the same fragments in a different unit order answer the same face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops_augment, report_ops_augment_intro_experiments, rows};
 use crate::collector::collect;
 use crate::library::{ElementIndex, resolve_container};

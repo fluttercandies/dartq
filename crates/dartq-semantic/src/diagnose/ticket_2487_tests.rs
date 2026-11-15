@@ -23,6 +23,7 @@
 //! its flow face); these pins prove the id-keyed set answers the same
 //! for the undefined, registered, kind-spelling, and scoped-parameter
 //! faces through the mounted `ResolvedTypeOps`.
+#![allow(clippy::redundant_closure, clippy::semicolon_if_nothing_returned)]
 
 use super::super::types::FileReport;
 use super::async_return_tests::{code_names, report};
@@ -43,7 +44,7 @@ fn rows(report: &FileReport, code: &str) -> Vec<(u32, u32)> {
 /// The plain `=` face over a wide right-hand side: `a = <4000-term
 /// int chain>` still lands the assignability verdict the single scan
 /// produced — `invalid_assignment` at the whole right-hand expression
-/// (the ticket_3145 `y = B().x` verdict over a multi-row window).
+/// (the `ticket_3145` `y = B().x` verdict over a multi-row window).
 #[test]
 fn assignment_wide_rhs_reports() {
     let tail = "b.x + ".repeat(4000);
@@ -63,7 +64,7 @@ fn assignment_wide_rhs_reports() {
 /// The compound face reads the same helper: `i += <wide String chain>`
 /// keeps its verdict — the `int.+` parameter refuses `String` (ATNA)
 /// and the `num` result refuses the `int` write-back
-/// (`invalid_assignment`; the ticket_2967 fixture family's shape,
+/// (`invalid_assignment`; the `ticket_2967` fixture family's shape,
 /// assignment_expression_resolver.dart:308-313/368-372).
 #[test]
 fn compound_assignment_wide_rhs_reports() {
@@ -74,9 +75,7 @@ fn compound_assignment_wide_rhs_reports() {
     );
     let report = report(&source);
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|code| *code == "invalid_assignment"),
+        code_names(&report).contains(&"invalid_assignment"),
         "{:?}",
         report.diagnostics
     );
@@ -85,8 +84,8 @@ fn compound_assignment_wide_rhs_reports() {
 /// The index-write face over a wide right-hand side: `l[c] = <4000-term
 /// int chain>` skips the folded index-result value row to find the `l`
 /// target — the index argument `c` keeps its read credit and the whole
-/// file stays silent (the ticket_2423 `folded_index_target` verdict
-/// over a multi-row tail, the ticket_2436 `operator []=` decl).
+/// file stays silent (the `ticket_2423` `folded_index_target` verdict
+/// over a multi-row tail, the `ticket_2436` `operator []=` decl).
 #[test]
 fn index_assignment_skips_the_folded_value_row() {
     let tail = "1 + ".repeat(4000);
@@ -122,8 +121,8 @@ fn assignment_target_visits_stay_in_the_prefix() {
     ASSIGNMENT_TARGET_VISITS.with(|visits| visits.set(0));
     ASSIGNMENT_TARGET_MAX_TAIL.with(|tail| tail.set(0));
     let report = report(&source);
-    let visits = ASSIGNMENT_TARGET_VISITS.with(|visits| visits.get());
-    let max_tail = ASSIGNMENT_TARGET_MAX_TAIL.with(|tail| tail.get());
+    let visits = ASSIGNMENT_TARGET_VISITS.with(std::cell::Cell::get);
+    let max_tail = ASSIGNMENT_TARGET_MAX_TAIL.with(std::cell::Cell::get);
     // The interpolation assignment's element rows stay live at check
     // time: at least one call saw a >4000-row post-operator tail the old
     // `.rev().find` walked element by element.
@@ -165,9 +164,7 @@ fn undefined_tested_head_reports_its_code() {
                       }";
     let report = report_ops(source);
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|name| *name == "type_test_with_undefined_name"),
+        code_names(&report).contains(&"type_test_with_undefined_name"),
         "{:?}",
         report.diagnostics
     );
@@ -186,9 +183,7 @@ fn defined_tested_head_stays_out_of_the_set() {
                       }";
     let report = report_ops(source);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "type_test_with_undefined_name"),
+        !code_names(&report).contains(&"type_test_with_undefined_name"),
         "{:?}",
         report.diagnostics
     );
@@ -209,9 +204,7 @@ fn kind_spellings_stay_out_of_the_set() {
                       }";
     let report = report_ops(source);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "type_test_with_undefined_name"),
+        !code_names(&report).contains(&"type_test_with_undefined_name"),
         "{:?}",
         report.diagnostics
     );
@@ -229,9 +222,7 @@ fn scoped_parameter_tested_head_stays_out_of_the_set() {
                       }";
     let report = report_ops(source);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "type_test_with_undefined_name"),
+        !code_names(&report).contains(&"type_test_with_undefined_name"),
         "{:?}",
         report.diagnostics
     );
@@ -255,9 +246,7 @@ fn undefined_tested_head_promotes_nothing() {
         report.diagnostics
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|name| *name == "undefined_getter"),
+        code_names(&report).contains(&"undefined_getter"),
         "the member read resolves against the declared `int` face: {:?}",
         report.diagnostics
     );

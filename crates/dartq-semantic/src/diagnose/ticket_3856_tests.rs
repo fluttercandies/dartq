@@ -39,8 +39,11 @@
 //! (`diagnose::duplicate_definition_diagnostics`) render the same code from
 //! the same log, and the engine's bake-versus-fold drop accepts both names
 //! (`semdiag.rs`).
+#![allow(
+    clippy::empty_line_after_doc_comments,
+    clippy::semicolon_if_nothing_returned
+)]
 
-use crate::codes::SemanticCode;
 use dartq_diagnostics::Severity;
 
 use super::test_rig::report_ops_bare;

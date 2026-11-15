@@ -20,6 +20,7 @@
 //! lands in the matrix as the isolated `sdk_unavailable` row (compat's
 //! failure-isolation doctrine).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -746,7 +747,7 @@ fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
         .get("memory")
         .and_then(|memory| memory.get("max_concurrent"))
         .filter(|cap| !cap.is_null())
-        && !cap.as_i64().is_some_and(|cap| cap >= 0)
+        && cap.as_i64().is_none_or(|cap| cap < 0)
     {
         let shown = serde_yaml::to_string(cap).unwrap_or_default();
         return Err(ConfigError::Invalid(format!(
@@ -1058,10 +1059,9 @@ mod tests {
     fn absent_or_defaults_only_config_stays_byte_identical() {
         let root = fixture("absent");
         assert!(load(&root).expect("absent is none").is_none());
-        assert!(
-            compat_axis_roots(&root, &[], &[])
-                .expect("no axes")
-                .is_empty()
+        assert_eq!(
+            compat_axis_roots(&root, &[], &[]).expect("no axes"),
+            [] as [std::path::PathBuf; 0]
         );
 
         let target = root.join("lib/a.dart");
@@ -1092,10 +1092,9 @@ mod tests {
             config.generated.expect("generated").patterns,
             Some(vec!["*.g.dart".to_owned()])
         );
-        assert!(
-            compat_axis_roots(&root, &[], &[])
-                .expect("no axes")
-                .is_empty()
+        assert_eq!(
+            compat_axis_roots(&root, &[], &[]).expect("no axes"),
+            [] as [std::path::PathBuf; 0]
         );
         fs::remove_dir_all(&root).ok();
     }

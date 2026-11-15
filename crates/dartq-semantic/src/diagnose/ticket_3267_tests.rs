@@ -3,7 +3,7 @@
 //!
 //! Upstream decides an assignment against the write element's own type
 //! (`AssignmentExpressionImpl.writeType`, upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart:361)
+//! `pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart:361`)
 //! with `isSubtypeOf(rightType, writeType)`. For a member whose declared
 //! type is a bounded type parameter (`class Holder<T extends A> { T slot; }`)
 //! that write type is the PARAMETER `T`, never its bound `A`: a plain type
@@ -29,6 +29,7 @@
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (the module
 //! lives outside this ticket's write scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 

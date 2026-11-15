@@ -26,6 +26,7 @@
 //! `//+ ` + the line, or bare `//+` for an empty line. File bytes are
 //! canonicalized to end with exactly one newline.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// Why a `.case` payload could not be parsed.
 #[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)] // format reader for the consuming lanes; exercised by tests

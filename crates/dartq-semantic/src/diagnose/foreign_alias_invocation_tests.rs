@@ -7,6 +7,7 @@
 //! graph-wide container face (the alias's own top-level declaration is
 //! not a container). Oracle provenance: `dart analyze` 3.13.1.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, code_names, report_ops_imports};
 
 /// `TCG()` over an imported alias whose RHS head nothing declares

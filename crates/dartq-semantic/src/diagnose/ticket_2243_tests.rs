@@ -10,6 +10,7 @@
 //!    `C<int>`; dartq leaves it unpromoted (an argument-less RHS
 //!    promotes).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

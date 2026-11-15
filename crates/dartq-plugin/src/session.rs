@@ -31,6 +31,7 @@
 //! - Any `Err` from [`Session::handle`] is fatal: the caller must discard the
 //!   session and kill the plugin process. The session never resynchronizes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;

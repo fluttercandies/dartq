@@ -9,6 +9,7 @@
 //! fixture below was probed silent against oracle `dart analyze` (fvm
 //! default) unless stated otherwise.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -78,7 +79,7 @@ fn code_names(report: &FileReport) -> Vec<&'static str> {
 }
 
 /// The collection-head stubs the written annotations name
-/// (ticket_2326 harness convention).
+/// (`ticket_2326` harness convention).
 const LITERAL_HARNESS: &str = "class int {}\nclass String {}\nclass List<T> {}\n\
                               class Set<T> {}\nclass Map<K, V> {}\nclass Iterable<T> {}\n\
                               class Stream<T> {}\nclass dynamic_ {}\nclass Object {}\n";

@@ -7,6 +7,7 @@
 //! Each pin reproduces the upstream behavior the shape implements; the
 //! shapes were verified net-neutral against the full lib suite.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

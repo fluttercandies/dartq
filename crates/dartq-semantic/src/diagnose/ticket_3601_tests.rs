@@ -42,6 +42,7 @@
 //! reports `'_'` for `.member() == member`, `Object` for the `(x as Object)
 //! == .y` left casts, and `missing_context` for `assert(.blue == color)`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use crate::diagnose::FileReport;
 

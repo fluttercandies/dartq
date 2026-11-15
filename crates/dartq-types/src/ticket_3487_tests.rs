@@ -28,6 +28,7 @@
 //! counterfactual was run too: rewriting `E1`'s bounds, acyclically, so its
 //! to-bounds type is the other answer flips the diagnostic as stated.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
 use crate::instantiate_to_bound::{
     BoundsInstantiation, instantiate_type_formals_to_bounds_fixpoint,

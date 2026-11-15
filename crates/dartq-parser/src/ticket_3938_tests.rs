@@ -23,6 +23,7 @@
 //!    `parse_top_level_method` — the `()` parameter list is consumed and
 //!    `class` carries the missing-body row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::parser::Parser;
 use crate::tests::collector::{Collector, latest_features, scan_ok};
 
@@ -94,7 +95,7 @@ fn annotation_getter_reparse_full_row_set() {
 
 /// `@p.A.ctor<B>() class C {}`: the `<B>` reparses as binary `<`/`>`
 /// operators (`type_args_after_third_segment_reparse_as_binary` in
-/// ticket_3930_tests.rs pins the head four rows). After the
+/// `ticket_3930_tests.rs` pins the head four rows). After the
 /// `top_level_operator` row at `>`, the `()` group reparses as an
 /// `operator>()` declaration — oracle reports `missing_function_body` at
 /// `class` (1:16 len 5).

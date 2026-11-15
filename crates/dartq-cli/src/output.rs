@@ -16,7 +16,7 @@
 //!
 //! The three faces encode the same value — there is no key-renaming
 //! layer. The producers own the vocabulary: the command faces emit the
-//! short snake_case table the daemon's `dartq/*` answers share natively
+//! short `snake_case` table the daemon's `dartq/*` answers share natively
 //! (`v`, `diags`, `sev`, `decls`, `refs`, `off`, and so on), and the two
 //! frozen long-spelling contracts keep theirs on every face — the
 //! diagnostic faces' json envelope (the oracle-parity dialect) and the
@@ -27,6 +27,7 @@
 //!
 //! [Language Object Notation v1]: https://github.com/fluttercandies/lon/blob/main/spec/lon-v1.md
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use clap::ValueEnum;
 
 /// The analyze/check faces' lon document — the shared builder both the CLI

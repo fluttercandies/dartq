@@ -1,5 +1,5 @@
 //! #3954 pins — the `!` staging gate's unknown-operand admission
-//! (`Engine::check_null_assert`, engine_core.rs): the gate no longer refuses
+//! (`Engine::check_null_assert`, `engine_core.rs)`: the gate no longer refuses
 //! an unknown-typed bare local read, so an implicitly typed formal and an
 //! unannotated `var` reach the teardown promotion re-decision
 //! (`flush_null_aware_staged`) exactly like `dynamic`. Upstream
@@ -7,7 +7,7 @@
 //! promoted face — it never rejects an unknown declared type.
 //!
 //! The acceptance pair (`implicit_formal_promoted_bang_reports`,
-//! `implicit_var_promoted_bang_reports`) lives in ticket_3933_tests.rs —
+//! `implicit_var_promoted_bang_reports`) lives in `ticket_3933_tests.rs` —
 //! this file pins the bounds the relaxed gate must hold:
 //!
 //! | fixture                                    | oracle  |
@@ -23,6 +23,7 @@
 //! `ty != Ty::Unknown` conjunct cannot fabricate a report. The qualified
 //! (`c.m!`) arm stays out through the unchanged `!qualified` conjunct.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

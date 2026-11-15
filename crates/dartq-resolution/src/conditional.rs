@@ -31,6 +31,7 @@
 //! Under the engine's empty default context (today's oracle truth, no
 //! `-D` surface) every condition misses and the primary URI always wins.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use rustc_hash::FxHashMap;
 
 /// One `if (name == 'value') 'uri'` clause of a configurable directive.

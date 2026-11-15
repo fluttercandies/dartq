@@ -11,6 +11,7 @@
 //! back anyway. `named_field_span` self-detects (no adjoining `:` →
 //! `None`), so the gate is gone and every candidate goes through it.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 use crate::diagnose::FileReport;
 

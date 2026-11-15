@@ -11,6 +11,7 @@
 //! `== null` branch (promoted to `Null`), the else branch, and the
 //! unguarded read keep the report.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

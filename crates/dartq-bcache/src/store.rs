@@ -124,6 +124,7 @@
 //!   plus one walk over the blobs, O(entries + blobs), holding one small
 //!   record per blob. `gc` rebooks the usage counter to what it saw.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -496,17 +497,14 @@ impl CasStore {
         let mut live = Vec::with_capacity(entries.len());
         let mut evict = Vec::new();
         for entry in entries {
-            match entry.facts {
-                Ok(facts) => {
-                    for blob in &facts.blobs {
-                        *refs.entry(*blob).or_default() += 1;
-                    }
-                    live.push((facts.last_hit_unix, entry.dir, facts.blobs));
+            if let Ok(facts) = entry.facts {
+                for blob in &facts.blobs {
+                    *refs.entry(*blob).or_default() += 1;
                 }
-                Err(_) => {
-                    report.corrupt_manifests += 1;
-                    evict.push(entry.dir);
-                }
+                live.push((facts.last_hit_unix, entry.dir, facts.blobs));
+            } else {
+                report.corrupt_manifests += 1;
+                evict.push(entry.dir);
             }
         }
 
@@ -896,7 +894,7 @@ impl CasStore {
         {
             let lock = self.pin_lock()?;
             let taken = try_flock(&lock, libc::LOCK_EX).map_err(io_at(&self.pin_lock_path()))?;
-            return Ok(taken.then_some(lock));
+            Ok(taken.then_some(lock))
         }
         #[cfg(not(unix))]
         Ok(None)
@@ -1193,22 +1191,22 @@ impl CasStore {
     }
 
     /// The blob count and byte total of [`Self::scan_blobs`] at the
-    /// cost of a bare directory walk. stats() only ever consumes those
+    /// cost of a bare directory walk. `stats()` only ever consumes those
     /// two numbers, so this walk keeps the per-blob work at exactly
     /// what the store's differential test measures a bare walk at —
     /// one `metadata` fetch plus a borrowed-name check — with none of
-    /// scan_blobs' baggage: no PathBuf per blob (names come from
+    /// `scan_blobs`' baggage: no `PathBuf` per blob (names come from
     /// `DirEntry::file_name()`, never joined into paths), no
     /// `ScannedBlob` materialization into a Vec, no mtime a count
     /// never reads, no digest decode a count never needs. The name
-    /// gate is scan_blobs' own — a regular file, under the shard its
+    /// gate is `scan_blobs`' own — a regular file, under the shard its
     /// first two digits prescribe, spelled as a digest: the spelling
     /// check [`is_hex_digest`] decides acceptance exactly as
     /// `name.parse::<BlobId>()` does (`from_str` accepts iff the
     /// spelling is canonical, and a canonical spelling always decodes)
     /// without materializing the 32 bytes — so foreign files stay
     /// uncounted here exactly as they stay untouched there.
-    /// scan_blobs itself stays: gc's in-flight windowing needs the
+    /// `scan_blobs` itself stays: gc's in-flight windowing needs the
     /// ids and mtimes; the differential test (a 60k-blob store, stats
     /// vs a bare walk, budget ×2) is what quantifies the "nothing per
     /// blob beyond the walk" claim.
@@ -1381,7 +1379,7 @@ impl Drop for Scratch {
 ///
 /// Apple platforms issue `F_BARRIERFSYNC`, a write barrier, instead of the
 /// drive-cache flush `File::sync_data` maps to there (`F_FULLFSYNC`,
-/// milliseconds per call on Apple NVMe — it would dominate an ingest of
+/// milliseconds per call on Apple `NVMe` — it would dominate an ingest of
 /// many small files and the `record_hit` of every cache hit). A volume that
 /// rejects the barrier gets the full flush. Elsewhere: `fdatasync`.
 fn sync_before_rename(file: &File) -> io::Result<()> {
@@ -1646,7 +1644,7 @@ mod tests {
         (path, BlobId(*blake3::hash(bytes).as_bytes()))
     }
 
-    /// One DirRecord over `sources`, named `name`, replayable per `rule`.
+    /// One `DirRecord` over `sources`, named `name`, replayable per `rule`.
     fn record(name: &str, rule: NameRule, sources: &[(PathBuf, BlobId)]) -> DirRecord {
         DirRecord {
             name_observed: name.to_owned(),
@@ -1936,8 +1934,8 @@ mod tests {
         .map(|(name, len)| source(&f.build, name, &vec![name.as_bytes()[0]; len]));
         put(&f, 1, &[a.clone(), b.clone()], 100);
         put(&f, 2, &[b.clone(), c.clone()], 200);
-        put(&f, 3, &[d.clone()], now - 10);
-        put(&f, 4, &[orphan.clone()], 50);
+        put(&f, 3, std::slice::from_ref(&d), now - 10);
+        put(&f, 4, std::slice::from_ref(&orphan), 50);
         drop_entry(&f, 4);
 
         // 15_000 bytes stay referenced once the orphan goes; evicting the
@@ -1999,9 +1997,9 @@ mod tests {
         // Two runs rewrote the same dill path with different bytes.
         let dill = "ab.cache.dill.track.dill";
         let v1 = source(&f.build, dill, b"kernel v1");
-        put(&f, 1, &[v1.clone()], 100);
+        put(&f, 1, std::slice::from_ref(&v1), 100);
         let v2 = source(&f.build, dill, b"kernel v2");
-        put(&f, 1, &[v2.clone()], 200);
+        put(&f, 1, std::slice::from_ref(&v2), 200);
 
         let manifest = f.store.lookup(&key(1)).unwrap().unwrap();
         assert_eq!(manifest.dirs[0].files.len(), 1, "no append-only blob list");
@@ -2041,9 +2039,9 @@ mod tests {
         let own = source(&f.build, "own", &[b'o'; 48]);
         let shared = source(&f.build, "shared", &[b's'; 32]);
         put(&f, 1, &[own.clone(), shared.clone()], 100);
-        put(&f, 2, &[shared.clone()], 100);
+        put(&f, 2, std::slice::from_ref(&shared), 100);
         let next = source(&f.build, "next", &[b'n'; 16]);
-        put(&f, 1, &[next.clone()], 200);
+        put(&f, 1, std::slice::from_ref(&next), 200);
 
         assert!(f.store.blob_path(&own.1).exists(), "marked, not deleted");
         assert_eq!(f.store.scan_detached().unwrap().len(), 2, "both drops");
@@ -2069,7 +2067,7 @@ mod tests {
         );
         assert_eq!(f.store.reclaim_detached().unwrap(), (0, 0), "idempotent");
 
-        put(&f, 2, &[next.clone()], 300);
+        put(&f, 2, std::slice::from_ref(&next), 300);
         assert_eq!(f.store.reclaim_detached().unwrap(), (1, 32));
         assert!(!f.store.blob_path(&shared.1).exists());
         assert!(f.store.lookup(&key(1)).unwrap().is_some());
@@ -2085,7 +2083,7 @@ mod tests {
     fn store_reclaim_waits_for_every_pin() {
         let f = fixture();
         let v1 = source(&f.build, "k.dill", b"kernel v1");
-        put(&f, 1, &[v1.clone()], 100);
+        put(&f, 1, std::slice::from_ref(&v1), 100);
         let v2 = source(&f.build, "k.dill", b"kernel v2!");
         put(&f, 1, &[v2], 200);
 
@@ -2122,7 +2120,7 @@ mod tests {
     fn store_reclaim_spares_a_blob_touched_after_its_detach() {
         let f = fixture();
         let v1 = source(&f.build, "k.dill", b"kernel v1");
-        put(&f, 1, &[v1.clone()], 100);
+        put(&f, 1, std::slice::from_ref(&v1), 100);
         // As written by an earlier run: the touch below then moves the
         // mtime unmistakably, whatever the filesystem's clock grain.
         backdate(&f.store.blob_path(&v1.1), 600);
@@ -2157,9 +2155,9 @@ mod tests {
         let now = unix_secs(SystemTime::now());
         let grace = 3_600;
         let v1 = source(&f.build, "k.dill", b"kernel v1");
-        put(&f, 1, &[v1.clone()], now);
+        put(&f, 1, std::slice::from_ref(&v1), now);
         let v2 = source(&f.build, "k.dill", b"kernel v2!");
-        put(&f, 1, &[v2.clone()], now);
+        put(&f, 1, std::slice::from_ref(&v2), now);
 
         let report = f.store.gc(0, grace, now).unwrap();
         assert_eq!(report.entries_evicted, 0, "the hit is grace-young");
@@ -2176,7 +2174,7 @@ mod tests {
 
         let pin = f.store.pin().expect("pin");
         let v3 = source(&f.build, "k.dill", b"kernel v3!!");
-        put(&f, 1, &[v3.clone()], now);
+        put(&f, 1, std::slice::from_ref(&v3), now);
         let pinned = f.store.gc(0, grace, now).unwrap();
         assert_eq!(pinned.blobs_removed, 0, "the pin defers the reclaim");
         assert_eq!(f.store.grace_deadline(), Some(now + grace), "re-armed");
@@ -2203,7 +2201,7 @@ mod tests {
         fs::create_dir_all(f.root.join(META)).unwrap();
         fs::write(f.store.detached_dir(), b"not a directory").unwrap();
         let v1 = source(&f.build, "k.dill", b"kernel v1");
-        put(&f, 1, &[v1.clone()], 100);
+        put(&f, 1, std::slice::from_ref(&v1), 100);
         let v2 = source(&f.build, "k.dill", b"kernel v2!");
         put(&f, 1, &[v2], 200);
 
@@ -2229,7 +2227,7 @@ mod tests {
     fn store_plain_sweep_drops_an_unconsumed_marker_with_its_blob() {
         let f = fixture();
         let v1 = source(&f.build, "k.dill", b"kernel v1");
-        put(&f, 1, &[v1.clone()], 100);
+        put(&f, 1, std::slice::from_ref(&v1), 100);
         let v2 = source(&f.build, "k.dill", b"kernel v2!");
         put(&f, 1, &[v2], 200);
         assert_eq!(f.store.scan_detached().unwrap().len(), 1);
@@ -2486,7 +2484,7 @@ mod tests {
         // bytes, same manifest hit field, no sidecar — is colder and
         // goes first under a budget that keeps one entry's worth.
         let cold = source(&f.build, "cold", b"cold entry bytes");
-        put(&f, 2, &[cold.clone()], 100);
+        put(&f, 2, std::slice::from_ref(&cold), 100);
         let report = f
             .store
             .gc(b"cold entry bytes".len() as u64, 0, later())
@@ -2510,7 +2508,7 @@ mod tests {
     fn store_gc_spares_in_flight_files() {
         let f = fixture();
         let orphan = source(&f.build, "o", &[b'o'; 64]);
-        put(&f, 1, &[orphan.clone()], 100);
+        put(&f, 1, std::slice::from_ref(&orphan), 100);
         drop_entry(&f, 1);
         // The scratch file of an ingest that may still be writing.
         fs::write(f.root.join(TMP).join("4242-0-0"), [0u8; 16]).unwrap();
@@ -2578,7 +2576,7 @@ mod tests {
         // sweep: drop the last entry of a shard through the budget
         // path, and the shard does not linger.
         let b = source(&f.build, "b", &[b'b'; 16]);
-        put(&f, 2, &[b.clone()], 100);
+        put(&f, 2, std::slice::from_ref(&b), 100);
         fs::remove_file(busy.join("hold")).unwrap();
         let report = f.store.gc(0, 0, later()).unwrap();
         assert_eq!(report.entries_evicted, 2);
@@ -2784,8 +2782,8 @@ mod tests {
         let f = fixture();
         let a = source(&f.build, "a", &[b'a'; 40]);
         let b = source(&f.build, "b", &[b'b'; 40]);
-        put(&f, 1, &[a.clone()], 100);
-        put(&f, 2, &[b.clone()], 200);
+        put(&f, 1, std::slice::from_ref(&a), 100);
+        put(&f, 2, std::slice::from_ref(&b), 200);
 
         let garbage = f.store.entry_path(&key(3));
         fs::create_dir_all(garbage.parent().unwrap()).unwrap();
@@ -2834,7 +2832,7 @@ mod tests {
     fn store_unknown_variants_are_counted_not_fatal() {
         let f = fixture();
         let a = source(&f.build, "a", &[b'a'; 10]);
-        put(&f, 1, &[a.clone()], 100);
+        put(&f, 1, std::slice::from_ref(&a), 100);
 
         let future = draft(&key(2), std::slice::from_ref(&a), 150);
         let mut json = String::from_utf8(to_json(&future).unwrap()).unwrap();
@@ -2878,7 +2876,7 @@ mod tests {
         let store = CasStore::open(&cas).unwrap();
         let src = source(dir.path(), "k.dill", b"kernel bytes");
         store
-            .ingest(draft(&key(1), &[src.clone()], 100), &[src])
+            .ingest(draft(&key(1), std::slice::from_ref(&src), 100), &[src])
             .unwrap();
         store.record_hit(&key(1)).unwrap();
 
@@ -3014,7 +3012,7 @@ mod tests {
         assert!(manifests > 0, "the race must leave live entries to check");
     }
 
-    /// The A13 stress shape: record_hit hammering a key while an ingest
+    /// The A13 stress shape: `record_hit` hammering a key while an ingest
     /// replaces the same key's manifest. The manifest on disk is exactly
     /// the last ingested generation — a hit never reverts it — and the
     /// hits landed in the sidecar instead.
@@ -3093,7 +3091,7 @@ mod tests {
             let src = source(
                 &f.build,
                 &format!("s{i:02}"),
-                &vec![(i % 7) as u8; i as usize + 100],
+                &vec![i % 7; i as usize + 100],
             );
             put(&f, i, std::slice::from_ref(&src), 100 + u64::from(i));
             originals.push(src);
@@ -3114,7 +3112,7 @@ mod tests {
         // Replacements add the new generation's bytes; the superseded
         // blobs stay on disk until gc.
         for i in 0..5u8 {
-            let src = source(&f.build, &format!("r{i:02}"), &[(i % 11) as u8 | 0x80; 300]);
+            let src = source(&f.build, &format!("r{i:02}"), &[(i % 11) | 0x80; 300]);
             put(&f, i, std::slice::from_ref(&src), 200);
         }
         check(&f);

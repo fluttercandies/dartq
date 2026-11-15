@@ -24,6 +24,7 @@
 //! Each pin carries the oracle's verdict for the same fixture
 //! (`dart analyze` 3.13.7); positives name the code and anchor verbatim.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, report_ops_bare, rows};
 
 fn code_count(report: &crate::diagnose::FileReport, name: &str) -> usize {
@@ -48,7 +49,7 @@ fn wnta_ctor(report: &crate::diagnose::FileReport) -> usize {
 /// `x.expectStaticType<T>` reports only the `undefined_method` face,
 /// never the receiver's type-argument count.
 ///
-/// Oracle: `undefined_method` per send, no wrong_number_of_type_arguments.
+/// Oracle: `undefined_method` per send, no `wrong_number_of_type_arguments`.
 #[test]
 fn extension_member_on_core_receiver_reports_no_arity() {
     let report = report_ops(
@@ -80,7 +81,7 @@ fn extension_member_on_core_receiver_reports_no_arity() {
 /// so `c.foo<int>` is the undefined-member face, never an arity verdict.
 /// The receiver's `C<T>` declaration is uninvolved.
 ///
-/// Oracle: no wrong_number_of_type_arguments (the member miss owns it).
+/// Oracle: no `wrong_number_of_type_arguments` (the member miss owns it).
 #[test]
 fn missing_member_on_generic_receiver_reports_no_arity() {
     let report = report_ops(
@@ -101,7 +102,7 @@ fn missing_member_on_generic_receiver_reports_no_arity() {
 /// (a) `super.foo<int>` where the superclass lacks `foo` — the miss is
 /// the undefined-member face, not an arity verdict on `super`'s type.
 ///
-/// Oracle: no wrong_number_of_type_arguments.
+/// Oracle: no `wrong_number_of_type_arguments`.
 #[test]
 fn missing_super_member_reports_no_arity() {
     let report = report_ops(
@@ -119,7 +120,7 @@ fn missing_super_member_reports_no_arity() {
 /// (a) A `dynamic` receiver's member send can never resolve —
 /// `i<int>.foo()` is the undefined-member face, never an arity verdict.
 ///
-/// Oracle: no wrong_number_of_type_arguments.
+/// Oracle: no `wrong_number_of_type_arguments`.
 #[test]
 fn dynamic_receiver_member_reports_no_arity() {
     let report = report_ops(
@@ -140,7 +141,7 @@ fn dynamic_receiver_member_reports_no_arity() {
 /// instantiation at all — `var A`, `int v`, `void T()` heads used to
 /// answer `Some(0)` from the top-level-decl fallback.
 ///
-/// Oracle: no wrong_number_of_type_arguments (notAType/undefined faces
+/// Oracle: no `wrong_number_of_type_arguments` (notAType/undefined faces
 /// own those spellings).
 #[test]
 fn non_type_heads_report_no_arity() {
@@ -169,7 +170,7 @@ fn non_type_heads_report_no_arity() {
 /// `test_class_generic_new_typeArgs` shape, oracle `7:13|5`). The `A<int>`
 /// head is correct arity (1 given, 1 declared).
 ///
-/// Oracle: one wrong_number_of_type_arguments_constructor.
+/// Oracle: one `wrong_number_of_type_arguments_constructor`.
 #[test]
 fn unnamed_ctor_type_args_report_ctor_code() {
     let report = report_ops(
@@ -192,10 +193,10 @@ fn unnamed_ctor_type_args_report_ctor_code() {
 
 /// (b) `A<int>.foo<int>` — a named-constructor selector's group reports
 /// `_constructor` at the `<int>` group (upstream
-/// `type_instantiation_target.dart` ConstructorElement arm,
+/// `type_instantiation_target.dart` `ConstructorElement` arm,
 /// `.at(typeArgumentList)`); the `A<int>` head is correct arity.
 ///
-/// Oracle: one wrong_number_of_type_arguments_constructor.
+/// Oracle: one `wrong_number_of_type_arguments_constructor`.
 #[test]
 fn named_ctor_type_args_report_ctor_code() {
     let report = report_ops(
@@ -223,7 +224,7 @@ fn named_ctor_type_args_report_ctor_code() {
 /// keyword spelling's head row latches a stale pre-expression range —
 /// a row-model gap upstream of the arity emit, not the anchor rule.)
 ///
-/// Oracle: one wrong_number_of_type_arguments spanning `C<int>`.
+/// Oracle: one `wrong_number_of_type_arguments` spanning `C<int>`.
 #[test]
 fn implicit_creation_reports_named_type_anchor() {
     let report = report_ops(
@@ -248,7 +249,7 @@ fn implicit_creation_reports_named_type_anchor() {
 /// annotation reports the whole `A<A>?` span (5 bytes: `A`,`<`,`A`,`>`,`?`)
 /// — upstream `.at(node)` includes the `?` (`test_class_tooFew`'s `3:1|5`).
 ///
-/// Oracle: one wrong_number_of_type_arguments spanning `A<A>?`.
+/// Oracle: one `wrong_number_of_type_arguments` spanning `A<A>?`.
 #[test]
 fn nullable_annotation_anchor_includes_question_mark() {
     let report = report_ops_bare(
@@ -273,7 +274,7 @@ fn nullable_annotation_anchor_includes_question_mark() {
 /// reports the base code at the bare `<int>` group (the
 /// `TypeInstantiation`'s typeArgumentList, `.at(typeArgumentList)`).
 ///
-/// Oracle: one wrong_number_of_type_arguments at `<int>` (5 bytes).
+/// Oracle: one `wrong_number_of_type_arguments` at `<int>` (5 bytes).
 /// (`Fn<int>?` as an annotation goes through the `NamedType` face and
 /// reports the whole `Fn<int>?` span — the expression read below is the
 /// `TypeInstantiation` face.)
@@ -299,10 +300,10 @@ fn typedef_instantiation_reports_at_group() {
 
 /// The typedef-constructor-reference face: `MyList<int>.filled` over
 /// `typedef MyList = List` reports the `NamedType`'s `MyList<int>` span
-/// (a `.` after the group makes it a ConstructorReference, `.at(node)`).
+/// (a `.` after the group makes it a `ConstructorReference`, `.at(node)`).
 /// `MyList` declares 0 params over `List<E>`'s 1.
 ///
-/// Oracle: one wrong_number_of_type_arguments spanning `MyList<int>` (11
+/// Oracle: one `wrong_number_of_type_arguments` spanning `MyList<int>` (11
 /// bytes).
 #[test]
 fn typedef_ctor_ref_reports_named_type_anchor() {
@@ -327,7 +328,7 @@ fn typedef_ctor_ref_reports_named_type_anchor() {
 /// `Never<int>` — the builtin bottom type is a type-defining element of
 /// arity 0, so a written group reports the base code.
 ///
-/// Oracle: one wrong_number_of_type_arguments.
+/// Oracle: one `wrong_number_of_type_arguments`.
 #[test]
 fn never_type_args_report() {
     let report = report_ops("void f(Never<int> x) {}\n");

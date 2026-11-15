@@ -4,7 +4,7 @@
 //! `body_might_complete_normally` verdict reports the ERROR twin at the
 //! declaring name because `Never` is potentially non-nullable
 //! (`typeSystem.isPotentiallyNonNullable(returnType)` picks the
-//! COMPILE_TIME_ERROR arm, resolver.dart:587-590).
+//! `COMPILE_TIME_ERROR` arm, resolver.dart:587-590).
 //!
 //! Oracle (`dart analyze` 3.13.7, `--format=machine`), measured on the
 //! ticket fixture `int f() { Never g() {} return g(); }`:
@@ -47,6 +47,9 @@
 //! verdict; upstream reports the `_nullable` WARNING twin for `Never?`,
 //! whose `FutureOr` base is `Null` — silent upstream, but the flow
 //! fact's emission contract is unaffected).
+
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;

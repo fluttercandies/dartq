@@ -15,6 +15,7 @@
 //! `census-20261104-092425` (`target/conformance/`, in-workspace only);
 //! renderings are the oracle's own machine rows over the same fixtures.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, report_ops_core_ctor};
 use super::*;
 
@@ -163,7 +164,7 @@ main() {
 /// assignment kept its silence.
 #[test]
 fn sdk_ctor_tearoff_faces_render_official_signatures() {
-    let source = r#"
+    let source = r"
 main() {
   var a = List<int>.filled;
   var b = List<int>.empty;
@@ -184,7 +185,7 @@ main() {
   int zh = h;
   int zi = i;
 }
-"#;
+";
     let report = report_ops_core_ctor(source);
     let expected = [
         "List<int> Function(int, int, {bool growable})",

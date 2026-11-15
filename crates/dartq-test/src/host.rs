@@ -16,6 +16,7 @@
 //!   shares, in [`UNIT`]s: a test run waits for the analyzers, builds and
 //!   other runs already holding memory, and they for it.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

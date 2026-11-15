@@ -7,6 +7,7 @@
 //! the interpreter can split a C-style `for` header into its
 //! initializers/condition/updaters regions by token offset.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_parser::{IdentifierContext, TokenSpan};
 use dartq_source::SourceRange;
 
@@ -467,7 +468,7 @@ pub enum Ev {
     /// The `as` cast's type spelling begins; `span` is the `as` operator
     /// token — the dead-window poll for a Never-typed operand's exit (the
     /// official `checkUnreachableNode(node.type)` face,
-    /// type_analyzer.dart:2090).
+    /// `type_analyzer.dart:2090`).
     AsBegin {
         span: TokenSpan,
     },
@@ -479,7 +480,7 @@ pub enum Ev {
     /// Never-typed operand's exit inside a conditional arm leaves the cast
     /// type the first dead node (`dead_code_verifier.dart`'s `_visitNode`
     /// at the `TypeAnnotation` child), and the arm's `flowEnd`
-    /// (type_analyzer.dart:2588/2616) ends the row at the arm's own end.
+    /// (`type_analyzer.dart:2588/2616`) ends the row at the arm's own end.
     AsOperator {
         type_head: TokenSpan,
     },
@@ -537,7 +538,7 @@ pub enum Ev {
     /// The `?[` of a null-aware index selector was just consumed — the
     /// receiver is the top of the expression stack and the operand's events
     /// have not run yet (official `nullAwareAccess_rightBegin` timing,
-    /// flow_analysis.dart:9199). The skip-path state must be captured here:
+    /// `flow_analysis.dart:9199`). The skip-path state must be captured here:
     /// by [`Ev::IndexAccess`] the operand's own `throw`/Never events have
     /// already landed on `current`.
     ///
@@ -696,7 +697,7 @@ pub enum Ev {
         /// `cascadeExpression_afterTarget`'s `isNullAware`): the sections
         /// run on the target's not-null path and the skip state joins at
         /// [`Ev::CascadeEnd`] (`nullAwareAccess_end`,
-        /// flow_analysis.dart:7400).
+        /// `flow_analysis.dart:7400`).
         null_aware: bool,
     },
     CascadeAccess {
@@ -709,7 +710,7 @@ pub enum Ev {
     /// A spread element's `...`/`...?` operator token
     /// (`handleSpreadExpression`): the element's own first token — the
     /// dead-element row anchors there (`{for (; false;) ...dyn}` reports
-    /// `...dyn};`, dead_code_verifier `_visitNode` :183-205), one token
+    /// `...dyn};`, `dead_code_verifier` `_visitNode` :183-205), one token
     /// before the element's inner expression.
     Spread {
         token: TokenSpan,
@@ -756,7 +757,7 @@ pub enum Ev {
     /// assignment's target group starts at that token, so a C-style `for`
     /// updater like `(i) = (i + 1)` partitions its whole assignment — the
     /// unspanned `AssignedVarPattern`/`PatternAssign` events ride inside —
-    /// into the updater region (upstream for_resolver.dart resolves it
+    /// into the updater region (upstream `for_resolver.dart` resolves it
     /// through the ordinary assignment machinery; the loop keeps its
     /// condition's both arms and exits normally).
     PatternBegin {

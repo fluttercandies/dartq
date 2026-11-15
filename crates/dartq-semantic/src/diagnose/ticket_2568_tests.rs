@@ -1,5 +1,6 @@
 //! The #2568 pins: nullable-usage sweep — fill in as roots close. The rig
 //! declares no imports, so every pin spells custom types only.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::*;
 use crate::collector::collect;

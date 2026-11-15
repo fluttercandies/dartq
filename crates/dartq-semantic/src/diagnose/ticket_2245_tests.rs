@@ -11,6 +11,7 @@
 //! argument onto the wrong formal — the intl `_checkAndThrow`
 //! misalignment against the oracle).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

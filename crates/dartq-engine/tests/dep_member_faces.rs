@@ -10,12 +10,17 @@
 //! members).
 //!
 //! The fixture is a throwaway tree shaped like the dep-interface assembly
-//! (see dep_index.rs): the `dep` package is hosted-classified through the
+//! (see `dep_index.rs)`: the `dep` package is hosted-classified through the
 //! `pubspec.lock` entry (cache content, never workspace source) with its
 //! root on disk beside the workspace, and the workspace barrel re-exports
 //! the dep file's containers. The dep files are never fed as content — they
 //! reach the analysis only through the on-disk load the re-export triggers.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::semicolon_if_nothing_returned
+)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,7 +40,7 @@ const SYNTACTIC_ENTITY: &str = "abstract class SyntacticEntity {\n  int get offs
 /// name. `Token` is the abstract-implements shape (`abstract class Token
 /// implements SyntacticEntity`) with instance getters; `TokenClass` is the
 /// second same-package container the generalization pin reads.
-const TOKEN: &str = r#"import '../base/syntactic_entity.dart';
+const TOKEN: &str = r"import '../base/syntactic_entity.dart';
 
 abstract class Token implements SyntacticEntity {
   String get lexeme;
@@ -48,7 +53,7 @@ class TokenClass {
 
   const TokenClass(this.isBuiltIn);
 }
-"#;
+";
 
 /// The workspace barrel: an export-only library over the dep file — the
 /// analyzer package's `lib/dart/ast/token.dart` shape (`library;` plus the
@@ -64,7 +69,7 @@ const DIRECT: &str =
 /// re-exported container, and instance reads climb it. `lexeme`/`isEof`
 /// resolve through the dep face (silent); `nope` is genuinely missing
 /// (`undefined_getter`); `TokenClass` proves the second container.
-const MAIN: &str = r#"import 'token.dart';
+const MAIN: &str = r"import 'token.dart';
 
 class N {
   final Token name;
@@ -87,10 +92,10 @@ void h(TokenClass c) {
   c.isBuiltIn;
   c.nope;
 }
-"#;
+";
 
 /// A throwaway workspace + hosted-classified dep package, assembled through
-/// the real dartq-pub/dartq-package/dartq-sdk faces (the pub_universe
+/// the real dartq-pub/dartq-package/dartq-sdk faces (the `pub_universe`
 /// fixture's assembly). Returns the engine and the workspace root. The
 /// variant flags toggle the broken-universe shapes the corpus census
 /// probes: `with_dep_entry=false` omits the dep from the package config

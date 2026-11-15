@@ -52,6 +52,7 @@
 //! Callers pass the owning library and the current file explicitly; a name a
 //! sibling part imported is not visible here.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -111,7 +112,7 @@ impl ElementIndex {
     #[must_use]
     pub fn get(&self, file: FileId) -> Option<&FileElements> {
         if let Some(cells) = self.enriched_by_file.get() {
-            for cell in cells.iter() {
+            for cell in cells {
                 if let Some(Some(map)) = cell.get()
                     && let Some(arc) = map.get(&file)
                 {
@@ -235,7 +236,7 @@ impl ElementIndex {
 ///
 /// Upstream an `augment` head declares a FRAGMENT of the element its
 /// introduction declares (`element.firstFragment` is the introduction,
-/// upstream Dart SDK source, pkg/_fe_analyzer_shared augmentation
+/// upstream Dart SDK source, pkg/_`fe_analyzer_shared` augmentation
 /// handling), so the element's member face is the union of every fragment's
 /// members — whichever unit the spelling is written in. The units are
 /// collected independently, so the union cannot be a collection-time
@@ -581,7 +582,7 @@ fn build_fragments(
         for (unit, dups) in appended {
             let elements = if let Some(existing) = enriched.get(&unit) {
                 let mut elements = (**existing).clone();
-                let mut all: Vec<DuplicateDecl> = elements.duplicates.iter().copied().collect();
+                let mut all: Vec<DuplicateDecl> = elements.duplicates.to_vec();
                 all.extend(dups);
                 all.sort_by_key(|d| d.range.offset);
                 elements.duplicates = all.into_boxed_slice();
@@ -591,7 +592,7 @@ fn build_fragments(
                     continue;
                 };
                 let mut elements = (**raw).clone();
-                let mut all: Vec<DuplicateDecl> = elements.duplicates.iter().copied().collect();
+                let mut all: Vec<DuplicateDecl> = elements.duplicates.to_vec();
                 all.extend(dups);
                 all.sort_by_key(|d| d.range.offset);
                 elements.duplicates = all.into_boxed_slice();
@@ -649,7 +650,7 @@ fn sanitize_entry(entry: &MemberEntry) -> MemberEntry {
     if !ty_is_pool_free(entry.return_ty) {
         entry.return_ty = Ty::Unknown;
     }
-    for bound in entry.type_param_bounds.iter_mut() {
+    for bound in &mut entry.type_param_bounds {
         if !ty_is_pool_free(*bound) {
             *bound = Ty::Unknown;
         }
@@ -1334,10 +1335,10 @@ pub(crate) fn supertype_has_instance_members(
 /// (`IterableBase`/`IterableMixin` are `Iterable` itself, `SetMixin` is
 /// `SetBase`, `MapMixin` is `MapBase`, the two `*SinkBase` names their
 /// sink — sdk/lib/collection/iterable.dart:11,18, set.dart:322,
-/// maps.dart:204, sdk/lib/convert/{string_conversion,byte_conversion}
+/// maps.dart:204, `sdk/lib/convert/{string_conversion,byte_conversion`}
 /// .dart:162,38), the `implements` clauses the alias targets carry
 /// (set.dart:23, maps.dart:21), and `SplayTreeSet`'s `with Iterable<E>,
-/// SetMixin<E>` application (splay_tree.dart:998) whose private `_SplayTree`
+/// SetMixin<E>` application (`splay_tree.dart:998`) whose private `_SplayTree`
 /// superclass never resolves outside the SDK. An unindexed name is answered
 /// only when it appears here as implementing `interface`; every other
 /// unindexed name (an unanalyzed dependency, an SDK type absent from the
@@ -1421,7 +1422,7 @@ fn supertype_edges(container: &Container, strings: &StringTable) -> Vec<StringId
 /// makes it terminate as an ordinary shared node.
 /// Whether an unresolvable supertype hop is a dead edge rather than a
 /// broken chain. A name the scope cannot resolve at all — undefined,
-/// ambiguous, a non-class declaration — is the oracle's InvalidType
+/// ambiguous, a non-class declaration — is the oracle's `InvalidType`
 /// supertype: it contributes nothing to the interface. A name that resolves
 /// to a declaration whose file carries no model (the synthetic SDK face)
 /// is the broken chain: the oracle sees members we cannot index.
@@ -1468,13 +1469,14 @@ pub(crate) fn implements_interface(
     // `extensionTypeErasure` is the RUNTIME `is` face, which this walk
     // never answers). An unindexed seed is answered by the core face
     // alone — the name could implement anything else.
-    let seed: (StringId, FileId, LibraryId);
-    match resolve_container(graph, namespaces, index, lib, file, name) {
-        Some((_, owner)) => seed = (name, owner, lib),
-        None => {
-            return core_implements(&core, name, interface).then_some(true);
-        }
-    }
+
+    let seed: (StringId, FileId, LibraryId) =
+        match resolve_container(graph, namespaces, index, lib, file, name) {
+            Some((_, owner)) => (name, owner, lib),
+            None => {
+                return core_implements(&core, name, interface).then_some(true);
+            }
+        };
     let (start, start_file, start_lib) = seed;
     // An entity ask whose interface spelling resolves to nothing (an
     // undefined name or a type formal — formals answer through their
@@ -1547,7 +1549,7 @@ pub(crate) fn implements_interface(
 /// Whether `name` can enter `lib`'s unit scope through an import: an
 /// `as` prefix spelled `name` (import prefixes are library-scope names,
 /// upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-/// scope_analyzer.dart), or an unprefixed import whose target's export
+/// `scope_analyzer.dart`), or an unprefixed import whose target's export
 /// scope carries `name` under the directive's combinators — the same
 /// merge [`LibraryScopes::build`] runs over the import face, scoped to
 /// the one-name question a shadowing check asks (a prefixed import
@@ -1580,7 +1582,7 @@ pub(crate) fn import_shadows(graph: &LibraryGraph, lib: LibraryId, name: StringI
 /// The name-level cut of the JS-interop classification, which reads the
 /// class element's own metadata (`metadata.hasJS`, upstream Dart SDK
 /// source, pkg/linter/lib/src/rules/
-/// invalid_runtime_check_with_js_interop_types.dart
+/// `invalid_runtime_check_with_js_interop_types.dart`
 /// `_jsTypeForStaticInterop`): only the resolved container's own
 /// annotation rows answer, the supertype chain is not walked.
 ///

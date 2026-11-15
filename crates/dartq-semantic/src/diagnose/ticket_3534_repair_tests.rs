@@ -26,6 +26,7 @@
 //! Oracle probes: `dart analyze` 3.13.7 / the extracted conformance
 //! cases (`test_visitSetOrMapLiteral_ambiguous*`,
 //! `SpreadElementTest::test_*_downward`, `*_spread_null`).
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{code_names, report_ops};
 
@@ -234,7 +235,7 @@ fn null_aware_spread_over_null_constant_stays_silent() {
 /// `not_null_aware_null_spread` never fires inside the const context
 /// (the const verifier's own report wins the face; the non-const twin
 /// below still owes `not_null_aware_null_spread` alone). Probed dart
-/// analyze 3.13.7: one CONST_SPREAD_EXPECTED_MAP at `a`, nothing else.
+/// analyze 3.13.7: one `CONST_SPREAD_EXPECTED_MAP` at `a`, nothing else.
 #[test]
 fn non_aware_spread_over_null_reports_the_const_face_only() {
     let fixture = "const a = null;\nconst Map<String, int> x = {'k': 0, ...a};\n";
@@ -247,7 +248,7 @@ fn non_aware_spread_over_null_reports_the_const_face_only() {
 }
 
 /// A typed list's element ask reads the spread's ELEMENT contribution,
-/// never the operand whole (type_analyzer.dart's spread-element
+/// never the operand whole (`type_analyzer.dart`'s spread-element
 /// resolution): a `Null`/non-iterable/undecidable operand is the
 /// iterability verifier's row alone, and a raw `Iterable` donates
 /// `dynamic` — all silent under `list_element_type_not_assignable`.

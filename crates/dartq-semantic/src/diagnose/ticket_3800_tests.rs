@@ -14,6 +14,8 @@
 //!   `() {}` and `const b = () => 1;` at `() => 1`, not at the body token
 //!   the const capture folds the literal to.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

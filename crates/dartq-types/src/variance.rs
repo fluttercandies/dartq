@@ -49,6 +49,7 @@
 //! so [`Variance::Unrelated`] is a *computation* result (it says "the
 //! parameter does not occur free in the type"), never a declared variance.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
 use crate::system::{DEPTH_LIMIT, TypeSystem};
 use crate::table::TypeTable;
@@ -256,12 +257,15 @@ pub fn variance_in_type(
 /// concrete [`ParamFactsTable`]. A snapshot whose parameter facts are split
 /// across the shared table and an overlay (the generic-function binder
 /// facts a signature map records per signature) answers `p`'s facts through
-/// the overlay first: the bound-invariance leg (variance_builder.dart:
+/// the overlay first: the bound-invariance leg (`variance_builder.dart`:
 /// 131-140) keys on `facts_of(p).bound`, and a binder bound the shared
 /// table never saw would leave the leg silent — the `Contravariant` answer
 /// the `Never` default then grounds, where the oracle's `invariant` reads
 /// `dynamic`.
 #[must_use]
+/// # Panics
+///
+/// Panics if the type hierarchy is in an inconsistent state.
 pub fn variance_in_type_with(
     sys: &TypeSystem<'_>,
     facts_of: &dyn Fn(TypeParamId) -> ParamFacts,
@@ -357,6 +361,7 @@ pub fn typedef_parameter_variances_with(
         .collect()
 }
 
+#[expect(clippy::too_many_lines, reason = "the variance computation walk")]
 fn variance_in_type_bounded(
     table: &TypeTable,
     facts_of: &dyn Fn(TypeParamId) -> ParamFacts,

@@ -18,6 +18,7 @@
 //! cannot ground stays silent (the under-report direction, never a
 //! fabricated row).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// The fixture-relative byte offset of `needle` (the rig mounts

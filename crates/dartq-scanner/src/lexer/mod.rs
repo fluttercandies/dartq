@@ -265,15 +265,12 @@ impl<'s> Lexer<'s> {
                 // `get` reads without slicing, so a cursor that ever left a
                 // char boundary cannot panic here; the byte is then taken as
                 // a single unit and the loop still structurally advances.
-                match self.src.get(p..).and_then(|tail| tail.chars().next()) {
-                    Some(ch) => {
-                        p += ch.len_utf8();
-                        self.utf16_value += ch.len_utf16() as u32;
-                    }
-                    None => {
-                        p += 1;
-                        self.utf16_value += 1;
-                    }
+                if let Some(ch) = self.src.get(p..).and_then(|tail| tail.chars().next()) {
+                    p += ch.len_utf8();
+                    self.utf16_value += ch.len_utf16() as u32;
+                } else {
+                    p += 1;
+                    self.utf16_value += 1;
                 }
             }
         }
@@ -1095,7 +1092,7 @@ impl<'s> Lexer<'s> {
     /// `(begin, synthetic close)` pair is recorded for the parser's
     /// post-parse report — `expected_token` pinned at `begin.endGroup`'s
     /// offset as it stands after the parse (analyzer translation
-    /// `charOffset = begin.endToken.charOffset`, translate_error_token.dart;
+    /// `charOffset = begin.endToken.charOffset`, `translate_error_token.dart`;
     /// oracle `dart analyze --format=json` on `{[1};` → `expected_token` ']'
     /// @ the `}` offset, len 1). No diagnostic is emitted here.
     fn report_unmatched_begin(

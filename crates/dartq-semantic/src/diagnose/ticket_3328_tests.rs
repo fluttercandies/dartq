@@ -22,6 +22,7 @@
 //! diagnostic end to end through the shared rig, which mounts the adapter
 //! the way the engine does.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::test_rig::report_ops;
 use crate::library::ElementIndex;

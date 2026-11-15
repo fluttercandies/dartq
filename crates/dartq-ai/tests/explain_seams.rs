@@ -5,6 +5,7 @@
 //! tier's counts mirroring the row builders exactly, and the empty-face
 //! degradation answering present, empty arrays (never placeholders).
 
+#![allow(clippy::disallowed_names, clippy::semicolon_if_nothing_returned)]
 use std::path::Path;
 
 use dartq_ai::explain::{self as query, ConstructorFact, SuperTypeRow, SymbolDeclHit, Verbosity};

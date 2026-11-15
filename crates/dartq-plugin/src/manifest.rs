@@ -10,6 +10,7 @@
 //! Unknown top-level fields are ignored, so a newer manifest still parses on
 //! an older core. Unknown capability names are ignored likewise.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::Path;
 
 use serde_json::{Map, Value};

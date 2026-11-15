@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    FixInput, Keyword, Path, TokenKind, TokenTable, cut_line, depth0_find, hit_tokens,
+    int_literal_value, is_null_token, kind_of, line_bounds, matching_begin, on_type_start,
+    replace_exact, same_tokens, slice16, span_over, statement_end, token_end, token_text,
+    trivia_run, utf16_count, utf16_offset_to_byte, word_at,
+};
 
 // ---------------------------------------------------------------------------
 // Semantic source: the cross-file create-file family
@@ -35,9 +40,7 @@ pub(crate) fn create_missing_uri_target(input: &FixInput<'_>) -> Option<(String,
     // reaches the token stream, and directives carry no tokens between
     // keyword and URI.
     match kind_of(tokens, first.checked_sub(1)?)? {
-        TokenKind::Keyword(Keyword::Import)
-        | TokenKind::Keyword(Keyword::Export)
-        | TokenKind::Keyword(Keyword::Part) => {}
+        TokenKind::Keyword(Keyword::Import | Keyword::Export | Keyword::Part) => {}
         _ => return None,
     }
     // The quoted URI must be the literal's inner text — the plain-literal
@@ -358,10 +361,9 @@ pub(crate) fn is_empty_call(input: &FixInput<'_>) -> Option<(u32, u32, String)> 
     };
     let (value, access, literal_on_right) = if let Some(value) = literal_run(op + 1..last + 1) {
         (value, first..op, true)
-    } else if let Some(value) = literal_run(first..op) {
-        (value, op + 1..last + 1, false)
     } else {
-        return None;
+        let value = literal_run(first..op)?;
+        (value, op + 1..last + 1, false)
     };
     // The access ends `… . length` — a null-aware `?.` access has no
     // provable emptiness getter and drops.
@@ -794,7 +796,7 @@ pub(crate) fn final_to_var(
 /// `const [1] as T` cast, or a `const` under a nested `=` keeps its
 /// keyword — upstream reads `initializer.constKeyword` off those three
 /// node kinds alone; upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/replace_final_with_const.dart).
+/// `pkg/analysis_server/lib/src/services/correction/dart/replace_final_with_const.dart`).
 /// The deletion is `startStart(const, const.next)`: the trivia run —
 /// whitespace AND comments — to the next real token.
 pub(crate) fn final_with_const(
@@ -1037,10 +1039,12 @@ pub(crate) fn remove_empty_catch(
                 Some(back)
                     if matches!(
                         kind_of(tokens, back),
-                        Some(TokenKind::Identifier)
-                            | Some(TokenKind::Gt)
-                            | Some(TokenKind::GtGt)
-                            | Some(TokenKind::GtGtGt)
+                        Some(
+                            TokenKind::Identifier
+                                | TokenKind::Gt
+                                | TokenKind::GtGt
+                                | TokenKind::GtGtGt
+                        )
                     ) =>
                 {
                     on_type_start(tokens, text, back)?
@@ -1078,26 +1082,24 @@ pub(crate) fn remove_empty_catch(
         text,
         utf16_offset_to_byte(text, clause_start16),
         token_end(tokens.get(last)?),
-    ) {
-        if text[line_start..utf16_offset_to_byte(text, clause_start16)]
+    ) && text[line_start..utf16_offset_to_byte(text, clause_start16)]
+        .bytes()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
+        && text[token_end(tokens.get(last)?)..line_end]
             .bytes()
             .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
-            && text[token_end(tokens.get(last)?)..line_end]
-                .bytes()
-                .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
-        {
-            let (cut_start, _) = cut_line(text, line_start, line_end);
-            let eol = if text[line_end..].starts_with("\r\n") {
-                2
-            } else {
-                usize::from(text[line_end..].starts_with('\n'))
-            };
-            return Some((
-                cut_start,
-                utf16_count(&text[line_start..token_end(tokens.get(last)?) + eol]),
-                String::new(),
-            ));
-        }
+    {
+        let (cut_start, _) = cut_line(text, line_start, line_end);
+        let eol = if text[line_end..].starts_with("\r\n") {
+            2
+        } else {
+            usize::from(text[line_end..].starts_with('\n'))
+        };
+        return Some((
+            cut_start,
+            utf16_count(&text[line_start..token_end(tokens.get(last)?) + eol]),
+            String::new(),
+        ));
     }
     let head_ws = text[..utf16_offset_to_byte(text, clause_start16)].len()
         - text[..utf16_offset_to_byte(text, clause_start16)]
@@ -1184,7 +1186,7 @@ pub(crate) fn convert_quotes(
         // new quote (the official `_canKeepAsRaw`) — otherwise the fix
         // drops rather than re-spelling a non-raw escape set.
         let content = head.get(raw_skip + lead..head.len() - trail)?;
-        let triple: String = std::iter::repeat(target as char).take(3).collect();
+        let triple: String = std::iter::repeat_n(target as char, 3).collect();
         if content.ends_with(target as char) || content.contains(&triple) {
             return None;
         }
@@ -1254,7 +1256,7 @@ pub(crate) fn push_converted(
     let mut escaping = false;
     let mut run = 0u32;
     for (index, &ch) in chars.iter().enumerate() {
-        if ch as u32 == new as u32 {
+        if ch as u32 == u32::from(new) {
             if escaping {
                 escaping = false;
             } else if multiline {
@@ -1270,7 +1272,7 @@ pub(crate) fn push_converted(
             }
         } else {
             run = 0;
-            if ch as u32 == old as u32 && escaping {
+            if ch as u32 == u32::from(old) && escaping {
                 out.pop();
                 escaping = false;
             }
@@ -1311,7 +1313,7 @@ pub(crate) fn binds_loose(tokens: &TokenTable, range: core::ops::Range<usize>) -
             | TokenKind::OpenCurly
             | TokenKind::StringInterpolationExpression => depth += 1,
             TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                depth = depth.checked_sub(1).unwrap_or(0);
+                depth = depth.saturating_sub(1);
             }
             _ if depth == 0 => {
                 if matches!(
@@ -1354,8 +1356,7 @@ pub(crate) fn binds_loose(tokens: &TokenTable, range: core::ops::Range<usize>) -
                         | TokenKind::QuestionQuestionEq
                         | TokenKind::PeriodPeriod
                         | TokenKind::QuestionPeriodPeriod
-                        | TokenKind::Keyword(Keyword::Is)
-                        | TokenKind::Keyword(Keyword::As)
+                        | TokenKind::Keyword(Keyword::Is | Keyword::As)
                 ) {
                     return true;
                 }

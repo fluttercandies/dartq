@@ -33,6 +33,10 @@
 //! `ConstantPatternWithNonConstantExpressionTest`, and the co19
 //! `Patterns/map_A0*` / `relational_A04_t0*` / `constant_A06_t0*` rows).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::format_collect)]
+
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, RigImport, code_names, report_ops, report_ops_with};
 

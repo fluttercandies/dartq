@@ -20,6 +20,19 @@
 //! (`conformance extract` produces it); a missing corpus fails the test
 //! with instructions rather than passing vacuously.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::format_push_string,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::semicolon_if_nothing_returned
+)]
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -469,7 +482,7 @@ fn materialize_case(case: &Case, root: &Path, mocks_abs: &Path) -> Result<(), St
         let path = root.join(rel);
         let parent = path.parent().expect("section path has a parent");
         std::fs::create_dir_all(parent)
-            .and_then(|_| std::fs::write(&path, content))
+            .and_then(|()| std::fs::write(&path, content))
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     }
     for (name, files) in &inline_aux {
@@ -477,7 +490,7 @@ fn materialize_case(case: &Case, root: &Path, mocks_abs: &Path) -> Result<(), St
             let path = root.join(".aux").join(name).join(rel);
             let parent = path.parent().expect("aux file path has a parent");
             std::fs::create_dir_all(parent)
-                .and_then(|_| std::fs::write(&path, content))
+                .and_then(|()| std::fs::write(&path, content))
                 .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         }
     }
@@ -587,7 +600,7 @@ impl Row {
 }
 
 fn sort_rows(rows: &mut Vec<Row>) {
-    rows.sort_by(|a, b| a.cmp_text(b));
+    rows.sort_by(Row::cmp_text);
 }
 
 fn diff_sorted<'a>(expected: &'a [Row], actual: &'a [Row]) -> (Vec<&'a Row>, Vec<&'a Row>) {
@@ -770,14 +783,12 @@ fn sdk_root() -> PathBuf {
         }
     }
     // `dart` on PATH: <sdk>/bin/dart → sdk root is two levels up.
-    if let Some(path) = find_on_path("dart") {
-        if let Some(bin) = path.parent() {
-            if let Some(root) = bin.parent() {
-                if looks_like_sdk(root) {
-                    return root.to_path_buf();
-                }
-            }
-        }
+    if let Some(path) = find_on_path("dart")
+        && let Some(bin) = path.parent()
+        && let Some(root) = bin.parent()
+        && looks_like_sdk(root)
+    {
+        return root.to_path_buf();
     }
     panic!(
         "no Dart SDK found: set DART_SDK, install under ~/.dartq-oracle/, or put `dart` on PATH"
@@ -910,16 +921,15 @@ fn run_case(case: &Case, case_root: &Path, sdk: &Path, mocks_abs: &Path) -> Case
         run.error = Some(format!("discover_workspace: {e}"));
         return run;
     }
-    let diagnostics = match engine.analyze(
+    let diagnostics = if let Ok(diagnostics) = engine.analyze(
         &[],
         &mut |_| {},
         &dartq_engine::CancellationToken::default(),
     ) {
-        Ok(diagnostics) => diagnostics,
-        Err(_) => {
-            run.error = Some("analyze cancelled".to_string());
-            return run;
-        }
+        diagnostics
+    } else {
+        run.error = Some("analyze cancelled".to_string());
+        return run;
     };
     let root_str = case_root.to_string_lossy().into_owned();
     for diag in &diagnostics {
@@ -927,12 +937,11 @@ fn run_case(case: &Case, case_root: &Path, sdk: &Path, mocks_abs: &Path) -> Case
             run.outside += 1;
             continue;
         };
-        let rel = match path.strip_prefix(case_root) {
-            Ok(rel) => rel,
-            Err(_) => {
-                run.outside += 1;
-                continue;
-            }
+        let rel = if let Ok(rel) = path.strip_prefix(case_root) {
+            rel
+        } else {
+            run.outside += 1;
+            continue;
         };
         let file = rel
             .components()
@@ -943,15 +952,14 @@ fn run_case(case: &Case, case_root: &Path, sdk: &Path, mocks_abs: &Path) -> Case
             run.outside += 1;
             continue;
         }
-        let (line, column) = match (engine.line_index(diag.file), engine.content(diag.file)) {
-            (Some(index), Some(bytes)) => {
-                let text = std::str::from_utf8(bytes).unwrap_or("");
-                index.line_col_utf16(text, diag.range.offset)
-            }
-            _ => {
-                run.outside += 1;
-                continue;
-            }
+        let (line, column) = if let (Some(index), Some(bytes)) =
+            (engine.line_index(diag.file), engine.content(diag.file))
+        {
+            let text = std::str::from_utf8(bytes).unwrap_or("");
+            index.line_col_utf16(text, diag.range.offset)
+        } else {
+            run.outside += 1;
+            continue;
         };
         let message = diag.message.as_str().replace(root_str.as_str(), "<chunk>");
         run.rows.push(Row::new(
@@ -976,7 +984,7 @@ fn run_case(case: &Case, case_root: &Path, sdk: &Path, mocks_abs: &Path) -> Case
 /// like `diagnostics/cast_to_non_type`) and asserts zero divergences.
 ///
 /// Every case is accounted: pass / fail (with per-row missing+extra detail)
-/// / oracle_crash (skipped, counted) / materialize-or-engine error (failed
+/// / `oracle_crash` (skipped, counted) / materialize-or-engine error (failed
 /// with the error text). The assertion collects ALL divergences before
 /// failing — never panic-loops on the first.
 pub fn run_family(prefix: &str) {
@@ -1029,7 +1037,7 @@ pub fn run_family(prefix: &str) {
             "corpus-{}-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-            id.replace('/', "_").replace('#', "_")
+            id.replace(['/', '#'], "_")
         );
         let root = std::env::temp_dir().join(tag);
         let _ = std::fs::remove_dir_all(&root);

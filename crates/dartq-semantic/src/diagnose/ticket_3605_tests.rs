@@ -8,7 +8,7 @@
 //! `resolveStaticExtension` binds a unique static member of the
 //! on-declaration's extensions (`type_property_resolver.dart:245`),
 //! which the row face never consulted — every such access fabricated
-//! `undefined_getter` (ExtensionMethodsExternalReferenceTest's 11
+//! `undefined_getter` (`ExtensionMethodsExternalReferenceTest`'s 11
 //! `test_static_*_success_*` cases).
 //!
 //! Pins, oracle 3.13.7:
@@ -28,6 +28,7 @@
 //!   - `C.m()` over `static void m()` still reports `undefined_method`:
 //!     the invocation face does not ride the static-extension tail.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 // `A.foo` over a unique static extension getter on the accessed
@@ -36,7 +37,7 @@ use super::test_rig::{assert_silent, code_names, report_ops, rows};
 #[test]
 fn static_extension_getter_on_class_resolves() {
     let report = report_ops(
-        r#"
+        r"
 class A {}
 
 extension E on A {
@@ -46,7 +47,7 @@ extension E on A {
 void f() {
   A.foo;
 }
-"#,
+",
     );
     assert!(
         !code_names(&report).contains(&"undefined_getter"),
@@ -61,7 +62,7 @@ void f() {
 #[test]
 fn static_extension_getter_on_generic_class_resolves() {
     let report = report_ops(
-        r#"
+        r"
 class A<X> {}
 
 extension E on A<String> {
@@ -71,7 +72,7 @@ extension E on A<String> {
 void f() {
   A.foo;
 }
-"#,
+",
     );
     assert!(
         !code_names(&report).contains(&"undefined_getter"),
@@ -86,7 +87,7 @@ void f() {
 #[test]
 fn static_extension_getter_via_typedef_resolves() {
     let report = report_ops(
-        r#"
+        r"
 class A {}
 
 typedef T = A;
@@ -99,7 +100,7 @@ void f() {
   A.foo;
   T.foo;
 }
-"#,
+",
     );
     assert!(
         !code_names(&report).contains(&"undefined_getter"),
@@ -115,7 +116,7 @@ void f() {
 #[test]
 fn static_extension_setter_on_class_resolves() {
     let report = report_ops(
-        r#"
+        r"
 class A {}
 
 extension E on A {
@@ -126,7 +127,7 @@ void f() {
   A.s = 1;
   A.s += 1;
 }
-"#,
+",
     );
     assert_silent(&report);
 }
@@ -137,7 +138,7 @@ void f() {
 #[test]
 fn static_extension_field_stays_ambiguous() {
     let report = report_ops(
-        r#"
+        r"
 class A {}
 
 extension E on A {
@@ -148,7 +149,7 @@ void f() {
   A.a;
   A.a = 2;
 }
-"#,
+",
     );
     let codes = code_names(&report);
     assert!(
@@ -168,7 +169,7 @@ void f() {
 #[test]
 fn static_extension_miss_still_reports() {
     let report = report_ops(
-        r#"
+        r"
 class A {}
 
 extension E on A {
@@ -178,7 +179,7 @@ extension E on A {
 void f() {
   A.gone;
 }
-"#,
+",
     );
     let codes = code_names(&report);
     assert_eq!(codes, ["undefined_getter"]);
@@ -197,13 +198,13 @@ void f() {
 #[test]
 fn generic_container_miss_names_this_type() {
     let report = report_ops(
-        r#"
+        r"
 class C<K, V> {}
 
 void f() {
   C.gone;
 }
-"#,
+",
     );
     assert!(
         rows(&report)
@@ -220,7 +221,7 @@ void f() {
 #[test]
 fn static_extension_invoke_still_reports() {
     let report = report_ops(
-        r#"
+        r"
 class C {}
 
 extension E on C {
@@ -230,7 +231,7 @@ extension E on C {
 void f() {
   C.m();
 }
-"#,
+",
     );
     let codes = code_names(&report);
     assert_eq!(codes, ["undefined_method"]);

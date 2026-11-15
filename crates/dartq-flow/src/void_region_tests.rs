@@ -5,6 +5,7 @@
 //! first dead node, the chain does not contain it), and the next dead
 //! statement must not open a second row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

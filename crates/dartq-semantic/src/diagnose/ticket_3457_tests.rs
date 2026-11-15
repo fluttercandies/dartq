@@ -15,15 +15,16 @@
 //!   at `m` (the nullable bound's member is still found, but the
 //!   receiver can be null).
 //! - `FutureOr<int?>`: `x.gone()` reports `unchecked_use_of_nullable_value`
-//!   (the `Future`/`on Object` extension face a nullable FutureOr cannot
+//!   (the `Future`/`on Object` extension face a nullable `FutureOr` cannot
 //!   unconditionally invoke); `FutureOr<int>` `y.gone()` reports
-//!   `undefined_method` for the type 'FutureOr'.
+//!   `undefined_method` for the type '`FutureOr`'.
 //!
 //! Runs under the core-preloaded rig (`report_ops`): `FutureOr` is a
 //! names-only stub, and `Bound` declares its own members. Registered
 //! through `diagnose/tests.rs`'s `#[path]` block; the module stays inside
 //! the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops_bare};
 use super::*;
 
@@ -43,7 +44,7 @@ fn oracle_rows<'a>(report: &FileReport, source: &'a str) -> Vec<(&'static str, u
             )
         })
         .collect();
-    rows.sort();
+    rows.sort_unstable();
     rows
 }
 
@@ -146,7 +147,7 @@ fn future_or_nullable_receiver_reports_unchecked() {
 
 /// `FutureOr<int>`'s non-null face answers the extension member but the
 /// name is still not `FutureOr`'s own — `undefined_method` for the type
-/// 'FutureOr'.
+/// '`FutureOr`'.
 #[test]
 fn future_or_non_null_receiver_reports_undefined_method() {
     let fixture = "void f(FutureOr<int> y) {\n\

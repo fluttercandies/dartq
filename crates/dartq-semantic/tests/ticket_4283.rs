@@ -15,6 +15,11 @@
 //! `Leaf -> Mid -> Base` chain and deads the else arm — a row that
 //! disappears if either closure path under-registers.
 
+#![allow(
+    dead_code,
+    clippy::too_many_lines,
+    clippy::semicolon_if_nothing_returned
+)]
 use std::path::Path;
 
 use dartq_language::{Feature, FeatureSet, LanguageVersion};

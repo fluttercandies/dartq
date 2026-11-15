@@ -1,12 +1,18 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::needless_range_loop,
+    clippy::unnecessary_debug_formatting,
+    clippy::many_single_char_names
+)]
 use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
-/// The #2970 cluster pins: `null_check_on_nullable_type_parameter`,
-/// `unnecessary_null_checks`, and `avoid_futureor_void` oracle shapes
-/// through the production bridge (the semantic face mounted where the
-/// rule consults resolution). Every pin cites the conformance row it
-/// mirrors (`conformance/expected.tsv`, extracted from the pinned
-/// `dart analyze` 3.13.7 oracle), so the conformance diff and the pin
-/// assert the same verdict.
+// The #2970 cluster pins: `null_check_on_nullable_type_parameter`,
+// `unnecessary_null_checks`, and `avoid_futureor_void` oracle shapes
+// through the production bridge (the semantic face mounted where the
+// rule consults resolution). Every pin cites the conformance row it
+// mirrors (`conformance/expected.tsv`, extracted from the pinned
+// `dart analyze` 3.13.7 oracle), so the conformance diff and the pin
+// assert the same verdict.
 
 // —— null_check_on_nullable_type_parameter ————————————————————————————
 // Upstream Dart SDK source, pkg/linter .../null_check_on_nullable_type_parameter.dart:59-72
@@ -15,9 +21,9 @@ use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 // the same non-null type. A parameter with no bound, a `dynamic` bound,
 // or a nullable bound is potentially nullable; `extends Object` is not.
 
-/// `test_expectedSameTypeVariable_arrow#0` —
-/// `INFO|…|2:18|1` — the arrow body's expected type is the same bare
-/// parameter.
+// `test_expectedSameTypeVariable_arrow#0` —
+// `INFO|…|2:18|1` — the arrow body's expected type is the same bare
+// parameter.
 #[test]
 fn ncvp_bare_parameter_arrow_reports() {
     let f = Fixture::parse("T f<T>(T? p) => p!;\n");

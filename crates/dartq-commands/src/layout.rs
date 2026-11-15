@@ -3,6 +3,7 @@
 //! from the resident line index, text borrowed straight from the content
 //! store — no per-diagnostic file reads or copies.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::path::Path;
 

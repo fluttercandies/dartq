@@ -18,6 +18,7 @@
 //!   `flowEnd(elseExpression)` reports `[annotation.offset,
 //!   elseExpression.end)` — one row covering the annotation through the
 //!   arm's closer, never fragments.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{code_names, report_ops};
 use super::*;
@@ -56,7 +57,7 @@ fn probe_typedef_fn_subtype_true() {
 
 /// Probe: `func4 is Func1` — `int Function([int a, int b, int c])` against
 /// `int Function(int)`: optional-tail drop keeps it a subtype
-/// (co19 typedef/is_test).
+/// (co19 `typedef/is_test`).
 #[test]
 fn probe_typedef_optional_tail_subtype() {
     let report = report_ops(
@@ -130,7 +131,7 @@ fn probe_generic_arg_typedef_reflexive() {
     );
 }
 
-/// Probe: `C<void___int>() is C<void_>` — the co19 optional2_test shape:
+/// Probe: `C<void___int>() is C<void_>` — the co19 `optional2_test` shape:
 /// a created generic instance with typedef'd function-type arguments
 /// tested against the same generic head with a different typedef
 /// argument. `void___int = void Function([int])` <: `void_ = void
@@ -156,7 +157,7 @@ fn probe_generic_arg_typedef_fn_subtype() {
 /// Probe: generic-typedef target — `f13 is F13<bool>` where `f13` is
 /// `List<int> Function(List<int>) Function(int)` and
 /// `F13<T> = List<int> Function(List<T>) Function(int)`: NOT a subtype,
-/// oracle stays silent (co19 function_type13_test extra rows).
+/// oracle stays silent (co19 `function_type13_test` extra rows).
 #[test]
 fn probe_generic_typedef_arg_mismatch_silent() {
     let report = report_ops(
@@ -176,7 +177,7 @@ fn probe_generic_typedef_arg_mismatch_silent() {
 /// Probe: `new OneArg<String>().foo is OneArg` — the operand head hides
 /// behind the `<String>` type-args group and the `()` call group; the
 /// oracle anchors `unnecessary_type_check` at `new` (the whole
-/// IsExpression), not at `foo` or `()`.
+/// `IsExpression`), not at `foo` or `()`.
 #[test]
 fn probe_generic_creation_member_operand_anchors_at_new() {
     let source = "class OneArg<A> {\n\
@@ -254,7 +255,7 @@ fn probe_throw_as_function_type_dead_interval() {
 /// `m15 is List<T> Function(int, [List<int> x]) Function()` where `m15`'s
 /// own type parameter `T` flows into both sides. Oracle stays silent
 /// (the operand type is not a subtype of the target under the free `T`).
-/// The function_type co19 family produced ~68 extra rows of this shape.
+/// The `function_type` co19 family produced ~68 extra rows of this shape.
 #[test]
 fn probe_generic_function_tearoff_stays_silent() {
     let report = report_ops(

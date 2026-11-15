@@ -39,6 +39,7 @@
 //! `literals.rs` and here and parses full expressions — exactly where the
 //! official shares one implementation.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind};
 
 use crate::expr_const::SELECTOR_PRECEDENCE;
@@ -368,7 +369,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 
     /// Whether the just-parsed operand ends in an assignable shape: the
     /// official test is the expression shape (`_isAssignable`,
-    /// ast_builder.dart:6607 — names, property extractions, index targets),
+    /// `ast_builder.dart:6607` — names, property extractions, index targets),
     /// proxied by the operand's last token as in the assignment arm. A `]`
     /// ending reads as the index-target shape — a list literal there is the
     /// rare face and stays on the safe silent side. Retained for
@@ -385,6 +386,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// `handleRecoverableError(diag, beginToken, endToken)` row extent
     /// (the analyzer's offset/length formula): one
     /// `[begin.offset, end.offset + end.length)` span.
+    #[allow(clippy::unused_self)]
     pub(crate) fn span_through(&self, begin: TokenSpan, end: TokenSpan) -> TokenSpan {
         crate::token_id::TokenSpan::new(
             begin.id,
@@ -548,7 +550,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         // index arms and the dot bracket-operand face; every other operand
         // rebinding (binary, cascade, postfix, written-out operators)
         // yields a different shape and clears it.
-        let mut lhs_ends_index = false;
         // The official `_isAssignable` expression-shape test
         // (ast_builder.dart:6607-6620 — `Identifier`, `PropertyAccess`,
         // `IndexExpression` only), tracked as the walk mutates `left`:
@@ -599,7 +600,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.attempt_written_out_operator(precedence, None, allow_cascades)
             {
                 left = new_left;
-                lhs_ends_index = false;
                 lhs_assignable = false;
                 is_dot_shorthand = false;
                 continue;
@@ -628,7 +628,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 last_cascade = true;
                 left = self.parse_cascade_expression(left);
-                lhs_ends_index = false;
                 lhs_assignable = false;
             } else if token_level == ASSIGNMENT_PRECEDENCE {
                 // AstBuilder assignment-target checks: `handleAssignment-
@@ -646,8 +645,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // postfix variant (:5849-5860) keeps its own shape.
                 // `Token.isOperator`-style proxy for the assignability check
                 // (:5856): the LHS must end in an identifier (or the `]` of
-                // a selector-attached index target — `lhs_ends_index`
-                // distinguishes it from a list literal's closer). The final
+                // a selector-attached index target — `lhs_assignable` tracks
+                // that shape). The final
                 // LHS token's kind: a table id is read back by offset (a
                 // span id can alias an inserted token); an inserted
                 // (synthetic) token is read by id — its offset points at the
@@ -723,7 +722,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 self.listener.handle_assignment_expression(operator, end);
                 left = end;
-                lhs_ends_index = false;
                 lhs_assignable = false;
             } else if token_level == POSTFIX_PRECEDENCE {
                 match kind {
@@ -743,7 +741,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                             .handle_unary_postfix_assignment_expression(operator);
                         self.cursor.advance();
                         left = operator;
-                        lhs_ends_index = false;
                         lhs_assignable = false;
                     }
                     TokenKind::Bang => {
@@ -751,7 +748,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         self.listener.handle_non_null_assert_expression(bang);
                         self.cursor.advance();
                         left = bang;
-                        lhs_ends_index = false;
                         lhs_assignable = false;
                     }
                     _ => break,
@@ -774,7 +770,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         if self.features.anonymous_methods_enabled && self.begins_anonymous_method()
                         {
                             left = self.parse_anonymous_method(dot);
-                            lhs_ends_index = false;
                             lhs_assignable = false;
                         } else {
                             // The null-aware split rides the `?`: the member
@@ -832,8 +827,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                             // missing_identifier row on the assignment — no
                             // selector rows). The last real token is the `]`, so
                             // the shape flag must carry the assignability.
-                            lhs_ends_index =
-                                matches!(operand_kind, TokenKind::OpenSquare | TokenKind::Index);
                             // `PropertyAccess` is assignable
                             // (ast_builder.dart:27397): a `.`/`?.` name
                             // selector keeps the run assignable — the
@@ -868,7 +861,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                             self.parse_argument_or_index_star(left, type_arg, false);
                         left = end;
                         type_arg = ta;
-                        lhs_ends_index = ends_index;
                         lhs_assignable = ends_index;
                     }
                     TokenKind::Question => {
@@ -878,7 +870,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                             self.parse_argument_or_index_star(left, type_arg, true);
                         left = end;
                         type_arg = ta;
-                        lhs_ends_index = ends_index;
                         lhs_assignable = ends_index;
                     }
                     TokenKind::Index => {
@@ -889,7 +880,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                             self.parse_argument_or_index_star(left, type_arg, false);
                         left = end;
                         type_arg = ta;
-                        lhs_ends_index = ends_index;
                         lhs_assignable = ends_index;
                     }
                     TokenKind::Bang => {
@@ -897,7 +887,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         self.listener.handle_non_null_assert_expression(bang);
                         self.cursor.advance();
                         left = bang;
-                        lhs_ends_index = false;
                         lhs_assignable = false;
                     }
                     _ => {
@@ -906,7 +895,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
                         self.cursor.advance();
                         left = at;
-                        lhs_ends_index = false;
                         lhs_assignable = false;
                     }
                 }
@@ -920,7 +908,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     self.report(msg::missing_assignable_selector(), left);
                 }
                 left = self.parse_is_operator_rest();
-                lhs_ends_index = false;
                 lhs_assignable = false;
             } else if kind == TokenKind::Keyword(Keyword::As) {
                 // `reportErrorIfSuper(expression)` (ast_builder.dart:3619):
@@ -929,11 +916,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     self.report(msg::missing_assignable_selector(), left);
                 }
                 left = self.parse_as_operator_rest();
-                lhs_ends_index = false;
                 lhs_assignable = false;
             } else if kind == TokenKind::Question {
                 left = self.parse_conditional_expression_rest();
-                lhs_ends_index = false;
                 lhs_assignable = false;
             } else if !self.features.triple_shift_enabled
                 && kind == TokenKind::GtGt
@@ -948,7 +933,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // expression recursion (the 500-deep canary), so the split
                 // path's locals must not grow it.
                 left = self.parse_triple_shift_binary_rest(level, allow_cascades);
-                lhs_ends_index = false;
                 lhs_assignable = false;
             } else if !self.features.triple_shift_enabled
                 && kind == TokenKind::GtGt
@@ -959,7 +943,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // The `>>>=` split face (parser_impl.dart:7259-7275) — see
                 // [`Self::parse_triple_shift_assignment_rest`].
                 left = self.parse_triple_shift_assignment_rest(allow_cascades);
-                lhs_ends_index = false;
                 lhs_assignable = false;
             } else {
                 // Plain binary (:6818-6851). Equality/relational chains are
@@ -988,7 +971,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.listener.handle_binary_rhs_end(operator, rhs_last);
                 self.listener.end_binary_expression(operator, right);
                 left = right;
-                lhs_ends_index = false;
                 lhs_assignable = false;
             }
             // Loop bookkeeping (:6874-6920). A `None` precedence is an
@@ -1008,7 +990,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         self.attempt_written_out_operator(precedence, Some(level), allow_cascades)
                     {
                         left = new_left;
-                        lhs_ends_index = false;
                         lhs_assignable = false;
                         // Official post-acceptance bookkeeping: recompute the
                         // follower's level and re-run the `<= level` check
@@ -1705,7 +1686,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 
     /// `parseSend` at an expression-continuation position with the official
     /// `ensureIdentifier` `new`-rewrite folded in: `expressionContinuation`
-    /// allows `new` as an identifier (identifier_context_impl.dart:391,
+    /// allows `new` as an identifier (`identifier_context_impl.dart:391`,
     /// `allowsNewAsIdentifier => isContinuation`), so `..new()` names the
     /// unnamed constructor and is consumed without an identifier-recovery
     /// report (`_tryRewriteNewToIdentifier`, parser_impl.dart:4101-4111;

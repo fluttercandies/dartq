@@ -6,6 +6,7 @@
 //! contract), and `rootUri` resolution treats the config's own directory
 //! (`.dart_tool/`) as the relative base — never the package root.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 

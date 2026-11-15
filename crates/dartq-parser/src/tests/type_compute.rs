@@ -12,6 +12,7 @@
 //! resolve to TYPE being the pattern itself (sdk#52199): the follower
 //! `when` stays a guard instead of a variable-pattern name.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, Logged, setup};
 
 fn parse(source: &'static str) -> Collector {

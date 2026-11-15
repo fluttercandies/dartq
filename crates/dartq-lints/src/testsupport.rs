@@ -8,6 +8,7 @@
 //! payload-contract pins; behavioral case suites (the upstream port) live
 //! in the dartq-fixture DSL.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 #![cfg(any(test, feature = "test-support"))]
 
 use std::path::{Path, PathBuf};
@@ -113,6 +114,7 @@ impl Fixture {
     /// The unit the run helpers build — the shell faces' direct consumers
     /// (`run_breaking_version_annotations`,
     /// `unnecessary_ignore_late_rows`) mount their own runs over it.
+    #[must_use]
     pub fn unit(&self) -> Unit<'_> {
         Unit {
             source: &self.source,
@@ -130,6 +132,7 @@ impl Fixture {
     }
 
     /// Runs `rules` over the fixture.
+    #[must_use]
     pub fn run(&self, rules: &EnableSet) -> Vec<Lint> {
         let unit = self.unit();
         run(&unit, rules, &rustc_hash::FxHashSet::default())
@@ -137,6 +140,7 @@ impl Fixture {
 
     /// [`Fixture::run`] with the containing-package facts mounted — the
     /// pub-aware rules' dispatch face.
+    #[must_use]
     pub fn run_workspace(&self, rules: &EnableSet, facts: &crate::WorkspaceFacts) -> Vec<Lint> {
         let unit = Unit {
             source: &self.source,
@@ -160,6 +164,7 @@ impl Fixture {
     /// `use_build_context_synchronously`); `workspace` rides along because
     /// the async rule's test-directory exemption reads it. A `None` face
     /// keeps its rule silent.
+    #[must_use]
     pub fn run_with(
         &self,
         rules: &EnableSet,
@@ -289,6 +294,7 @@ pub fn unit_of(
 }
 
 /// Convenience: enable one rule by name.
+#[must_use]
 pub fn one_rule(name: &str) -> EnableSet {
     let (set, unknown) = EnableSet::resolve([name]);
     assert!(unknown.is_empty(), "unknown rule {name}");
@@ -314,6 +320,7 @@ pub fn identifier(b: &mut AstBuilder, first: u32, end: u32) {
 /// Index of the `nth` (0-based) token whose lexeme is `needle` — tree
 /// builders address tokens by index; lexeme addressing keeps the tree
 /// closures readable against the source snippet above them.
+#[must_use]
 pub fn tok(source: &str, tokens: &TokenTable, needle: &str, nth: usize) -> u32 {
     let mut seen = 0;
     for i in 0..tokens.as_slice().len() {
@@ -328,6 +335,7 @@ pub fn tok(source: &str, tokens: &TokenTable, needle: &str, nth: usize) -> u32 {
 }
 
 /// UTF-16 offset of token `index` in the fixture.
+#[must_use]
 pub fn utf16_at(fixture: &Fixture, index: u32) -> u32 {
     fixture
         .tokens

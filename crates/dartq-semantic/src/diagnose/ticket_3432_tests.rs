@@ -22,6 +22,7 @@
 //! clear once their owners route the reads through
 //! `effective_ctor_container`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, assert_silent, report_ops, report_ops_with};
 use super::*;
 

@@ -16,6 +16,7 @@
 //! classified its receiver `nullOrEquivalent`, and the member poll went
 //! dead.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

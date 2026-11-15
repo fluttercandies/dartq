@@ -22,6 +22,7 @@
 //! display name keeps an operator's own `=` (`==`, `[]=`) while a real
 //! setter's `name=` marker strips back to `name` (`member_display_name`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, assert_silent, report_ops, rows};
 
 /// The absolute fixture offset of `needle` (the prelude the rig prepends

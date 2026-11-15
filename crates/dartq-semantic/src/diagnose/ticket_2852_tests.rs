@@ -9,6 +9,7 @@
 //! variable's read — plain or shadowing the function spelling — never
 //! takes the channel.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

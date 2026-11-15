@@ -27,6 +27,7 @@
 //! walk instantiates), matching the oracle's resolution over the
 //! unsubstituted signature.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// The bare `Function` callee's result is `dynamic` — the oracle resolves

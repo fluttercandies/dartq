@@ -13,6 +13,7 @@
 //! token literals span their token, so the literal forms keep their
 //! anchors (the #2444/#1351 pin families hold).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

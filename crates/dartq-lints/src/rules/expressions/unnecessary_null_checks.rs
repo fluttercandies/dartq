@@ -225,7 +225,7 @@ pub(super) fn entry_containing(c: &Check<'_>, literal: u32, inner: u32) -> Optio
             | NodeKind::ElseControlFlow
             | NodeKind::ForControlFlow
             | NodeKind::SetOrMapLiteral => {
-                pending.extend(c.children(row).start..c.children(row).end)
+                pending.extend(c.children(row).start..c.children(row).end);
             }
             _ => {}
         }
@@ -256,7 +256,7 @@ pub(super) fn entry_side(c: &Check<'_>, entry: u32, real: u32) -> usize {
     let key_side = c
         .field(entry, PayloadField::Colon)
         .is_some_and(|colon| c.unit.ast.token_range(real).end <= colon + 1);
-    if key_side { 0 } else { 1 }
+    usize::from(!key_side)
 }
 
 /// The written type row of the declaration an initializer belongs to:

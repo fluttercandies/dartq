@@ -12,6 +12,7 @@
 //! nothing — no row at all, the write never counts as a use, and reads
 //! credit the original declarations.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

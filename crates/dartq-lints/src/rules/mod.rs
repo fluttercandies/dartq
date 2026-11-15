@@ -9,6 +9,7 @@
 //! divergences are documented on the rule. Rules not portable at all are
 //! listed in the crate docs with their blocker.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 pub(crate) mod collections;
 pub(crate) mod const_ability;
 pub(crate) mod declarations;

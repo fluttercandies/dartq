@@ -23,10 +23,12 @@
 //! already routes — and keeps `Prefixed` in the plain positions (the
 //! local-head silence and the broken-import guard ride its own fields).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use crate::diagnose::test_rig::{RigImport, assert_silent, code_names, report_ops_imports};
 
 /// `import 'package:p/p.dart' as p` — a live prefix edge.
-const P: RigImport = RigImport {
+const P: RigImport<'_> = RigImport {
     uri: "package:p/p.dart",
     prefix: Some("p"),
     source: "class C {}",

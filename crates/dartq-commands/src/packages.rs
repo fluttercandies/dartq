@@ -10,6 +10,7 @@
 //! and the SDK constraint it needs, a missing universe names the
 //! nearest pubspec or checkout marker above the invocation directory.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 
 use dartq_pub::PubError;

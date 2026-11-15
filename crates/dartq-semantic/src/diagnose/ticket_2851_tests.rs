@@ -35,6 +35,7 @@
 //!   (`test_deadBlock_else_nested#0` passes — the existing
 //!   branch-empty suppression in the flow's `Ev::Block` arm).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 
@@ -163,7 +164,7 @@ fn non_const_condition_keeps_statement_and_element_arms_live() {
 /// The adjacent faces are untouched by the dead-arm work: the #2814
 /// for-in iterable operand still reports its single
 /// `unchecked_use_of_nullable_value` row, the #2805 close-frame verdict
-/// still reports the unread loop variable, and neither rides a dead_code
+/// still reports the unread loop variable, and neither rides a `dead_code`
 /// row.
 #[test]
 fn adjacent_operand_and_usage_faces_unchanged() {

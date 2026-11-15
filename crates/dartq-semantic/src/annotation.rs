@@ -53,6 +53,7 @@
 //! re-exported through a barrel library is not recognized — the import
 //! target's uri must itself be `package:meta/…`, not merely transitively
 //! export it.
+#![allow(unreachable_patterns)]
 
 use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
@@ -1295,19 +1296,19 @@ mod tests {
                     builder.declare(node, name, file);
                 }
             }
-            if let Some(core) = core_node {
-                if !suppress_implicit_core {
-                    builder.import(
-                        lib,
-                        ImportEdge {
-                            target: Some(core),
-                            prefix: None,
-                            deferred: false,
-                            non_library: false,
-                            combinators: Combinators::unfiltered(),
-                        },
-                    );
-                }
+            if let Some(core) = core_node
+                && !suppress_implicit_core
+            {
+                builder.import(
+                    lib,
+                    ImportEdge {
+                        target: Some(core),
+                        prefix: None,
+                        deferred: false,
+                        non_library: false,
+                        combinators: Combinators::unfiltered(),
+                    },
+                );
             }
             for (uri, prefix, combinators) in edges {
                 let target = builder.intern(uri);
@@ -1446,7 +1447,7 @@ mod tests {
     /// bare `@deprecated` (no args) carries none.
     #[test]
     fn deprecation_message_normalizes_like_the_oracle() {
-        let mut strings = StringTable::new();
+        let strings = StringTable::new();
         let args = |text: &'static str| Some(strings.intern(text));
         assert_eq!(deprecation_message(None, &strings), None);
         assert_eq!(deprecation_message(args("()"), &strings), None);

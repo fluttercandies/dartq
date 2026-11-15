@@ -6,6 +6,7 @@
 //! adoption (scanner synthetic closer carries a real offset into the
 //! parser's group matching).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, setup};
 
 /// Sorted diagnostic-code multiset of one whole-unit parse.

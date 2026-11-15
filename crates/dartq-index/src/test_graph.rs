@@ -40,6 +40,7 @@
 //! guarantees it; an out-of-range target is a caller bug and surfaces as
 //! one). Output is deterministic: `tests_of` rows ascend.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use rustc_hash::FxHashMap;
 use std::path::Path;
 

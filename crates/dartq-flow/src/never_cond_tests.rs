@@ -4,6 +4,7 @@
 //! top-level getter read or an invocation result records its type after
 //! `handleExit` and keeps its arms dead.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

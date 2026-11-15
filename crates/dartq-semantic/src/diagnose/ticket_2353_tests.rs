@@ -31,6 +31,15 @@
 //! predicate there can separate the faces — and a broken-`package:`
 //! import fixture the names-only unit rig cannot express.
 
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::semicolon_if_nothing_returned
+)]
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::format_collect)]
+#![allow(unused_imports)]
+
 use super::*;
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};

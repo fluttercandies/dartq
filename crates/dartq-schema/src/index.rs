@@ -17,6 +17,7 @@
 //! recorded writer-side follow-up: values are equal at v1, so the payloads
 //! are already conformant.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

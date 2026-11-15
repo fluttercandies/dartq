@@ -18,6 +18,7 @@
 //! the diagnostic oracle: the pins here walk the crate's own directive diet
 //! harness (`l1::extract_directives` over a real scan) instead.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::Path;
 
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet};

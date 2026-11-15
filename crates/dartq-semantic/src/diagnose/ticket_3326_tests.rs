@@ -1,4 +1,4 @@
-//! The #3326 pins — the unused_declaration cluster's annotation gate
+//! The #3326 pins — the `unused_declaration` cluster's annotation gate
 //! (`Engine::finalize_usage`'s `pragma_spared` / `js_spared`).
 //!
 //! Upstream's `unused_local_elements_verifier` honours exactly two metadata
@@ -23,6 +23,7 @@
 //! `test_topLevelFunction_isUsed_hasPragma_vmEntryPoint` — all silent), and
 //! the silent negatives that keep an unannotated private declaration
 //! reporting.
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;

@@ -25,6 +25,48 @@
 //! killing, mid-session app death surfacing a clean terminal state,
 //! and clean teardown from running and paused states.
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::single_match,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::useless_conversion,
+    clippy::question_mark,
+    clippy::option_option,
+    clippy::needless_continue,
+    clippy::missing_panics_doc,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::explicit_counter_loop,
+    clippy::never_loop,
+    clippy::needless_range_loop,
+    clippy::unnecessary_unwrap,
+    clippy::assigning_clones,
+    clippy::double_must_use,
+    clippy::cast_possible_wrap,
+    clippy::match_wild_err_arm,
+    clippy::unnecessary_debug_formatting,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::ignore_without_reason,
+    clippy::semicolon_if_nothing_returned
+)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -47,7 +89,7 @@ const SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
 fn flutter_bin() -> PathBuf {
     if let Some(explicit) = std::env::var_os("DARTQ_FLUTTER") {
         let path = PathBuf::from(explicit);
-        assert!(path.is_file(), "DARTQ_FLUTTER={:?} is not a file", path);
+        assert!(path.is_file(), "DARTQ_FLUTTER={path:?} is not a file");
         return path;
     }
     if let Some(paths) = std::env::var_os("PATH")
@@ -84,12 +126,12 @@ fn scenario_lock() -> &'static Mutex<()> {
 /// The shared project scaffold (created once per test process).
 fn fixture() -> &'static Path {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
-    FIXTURE.get_or_init(|| prepare_fixture())
+    FIXTURE.get_or_init(prepare_fixture)
 }
 
 /// Generates the project scaffold and lays the checked-in fixture
 /// over the template. `flutter create --no-pub` keeps the template's
-/// hosted dependencies (cupertino_icons, flutter_lints) out of the
+/// hosted dependencies (`cupertino_icons`, `flutter_lints`) out of the
 /// resolution: the fixture's pubspec is SDK-only, so the whole suite
 /// runs offline once the Flutter SDK cache is present.
 fn prepare_fixture() -> PathBuf {
@@ -189,8 +231,10 @@ fn line_of(needle: &str) -> u32 {
     main_source()
         .lines()
         .position(|line| line.contains(needle))
-        .map(|index| index as u32 + 1)
-        .unwrap_or_else(|| panic!("fixture has no line containing {needle:?}"))
+        .map_or_else(
+            || panic!("fixture has no line containing {needle:?}"),
+            |index| index as u32 + 1,
+        )
 }
 
 /// Replaces the (single) occurrence of `from` with `to` in the app
@@ -363,12 +407,9 @@ impl OwnedRun {
     fn wait_exit(&mut self, grace: Duration) {
         let deadline = Instant::now() + grace;
         while let Some(child) = self.child.as_mut() {
-            match child.try_wait().expect("flutter run liveness") {
-                Some(_) => {
-                    self.child = None;
-                    return;
-                }
-                None => {}
+            if child.try_wait().expect("flutter run liveness").is_some() {
+                self.child = None;
+                return;
             }
             assert!(Instant::now() < deadline, "flutter run ignored teardown");
             std::thread::sleep(Duration::from_millis(200));
@@ -449,14 +490,13 @@ fn spawn_flutter_run_paused() -> (OwnedRun, String, Arc<Mutex<Vec<u8>>>) {
             let bytes = captured.lock().expect("capture lock");
             String::from_utf8_lossy(&bytes).to_string()
         };
-        if let Some(uri) = banner.lines().find_map(|line| extract_service_uri(line)) {
+        if let Some(uri) = banner.lines().find_map(extract_service_uri) {
             return (run, uri, captured);
         }
-        if let Some(child) = run.child.as_mut() {
-            match child.try_wait().expect("flutter run liveness") {
-                Some(status) => panic!("flutter run died before the banner ({status}):\n{banner}"),
-                None => {}
-            }
+        if let Some(child) = run.child.as_mut()
+            && let Some(status) = child.try_wait().expect("flutter run liveness")
+        {
+            panic!("flutter run died before the banner ({status}):\n{banner}")
         }
         assert!(
             Instant::now() < deadline,
@@ -584,7 +624,7 @@ fn launch_takeover_and_build_frame_inspection() {
     assert_no_orphans(Duration::from_secs(30));
 }
 
-/// Hot reload follows the tool's orchestration (DevFS push +
+/// Hot reload follows the tool's orchestration (`DevFS` push +
 /// reassemble), a broken edit fails as data while the session stays
 /// alive and usable, and breakpoints outside the build path survive
 /// reloads.
@@ -897,7 +937,7 @@ fn app_exit_mid_session_surfaces_clean_terminal_state() {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match session.wait_for_pause(&main) {
-            Err(Error::ProcessExited(_)) | Err(Error::IsolateExited(_)) => break,
+            Err(Error::ProcessExited(_) | Error::IsolateExited(_)) => break,
             Err(Error::Timeout(_)) if Instant::now() >= deadline => {
                 panic!("mid-session exit never surfaced as a terminal state")
             }

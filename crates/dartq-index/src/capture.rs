@@ -80,6 +80,7 @@
 //! design and named arguments resolve only against a callee's
 //! formal list (#119's table, not a namespace hit).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -685,14 +686,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// name, so the key composes into a stack buffer and only a name longer
     /// than it falls back to the heap.
     fn setter_spelling(&self, name: StringId) -> StringId {
-        let name = self.strings.resolve(name);
         const STACK_KEY: usize = 64;
+        let name = self.strings.resolve(name);
         let mut buf = [0u8; STACK_KEY];
-        if name.len() + 1 <= STACK_KEY {
+        if name.len() < STACK_KEY {
             buf[..name.len()].copy_from_slice(name.as_bytes());
             buf[name.len()] = b'=';
             let key =
-                std::str::from_utf8(&buf[..name.len() + 1]).expect("utf-8 name plus `=` is utf-8");
+                std::str::from_utf8(&buf[..=name.len()]).expect("utf-8 name plus `=` is utf-8");
             self.strings.intern(key)
         } else {
             self.strings.intern(&format!("{name}="))
@@ -1670,6 +1671,7 @@ impl ParserListener for Capturer<'_, '_> {
 }
 
 #[cfg(test)]
+#[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
     use dartq_language::{FeatureSet, LanguageVersion};
@@ -2203,6 +2205,7 @@ mod tests {
     /// stays `UNKNOWN` (no per-element end event). ASCII sources, so the
     /// byte offsets read directly off the literal.
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn positional_columns_pin_bodied_declarations() {
         let strings = StringTable::new();
         let source = "class C { void m() {} int get g => 1; int a = 0, b = 1; } \
@@ -2246,6 +2249,7 @@ mod tests {
     /// members at their `;`, the named mixin application at its `;`, the
     /// bodyless mixin at its braces.
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn positional_columns_unknown_round_trip() {
         let strings = StringTable::new();
         let source = "class B<T> {} \

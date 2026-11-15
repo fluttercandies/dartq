@@ -15,7 +15,7 @@
 //! # The contract
 //!
 //! The upstream ladder (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/error/literal_element_verifier.dart
+//! `pkg/analyzer/lib/src/error/literal_element_verifier.dart`
 //! `_verifySpreadForListOrSet`/`_verifySpreadForMap` and
 //! `constant_verifier.dart` `_validateListOrSetSpread`/`_validateMapSpread`):
 //! a `Dynamic`/`Never` operand is silent; a `Null` operand is silent under
@@ -37,6 +37,8 @@
 //!
 //! Oracle answers `not_iterable_spread` at `1` and `not_map_spread` at
 //! `[1]` — dartq reported nothing before this fix.
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops};
 

@@ -2,6 +2,7 @@
 //! table into scanner tokens for `TokenTable::append_inserted` — the fold
 //! the AST bridge needs before any span read.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::parse_unit_with;
 use dartq_scanner::{ScanConfig, TokenKind, scan};
@@ -33,7 +34,7 @@ fn parse(source: &'static str) -> (Collector, Vec<dartq_scanner::Token>) {
 fn closer_split_drains_as_non_synthetic_gt_tokens() {
     let src = "List<List<int>> x;";
     let (listener, tokens) = parse(src);
-    assert!(listener.errors.is_empty());
+    assert_eq!(listener.errors, [] as [(std::string::String, u32, u32); 0]);
     // `>>` at 13 splits into the consumed leading `>` and the queued
     // remainder — both plain code, so not synthetic.
     assert_eq!(
@@ -95,8 +96,8 @@ fn recovery_synthetic_identifier_is_zero_width() {
 #[test]
 fn clean_parse_drains_empty_and_listener_round_trips() {
     let (listener, tokens) = parse("var x = 1;");
-    assert!(tokens.is_empty());
-    assert!(listener.errors.is_empty());
+    assert_eq!(tokens, [] as [dartq_scanner::Token; 0]);
+    assert_eq!(listener.errors, [] as [(std::string::String, u32, u32); 0]);
     assert!(!listener.log.is_empty(), "listener received events");
 }
 

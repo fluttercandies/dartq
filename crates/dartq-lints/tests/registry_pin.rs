@@ -9,9 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use dartq_lints::{
-    EnableSet, Group, SEMANTIC_RULES, emittable_rule_names, mounts_semantics, rule_by_name, rules,
-};
+use dartq_lints::{EnableSet, Group, SEMANTIC_RULES, mounts_semantics, rule_by_name, rules};
 
 /// The pinned `package:lints` snapshot's `core.yaml` — the critical set,
 /// pinned verbatim.
@@ -679,7 +677,7 @@ fn enable_set_all_and_resolve_agree() {
         assert!(all.is_enabled(dartq_lints::RuleId(i)));
     }
     let (resolved, unknown) = EnableSet::resolve(rules().iter().map(|s| s.name));
-    assert!(unknown.is_empty());
+    assert_eq!(unknown, [] as [&str; 0]);
     assert_eq!(resolved, all);
 }
 

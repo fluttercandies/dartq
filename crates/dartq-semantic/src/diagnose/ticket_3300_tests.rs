@@ -24,6 +24,7 @@
 //! but the access IS a dereference — the oracle reports the shared code at
 //! the selector, and these pins hold that row in place.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::diagnose::FileReport;
 

@@ -1,20 +1,20 @@
-//! The orphaned frontend_server reaper (#4100).
+//! The orphaned `frontend_server` reaper (#4100).
 //!
-//! A flutter_tools defect measured on 3.44.0: every modeled `flutter
+//! A `flutter_tools` defect measured on 3.44.0: every modeled `flutter
 //! build|run|test` left one `dartaotruntime … frontend_server[_aot]
 //! .dart.snapshot …` process behind when it exited — reparented to pid
-//! 1, idle, and leaked for good (flutter_tools never waited on it; the
+//! 1, idle, and leaked for good (`flutter_tools` never waited on it; the
 //! 3.44.9 and 3.47.9 SDKs on hand do not reproduce it, so the sweep
 //! finds nothing there and costs one `ps`). One leak per build is
 //! invisible and one per minute is a dead machine, so after each run's
 //! child exits the shim sweeps once: enumerate the process table with a
 //! single `ps` spawn and SIGTERM every process that (a) is parented by
 //! pid 1 or by one of this process's own live ancestors — either marks
-//! a parent that is no longer the frontend_server's flutter_tools: the
+//! a parent that is no longer the `frontend_server`'s `flutter_tools`: the
 //! kernel reparents an orphan to the nearest subreaper up the tree,
 //! or pid 1 where there is none, and every subreaper above a process
 //! we spawned is by the same tree one of our own ancestors; the
-//! frontend_server of a concurrent session is still owned by a live
+//! `frontend_server` of a concurrent session is still owned by a live
 //! dart/IDE process outside our tree, so it stays protected, (b) names
 //! `frontend_server` in its command line (the substring covers both the
 //! JIT snapshot and the `_aot` form), and (c) is no older than the run
@@ -26,6 +26,7 @@
 //! sends no signal to anything still owned by a live parent — the
 //! interactive `run` face's tty semantics are untouched.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fmt::Display;
 use std::process::Command;
 use std::time::SystemTime;
@@ -67,13 +68,11 @@ fn etime_secs(etime: &str) -> Option<u64> {
         None => (0, etime),
     };
     let clock_secs = clock.split(':').try_fold(0u64, |total, field| {
-        Some(
-            total
-                .checked_mul(60)?
-                .checked_add(field.parse::<u64>().ok()?)?,
-        )
+        total
+            .checked_mul(60)?
+            .checked_add(field.parse::<u64>().ok()?)
     })?;
-    Some(days.checked_mul(86_400)?.checked_add(clock_secs)?)
+    days.checked_mul(86_400)?.checked_add(clock_secs)
 }
 
 /// True when `ppid` names a parent that no longer owns the process:
@@ -82,7 +81,7 @@ fn etime_secs(etime: &str) -> Option<u64> {
 /// `PR_SET_CHILD_SUBREAPER` on a process up every tree they own —
 /// parks an orphan with the nearest subreaper instead of pid 1, and
 /// that subreaper is by construction one of our ancestors, so the two
-/// legs together cover both reparenting targets. A frontend_server
+/// legs together cover both reparenting targets. A `frontend_server`
 /// some live dart/IDE process outside this tree still owns is neither,
 /// so it stays protected.
 fn is_orphan_ppid(ppid: libc::pid_t, ancestors: &[libc::pid_t]) -> bool {
@@ -134,7 +133,7 @@ fn stat_ppid(pid: libc::pid_t) -> Option<libc::pid_t> {
     fields.next()?.parse().ok()
 }
 
-/// SIGTERMs every orphaned frontend_server this run could have leaked
+/// SIGTERMs every orphaned `frontend_server` this run could have leaked
 /// and returns their pids, `run_started` being the moment the child was
 /// spawned. One `ps` spawn, one stderr line per run that reaped
 /// anything; every failure is a note, never an error.
@@ -176,7 +175,7 @@ pub fn reap_orphaned_frontend_servers(run_started: SystemTime) -> Vec<libc::pid_
     if !reaped.is_empty() {
         let listed = reaped
             .iter()
-            .map(|pid| pid.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
         note(&format!(
@@ -197,7 +196,7 @@ mod tests {
 
     /// One fixture: a disowned `frontend_server_fixture_<pid>` process
     /// the reaper must see exactly like flutter's real leak — argv
-    /// names frontend_server, and once the spawning shell exits the
+    /// names `frontend_server`, and once the spawning shell exits the
     /// kernel parks it with pid 1 or, on a subreaper host (the CI
     /// runner), with the nearest subreaper up our own tree.
     /// The per-binary tag keeps the poll from adopting a leftover

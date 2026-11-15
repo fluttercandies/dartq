@@ -31,6 +31,7 @@
 //! initializer-list extras from `static_processing_A24_*` /
 //! `duplicate_initializers_test`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 use crate::diagnose::FileReport;
 

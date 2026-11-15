@@ -11,17 +11,41 @@
 //!   `// ignore_for_file: uri_does_not_exist` therefore drops the
 //!   `uri_does_not_exist` rows the URI layer baked into `facts.diagnostics`;
 //!   dartq's `diagnose_library` pushed them verbatim and over-fired.
-//! * `isPartOf` is a FileState identity test (`uriFile == container.file`,
+//! * `isPartOf` is a `FileState` identity test (`uriFile == container.file`,
 //!   file_state.dart:2248-2250) keyed on the URI a file was DISCOVERED
 //!   under, not its path. A `part 'file:///p2.dart'` literal registers `p2`
-//!   under a `file:`-uri FileState, so its `part of 'p1.dart'` resolves a
-//!   `file:`-uri FileState for `p1` that is NOT the `package:`-canonical
-//!   FileState `p1` was discovered as — `isPartOf` fails, the include does
+//!   under a `file:`-uri `FileState`, so its `part of 'p1.dart'` resolves a
+//!   `file:`-uri `FileState` for `p1` that is NOT the `package:`-canonical
+//!   `FileState` `p1` was discovered as — `isPartOf` fails, the include does
 //!   not attach, and the directive reports `part_of_different_library` with
 //!   `enclosingFile.file.uriStr` (canonical) / `includedFile.uriStr`
-//!   (file:-spelled). dartq interns targets by path, so the FileIds
+//!   (<file:-spelled>). dartq interns targets by path, so the `FileIds`
 //!   coincided and the include attached silently.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use common::Fixture;
@@ -122,10 +146,10 @@ fn an_unignored_uri_does_not_exist_still_reports() {
 }
 
 /// `part 'file:///…/p2.dart'` includes a part discovered under a `file:`
-/// URI while the includer resolves `package:`-canonically — the FileState
+/// URI while the includer resolves `package:`-canonically — the `FileState`
 /// identities differ, so `isPartOf` fails and the directive reports
 /// `part_of_different_library` with the canonical `enclosingFile.uriStr`
-/// and the file:-spelled `includedFile.uriStr`. dartq must not attach it.
+/// and the <file:-spelled> `includedFile.uriStr`. dartq must not attach it.
 #[test]
 fn a_file_uri_part_include_reports_part_of_different_library() {
     // `lib.dart` is the includer (canonical `package:`); `p2.dart` is its

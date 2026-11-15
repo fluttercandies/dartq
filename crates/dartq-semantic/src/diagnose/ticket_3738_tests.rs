@@ -10,6 +10,7 @@
 //! `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze` before the fix
 //! landed; the shapes were verified net-neutral against the lib suite.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{
     CORE_PRELUDE, RigImport, report_ops, report_ops_imports, report_ops_wildcards,
 };
@@ -187,7 +188,7 @@ fn function_head_extension_member_read() {
 // referenced.` at the `[]` span.
 
 /// `x[0] ??= 1` credits only `[]=`: `[]` reports `unused_element`,
-/// `[]=` stays silent (the if_null_assignment_implicit_extension corpus
+/// `[]=` stays silent (the `if_null_assignment_implicit_extension` corpus
 /// shape, verified against the oracle).
 #[test]
 fn index_compound_assignment_credits_only_index_set() {
@@ -246,7 +247,7 @@ fn index_plus_assignment_credits_only_index_set() {
 
 /// The null-aware `x?[i] ??= v` face — the census's exact shape
 /// (`maybeIndexable(...)?[0] ??= …` in the
-/// if_null_assignment_implicit_extension corpus) — follows the same
+/// `if_null_assignment_implicit_extension` corpus) — follows the same
 /// write-element credit: `[]` reports, `[]=` silent.
 #[test]
 fn null_aware_index_compound_credits_only_index_set() {

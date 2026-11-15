@@ -17,6 +17,7 @@
 //! over a chain-broken receiver keeps reporting, and an annotation name the
 //! scope answers stays silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

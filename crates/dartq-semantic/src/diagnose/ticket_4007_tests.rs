@@ -23,6 +23,7 @@
 //! `…|6|19|5|'String' vs 'int'`, `…|6|26|5|'String' vs 'int'`,
 //! `…|7|34|3|'Set<int>' vs 'int'`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use crate::diagnose::FileReport;
 

@@ -25,6 +25,10 @@
 //!
 //! These tests run in the dedicated serial verification phase.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, latest_features, scan_ok, setup};
 use crate::parser::MAX_DIAGNOSTICS;
 use crate::parser::Parser;
@@ -70,7 +74,7 @@ fn diagnostics_cap_latches_and_stops_parsing() {
     );
 }
 
-/// The 600-deep record-type case (manual/diagnostic/stack_overflow/1): the
+/// The 600-deep record-type case (`manual/diagnostic/stack_overflow/1)`: the
 /// official parser has NO depth counter on the type-descent path
 /// (`computeType` → `parseRecordType` → `parseRecordTypeField` → `computeType`
 /// recurses unguarded), so the oracle iterates and emits one
@@ -246,6 +250,16 @@ fn deep_parenthesized_patterns_parse_silently() {
 /// cap (10,000) must NOT clip the cascade.
 #[test]
 fn deep_statement_corpus_cascade_matches_oracle_rows() {
+    fn at(source: &str, line: u32, col: u32) -> u32 {
+        let mut offset = 0u32;
+        for (i, l) in source.lines().enumerate() {
+            if i as u32 + 1 == line {
+                return offset + col - 1;
+            }
+            offset += l.len() as u32 + 1;
+        }
+        panic!("line {line} beyond the input");
+    }
     // The corpus shape, regenerated (ASCII throughout, so UTF-16 offsets
     // equal byte offsets; only the line/column geometry matters for the
     // anchors, and every diagnostic-bearing line is byte-identical to the
@@ -274,17 +288,6 @@ fn deep_statement_corpus_cascade_matches_oracle_rows() {
     let source: &'static str = Box::leak(source.into_boxed_str());
 
     // 1-based (line, col) -> 0-based UTF-16 offset.
-    fn at(source: &str, line: u32, col: u32) -> u32 {
-        let mut offset = 0u32;
-        for (i, l) in source.lines().enumerate() {
-            if i as u32 + 1 == line {
-                return offset + col - 1;
-            }
-            offset += l.len() as u32 + 1;
-        }
-        panic!("line {line} beyond the input");
-    }
-
     let (table, text) = scan_ok(source);
     let mut listener = Collector::default();
     {
@@ -515,11 +518,11 @@ fn adversarial_inputs_terminate_with_bounded_diagnostics() {
 /// the `super` head, so the expression re-read returns without consuming it
 /// and the missing-comma continuation re-parsed the same head forever —
 /// each turn re-reporting and re-queueing tokens (unbounded diagnostics,
-/// GBs of RSS on the SDK's own illegal_initializer_test). The no-progress
+/// GBs of RSS on the SDK's own `illegal_initializer_test`). The no-progress
 /// guard breaks the stall and hands the tokens to the member loop
-/// (tests/language/variable/illegal_initializer_test.dart,
-/// co19 Generative_Constructors/initializers_t07,
-/// invalid_super_in_initializer test_constructor_name_is_keyword).
+/// (`tests/language/variable/illegal_initializer_test.dart`,
+/// co19 `Generative_Constructors/initializers_t07`,
+/// `invalid_super_in_initializer` `test_constructor_name_is_keyword`).
 #[test]
 fn initializer_loop_terminates_on_stalled_super_recovery() {
     let cases = [

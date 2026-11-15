@@ -18,6 +18,7 @@
 //! `Ty::Record` and the free-parameter `Unknown` still drop — under-report
 //! stands ahead of a fabricated face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

@@ -3,6 +3,7 @@
 //! 3.13.7); comments name the cluster and upstream face.
 //!
 //! Registered through `diagnose/tests.rs`'s `#[path]` block.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use crate::diagnose::test_rig::{CORE_PRELUDE, assert_silent, report_ops, rows};
 use crate::diagnose::types::FileReport;
@@ -90,14 +91,14 @@ void test1() {
 /// through the `T?` leaf; the instantiated formal is `int?`, silent.
 #[test]
 fn nullable_param_member_send_binds() {
-    let fixture = r#"
+    let fixture = r"
 class C {
   void f<T>(T? v) {}
 }
 void test(C c) {
   c.f(1);
 }
-"#;
+";
     let report = report_ops(fixture);
     assert_silent(&report);
 }
@@ -140,12 +141,12 @@ void test() {
 /// (upstream `P is P0?` arm) and binds `T := int`; silent.
 #[test]
 fn nullable_arg_nullable_param() {
-    let fixture = r#"
+    let fixture = r"
 void f<T>(T? v) {}
 void test(int? x) {
   f(x);
 }
-"#;
+";
     let report = report_ops(fixture);
     assert_silent(&report);
 }
@@ -208,12 +209,12 @@ enum E<T> {
 /// unsupplied `b` never walks. The solved formal is `int`; silent.
 #[test]
 fn solved_param_substitutes() {
-    let fixture = r#"
+    let fixture = r"
 void f<T>(T a, [T? b]) {}
 void test() {
   f(1);
 }
-"#;
+";
     let report = report_ops(fixture);
     assert_silent(&report);
 }

@@ -14,6 +14,7 @@
 //!   (`visitEnumConstantDeclaration`, :146-153) — `E(0)` gives the
 //!   selected constructor's first positional formal.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

@@ -9,6 +9,7 @@
 //! unconditionally once a parameter element resolved; the required-named
 //! walk is `_checkRequired` (required_parameters_verifier.dart:134-218).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::diagnose::FileReport;
 
@@ -291,7 +292,7 @@ f() {
 /// `f() { g<int, int>; } void g<T>() {}` — a top-level function's
 /// tear-off with surplus type arguments reports
 /// `wrong_number_of_type_arguments_element` (`type_instantiation_target`'s
-/// FunctionElement arm).
+/// `FunctionElement` arm).
 #[test]
 fn top_level_fn_tearoff_type_arity() {
     let source = "\

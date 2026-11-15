@@ -2374,7 +2374,7 @@ pub(crate) mod comment_references {
     /// `len - 2`, which can land mid-UTF-8-char. The caller's doc-form
     /// gate anchors the fixed `3`-byte marker offsets in ASCII.
     /// Yields each line's byte offset inside the lexeme with its content.
-    fn content_lines<'a>(lexeme: &'a str, is_line: bool) -> Vec<(usize, &'a str)> {
+    fn content_lines(lexeme: &str, is_line: bool) -> Vec<(usize, &str)> {
         if is_line {
             let mut start = lexeme
                 .find(|ch: char| ch != '/')
@@ -3922,7 +3922,7 @@ mod w5_approx_pins {
     /// (the official validator runs before the pipeline's ignore filter,
     /// `library_analyzer.dart:135`). The self-referencing shape: the
     /// `unnecessary_ignore` citation (line 1, targeting line 2) suppresses
-    /// the verdict on the avoid_empty_else citation below, but produces one
+    /// the verdict on the `avoid_empty_else` citation below, but produces one
     /// of its own — a citation nothing suppressed is itself unnecessary, and
     /// no entry targets the self-citation's own line.
     #[test]

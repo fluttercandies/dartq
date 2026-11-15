@@ -6,15 +6,15 @@
 //!    same operand row, while the oracle answers one row per consumed node
 //!    (upstream `checkForUseOfVoidResult`, generated/
 //!    error_detection_helpers.dart:245-258, called from
-//!    error_verifier.dart:470/:482 and bool_expression_verifier.dart:57);
+//!    `error_verifier.dart:470/:482` and `bool_expression_verifier.dart:57`);
 //! 2. the MISSING for-in element row: `_checkForEachParts`'s
 //!    `sequenceElementType is VoidType && variableType is! VoidType` arm
 //!    (error_verifier.dart:4478-4484) anchored `.at(node.iterable)`;
 //! 3. the collection literal's EXTRA row: the void use runs only when the
-//!    enclosing element type is not `void` (literal_element_verifier.dart
+//!    enclosing element type is not `void` (`literal_element_verifier.dart`
 //!    :95, the map arms :127/:166);
 //! 4. the named record field's ANCHOR: the `RecordLiteralNamedField` node
-//!    (`name: value`), not its value alone (record_literal_resolver.dart
+//!    (`name: value`), not its value alone (`record_literal_resolver.dart`
 //!    :159 `.at(field)`), and the field NODE's full extent on both shapes
 //!    (#3509 — see the residual-4 pin below).
 //!
@@ -22,6 +22,7 @@
 //! stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 

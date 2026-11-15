@@ -19,6 +19,7 @@
 //! and shadowing locals are parameters (an unreferenced parameter is
 //! never a diagnostic).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, assert_silent, code_names, report_ops, report_ops_imports, rows};
 
 /// `new p.C()` where `p` is a top-level function: the importPrefix arm's

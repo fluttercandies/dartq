@@ -37,6 +37,7 @@
 //! `is_mixin_application` is not captured), and the same-unit
 //! augment-before-intro ordering is not applied.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_diagnostics::{Diagnostic, Severity};
 use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
 use dartq_scanner::{Keyword, TokenKind};
@@ -179,7 +180,7 @@ impl Face<'_> {
                 } else {
                     &container.ctor_formals
                 };
-                table.get(name).map(|f| f.as_ref())
+                table.get(name).map(std::convert::AsRef::as_ref)
             }
             Face::Container(_) => None,
         }
@@ -318,7 +319,7 @@ fn augment_key(aug: &AugmentDecl, strings: &StringTable) -> (Option<StringId>, S
 /// merged scope, never its own formals alone: the merged element's
 /// parameter list is the fragment-linked list, and each body's formal
 /// scope is populated from the merged element (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/summary2/element_builder.dart
+/// `pkg/analyzer/lib/src/summary2/element_builder.dart`
 /// `_linkFormalParameters` — the intro, every augment, and every body read
 /// on the chain answer through the one parameter element per position).
 /// Oracle-pinned (3.13.7, `--enable-experiment=augmentations`): an intro
@@ -601,7 +602,7 @@ pub(super) fn augmentation_diagnostics(
         if container.kind != ContainerKind::Enum {
             continue;
         }
-        for constant in container.enum_constants.iter() {
+        for constant in &container.enum_constants {
             if let Some(member) = container.members.get(constant)
                 && member.is_augment
             {
@@ -651,9 +652,7 @@ pub(super) fn augmentation_diagnostics(
                 chain.last(),
                 Some(last) if !last.is_mixin_application && last.kind == aug.kind
             );
-            if !merged {
-                without_declaration(&mut out, file, aug, &chain);
-            } else {
+            if merged {
                 // The trailing same-kind run: its first entry is the
                 // introductory declaration (an earlier different-kind
                 // declaration started a new element upstream and never
@@ -688,6 +687,8 @@ pub(super) fn augmentation_diagnostics(
                 }
                 // An augmentation-only executable chain: the body checks
                 // bail (upstream `firstExecutableFragment.isAugmentation`).
+            } else {
+                without_declaration(&mut out, file, aug, &chain);
             }
         }
         // This augmentation joins the chain for the ones that follow it.
@@ -1255,7 +1256,7 @@ fn populate(
             // already-complete walk skips it.
             false,
         );
-        for (member_name, member) in container.members.iter() {
+        for (member_name, member) in &container.members {
             let member_kind = match member.kind {
                 MemberKind::Method => AugKind::Method,
                 MemberKind::Getter => AugKind::Getter,
@@ -1657,8 +1658,7 @@ fn check_formals(
     let entity_at = |index: usize| {
         cur_positional
             .get(index)
-            .map(|f| f.entity())
-            .unwrap_or(right_paren)
+            .map_or(right_paren, |f| f.entity())
     };
     if cur_required < first_required {
         let code = SemanticCode::AugmentationRequiredPositionalFormalParameterCount;
@@ -1757,7 +1757,7 @@ fn check_formals(
     // duplicate spelling (upstream overwrites), the augmentation's the
     // first (upstream `putIfAbsent`).
     let mut first_named: Vec<(StringId, &Formal)> = Vec::new();
-    for param in first.named.iter() {
+    for param in &first.named {
         if let Some(slot) = first_named.iter_mut().find(|(name, _)| *name == param.name) {
             slot.1 = param;
         } else {
@@ -1775,28 +1775,26 @@ fn check_formals(
     }
     let intro_unit_id = run.first().map_or(file, |entry| entry.unit);
     for (name, cur) in &cur_named {
-        match first_named.iter().find(|(candidate, _)| candidate == name) {
-            Some((_, first_param)) => {
-                check_pair(
-                    out,
-                    file,
-                    own,
-                    intro_unit_id,
-                    intro_unit,
-                    strings,
-                    canon,
-                    aug_params,
-                    &intro_params,
-                    cur,
-                    first_param,
-                    true,
-                );
-            }
-            None => {
-                let code = SemanticCode::AugmentationNamedFormalParameterExtra;
-                let message = code.message(strings.resolve(*name), "");
-                out.push(row(file, cur.entity(), code, message));
-            }
+        if let Some((_, first_param)) = first_named.iter().find(|(candidate, _)| candidate == name)
+        {
+            check_pair(
+                out,
+                file,
+                own,
+                intro_unit_id,
+                intro_unit,
+                strings,
+                canon,
+                aug_params,
+                &intro_params,
+                cur,
+                first_param,
+                true,
+            );
+        } else {
+            let code = SemanticCode::AugmentationNamedFormalParameterExtra;
+            let message = code.message(strings.resolve(*name), "");
+            out.push(row(file, cur.entity(), code, message));
         }
     }
     for (name, _) in &first_named {
@@ -1867,7 +1865,7 @@ fn check_default_chain(
             }
         };
     let mut positional_at = 0usize;
-    for formal in aug.formals.iter() {
+    for formal in &aug.formals {
         // The parameter element's slot: a positional index for the
         // positional kinds (required and optional share one indexing —
         // `formalParameterList.parameters` order upstream), a name for the
@@ -2075,7 +2073,7 @@ fn canon_top(
 
 /// The canonical signature for a nested slot (a type argument, a bound, a
 /// column inside a function type): an unresolvable leaf compares as the
-/// shared `?invalid` marker — two InvalidType occurrences are the same
+/// shared `?invalid` marker — two `InvalidType` occurrences are the same
 /// singleton upstream and judge equal, while an invalid leaf never equals
 /// a resolved one.
 fn canon_ty(
@@ -2214,7 +2212,7 @@ fn canon_into(
             let shape = unit.type_args.record_shape(shape);
             out.push('(');
             let mut first = true;
-            for field in shape.positional.iter() {
+            for field in &shape.positional {
                 if !first {
                     out.push(',');
                 }
@@ -2223,7 +2221,7 @@ fn canon_into(
                     out.push_str("?invalid");
                 }
             }
-            for (field_name, field) in shape.named.iter() {
+            for (field_name, field) in &shape.named {
                 if !first {
                     out.push(',');
                 }
@@ -2276,7 +2274,7 @@ fn canon_into(
             }
             out.push('(');
             let mut first = true;
-            for formal in shape.positional.iter() {
+            for formal in &shape.positional {
                 if !first {
                     out.push(',');
                 }
@@ -2286,7 +2284,7 @@ fn canon_into(
                     out.push_str("?invalid");
                 }
             }
-            for (formal_name, formal) in shape.named.iter() {
+            for (formal_name, formal) in &shape.named {
                 if !first {
                     out.push(',');
                 }
@@ -2542,7 +2540,7 @@ fn canon_alias_ty(
             let shape = decl_unit.type_args.record_shape(shape);
             out.push('(');
             let mut first = true;
-            for field in shape.positional.iter() {
+            for field in &shape.positional {
                 if !first {
                     out.push(',');
                 }
@@ -2553,7 +2551,7 @@ fn canon_alias_ty(
                     out.push_str("?invalid");
                 }
             }
-            for (field_name, field) in shape.named.iter() {
+            for (field_name, field) in &shape.named {
                 if !first {
                     out.push(',');
                 }
@@ -2580,7 +2578,7 @@ fn canon_alias_ty(
             }
             out.push_str(" Function(");
             let mut first = true;
-            for formal in shape.positional.iter() {
+            for formal in &shape.positional {
                 if !first {
                     out.push(',');
                 }
@@ -2591,7 +2589,7 @@ fn canon_alias_ty(
                     out.push_str("?invalid");
                 }
             }
-            for (formal_name, formal) in shape.named.iter() {
+            for (formal_name, formal) in &shape.named {
                 if !first {
                     out.push(',');
                 }
@@ -2938,7 +2936,7 @@ fn executable_body_diagnostics(
             container.kind,
             ContainerKind::Class | ContainerKind::Enum | ContainerKind::Mixin
         );
-        for (member_name, member) in container.members.iter() {
+        for (member_name, member) in &container.members {
             // `firstFragment.isAugmentation` — the declaration's own
             // `augment` keyword makes it a fragment, never an intro.
             if member.is_augment
@@ -3132,7 +3130,6 @@ fn executable_top_level_row(
 /// a `const` variable folds into it). `getter`/`setter` are
 /// `(chain_length, complete)`; `has_augmentations` is either chain
 /// growing past its intro (`error_verifier.dart:5428-5432`).
-#[expect(clippy::too_many_arguments)] // the walk's shared context columns
 fn report_incomplete_induced(
     out: &mut Vec<Diagnostic>,
     file: FileId,

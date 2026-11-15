@@ -11,6 +11,7 @@
 //! Oracle provenance: `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze` —
 //! each pin asserts the oracle's exact (code, offset, length, message).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 
@@ -144,7 +145,7 @@ fn this_null_aware_index_write_question_mark_is_silent() {
 }
 
 /// `this + this` inside `extension on A?` reports the OPERATOR face at the
-/// operator token — the BinaryExpression arm of the node-shape dispatch.
+/// operator token — the `BinaryExpression` arm of the node-shape dispatch.
 #[test]
 fn this_binary_operator_reports_operator_face() {
     let src = "\nclass A { A operator +(A o) => this; }\n\

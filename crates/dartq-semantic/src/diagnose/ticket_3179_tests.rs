@@ -18,6 +18,7 @@
 //! (`parser-fe/record/on`) — plus the plain `catch (e)` control and the
 //! `on Object?` face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, code_names, report_ops};
 
 /// The diagnostic rows' `(code, offset)` pairs, offsets relative to the
@@ -127,15 +128,13 @@ fn ticket_3179_nullable_object_head_takes_the_catch_all_arm() {
                 fixture.find("on int").unwrap()
             ),
         ],
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
     let report = report_ops(fixture);
     assert!(
         code_names(&report).iter().all(|code| {
             *code == "nullable_type_in_catch_clause" || *code == "dead_code_catch_following_catch"
         }),
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
 }

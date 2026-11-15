@@ -32,6 +32,7 @@
 //! send) — dropping THAT direction would trade the fixed rows for a wave
 //! of `argument_type_not_assignable` fabrications.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 
 fn code_names(report: &super::FileReport) -> Vec<&'static str> {

@@ -2,7 +2,7 @@
 //!
 //! The census families this ticket extracted diverge through three
 //! mechanisms, each rooted OUTSIDE the two files this lane was granted
-//! (the granted `resolved_ops.rs` name resolves to the flow TypeOps
+//! (the granted `resolved_ops.rs` name resolves to the flow `TypeOps`
 //! back-end at `src/resolved_ops.rs`, which hosts none of them; the
 //! operator faces live in `engine_core.rs`/`assignability.rs` — routed
 //! to lane D per the brief's own rule — and `row_resolution.rs`, a live
@@ -15,7 +15,7 @@
 //!
 //! Routed record (every row accounted, zero silent drops):
 //!
-//! * E-op argument-context ladder (14 rows, number_operator_context_test)
+//! * E-op argument-context ladder (14 rows, `number_operator_context_test`)
 //!   — `invoke_downward_context`/`send_position_context` reads the
 //!   enclosing generic call's formal RAW (`send_formals` in
 //!   `row_resolution.rs`), so `context<int>(…)`'s written `int` never
@@ -26,38 +26,38 @@
 //!   `_refineNumericInvocationContextNullSafe` clamp ladder, Dart SDK
 //!   source `pkg/analyzer/lib/src/dart/element/type_system.dart`
 //!   :1949-1962). Owning file: `row_resolution.rs` (row-model lane).
-//! * E-op dynamic-receiver const operand (6 rows, double_in_int_op id1-6)
+//! * E-op dynamic-receiver const operand (6 rows, `double_in_int_op` id1-6)
 //!   — the `|` argument check on a const-`dynamic` receiver reads the
 //!   operand's CONST VALUE type (`double`) where the oracle checks the
 //!   static type (`dynamic`, no check). Owning file: the dynamic/const
 //!   operator-argument faces (lane B3 / const faces).
-//! * E13 numeric-ladder Never guard (12 rows, number_operator_typing_test)
+//! * E13 numeric-ladder Never guard (12 rows, `number_operator_typing_test`)
 //!   — the ladder's `S <: double?` arm misses the upstream
 //!   `!s.isBottom` guard (`type_system.dart:2098`), so `T op never`
 //!   answers `double` where the oracle answers `num`. Owning file:
 //!   `engine_core.rs` (`refine_numeric_binary`, lane D).
-//! * E13 compound-result row face (34 rows, typing_test) — the compound
+//! * E13 compound-result row face (34 rows, `typing_test`) — the compound
 //!   assignment's value row keeps the RHS type (`d += i1` reads `int`,
 //!   `d += never` reads `Never`) where upstream's
 //!   `AssignmentExpressionImpl.staticType` is the operator RESULT the
 //!   write-back verdict already computes; the compound's receiver read
 //!   also skips the flow promotion (`d -= 1` on `Object&double`
-//!   resolves on `Object`, 11 undefined_operator rows). Owning file:
+//!   resolves on `Object`, 11 `undefined_operator` rows). Owning file:
 //!   `assignability.rs` (`check_compound_assignment`, lane D).
-//! * E13 promoted binary operand (7 rows, typing_test) — the binary
+//! * E13 promoted binary operand (7 rows, `typing_test`) — the binary
 //!   fold's operand faces read unpromoted declared types (`i + ni` over
 //!   `ni` promoted `N&int` answers `num`). Owning file:
 //!   `engine_core.rs` (`fold_binary` operand reads, lane D).
-//! * E13 null-assert on `Null` (2 rows, test_nullCheck_nullableContext)
+//! * E13 null-assert on `Null` (2 rows, `test_nullCheck_nullableContext`)
 //!   — `non_null_form` has no `Null → Never` arm (upstream
 //!   `promoteToNonNull`, `type_system.dart:1479`). Owning files:
 //!   `receiver_face.rs`/`types.rs`.
-//! * E13 conditional branch promotion (2 rows, named_parameters_test
+//! * E13 conditional branch promotion (2 rows, `named_parameters_test`
 //!   50:41/54:41) — the conditional fold reads arm rows without the
 //!   flow promotion the test applied (`c == null ? 0 : c` joins `int?`
 //!   where the oracle joins `int`). Owning file: `engine_core.rs`
 //!   (`fold_conditional`, lane D).
-//! * E13 field-initializer numeric context (1 row, typing_test 1090:14)
+//! * E13 field-initializer numeric context (1 row, `typing_test` 1090:14)
 //!   — a `double`-typed field's initializer context never reaches the
 //!   binary refinement (`n + 1` stays `num`). Owning file:
 //!   `engine_core.rs`/const faces (lane D).
@@ -68,6 +68,7 @@
 //! (invocation named-pairing), and the Never-flow `dead_code` +
 //! `unnecessary_type_check` pair (flow dead-code face).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

@@ -36,6 +36,7 @@
 //! deliberately small: richer per-code narrative is the docs page's job,
 //! not this report's.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};
@@ -222,7 +223,7 @@ pub(crate) fn validate_diagnostic_explain(value: &Value) -> Result<(), SchemaVio
         non_negative(field(obj, "total", p)?, &join(p, "total"))?;
         if let Some(lines) = obj.get("lines") {
             for (i, line) in array(lines, &join(p, "lines"))?.iter().enumerate() {
-                let lp = format!("{}.lines[{i}]", p);
+                let lp = format!("{p}.lines[{i}]");
                 crate::support::one_based(line, &lp)?;
             }
         }

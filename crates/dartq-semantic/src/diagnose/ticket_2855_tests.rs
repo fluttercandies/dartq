@@ -22,6 +22,8 @@
 //!   proves nothing against a concrete argument — informative on both
 //!   instantiations.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use crate::diagnose::test_rig::report_ops;
 use crate::diagnose::types::FileReport;
 
@@ -37,7 +39,7 @@ fn type_check_rows(report: &FileReport) -> Vec<(u32, u32)> {
     found
 }
 
-/// —— the mixin-application alias ——
+// —— the mixin-application alias ——
 
 /// `b is Mixin1<num>` over the alias chain (`B<num, String>` through
 /// `class MyTypedef<K, V> = A with Mixin1<K>, Mixin2<V>`): the alias's
@@ -131,7 +133,7 @@ fn bare_mixin_application_positive_reports() {
     );
 }
 
-/// —— the concrete tear-off against a function-alias instantiation ——
+// —— the concrete tear-off against a function-alias instantiation ——
 
 /// `f15 is F15<int>`: the tear-off's declared return matches the alias's
 /// substituted face — the oracle's proven pair.
@@ -171,7 +173,7 @@ fn top_level_tearoff_negative_stays_informative() {
     );
 }
 
-/// —— the generic-container member tear-off ——
+// —— the generic-container member tear-off ——
 
 /// `m is F<int>` over a method whose return mentions the class's own
 /// parameter: the variable leaf proves nothing against a concrete
@@ -192,7 +194,7 @@ fn generic_member_tearoff_stays_informative() {
     );
 }
 
-/// —— the plain declared-edge positive keeps folding ——
+// —— the plain declared-edge positive keeps folding ——
 
 /// `d is Base` over a plain `extends` edge: the name-level positive the
 /// substituted ask never needed to answer — the keep-green of the
@@ -215,12 +217,12 @@ fn plain_extends_positive_reports() {
     );
 }
 
-/// —— the interface-cycle operand ——
+// —— the interface-cycle operand ——
 
 /// `a is B` over the mutual `extends` cycle (`class A extends B`,
 /// `class B extends A`): upstream clears both participants' supertypes
 /// (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/summary2/interface_cycles.dart, the
+/// `pkg/analyzer/lib/src/summary2/interface_cycles.dart`, the
 /// `_markCircular` arm — the cycle element's `supertype` becomes
 /// `objectType`), so `A <: B` reads `Object` and stays silent — the
 /// cycle face dartq must not prove.

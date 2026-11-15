@@ -6,7 +6,7 @@
 //!
 //! The watch face is a [`WatchSource`] seam carrying two substrates into
 //! the same drain-debounce-hand-off cycle: the **OS-event substrate**
-//! (the default — `notify`'s recommended watcher, FSEvents on macOS and
+//! (the default — `notify`'s recommended watcher, `FSEvents` on macOS and
 //! inotify on Linux, pinned end to end by the spawned-thread test) and the
 //! **bounded-interval directory poll** — the watch face's proven shape,
 //! kept as the `DARTQ_WATCH_SUBSTRATE=poll` escape hatch and the
@@ -74,6 +74,7 @@
 //! substrate rescan notice (lost or coalesced history) says so and lets
 //! the next batch's re-discovery self-heal.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -261,14 +262,14 @@ impl WatchSource for PollSource {
     }
 }
 
-/// The OS-event substrate: `notify`'s recommended watcher — FSEvents on
+/// The OS-event substrate: `notify`'s recommended watcher — `FSEvents` on
 /// macOS, inotify on Linux. Gated to the two platforms the daemon ships
 /// for; the Linux face is the same platform-agnostic wrapper (notify
 /// selects the backend) and is compile-checked there, not on this host.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct NotifySource {
     /// The workspace root as given: event paths arrive under the
-    /// canonicalized watch root (FSEvents reports resolved paths), and the
+    /// canonicalized watch root (`FSEvents` reports resolved paths), and the
     /// intake batch must carry the walk's path forms.
     root: PathBuf,
     /// The canonical watch root, stripped off incoming event paths.
@@ -1377,13 +1378,13 @@ mod tests {
         assert_eq!(metrics.observed_drains.load(Ordering::Relaxed), 1);
     }
 
-    /// The OS-event substrate end to end (FSEvents on this host): a
+    /// The OS-event substrate end to end (`FSEvents` on this host): a
     /// create, a rewrite, and a removal each surface — with their kind and
     /// in the workspace's own path form — inside a bounded window. The
     /// substrate must start for the test to mean anything: a fallback to
     /// poll would fail loudly at the `expect`, not pass vacuously.
     ///
-    /// The stream is flushed warm first: FSEvents holds back its first
+    /// The stream is flushed warm first: `FSEvents` holds back its first
     /// delivery batch for as long as fseventsd lags under host load
     /// (sub-second quiet, measured past 30s at load 5-8 — every post-arm
     /// write rides that one batch), so a phase pinned against a cold

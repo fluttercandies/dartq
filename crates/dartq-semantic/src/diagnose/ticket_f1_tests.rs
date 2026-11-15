@@ -19,6 +19,7 @@
 //! core — plus the negative faces: a genuinely absent spelling still
 //! reports, through promotion and without it.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::library::ElementIndex;

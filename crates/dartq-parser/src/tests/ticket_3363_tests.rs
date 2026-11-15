@@ -22,6 +22,7 @@
 //! reports on the blocker with the `,` template — pinned here only as a
 //! no-`}`-row regression guard.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::parser::Parser;
 

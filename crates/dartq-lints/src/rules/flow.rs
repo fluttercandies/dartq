@@ -3,6 +3,7 @@
 //! `use_rethrow_when_possible`, `avoid_returning_null_for_void`,
 //! `use_test_throws_matchers`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::{Check, narrow_u32};

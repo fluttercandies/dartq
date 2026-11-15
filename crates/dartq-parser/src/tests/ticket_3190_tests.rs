@@ -16,6 +16,7 @@
 //!   `covariant` in a plain `extension` body takes
 //!   `invalid_use_of_covariant_in_extension` in the walk.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok, version_features};
 
 struct Rows {

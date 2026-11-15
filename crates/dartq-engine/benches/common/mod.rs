@@ -16,7 +16,11 @@
 //! The two never share one number and are never compared as like-for-like;
 //! each bench's acceptance-axis line names its axis explicitly.
 
-#![allow(dead_code)]
+#![allow(
+    clippy::useless_conversion,
+    dead_code,
+    clippy::semicolon_if_nothing_returned
+)]
 
 use std::fmt::Write as _;
 use std::path::PathBuf;

@@ -10,6 +10,7 @@
 //! `test_switchCase_final_rethrow` expects `11:9|8` (`rethrow;`) and got
 //! `[]`. Oracle A/B (`dart analyze` 3.13.1) on the fixtures below.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ticket_3096_tests::dead_of;
 
 /// Oracle `9:9|8`: the `finally { return; }` kills the flow, so the

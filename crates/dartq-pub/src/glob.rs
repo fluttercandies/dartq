@@ -24,6 +24,7 @@
 //! matching via [`Glob::matches_path`], the `package:glob` `Glob.matches`
 //! shape the analyzer compiles exclude patterns into).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 
 /// Whether `s` contains any glob wildcard character, per pub's detector
@@ -971,8 +972,8 @@ mod tests {
         assert_eq!(found, vec!["pkgs", "pkgs/a"]);
 
         // Missing literal intermediate directories are silently skipped.
-        assert!(listed("nope/*", &dir).is_empty());
-        assert!(listed("pkgs/missing/*", &dir).is_empty());
+        assert_eq!(listed("nope/*", &dir), Vec::<PathBuf>::new());
+        assert_eq!(listed("pkgs/missing/*", &dir), Vec::<PathBuf>::new());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

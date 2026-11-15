@@ -26,6 +26,7 @@
 //! abstract int foo;  + augment abstract int foo;       -> INDUCED_GETTER/SETTER_NOT_COMPLETE @ intro `foo`
 //! ```
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::FileReport;
 use crate::diagnose::test_rig::{
     CORE_PRELUDE, report_ops_augment_experiments, report_ops_augment_intro_experiments,

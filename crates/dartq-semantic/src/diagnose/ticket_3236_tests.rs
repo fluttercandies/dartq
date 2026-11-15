@@ -23,6 +23,7 @@
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs`
 //! is a live-lane file out of this ticket's write scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 
@@ -63,7 +64,7 @@ fn never_matches(report: &FileReport) -> Vec<u32> {
 }
 
 /// Same-declaration, disagreeing type arguments: `Box<S>` can hold no
-/// `Box<int>` (value_system.dart's pairwise argument ask,
+/// `Box<int>` (`value_system.dart`'s pairwise argument ask,
 /// type_system.dart:201-219 — `canBeSubtypeOf(S, int)` is false, `S` being
 /// an open class and `int` a closed one). Before #3236 the same-head branch
 /// answered `true` without consulting the arguments, so the pattern stayed

@@ -21,6 +21,7 @@
 //! (return/throw/rethrow/break/continue), which is exact for the shapes
 //! the official corpus exercises.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_parser::{IdentifierContext, TokenSpan};
 use rustc_hash::FxHashMap;
 
@@ -824,6 +825,7 @@ impl GapPass {
     // —— the walk ————————————————————————————————————————————————————————
 
     #[expect(clippy::too_many_lines)] // the per-event dispatch mirrors the upstream event walk; splitting would scatter the table
+    #[allow(clippy::match_same_arms)]
     fn step(&mut self, ev: &Ev) {
         match ev {
             // —— executable framing ——
@@ -1590,7 +1592,7 @@ impl GapPass {
             },
             Ev::This { span } => self.push_val(Kind::This, *span, NO_GUARD),
             Ev::OtherExpr { span } | Ev::Int { span } | Ev::Double { span } => {
-                self.push_val(Kind::Other, *span, NO_GUARD)
+                self.push_val(Kind::Other, *span, NO_GUARD);
             }
             Ev::Bool { value, .. } => {
                 // A constant condition checks nothing: both polarities

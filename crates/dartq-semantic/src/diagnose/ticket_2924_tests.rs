@@ -12,6 +12,7 @@
 //! resolution probes for the top-level / parameter / extension /
 //! constructor faces.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::diagnose::test_rig::{RigImport, report_ops_imports};
 use crate::library::ElementIndex;
@@ -195,7 +196,7 @@ fn dmu_typedef_type_use() {
 // —— deprecated_member_use: the named-parameter face ———————————————————
 
 /// A `name:` argument bound to a deprecated named formal reports at the
-/// LABEL — the NamedExpression's own anchor, not the callee's (upstream
+/// LABEL — the `NamedExpression`'s own anchor, not the callee's (upstream
 /// `test_namedParameter`, `_visitParametersAndArguments`).
 #[test]
 fn dmu_deprecated_named_parameter_top_level() {

@@ -4,7 +4,7 @@
 //! 1. **Type-argument group recovery flag** (`type_args.rs`,
 //!    `scan_type_group`). The official group scan folds each member type's
 //!    own `recovered` flag into the group's (`recovered = recovered |
-//!    typeInfo.recovered`, type_info_impl.dart:1357). Without the fold a
+//!    typeInfo.recovered`, `type_info_impl.dart:1357`). Without the fold a
 //!    group whose nested argument list recovered (`<e, 1>`) still looked
 //!    clean, so `a(b < c, d < e, 1 >> (2))` parsed as a generic invocation
 //!    and fabricated `expected_type_name` /
@@ -19,7 +19,7 @@
 //!    instead of `Expected to find ')'` at the period.
 //! 3. **Type-reference identifier recovery template** (`recovery.rs` +
 //!    `types.rs`). The whole type-reference family carries
-//!    `recoveryTemplate: diag.expectedType` (identifier_context_impl.dart:
+//!    `recoveryTemplate: diag.expectedType` (`identifier_context_impl.dart`:
 //!    1486-1508) and keeps the type-argument group delimiters current
 //!    (:1533-1552); a `.`-prefixed type with its prefix missing is admitted
 //!    in the required position (type_info.dart:193-202). `<.[]` therefore
@@ -27,6 +27,7 @@
 //!    and `[<y.<z>(){}]` reports `expected_type_name` at the inner `<`,
 //!    never `missing_identifier`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::parser::Parser;
 use crate::tests::collector::{Collector, latest_features, scan_ok};
 

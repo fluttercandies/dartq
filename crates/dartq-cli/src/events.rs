@@ -6,6 +6,7 @@
 //! streams keep their cursor-paged RPC faces on the session socket; this
 //! verb is the CLI-side read of the same session's records.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::PathBuf;
 
 use clap::Args;
@@ -210,7 +211,7 @@ mod tests {
         // cursor prints, at-or-below prints nothing — both clean.
         assert_eq!(read("progress", None, 100), exit::CLEAN);
         std::fs::write(
-            &layout.dir.join("trace.jsonl"),
+            layout.dir.join("trace.jsonl"),
             "{\"event\":\"LibraryAnalyzed\",\"uri\":\"package:fx/a.dart\",\"from_cache\":false}\n",
         )
         .expect("trace");

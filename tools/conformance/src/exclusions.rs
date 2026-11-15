@@ -24,6 +24,7 @@
 //! through actual dartq rows only, so they are exclusions rather than
 //! accounting gaps.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// Sorted id list; lookups use binary search.
 pub const GROUPING_IDS: &[&str] = &[
     "_core",

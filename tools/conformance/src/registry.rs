@@ -3,6 +3,7 @@
 //! (`rule_meta.rs` consts), and language features
 //! (`experimental_features.yaml`). Parsed read-only; never hand-edited.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]

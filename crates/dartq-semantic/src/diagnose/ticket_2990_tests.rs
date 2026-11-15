@@ -14,6 +14,7 @@
 //! question token, :7314-7318). Every expectation below is a verbatim
 //! oracle 3.13.7 row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::super::test_rig::report_ops_bare;
 use super::super::types::FileReport;
 
@@ -111,7 +112,7 @@ fn member_after_index_reads_the_pre_lift_element() {
 /// nullable list is exactly what it exists for), while the `?.` over its
 /// result reports — its receiver is non-null only because the index
 /// shorted it. The causing operator is the index's `?` token (1 column),
-/// never `?.` (`previousShortCircuitingOperator`'s IndexExpression arm
+/// never `?.` (`previousShortCircuitingOperator`'s `IndexExpression` arm
 /// answers `target.question`, :7314-7318).
 #[test]
 fn nullable_receiver_index_short_circuit_uses_question_context() {

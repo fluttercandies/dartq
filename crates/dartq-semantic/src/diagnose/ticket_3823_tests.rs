@@ -14,6 +14,7 @@
 //! :71-88, `resolver.dart` :4180-4195 and `yield_statement_resolver.dart`
 //! :163-168 are the statement-operand asks, each anchored `.at(expression)`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops, rows};
 use crate::diagnose::types::FileReport;
 
@@ -86,7 +87,7 @@ fn void_for_in_iterable_reports_iterator_face() {
     assert_unchecked(&report, fixture, &[(36, 1, ITERATOR_MSG)]);
 }
 
-/// A ParenthesizedExpression operand types as its INNER expression
+/// A `ParenthesizedExpression` operand types as its INNER expression
 /// (`ParenthesizedExpression.staticType` is the child's) while the oracle's
 /// `.at(expression)` anchor covers the parens — `for (var v in (x))`
 /// reports `(x)`, length 3, never the inner `x`.

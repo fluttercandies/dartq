@@ -1,4 +1,4 @@
-//! port_upstream — converts one upstream linter rule test into a
+//! `port_upstream` — converts one upstream linter rule test into a
 //! dartq-fixture data file.
 //!
 //! ```text
@@ -10,17 +10,18 @@
 //! per-file tally — ported vs skipped, each skip with its reason — always
 //! goes to stderr.
 
+#![allow(clippy::manual_let_else)]
 use std::io::{Read, Write};
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
-    let (input, output) = match (args.next(), args.next(), args.next()) {
-        (Some(input), output, None) => (input, output),
-        _ => {
+    let (input, output) =
+        if let (Some(input), output, None) = (args.next(), args.next(), args.next()) {
+            (input, output)
+        } else {
             eprintln!("usage: port_upstream <rule_test.dart> [out.fixture]");
             std::process::exit(2);
-        }
-    };
+        };
     let mut source = String::new();
     match std::fs::File::open(&input) {
         Ok(mut file) => {
@@ -51,21 +52,18 @@ fn main() {
         }
     };
     let rendered = dartq_fixture::render(&outcome);
-    match output {
-        Some(path) => {
-            if let Err(e) = std::fs::write(&path, rendered) {
-                eprintln!(
-                    "port_upstream: cannot write {}: {e}",
-                    path.to_string_lossy()
-                );
-                std::process::exit(2);
-            }
+    if let Some(path) = output {
+        if let Err(e) = std::fs::write(&path, rendered) {
+            eprintln!(
+                "port_upstream: cannot write {}: {e}",
+                path.to_string_lossy()
+            );
+            std::process::exit(2);
         }
-        None => {
-            let mut stdout = std::io::stdout().lock();
-            let _ = stdout.write_all(rendered.as_bytes());
-            let _ = stdout.flush();
-        }
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(rendered.as_bytes());
+        let _ = stdout.flush();
     }
     let (ported, skipped) = outcome.tally();
     eprintln!(

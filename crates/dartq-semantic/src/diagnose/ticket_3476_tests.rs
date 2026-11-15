@@ -19,6 +19,7 @@
 //! or a nameless executable contributes no `nameOffset` — its nameless
 //! locals fall to the `?? 0` arm and anchor at the file start.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 
 /// `report_ops` mounts [`CORE_PRELUDE`] ahead of the fixture — every

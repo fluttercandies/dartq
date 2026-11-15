@@ -14,6 +14,7 @@
 //! `unexpected_token`) that we do not replicate — dartq's bounded-depth
 //! bailout is the contract, not the oracle's unbounded crash recovery.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, setup};
 
 /// Parses `source` with the latest feature set and returns the sorted

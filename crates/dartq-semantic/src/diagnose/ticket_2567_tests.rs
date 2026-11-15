@@ -1,5 +1,6 @@
 //! The #2567 pins: assignability matrix sweep — fill in as roots close. The rig
 //! declares no imports, so every pin spells custom types only.
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
 
 use super::*;
 use crate::collector::collect;
@@ -307,7 +308,7 @@ fn if_null_rhs_generic_call_promotes_target() {
 /// target: the collector's declaration-site inference types the const's
 /// member table entry from its arithmetic-literal initializer, the read
 /// stages `int`, and the join writes the non-null face (the corpus
-/// extract_archive_to_disk.dart 136 family).
+/// `extract_archive_to_disk.dart` 136 family).
 #[test]
 fn if_null_rhs_numeric_const_promotes_target() {
     let report = report(
@@ -339,9 +340,9 @@ fn if_null_rhs_numeric_const_promotes_target() {
 /// `int` — the numeric-call refinement
 /// (`_refineNumericInvocationTypeNullSafe`'s `clamp` sibling,
 /// type_system.dart:2122-2160) — so the write to the `int` field checks
-/// clean (the corpus input_memory_stream.dart 92/99 family), while a
+/// clean (the corpus `input_memory_stream.dart` 92/99 family), while a
 /// non-`num` receiver's own `remainder` keeps its declared return (the
-/// BigInt regression guard).
+/// `BigInt` regression guard).
 #[test]
 fn clamp_refines_to_int_on_int_operands() {
     let report = report(
@@ -405,7 +406,7 @@ fn never_clause_argument_keeps_the_supertype_edge() {
 /// `AD<T>` in the case body (official `downwardInferObjectPattern
 /// RequiredType`'s step-by-step instantiation). The direct-only scan
 /// refused every grandchild and the case body's argument kept the
-/// declared `AV<T>` (riverpod async_value.dart map/when family — 6
+/// declared `AV<T>` (riverpod `async_value.dart` map/when family — 6
 /// oracle-silent rows).
 #[test]
 fn raw_pattern_infers_through_intermediate_sealed_layer() {
@@ -520,7 +521,7 @@ fn super_accessor_read_types_against_the_super_declaration() {
 /// `first` through the SDK super-face alias — and an unknown member still
 /// reports (the frozen consult's Known/Absent split). The pre-fix walk
 /// answered a clean `Missing` on the resolved stub and reported every
-/// legal member (the file_byte_store/drift `response.sendPort` /
+/// legal member (the `file_byte_store/drift` `response.sendPort` /
 /// The SDK-stub member seam (dart:isolate's names-only `ReceivePort`):
 /// the stub unit registers as its `dart:` node's unit with a bare
 /// declaration and no element model — production's face-file shape
@@ -899,8 +900,8 @@ fn foreign_container_return_instantiated_from_receiver() {
 /// `SetMixin` — upstream sdk/lib/collection + convert typedefs): the
 /// creation returned as the core interface stays silent (the corpus rows
 /// xml ancestors.dart:8, petitparser matches.dart:27, collection
-/// priority_queue.dart:314), while a base the SDK never declares (`Nope`)
-/// stays the dead InvalidType edge that reports.
+/// `priority_queue.dart:314`), while a base the SDK never declares (`Nope`)
+/// stays the dead `InvalidType` edge that reports.
 #[test]
 fn sdk_collection_alias_face_reaches_core_interface() {
     let r = super::test_rig::report_ops(concat!(
@@ -929,7 +930,7 @@ fn sdk_collection_alias_face_reaches_core_interface() {
 
 /// The `yield*` implied type is the RAW expression type
 /// (`impliedReturnType = expressionType` for the isYieldEach ask,
-/// yield_statement_resolver.dart — the live oracle prints 'String', never
+/// `yield_statement_resolver.dart` — the live oracle prints 'String', never
 /// a 'Stream<String>' wrap). A sequence subtype carrying its own fixed
 /// instantiation (`Seq extends Iterable<Item>`) answers through its
 /// clause and stays silent (the corpus rows xml xpath sequence.dart);
@@ -961,10 +962,10 @@ fn yield_star_implied_type_is_raw_expression_type() {
 /// A switch-expression scrutinee read through a receiver whose Named
 /// type arrived from CROSS-FILE inference (the callee's own library
 /// spells the return type; the consuming file never imports the name)
-/// is not the InvalidType face: the oracle's element model carries the
+/// is not the `InvalidType` face: the oracle's element model carries the
 /// resolved element (`var result = typePropertyResolver.resolve()`
 /// types the scrutinee `ResolutionResult` and keeps every arm live —
-/// the corpus property_element_resolver.dart:1615 rows). Only a head
+/// the corpus `property_element_resolver.dart:1615` rows). Only a head
 /// the whole graph fails to declare is the invalid face.
 #[test]
 fn cross_file_inferred_scrutinee_keeps_arms_live() {
@@ -1041,16 +1042,16 @@ fn foreign_element_type_callback_formal_is_not_nullable() {
         .filter(|d| d.code.name == "unchecked_use_of_nullable_value")
         .map(|d| d.message.as_str())
         .collect();
-    assert!(unchecked.is_empty(), "unchecked rows: {:?}", unchecked);
+    assert!(unchecked.is_empty(), "unchecked rows: {unchecked:?}");
 }
 
 /// A cascade section's receiver reads the target's flow-PROMOTED face:
 /// `if (v != null) v..a()..b()` resolves every section against
-/// `cascade.target2`'s promoted type (type_analyzer.dart's
+/// `cascade.target2`'s promoted type (`type_analyzer.dart`'s
 /// `cascadeReceiver`), so neither section reports
 /// `unchecked_use_of_nullable_value` (the corpus rows riverpod
-/// element.dart:126/127, analyzer ast_builder.dart:1349/1350, archive
-/// zip_decoder.dart:72/73). Only the pure null-stripping promotion
+/// element.dart:126/127, analyzer `ast_builder.dart:1349/1350`, archive
+/// `zip_decoder.dart:72/73`). Only the pure null-stripping promotion
 /// substitutes — a `?..` section keeps its nullable latched face.
 #[test]
 fn cascade_section_receiver_reads_promoted_target() {
@@ -1104,7 +1105,7 @@ fn bang_rhs_write_promotes_the_local() {
 }
 
 /// A prefixed import never shadows the bare namespace (#2567, the
-/// blaze_watcher shape): the unit imports `other.dart` bare — its own
+/// `blaze_watcher` shape): the unit imports `other.dart` bare — its own
 /// `File` carrying the members — beside a PREFIXED import of `sdk.dart`
 /// exporting a different, member-less `File`. The flat registry answers
 /// the bare spelling with the bare import's declaration, `is File`
@@ -1233,19 +1234,19 @@ fn element_constructor_rhs_instantiates_from_the_write_context() {
     assert_eq!(miss, Vec::<&str>::new(), "{:?}", messages(&r));
 }
 
-/// A nullable-`on` extension member wins over the class's own instance
-/// member on a nullable receiver (#2567, the manifest_item shape): the
-/// oracle's applicable-extension consult runs against the nullable
-/// receiver type, and `extension E on E?` resolves the access without a
-/// dereference — `x.match(...)` stays silent even though the class also
-/// declares an instance `match` (the unsafe instance read never runs).
+// A nullable-`on` extension member wins over the class's own instance
+// member on a nullable receiver (#2567, the `manifest_item` shape): the
+// oracle's applicable-extension consult runs against the nullable
+// receiver type, and `extension E on E?` resolves the access without a
+// dereference — `x.match(...)` stays silent even though the class also
+// declares an instance `match` (the unsafe instance read never runs).
 
-/// Explicit type arguments at a call to a generic top-level function
-/// declared in ANOTHER file fix its inference parameters outright — the
-/// upward face (here: `List<Object?>` arguments, which alone would solve
-/// `T1/T2 := Object?`, a nullable face) neither re-solves nor poisons the
-/// written instantiation. The oracle runs no inference over an explicit
-/// argument list (instance_member_inferrer.dart:511-521).
+// Explicit type arguments at a call to a generic top-level function
+// declared in ANOTHER file fix its inference parameters outright — the
+// upward face (here: `List<Object?>` arguments, which alone would solve
+// `T1/T2 := Object?`, a nullable face) neither re-solves nor poisons the
+// written instantiation. The oracle runs no inference over an explicit
+// argument list (instance_member_inferrer.dart:511-521).
 
 /// A field whose initializer is a typed collection literal carries the
 /// literal's written arguments as its declared face (`final _commands =
@@ -1451,7 +1452,7 @@ fn promoted_field_read_rhs_promotes_the_write_target() {
 /// way the class-member design does — the record arm bakes the short's
 /// `?` into the stored face, so the field's own face rides the
 /// shorted-field map and the continuation never dereferences the short's
-/// null (assignment_expression_resolver.dart:686/693/694).
+/// null (`assignment_expression_resolver.dart:686/693/694`).
 #[test]
 fn record_short_field_chain_continuation_stays_clean() {
     let src = concat!(
@@ -1527,8 +1528,8 @@ fn cascade_sections_on_promoted_local_stay_clean() {
 /// A switch whose scrutinee is a generic call's return —
 /// `readEnum(Tag.values)` with `T readEnum<T extends Enum>(List<T> values)`
 /// returns the ENUM, so the two-case switch is exhaustive and the body
-/// cannot complete normally (the corpus ast_binary_reader.dart:435/:864/
-/// :880/:966/:1096/:1150/:1170 and bundle_reader.dart:1515/:1631 rows —
+/// cannot complete normally (the corpus `ast_binary_reader.dart:435/:864`/
+/// :880/:966/:1096/:1150/:1170 and `bundle_reader.dart:1515/:1631` rows —
 /// the staged invocation result feeds the always-exhaustive verdict; the
 /// dot-spelled `_reader.readEnum(...)` callee takes the same staging).
 #[test]

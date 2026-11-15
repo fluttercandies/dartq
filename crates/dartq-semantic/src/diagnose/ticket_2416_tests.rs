@@ -22,6 +22,7 @@
 //! `dart analyze` 3.13.1; `/tmp/census7_target/release/dartq` emitted
 //! `return_of_invalid_type` at both return sites pre-fix.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

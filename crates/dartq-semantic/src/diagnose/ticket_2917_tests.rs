@@ -19,6 +19,7 @@
 //!   rows: the bare generic tear-off, the receiver instantiation, and
 //!   the parenthesized instantiation, each constant-true.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 fn undefined_operators(report: &super::FileReport) -> Vec<String> {
@@ -75,7 +76,7 @@ fn postfix_index_write_reports_both_spellings() {
 
 /// `++a[0]` — the prefix junction resolves its operand for write with
 /// read exactly like the postfix face (upstream
-/// prefix_expression_resolver.dart:50), so the pair reports here too.
+/// `prefix_expression_resolver.dart:50`), so the pair reports here too.
 #[test]
 fn prefix_index_write_reports_both_spellings() {
     let report = report_ops("class A {}\nf(A a) {\n  ++a[0];\n}\n");

@@ -23,6 +23,7 @@
 //!   infers upward — the solved slot substitutes the formal leaf before
 //!   the verdict (upstream `FunctionTypeAliasElement.instantiate`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

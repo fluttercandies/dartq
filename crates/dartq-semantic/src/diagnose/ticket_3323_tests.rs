@@ -25,6 +25,7 @@
 //! const group's rows are staged by no pass at all (the parser emits the
 //! field/top-level spelling, the listener latches non-const groups only).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

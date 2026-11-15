@@ -19,6 +19,7 @@
 //! (`}` at the stray separator in a minimal `if (o case …)` shell) is a
 //! separate, unpinned shape.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::parser::Parser;
 

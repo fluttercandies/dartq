@@ -16,7 +16,7 @@ use dartq_semantic::model::Ty;
 /// non-static field declared in the same class body (a constructor and
 /// its class always share a file); the subtype check
 /// (upstream Dart SDK source,
-/// pkg/linter/lib/src/rules/prefer_initializing_formals.dart:163
+/// `pkg/linter/lib/src/rules/prefer_initializing_formals.dart:163`
 /// `typeSystem.isSubtypeOf`) runs on the resolved declared types
 /// (the constructor formal's and the field's captured [`Ty`] columns —
 /// nullability and shape equality decide, function-shape columns

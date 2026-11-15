@@ -34,10 +34,11 @@
 //! `invalid_assignment`/`return_of_invalid_type` rows quoting the
 //! instantiated display.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
-fn rows_named<'a>(report: &'a FileReport, code: &str) -> Vec<(u32, u32, String)> {
+fn rows_named(report: &FileReport, code: &str) -> Vec<(u32, u32, String)> {
     let mut rows: Vec<(u32, u32, String)> = report
         .diagnostics
         .iter()
@@ -62,14 +63,14 @@ fn at(source: &str, needle: &str) -> u32 {
 /// question that stayed silent.
 #[test]
 fn declared_bare_alias_binds_the_i2b_face() {
-    let source = r#"
+    let source = r"
 class A<X> {}
 typedef G<X extends A<X>> = X Function();
 main() {
   G source = () => throw 0;
   G<A<Never>> target = source;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         rows_named(&report, "invalid_assignment"),
@@ -89,14 +90,14 @@ main() {
 /// (the fill never invents a mismatch).
 #[test]
 fn declared_bare_alias_into_same_head_stays_silent() {
-    let source = r#"
+    let source = r"
 class A<X> {}
 typedef G<X extends A<X>> = X Function();
 main() {
   G source = () => throw 0;
   G target = source;
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_named(&report, "invalid_assignment").is_empty(),
@@ -112,13 +113,13 @@ main() {
 /// annotation is the declared type the oracle instantiates.
 #[test]
 fn parameter_bare_alias_binds_the_i2b_face() {
-    let source = r#"
+    let source = r"
 class A<X> {}
 typedef G<X extends A<X>> = X Function();
 testme(G source) {
   G<A<Never>> target = source;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         rows_named(&report, "invalid_assignment"),
@@ -141,14 +142,14 @@ testme(G source) {
 /// declaration (oracle 3.13.7: line 6, column 25).
 #[test]
 fn nullable_bare_alias_binds_the_nullable_i2b_face() {
-    let source = r#"
+    let source = r"
 class A<X> {}
 typedef G<X extends A<X>> = X Function();
 main() {
   G? source;
   G<A<Never>>? target = source;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         rows_named(&report, "invalid_assignment"),
@@ -172,11 +173,11 @@ main() {
 /// is the oracle's `G<A<dynamic>>`.
 #[test]
 fn return_annotation_displays_the_i2b_face() {
-    let source = r#"
+    let source = r"
 class A<X> {}
 typedef G<X extends A<X>> = X Function();
 G f() => 0;
-"#;
+";
     let report = report_ops(source);
     let rows = rows_named(&report, "return_of_invalid_type");
     assert_eq!(rows.len(), 1, "one return_of_invalid_type row: {rows:?}");
@@ -193,13 +194,13 @@ G f() => 0;
 /// `B`, and the message never invents a `B<...>` group.
 #[test]
 fn non_generic_head_stays_bare() {
-    let source = r#"
+    let source = r"
 class B {}
 main() {
   B b = B();
   String s = b;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         rows_named(&report, "invalid_assignment"),
@@ -218,14 +219,14 @@ main() {
 /// answer, not a per-parameter echo.
 #[test]
 fn two_param_alias_binds_the_fixpoint_defaults() {
-    let source = r#"
+    let source = r"
 class A<X> {}
 typedef H<X extends A<X>, Y extends X> = X Function();
 main() {
   H source = () => throw 0;
   H<A<Never>, A<Never>> target = source;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_named(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "one invalid_assignment row: {rows:?}");

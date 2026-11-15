@@ -17,6 +17,7 @@
 //! Every expected span below is the oracle's `line:column|length` row for the
 //! same shape.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
 /// One row for `source`: it opens at the `nth` `needle` token and spans
@@ -213,241 +214,241 @@ fn unnecessary_statements_oracle_corpus_pins() {
     let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
         (
             "test_asExpression#0",
-            r#"
+            r"
 void f(Object o) {
   o as int;
 }
-"#,
+",
             &[],
         ),
         (
             "test_binaryExpression#0",
-            r#"
+            r"
 void f() {
   1 + 1;
 }
-"#,
+",
             &[(3, 3, 5)],
         ),
         (
             "test_binaryExpression_andAnd#0",
-            r#"
+            r"
 void f() {
   true && 1 == 2;
 }
-"#,
+",
             &[(3, 11, 6)],
         ),
         (
             "test_binaryExpression_or#0",
-            r#"
+            r"
 void f() {
   false || 1 == 2;
 }
-"#,
+",
             &[(3, 12, 6)],
         ),
         (
             "test_binaryExpression_or_rightSideHasEffect#0",
-            r#"
+            r"
 void f() {
   false || 7.isEven;
 }
-"#,
+",
             &[],
         ),
         (
             "test_construcorTearoff_new#0",
-            r#"
+            r"
 void f() {
   ArgumentError.new;
 }
-"#,
+",
             &[(3, 3, 17)],
         ),
         (
             "test_constructorTearoff_named#0",
-            r#"
+            r"
 void f() {
   DateTime.now;
 }
-"#,
+",
             &[(3, 3, 12)],
         ),
         (
             "test_doStatement#0",
-            r#"
+            r"
 void f() {
   do {} while (1 == 2);
 }
-"#,
+",
             &[],
         ),
         (
             "test_forEachStatement#0",
-            r#"
+            r"
 void f() {
   for (var i in []) {}
 }
-"#,
+",
             &[],
         ),
         (
             "test_forLoopUpdaters_subsequent#0",
-            r#"
+            r"
 void f() {
   for (; 1 == 2; print(7), []) {}
 }
-"#,
+",
             &[(3, 28, 2)],
         ),
         (
             "test_forStatement#0",
-            r#"
+            r"
 void f() {
   for (; 1 == 2;) {}
 }
-"#,
+",
             &[],
         ),
         (
             "test_functionTearoff#0",
-            r#"
+            r"
 void f() {
   g;
 }
 void g() {}
-"#,
+",
             &[(3, 3, 1)],
         ),
         (
             "test_ifNull#0",
-            r#"
+            r"
 void f() {
   null ?? 7;
 }
-"#,
+",
             &[(3, 11, 1)],
         ),
         (
             "test_ifNull_rightSideHasEffect#0",
-            r#"
+            r"
 void f() {
   null ?? 7.toString();
 }
-"#,
+",
             &[],
         ),
         (
             "test_ifStatement#0",
-            r#"
+            r"
 void f() {
   if (1 == 2) {
   } else if (1 == 2) {
   }
 }
-"#,
+",
             &[],
         ),
         (
             "test_inDoWhile#0",
-            r#"
+            r"
 void f() {
   do {
     [];
   } while (1 == 2);
 }
-"#,
+",
             &[(4, 5, 2)],
         ),
         (
             "test_inForLoop#0",
-            r#"
+            r"
 void f() {
   for (var i in []) {
     ~1;
   }
 }
-"#,
+",
             &[(4, 5, 2)],
         ),
         (
             "test_inForLoopInitializer#0",
-            r#"
+            r"
 void f() {
   for (7; 1 == 2;) {}
 }
-"#,
+",
             &[(3, 8, 1)],
         ),
         (
             "test_inForLoopUpdaters#0",
-            r#"
+            r"
 void f() {
   for (; 1 == 2; []) {}
 }
-"#,
+",
             &[(3, 18, 2)],
         ),
         (
             "test_inIfBody#0",
-            r#"
+            r"
 void f() {
   if (1 == 2) {
     [];
   }
 }
-"#,
+",
             &[(4, 5, 2)],
         ),
         (
             "test_inSwitchStatement_case#0",
-            r#"
+            r"
 void f() {
   switch (7) {
     case 6:
       [];
   }
 }
-"#,
+",
             &[(5, 7, 2)],
         ),
         (
             "test_inSwitchStatement_case_break#0",
-            r#"
+            r"
 void f() {
   switch (7) {
     case 6:
       break;
   }
 }
-"#,
+",
             &[],
         ),
         (
             "test_inSwitchStatement_default#0",
-            r#"
+            r"
 void f() {
   switch (7) {
     default:
       [];
   }
 }
-"#,
+",
             &[(5, 7, 2)],
         ),
         (
             "test_instanceCreationExpression#0",
-            r#"
+            r"
 void f() {
   List.empty();
 }
-"#,
+",
             &[],
         ),
         (
             "test_instanceField#0",
-            r#"
+            r"
 void f() {
   C().g;
 }
@@ -455,150 +456,150 @@ void f() {
 class C {
   int g = 1;
 }
-"#,
+",
             &[(3, 3, 5)],
         ),
         (
             "test_instanceField2#0",
-            r#"
+            r"
 void f(C c) {
   c.g;
 }
 class C {
   int g = 1;
 }
-"#,
+",
             &[(3, 3, 3)],
         ),
         (
             "test_instanceGetter2#0",
-            r#"
+            r"
 void f(List<int> list) {
   list.first;
 }
-"#,
+",
             &[],
         ),
         (
             "test_intLiteral#0",
-            r#"
+            r"
 void f() {
   1;
 }
-"#,
+",
             &[(3, 3, 1)],
         ),
         (
             "test_listLiteral#0",
-            r#"
+            r"
 void f() {
   [];
 }
-"#,
+",
             &[(3, 3, 2)],
         ),
         (
             "test_localVariable#0",
-            r#"
+            r"
 void f() {
   var g = 1;
   g;
 }
-"#,
+",
             &[(4, 3, 1)],
         ),
         (
             "test_mapLiteral#0",
-            r#"
+            r"
 void f() {
   <dynamic, dynamic>{};
 }
-"#,
+",
             &[(3, 3, 20)],
         ),
         (
             "test_methodInvocation#0",
-            r#"
+            r"
 void f() {
   g();
 }
 void g() {}
-"#,
+",
             &[],
         ),
         (
             "test_methodInvocation2#0",
-            r#"
+            r"
 void f(List<int> list) {
   list.forEach((_) {});
 }
-"#,
+",
             &[],
         ),
         (
             "test_methodTearoff#0",
-            r#"
+            r"
 void f() {
   List.empty().where;
 }
-"#,
+",
             &[(3, 3, 18)],
         ),
         (
             "test_methodTearoff_returned_InLocalFunction#0",
-            r#"
+            r"
 void f() {
   // ignore: unused_element
   g() => List.empty().where;
 }
-"#,
+",
             &[],
         ),
         (
             "test_methodTearoff_returned_InTopLevelFunction#0",
-            r#"
+            r"
 Object f() => List.empty().where;
-"#,
+",
             &[],
         ),
         (
             "test_methodTearoff_returned_inFunctionLiteral#0",
-            r#"
+            r"
 void f() {
   () => List.empty().where;
 }
-"#,
+",
             &[(3, 3, 24)],
         ),
         (
             "test_patternAssignment_ok#0",
-            r#"
+            r"
 f() {
   var (a, b) = (0, 0);
   var result = (1, 2);
   (a, b) = (a + result.$1, b + result.$2);
 }
-"#,
+",
             &[],
         ),
         (
             "test_rethrow#0",
-            r#"
+            r"
 void f() {
   try {} catch (_) {
     rethrow;
   }
 }
-"#,
+",
             &[],
         ),
         (
             "test_returnStatement_binaryOperation#0",
-            r#"
+            r"
 int f() {
   return 1 + 1;
 }
-"#,
+",
             &[],
         ),
         (
@@ -612,128 +613,128 @@ void f() {
         ),
         (
             "test_switchStatement#0",
-            r#"
+            r"
 void f() {
   switch (~1) {}
 }
-"#,
+",
             &[],
         ),
         (
             "test_throwExpression#0",
-            r#"
+            r"
 void f() {
   throw Exception();
 }
-"#,
+",
             &[],
         ),
         (
             "test_topLevelGetter#0",
-            r#"
+            r"
 void f() {
   g;
 }
 int get g => 1;
-"#,
+",
             &[],
         ),
         (
             "test_topLevelVariable#0",
-            r#"
+            r"
 void f() {
   g;
 }
 int g = 1;
-"#,
+",
             &[(3, 3, 1)],
         ),
         (
             "test_unaryOperation#0",
-            r#"
+            r"
 void f() {
   ~1;
 }
-"#,
+",
             &[(3, 3, 2)],
         ),
         (
             "test_unaryOperation_postfix#0",
-            r#"
+            r"
 void f(int x) {
   x++;
 }
-"#,
+",
             &[],
         ),
         (
             "test_unaryOperation_prefix#0",
-            r#"
+            r"
 void f(int x) {
   ++x;
 }
-"#,
+",
             &[],
         ),
         (
             "test_whileStatement#0",
-            r#"
+            r"
 void f() {
   while (1 == 2) {}
 }
-"#,
+",
             &[],
         ),
         (
             "doc_bad_0",
-            r#"void f(int Function() first, int Function() second) {
+            r"void f(int Function() first, int Function() second) {
   first() + second();
 }
-"#,
+",
             &[(2, 3, 18)],
         ),
         (
             "doc_bad_1",
-            r#"myvar;
+            r"myvar;
 list.clear;
 1 + 2;
 methodOne() + methodTwo();
 foo ? bar : baz;
-"#,
+",
             &[],
         ),
         (
             "doc_good_0",
-            r#"void f(int Function() first, int Function() second) {}
-"#,
+            r"void f(int Function() first, int Function() second) {}
+",
             &[],
         ),
         (
             "doc_good_1",
-            r#"void f(int Function() first, int Function() second) {
+            r"void f(int Function() first, int Function() second) {
   print(first() + second());
 }
-"#,
+",
             &[],
         ),
         (
             "doc_good_2",
-            r#"void f(int Function() first, int Function() second) {
+            r"void f(int Function() first, int Function() second) {
   first();
   second();
 }
-"#,
+",
             &[],
         ),
         (
             "doc_good_3",
-            r#"some.method();
+            r"some.method();
 const SomeClass();
 methodOne();
 methodTwo();
 foo ? bar() : baz();
 return myvar;
-"#,
+",
             &[],
         ),
     ];

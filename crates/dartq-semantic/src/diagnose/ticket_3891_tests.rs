@@ -18,6 +18,7 @@
 //! type parameter, plus the passing controls (instantiated bounds stay
 //! silent), the unresolved head (suppresses), and the sibling
 //! `type_argument_not_matching_bounds` face (still fires, no interference).
+#![allow(unused_variables, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use crate::FileReport;
@@ -168,7 +169,7 @@ class B<T extends A<B>> {}
     );
 }
 
-/// The self-referential shapes (the SimpleParserTest rows): a bound
+/// The self-referential shapes (the `SimpleParserTest` rows): a bound
 /// naming its own declaration is a self-loop (`class C<A, B extends C,
 /// D>`), and an unresolved head with arguments recurses past it
 /// (`class C<A extends B<C>>` — `B` resolves to nothing, the inner `C`

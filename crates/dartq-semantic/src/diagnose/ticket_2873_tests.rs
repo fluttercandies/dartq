@@ -25,6 +25,7 @@
 //! T>`, the co19 `nnbd/list_length` function-pair shapes, and the
 //! `await_flatten`/`await_type_check` FutureOr unions.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -59,7 +60,7 @@ fn at(source: &str, needle: &str) -> u32 {
 /// leave after the substitution window.
 #[test]
 fn super_field_formal_substitutes_before_the_clause_map() {
-    let source = r#"
+    let source = r"
 class Indexable<ReadType, WriteType> {
   final ReadType _value;
   Indexable(this._value);
@@ -72,7 +73,7 @@ class Test2 extends Indexable<String?, String?> {
 main() {
   Test2();
 }
-"#;
+";
     let report = report_ops(source);
     assert!(atna_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
@@ -83,7 +84,7 @@ main() {
 /// never the raw superclass parameter `'S'`.
 #[test]
 fn super_argument_message_displays_the_clause_instantiation() {
-    let source = r#"
+    let source = r"
 class A2<S, T> {
   S x;
   T y;
@@ -93,7 +94,7 @@ class C2<S> {}
 class E2<S, T> extends A2<C2<S>, T> {
   E2(T a) : super(null, a);
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         atna_rows(&report),
@@ -113,7 +114,7 @@ class E2<S, T> extends A2<C2<S>, T> {
 /// String?>(null)` stays silent (`_value` reads `String?`).
 #[test]
 fn creation_argument_substitutes_the_written_type_arguments() {
-    let source = r#"
+    let source = r"
 class Indexable<ReadType, WriteType> {
   final ReadType _value;
   Indexable(this._value);
@@ -123,7 +124,7 @@ class Indexable<ReadType, WriteType> {
 main() {
   Indexable<String?, String?>(null);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(atna_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
@@ -134,14 +135,14 @@ main() {
 /// never the out-of-scope `T` spelling the refusal arm used to emit.
 #[test]
 fn tear_off_against_solved_type_parameter_reads_the_written_type() {
-    let source = r#"
+    let source = r"
 class A {}
 void foo() {}
 void f<T>(T t1, T t2) {}
 main() {
   f<Function>(foo, foo);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(atna_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
@@ -151,14 +152,14 @@ main() {
 /// identical pair stays silent.
 #[test]
 fn tear_off_against_alias_solved_parameter_unfolds_the_alias() {
-    let source = r#"
+    let source = r"
 typedef VoidCb = void Function();
 void foo() {}
 void f<T>(T t) {}
 main() {
   f<VoidCb>(foo);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(atna_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
@@ -168,14 +169,14 @@ main() {
 /// message displays the substituted spelling (`'C'`), never the raw `T`.
 #[test]
 fn tear_off_refusal_displays_the_substituted_class_type() {
-    let source = r#"
+    let source = r"
 class C {}
 void foo() {}
 void f<T>(T t) {}
 main() {
   f<C>(foo);
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         atna_rows(&report),
@@ -195,14 +196,14 @@ main() {
 /// substitution hoist (`g(foo)` against `g(D d)`).
 #[test]
 fn tear_off_refusal_holds_on_a_plain_class_formal() {
-    let source = r#"
+    let source = r"
 class D {}
 void foo() {}
 void g(D d) {}
 main() {
   g(foo);
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         atna_rows(&report),
@@ -221,17 +222,17 @@ main() {
 /// into `FutureOr<Object>` through the union's value leg (`Future<Object?>
 /// <: Object`), and the declared-closure negative — blind to the
 /// Future→FutureOr union — no longer demotes it
-/// (await_flatten_test 43:30).
+/// (`await_flatten_test` 43:30).
 #[test]
 fn future_or_union_value_leg_survives_the_declared_negative() {
-    let source = r#"
+    let source = r"
 class Future<T> {}
 class FutureOr<T> {}
 class Cell {}
 void main(Future<Cell?> f) {
   FutureOr<Object> x = f;
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         invalid_assignment_rows(&report).is_empty(),
@@ -245,13 +246,13 @@ void main(Future<Cell?> f) {
 /// — silent.
 #[test]
 fn future_or_union_future_of_future_value_leg_assigns() {
-    let source = r#"
+    let source = r"
 class Future<T> {}
 class FutureOr<T> {}
 void main(Future<int> f) {
   FutureOr<Future<int>> y = f;
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         invalid_assignment_rows(&report).is_empty(),
@@ -265,7 +266,7 @@ void main(Future<int> f) {
 /// the full instantiations.
 #[test]
 fn unrelated_future_or_pair_still_reports() {
-    let source = r#"
+    let source = r"
 class Future<T> {}
 class FutureOr<T> {}
 class Cell {}
@@ -273,7 +274,7 @@ class Other {}
 void main(Future<Other> f) {
   FutureOr<Cell> x = f;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         invalid_assignment_rows(&report),
@@ -293,12 +294,12 @@ void main(Future<Other> f) {
 /// (`'A<int, dynamic>'`), never the bare fold-sentinel head (`'A'`).
 #[test]
 fn creation_instantiation_rides_the_assignment_message() {
-    let source = r#"
+    let source = r"
 class A<S, T> {}
 main() {
   A<int, String> y = A<int, dynamic>();
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         invalid_assignment_rows(&report),
@@ -319,13 +320,13 @@ main() {
 /// the bare head.
 #[test]
 fn creation_instantiation_rides_the_argument_message() {
-    let source = r#"
+    let source = r"
 class A<S, T> {}
 void take(A<int, String> a) {}
 main() {
   take(A<int, dynamic>());
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         atna_rows(&report),
@@ -345,12 +346,12 @@ main() {
 /// declared pair assigns (`A<int, String>()` into `A<int, String>`).
 #[test]
 fn compatible_creation_instantiation_stays_silent() {
-    let source = r#"
+    let source = r"
 class A<S, T> {}
 main() {
   A<int, String> y = A<int, String>();
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         invalid_assignment_rows(&report).is_empty(),
@@ -374,7 +375,7 @@ main() {
 #[test]
 // un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn function_typed_written_arguments_substitute_into_the_formal() {
-    let source = r#"
+    let source = r"
 class C1<T> {}
 class C2<T> {}
 class CallableClass<T> {
@@ -390,7 +391,7 @@ main() {
   var callableClassC2Int = CallableClass<C2<int>>();
   Indexable<C1<int> Function()?, Function?>(null)[0] ??= callableClassC2Int;
 }
-"#;
+";
     let report = report_ops(source);
     assert!(atna_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }

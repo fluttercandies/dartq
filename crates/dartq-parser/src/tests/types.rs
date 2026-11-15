@@ -1,5 +1,6 @@
 //! Type annotation grammar tests.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::setup;
 use crate::parser::Parser;
 use crate::type_args::TypeParamOrArg;

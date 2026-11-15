@@ -19,8 +19,12 @@
 //! Oracle provenance: `dart analyze` 3.13.1 — a promoted field's `?.`
 //! reports `STATIC_WARNING.INVALID_NULL_AWARE_OPERATOR` at the operator
 //! (the `cascaded_field_promotion_*` inference-update-2 cases carry it).
+#![allow(
+    clippy::empty_line_after_doc_comments,
+    clippy::semicolon_if_nothing_returned
+)]
 
-use super::test_rig::{assert_silent, code_names, report_ops, rows};
+use super::test_rig::{code_names, report_ops, rows};
 
 /// `if (_g != null) { _g?.toString(); }` — the promoted private final
 /// field's `?.` is unnecessary. The implicit-`this` bare read carries the

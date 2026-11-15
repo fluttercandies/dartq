@@ -7,6 +7,7 @@
 //! relative tails unambiguous — the subject always rides, so the root
 //! always does on the produced face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

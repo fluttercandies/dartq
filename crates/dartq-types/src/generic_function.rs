@@ -33,6 +33,7 @@
 //!   failing regular pass re-checks the inverted arguments and reports
 //!   *those* (the inverted argument text is what lands in the message).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::error::TypeError;
 use crate::ids::{TypeId, TypeParamId};
 use crate::system::TypeSystem;
@@ -133,7 +134,7 @@ pub fn replace_top_bottom(sys: &TypeSystem<'_>, ty: TypeId) -> TypeId {
 /// argument is processed under its own parameter's declared variance
 /// combined with the incoming position — the official
 /// `_instantiatedTypeAlias` arm folds `typeParameter.variance.combine`
-/// (replace_top_bottom_visitor.dart:78) while the plain interface arm
+/// (`replace_top_bottom_visitor.dart:78`) while the plain interface arm
 /// passes the incoming variance only (:97-100). A legacy-covariant
 /// parameter reads `covariant.combine(variance) == variance`, so the arm
 /// is an identity extension over every declaration that spells no
@@ -203,6 +204,7 @@ fn answers_bottom(
         .is_some_and(|bound| sys.is_subtype(bound, bottom))
 }
 
+#[expect(clippy::too_many_lines, reason = "the top-bottom solver walk")]
 fn process_top_bottom(
     sys: &TypeSystem<'_>,
     facts: &ParamFactsTable,
@@ -246,10 +248,9 @@ fn process_top_bottom(
                     // facts snapshot does not carry reads legacy-covariant,
                     // which combines to the incoming variance alone — the
                     // plain interface arm's own face (:97-100).
-                    let combined = parameters
-                        .get(i)
-                        .map(|parameter| facts.get(*parameter).variance.combine(variance))
-                        .unwrap_or(variance);
+                    let combined = parameters.get(i).map_or(variance, |parameter| {
+                        facts.get(*parameter).variance.combine(variance)
+                    });
                     process_top_bottom(sys, facts, arg, combined, top, bottom, depth + 1)
                 })
                 .collect();

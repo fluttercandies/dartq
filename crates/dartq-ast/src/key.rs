@@ -2,6 +2,7 @@
 //! workspaces and contexts — the AST is shareable, semantics is not
 //!.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_language::FeatureSet;
 use dartq_source::ContentId;
 

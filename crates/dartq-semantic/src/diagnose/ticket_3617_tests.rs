@@ -19,6 +19,8 @@
 //!
 //! Message text is the pin: offsets are fixture-layout-local.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::FileReport;
 use super::test_rig::{assert_silent, report_ops, rows};
 

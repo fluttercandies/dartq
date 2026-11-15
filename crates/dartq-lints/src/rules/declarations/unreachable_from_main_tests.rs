@@ -382,7 +382,7 @@ fn external_variable_and_return_types_mark_reachable() {
 /// invocation (`T()`, `T.named()`) resolves through to B's constructor
 /// element — B rides the alias's reachability. A type-parameter BOUND
 /// (`<T extends C>`) never counts (`visitNamedType`'s parent is a
-/// TypeParameter, not a TypeArgumentList).
+/// `TypeParameter`, not a `TypeArgumentList`).
 #[test]
 fn typedef_alias_invocation_reaches_target_but_bounds_do_not() {
     let f = Fixture::parse("void main() {\n  T();\n}\n\nclass C {}\n\ntypedef T = C;\n");
@@ -1485,7 +1485,7 @@ fn doc_comment_reference_counts_as_use() {
 /// through the call chain. A plain type annotation does not count —
 /// `TypeReference` rows never enter the reference set, and a
 /// `Some(true)` face row riding only one reports (the official's
-/// NamedType filter over the workspace-global engine graph).
+/// `NamedType` filter over the workspace-global engine graph).
 #[test]
 fn expression_use_counts_type_annotation_does_not() {
     // The counted arm: `dead()` inside `live()` — `live` is called
@@ -1822,7 +1822,7 @@ fn widget_preview_alias_and_custom_preview_class() {
 /// pattern's type name counts when it is alias-like — the typedef
 /// reference (upstream `visitNamedType`'s `type.alias` arm). The head
 /// identifier tiles no Identifier row of its own, so the row pass
-/// reads the ObjectPattern row's name fields. A plain class in the
+/// reads the `ObjectPattern` row's name fields. A plain class in the
 /// same position stays uncounted (`test_class_referencedInObjectPattern`
 /// — structural matching against an unknown layout is no use).
 #[test]

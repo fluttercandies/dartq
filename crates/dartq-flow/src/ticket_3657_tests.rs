@@ -20,6 +20,7 @@
 //! an outer never-written local and a loop variable share a name, the bit
 //! says which of the two a post-loop read resolved to.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

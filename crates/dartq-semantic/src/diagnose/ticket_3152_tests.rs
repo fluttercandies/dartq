@@ -5,6 +5,7 @@
 //! assignment `var d` declaration, the same-line `// ignore:` code match,
 //! and the switch-expression arm-binder window. Every expectation is a
 //! verbatim oracle 3.13.7 row.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::pins::{report, unused_local_rows};
 
@@ -64,7 +65,7 @@ fn destructure_single_used_no_duplicate() {
 /// A nested destructuring registers every leaf once — `var (a, [b, c])`
 /// reads `c`, and NO binder reports a duplicate. The oracle reports NO
 /// unused row at all here: `visitPatternVariableDeclaration`
-/// (unused_local_elements_verifier.dart :688-715) skips the whole
+/// (`unused_local_elements_verifier.dart` :688-715) skips the whole
 /// declaration once ANY of its binders is read.
 /// Oracle 3.13.7: zero `unused_local_variable` rows.
 #[test]
@@ -100,7 +101,7 @@ fn destructure_nested_closure_scope_no_duplicate() {
 }
 
 /// The all-underscores binder in a destructuring is not a wildcard (the
-/// wildcard gate is exact `_` only, unused_local_elements_verifier.dart
+/// wildcard gate is exact `_` only, `unused_local_elements_verifier.dart`
 /// :985-994) — `var (__) = (1);` reports `unused_local_variable` AND, with
 /// the double-add retracted, no `duplicate_definition`.
 /// Oracle 3.13.7: `__` at (2,8) -> offset 13, length 2.
@@ -131,7 +132,7 @@ fn list_pattern_dunder_unused_no_duplicate() {
 /// A genuine same-scope redeclaration still reports `duplicate_definition`
 /// — the retraction only drops the self-coincident double-add, never a
 /// real second declaration.
-/// Oracle: `var i = 0; var i = 0;` → duplicate_definition at the SECOND
+/// Oracle: `var i = 0; var i = 0;` → `duplicate_definition` at the SECOND
 /// `i` and `unused_local_variable` on the first (a read binds the first
 /// declaration; the duplicate never receives one).
 #[test]
@@ -168,7 +169,7 @@ fn duplicate_read_binds_first_declaration() {
 
 /// An annotation mention credits a local read — the oracle's
 /// `visitNamedType`/identifier visit marks the annotation's name used
-/// (unused_local_elements_verifier.dart `_visitNameExpression` via
+/// (`unused_local_elements_verifier.dart` `_visitNameExpression` via
 /// `visitNode`). Oracle: `@a` on a sibling local reads `a`.
 #[test]
 fn annotation_head_credits_local_read() {
@@ -185,7 +186,7 @@ fn annotation_head_credits_local_read() {
 
 /// A same-line `// ignore: unused_field` must NOT suppress an
 /// `unused_local_variable` row — the ignore matches on the diagnostic's
-/// own code (upstream `IgnoreInfo` per-name match, ignore_info.dart
+/// own code (upstream `IgnoreInfo` per-name match, `ignore_info.dart`
 /// :150-163), so a wrong-code trailing ignore leaves the row live.
 /// Oracle: `var x = 0; // ignore: unused_field` still reports
 /// `unused_local_variable` on `x`.

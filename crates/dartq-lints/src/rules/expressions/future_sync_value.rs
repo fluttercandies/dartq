@@ -178,9 +178,7 @@ fn first_argument_reports(
             let spelled = analysis.strings().resolve(name);
             !(spelled == "Future" || spelled == "FutureOr")
         }
-        Some(dartq_semantic::model::Ty::Dynamic) | Some(dartq_semantic::model::Ty::Unknown) => {
-            false
-        }
+        Some(dartq_semantic::model::Ty::Dynamic | dartq_semantic::model::Ty::Unknown) => false,
         _ => true,
     }
 }

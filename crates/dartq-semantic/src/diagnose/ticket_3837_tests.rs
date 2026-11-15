@@ -17,6 +17,7 @@
 //!   `c?..x++`'s first section still answers
 //!   `verifyCascadeExpression`'s gate (`?..x` reports).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// `(offset, length)` pairs of the `dead_code` rows, rebased to the
@@ -35,9 +36,7 @@ fn dead_rows(source: &str) -> Vec<(usize, usize)> {
 }
 
 fn has_dead_code(source: &str) -> bool {
-    code_names(&report_ops(source))
-        .iter()
-        .any(|name| *name == "dead_code")
+    code_names(&report_ops(source)).contains(&"dead_code")
 }
 
 /// `l?[0]++` — the `?[` access resolves for write; upstream reports

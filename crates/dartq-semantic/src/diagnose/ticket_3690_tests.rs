@@ -42,6 +42,7 @@
 //! and the analyzer suite's
 //! `PatternTypeMismatchInIrrefutableContextTest`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 use crate::diagnose::FileReport;
 
@@ -383,7 +384,7 @@ fn no_pattern_no_rows() {
 ///
 /// Oracle (`object_A01_t09`): silent.
 #[test]
-fn census_object_a01_t09_nonNullable_list_getter_is_silent() {
+fn census_object_a01_t09_non_nullable_list_getter_is_silent() {
     let report = report_ops(&format!(
         "{SHAPES}void f() {{\n  var Square(areaAsList: [num c1]) = Square<Meter>();\n}}\n"
     ));

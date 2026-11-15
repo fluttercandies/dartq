@@ -8,6 +8,7 @@
 //! (`// @dart = 3.8`, oracle dart 3.13.7 — both fixtures verified against
 //! it in both modes).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_bare};
 use crate::FileReport;
 

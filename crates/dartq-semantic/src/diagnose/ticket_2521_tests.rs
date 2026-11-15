@@ -13,6 +13,7 @@
 //! following `s.length` reports nothing, so the send never types
 //! `dynamic`. The unpromoted control keeps the one diagnostic.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;
@@ -97,7 +98,7 @@ fn messages(report: &FileReport, name: &str) -> Vec<String> {
 /// the staged argument verdict stays cleaned.
 #[test]
 fn if_null_conditional_send_rhs_promotes() {
-    let source = r#"
+    let source = r"
 const bool kReleaseMode = true;
 
 typedef Callback = void Function();
@@ -110,7 +111,7 @@ void f(Callback callback, String? debugLabel) {
   debugLabel ??= kReleaseMode ? 'compute' : callback.toString();
   Config(debugLabel);
 }
-"#;
+";
     let report = unit_report(source);
     assert_eq!(
         messages(&report, "argument_type_not_assignable"),
@@ -125,7 +126,7 @@ void f(Callback callback, String? debugLabel) {
 /// the promoted type.
 #[test]
 fn plain_send_rhs_promotes() {
-    let source = r#"
+    let source = r"
 typedef Callback = void Function();
 
 class Config {
@@ -136,7 +137,7 @@ void f(Callback callback, String? s) {
   s = callback.toString();
   Config(s);
 }
-"#;
+";
     let report = unit_report(source);
     assert_eq!(
         messages(&report, "argument_type_not_assignable"),
@@ -150,7 +151,7 @@ void f(Callback callback, String? s) {
 /// around the send, the same promotion.
 #[test]
 fn if_null_direct_send_rhs_promotes() {
-    let source = r#"
+    let source = r"
 typedef Callback = void Function();
 
 class Config {
@@ -161,7 +162,7 @@ void f(Callback callback, String? s) {
   s ??= callback.toString();
   Config(s);
 }
-"#;
+";
     let report = unit_report(source);
     assert_eq!(
         messages(&report, "argument_type_not_assignable"),
@@ -177,7 +178,7 @@ void f(Callback callback, String? s) {
 /// promotes through it.
 #[test]
 fn dynamic_receiver_object_send_promotes() {
-    let source = r#"
+    let source = r"
 class Config {
   Config(String label);
 }
@@ -186,7 +187,7 @@ void f(dynamic d, String? s) {
   s = d.toString();
   Config(s);
 }
-"#;
+";
     let report = unit_report(source);
     assert_eq!(
         messages(&report, "argument_type_not_assignable"),
@@ -200,7 +201,7 @@ void f(dynamic d, String? s) {
 /// return, so the write promotes the nullable `int` target.
 #[test]
 fn object_hash_code_send_promotes() {
-    let source = r#"
+    let source = r"
 typedef Callback = void Function();
 
 class Config {
@@ -211,7 +212,7 @@ void f(Callback callback, int? id) {
   id ??= callback.hashCode;
   Config(id);
 }
-"#;
+";
     let report = unit_report(source);
     assert_eq!(
         messages(&report, "argument_type_not_assignable"),
@@ -230,7 +231,7 @@ void f(Callback callback, int? id) {
 /// at the factory call stays clean.
 #[test]
 fn map_index_bang_var_chain_promotes() {
-    let source = r#"
+    let source = r"
 class NumberSymbols {
   final String DEF_CURRENCY_CODE;
   const NumberSymbols({required this.DEF_CURRENCY_CODE});
@@ -250,7 +251,7 @@ void f(String? locale, {String? name, String? currencySymbol}) {
   currencySymbol ??= name;
   Config(currencySymbol);
 }
-"#;
+";
     let report = unit_report(source);
     assert_eq!(
         messages(&report, "argument_type_not_assignable"),
@@ -265,7 +266,7 @@ void f(String? locale, {String? name, String? currencySymbol}) {
 /// face that never fires.
 #[test]
 fn unpromoted_control_still_reports() {
-    let source = r#"
+    let source = r"
 typedef Callback = void Function();
 
 class Config {
@@ -275,7 +276,7 @@ class Config {
 void f(Callback callback, String? debugLabel) {
   Config(debugLabel);
 }
-"#;
+";
     let report = unit_report(source);
     assert_eq!(
         messages(&report, "argument_type_not_assignable"),

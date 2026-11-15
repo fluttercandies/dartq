@@ -5,11 +5,11 @@
 //! Upstream never compares prefix spellings: `NamedTypeResolver.resolve`
 //! resolves `p.C` through the prefix element's scope to the same element a
 //! bare `C` names (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/named_type_resolver.dart:78, the
+//! `pkg/analyzer/lib/src/dart/resolver/named_type_resolver.dart:78`, the
 //! prefix branch :85-114), a typedef's aliased type is the already-resolved
 //! RHS (pkg/analyzer/lib/src/summary2/types_builder.dart:320-334), and
 //! `_checkAllTypeChecks` asks `isSubtypeOf` over two resolved types
-//! (pkg/analyzer/lib/src/error/best_practices_verifier.dart:877/:924). The
+//! (`pkg/analyzer/lib/src/error/best_practices_verifier.dart:877/:924`). The
 //! collector interns the written dot-joined head instead, latched at the
 //! prefix token and consumed by the completing `handle_type` — which the
 //! parser fires at the PREFIX token AFTER the head's own `<...>` group. A
@@ -17,7 +17,7 @@
 //! entry, so `core.List<core.int>` declarations interned the bare `core`
 //! sentinel (args lost — a dropped two-root tree) and a function-typed
 //! annotation carrying one poisoned to `Unknown`. The census mass is the
-//! function_type family's prefixed FORMAL leaf (`typedef F6<T> = int
+//! `function_type` family's prefixed FORMAL leaf (`typedef F6<T> = int
 //! Function([core.List<core.int> x]) Function();`).
 //!
 //! Oracle provenance: `dart analyze --format=machine` (3.13.7 SDK) on
@@ -25,6 +25,7 @@
 //! import header; every `UNNECESSARY_TYPE_CHECK` row reads `Unnecessary type
 //! check; the result is always 'true'.` over the whole `is` expression.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops_core_prefixed, rows};
 
@@ -154,7 +155,7 @@ fn prefixed_formal_leaf_alias_against_plain_operand_reports() {
     assert_eq!(spans(&report, UTC).len(), 1, "{:#?}", rows(&report));
 }
 
-/// P7 — the census's function_type family itself (function_type0's
+/// P7 — the census's `function_type` family itself (`function_type0`'s
 /// F6/F23): a prefixed formal leaf inside the RETURNED function type, the
 /// top-level and the class-generic operands. Oracle: `…|11|11|11`,
 /// `…|12|11|13`, `…|16|9|13`, `…|17|9|15`.

@@ -8,9 +8,9 @@
 //! - `dependency` classification only reflects the root package's sections
 //!   and is absent in old locks;
 //! - absolute path dependencies serialize `relative: 'false'` — the
-//!   *string* `"false"`, a pub quirk that must parse as `false`
-//!  .
+//!   *string* `"false"`, a pub quirk that must parse as `false`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 
 use serde::Serialize;

@@ -23,6 +23,7 @@
 //! (`f(a.b)`) tiles beyond the four-piece group and counts piece-wise; the
 //! validated walkers accept that divergence, and so does this module.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
@@ -987,10 +988,8 @@ pub(crate) mod parameter_assignments {
                     }
                     depth -= 1;
                 }
-                ";" | "," => {
-                    if depth == 0 {
-                        return c.utf16_end_of_token(previous).unwrap_or(fallback);
-                    }
+                ";" | "," if depth == 0 => {
+                    return c.utf16_end_of_token(previous).unwrap_or(fallback);
                 }
                 _ => {}
             }
@@ -1738,7 +1737,7 @@ pub(crate) mod parameter_assignments {
 
         /// Pattern-assignment variable targets write the parameter; the
         /// report covers the whole outer pattern (`(a, b)` — the official
-        /// `reportAtNode(node.pattern)`, parameter_assignments.dart:63).
+        /// `reportAtNode(node.pattern)`, `parameter_assignments.dart:63`).
         #[test]
         fn reports_a_pattern_assignment_target() {
             let f = Fixture::parse("void f(int a) { (a, _) = (1, 2); }");

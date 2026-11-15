@@ -29,6 +29,30 @@
 //! `tests/cases/<case>/{manifest.json, expectations.json}` is
 //! mechanical and deferred until a consumer needs the files.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1204,8 +1228,8 @@ fn c10_part_detach_seeds_losing_library_importers() {
 
 /// C11 — include detach under per-library membership (audit P0 hole 2): n1
 /// and n2 both declare `library p8;` with a `part 'pn.dart';` directive, so
-/// pn is a MEMBER of both libraries — the baseline is clean (m resolves h()
-/// and g() through n2's namespace; the oracle's element layer links a
+/// pn is a MEMBER of both libraries — the baseline is clean (m resolves `h()`
+/// and `g()` through n2's namespace; the oracle's element layer links a
 /// name-matched part into every matching library), while pn's attribution
 /// owner is still the path-smallest claimant n1. Renaming n1's directive
 /// away dangles only n1's include — its name-mismatch row fires on

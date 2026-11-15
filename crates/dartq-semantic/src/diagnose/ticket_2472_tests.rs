@@ -26,6 +26,7 @@
 //! use named custom types — a numeric literal against a custom generic is
 //! the documented undecided face, not a decisive mismatch.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -168,7 +169,7 @@ class Ev {{
 /// The rig's `same` returns `Flag` (the xml census site's returned `bool`
 /// — its own silence probe); THIS rig's exact fixture reports one
 /// `non_bool_operand` at the whole send span (oracle-pinned, dart analyze
-/// 3.13.7: NON_BOOL_OPERAND "The operands of the operator '&&' must be
+/// 3.13.7: `NON_BOOL_OPERAND` "The operands of the operator '&&' must be
 /// assignable to 'bool'." at the 58-col `const Equality<Apple>()
 /// .same(other.attributes, attributes)` operand — the earlier silence
 /// expectation held the census site's shape over a rig whose own member
@@ -198,7 +199,7 @@ class Ev {{
     );
 }
 
-/// The start_element.dart/binary.dart shapes: the same creation spellings
+/// The `start_element.dart/binary.dart` shapes: the same creation spellings
 /// through a `new` keyword, a non-generic const head, and a top-level
 /// initializer — every arm of the creation fold keeps its silence.
 #[test]
@@ -302,7 +303,7 @@ class ALP extends LoadParams {
 }
 ";
 
-/// The census's android_webview_controller.dart shape: the factory forwards
+/// The census's `android_webview_controller.dart` shape: the factory forwards
 /// `headers:` — a generic-typed factory formal — to the creation's
 /// initializing formal whose default spells typed arguments. The slot's
 /// type is the field's declared `Pair<Apple, Pear>`, so the default's

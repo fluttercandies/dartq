@@ -50,6 +50,7 @@
 //! instantiation (a resolution error upstream, `InvalidType` there) stays
 //! out of the merge for the same reason.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::model::ArgListId;
 
@@ -176,7 +177,7 @@ impl<'s> ClauseScan<'s> {
     }
 }
 
-impl<'a> Engine<'a> {
+impl Engine<'_> {
     /// The #3626 whole-unit pass: every class-family declaration this file
     /// declares runs the interface-conflict walk. Runs beside
     /// [`Engine::verify_enum_member_set`] — every container is closed and
@@ -259,12 +260,12 @@ impl<'a> Engine<'a> {
     /// (source order; augmentation fragments append). A header that does
     /// not parse faithfully contributes no faces.
     fn scan_conflict_headers(&self) -> FxHashMap<StringId, Vec<Face>> {
-        let scan = ClauseScan::new(&self.tokens, self.source);
+        let scan = ClauseScan::new(self.tokens, self.source);
         let mut out: FxHashMap<StringId, Vec<Face>> = FxHashMap::default();
         let mut i = 0;
         while i < scan.len() {
             match scan.lexeme(i) {
-                Some("class") | Some("enum") => {
+                Some("class" | "enum") => {
                     i = self.scan_one_conflict_header(&scan, i + 1, &mut out);
                 }
                 // A `mixin class` header scans from its `class` keyword.
@@ -374,13 +375,14 @@ impl<'a> Engine<'a> {
                     });
                     i += 1;
                 }
-                Some(_) => match self.scan_conflict_face(scan, i, clause, faces) {
-                    Some(next) => i = next,
-                    None => {
+                Some(_) => {
+                    if let Some(next) = self.scan_conflict_face(scan, i, clause, faces) {
+                        i = next
+                    } else {
                         *faithful = false;
                         return i;
                     }
-                },
+                }
                 None => {
                     *faithful = false;
                     return i;
@@ -528,7 +530,7 @@ impl<'a> Engine<'a> {
                     }
                     depth -= 1;
                 }
-                Some("(") | Some("[") | Some("{") => {
+                Some("(" | "[" | "{") => {
                     i = scan.matching_end(i)?;
                 }
                 Some(",") if depth == 0 => return Some(i),
@@ -554,7 +556,7 @@ impl<'a> Engine<'a> {
                         return Some(i + 1);
                     }
                 }
-                Some(";") | Some("{") => return None,
+                Some(";" | "{") => return None,
                 _ => {}
             }
             i += 1;
@@ -626,7 +628,7 @@ struct IfaceWalk<'e, 'a> {
     null: StringId,
 }
 
-impl<'e, 'a> IfaceWalk<'e, 'a> {
+impl IfaceWalk<'_, '_> {
     /// The declaration's conflicts: one operand pair per conflicting
     /// element, in collection order.
     fn declaration_conflicts(&mut self, name: StringId) -> Vec<(Ty, Ty)> {
@@ -1294,12 +1296,11 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
             && !nullable
             && let Some(slot) = params.iter().position(|param| *param == name)
         {
-            return match bindings[slot] {
-                Some(bound) => bound == actual,
-                None => {
-                    bindings[slot] = Some(actual);
-                    true
-                }
+            return if let Some(bound) = bindings[slot] {
+                bound == actual
+            } else {
+                bindings[slot] = Some(actual);
+                true
             };
         }
         let Ty::Named {
@@ -1436,12 +1437,11 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
         key: (Option<StringId>, StringId),
         ty: Ty,
     ) {
-        let index = match cells.iter().position(|(k, _)| *k == key) {
-            Some(index) => index,
-            None => {
-                cells.push((key, MergeCell::default()));
-                cells.len() - 1
-            }
+        let index = if let Some(index) = cells.iter().position(|(k, _)| *k == key) {
+            index
+        } else {
+            cells.push((key, MergeCell::default()));
+            cells.len() - 1
         };
         self.update_cell(&mut cells[index].1, ty);
         if !record {
@@ -1592,38 +1592,39 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
                 // NORM(FutureOr<T>): a top argument collapses to itself,
                 // `Object` to itself, `Never` to `Future<Never>`, `Null`
                 // to `Future<Null>?`, else `FutureOr<NORM(T)>`.
-                if name == self.future_or && args != ArgListId::EMPTY {
-                    if let Some(argument) = {
+                if name == self.future_or
+                    && args != ArgListId::EMPTY
+                    && let Some(argument) = {
                         let pool = self.eng.boundary.pool();
                         pool.get(args).first().copied()
-                    } {
-                        let s = self.norm(argument);
-                        if self.is_top(s) || s == self.bare(self.object) {
-                            return s;
-                        }
-                        if self.is_never(s) {
-                            return Ty::Named {
-                                name: self.future,
-                                nullable: false,
-                                args: self.eng.boundary.intern_list(&[s]),
-                            };
-                        }
-                        if self.is_null(s) {
-                            return Ty::Named {
-                                name: self.future,
-                                nullable: true,
-                                args: self.eng.boundary.intern_list(&[s]),
-                            };
-                        }
-                        if s != argument {
-                            return Ty::Named {
-                                name,
-                                nullable: false,
-                                args: self.eng.boundary.intern_list(&[s]),
-                            };
-                        }
-                        return ty;
                     }
+                {
+                    let s = self.norm(argument);
+                    if self.is_top(s) || s == self.bare(self.object) {
+                        return s;
+                    }
+                    if self.is_never(s) {
+                        return Ty::Named {
+                            name: self.future,
+                            nullable: false,
+                            args: self.eng.boundary.intern_list(&[s]),
+                        };
+                    }
+                    if self.is_null(s) {
+                        return Ty::Named {
+                            name: self.future,
+                            nullable: true,
+                            args: self.eng.boundary.intern_list(&[s]),
+                        };
+                    }
+                    if s != argument {
+                        return Ty::Named {
+                            name,
+                            nullable: false,
+                            args: self.eng.boundary.intern_list(&[s]),
+                        };
+                    }
+                    return ty;
                 }
                 // NORM(C<T0..Tn>) = C<NORM(Ti)>.
                 if args != ArgListId::EMPTY {

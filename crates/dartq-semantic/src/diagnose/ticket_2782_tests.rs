@@ -26,6 +26,7 @@
 //!   witness always carries the constructor-form parentheses
 //!   (`_BaseStaticType.witnessToDart`, static_type.dart:214-239).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_bare};
 use super::*;
 

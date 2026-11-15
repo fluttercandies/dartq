@@ -58,6 +58,7 @@
 //! (the `_containsNamedExpression` enclosing-constructor arm), implicit
 //! `call` invocations, and enum-constant declaration heads.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::codes::MissingRequiredParamShape;
 use dartq_scanner::{Keyword, TokenKind};
@@ -125,8 +126,7 @@ impl Engine<'_> {
                 TokenKind::OpenParen => {
                     let opener_prev = index
                         .checked_sub(1)
-                        .map(|prev| tokens[prev].kind)
-                        .unwrap_or(TokenKind::Eof);
+                        .map_or(TokenKind::Eof, |prev| tokens[prev].kind);
                     let parent = stack.last().copied();
                     stack.push(BracketFrame {
                         paren: true,
@@ -218,7 +218,7 @@ impl Engine<'_> {
 
     /// Whether the `final` at `index` introduces a **field/super formal** —
     /// the parser's `fieldFormalParameter` production (`'final'
-    /// finalConstVarOrType? …`, `_fe_analyzer_shared` parser_impl.dart
+    /// finalConstVarOrType? …`, `_fe_analyzer_shared` `parser_impl.dart`
     /// `parseFormalParameter`: the type atom, then the `this`/`super` +
     /// `.` + name arm). A type annotation may sit between the keyword and
     /// the receiver (`final int this.x`, `final Map<String, int> this.m`,
@@ -230,7 +230,7 @@ impl Engine<'_> {
         let mut cursor = index + 1;
         while let Some(token) = tokens.get(cursor) {
             match token.kind {
-                TokenKind::Keyword(Keyword::This) | TokenKind::Keyword(Keyword::Super) => {
+                TokenKind::Keyword(Keyword::This | Keyword::Super) => {
                     return tokens.get(cursor + 1).map(|t| t.kind) == Some(TokenKind::Period);
                 }
                 // Nested groups of a type annotation — a function type's
@@ -307,17 +307,10 @@ impl Engine<'_> {
         match follow {
             // A declaration body or an explicit decl terminator — no
             // expression/argument `(` is followed by these.
-            Some(
-                TokenKind::OpenCurly
-                | TokenKind::Function
-                | TokenKind::Colon
-                | TokenKind::Star
-                | TokenKind::Keyword(Keyword::Async)
-                | TokenKind::Keyword(Keyword::Sync)
-                | TokenKind::Keyword(Keyword::Native)
-                | TokenKind::Keyword(Keyword::External)
-                | TokenKind::Keyword(Keyword::Covariant),
-            ) => true,
+            Some(TokenKind::OpenCurly | TokenKind::Function | TokenKind::Colon |
+TokenKind::Star |
+TokenKind::Keyword(Keyword::Async | Keyword::Sync | Keyword::Native |
+Keyword::External | Keyword::Covariant)) => true,
             // `;`/`}`/`Identifier`/end — a declaration's `;` (`C(…);`) and
             // a statement's `;` (`g(…);`, `(…);`) both land here; split on
             // the `(`-precede declaration head. A decl-head landing inside
@@ -327,7 +320,7 @@ impl Engine<'_> {
             // A `(` at top level (no enclosing group) is a declaration's
             // formal list — `parent == None` is the unit's own
             // declaration region, so it defaults to declaration context.
-            | None => decl_head(head) && parent.map_or(true, |f| f.decl_body),
+            | None => decl_head(head) && parent.is_none_or(|f| f.decl_body),
             // Any other follower — a binary/unary operator, `,`, `)`, `]`,
             // `?`, `.`, `in` — can only continue an expression, so the `(`
             // is a parenthesized expression, an argument list, or a record.
@@ -868,7 +861,7 @@ fn decl_head(head: Option<TokenKind>) -> bool {
 }
 
 /// Whether the `(` at `open` opens a primary-constructor declaration
-/// head — upstream `parsePrimaryConstructorOpt` (parser_impl.dart
+/// head — upstream `parsePrimaryConstructorOpt` (`parser_impl.dart`
 /// :3789-3792) fires `beginPrimaryConstructor` whenever a declaration
 /// head's `classNamePart` (`typeIdentifier typeParameters?` plus an
 /// optional `.ctorName`) is followed by `(` or `.name(`, for
@@ -939,10 +932,9 @@ fn primary_ctor_head(tokens: &[dartq_scanner::Token], open: usize) -> bool {
     cursor > 0
         && matches!(
             tokens[cursor - 1].kind,
-            TokenKind::Keyword(Keyword::Class)
-                | TokenKind::Keyword(Keyword::Enum)
-                | TokenKind::Keyword(Keyword::Mixin)
-                | TokenKind::Keyword(Keyword::Extension)
+            TokenKind::Keyword(
+                Keyword::Class | Keyword::Enum | Keyword::Mixin | Keyword::Extension
+            )
         )
 }
 

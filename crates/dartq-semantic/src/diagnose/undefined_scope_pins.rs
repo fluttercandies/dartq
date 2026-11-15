@@ -22,6 +22,7 @@
 //! Oracle provenance: `dart analyze` 3.13.7 (each pin probed against the
 //! real binary before the fix).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{
     RigImport, assert_silent, code_names, report_ops, report_ops_imports, report_ops_wildcards,
 };

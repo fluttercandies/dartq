@@ -21,6 +21,7 @@
 //! `diagnose/tests.rs`'s `#[path]` block; the module stays inside the
 //! `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops_bare};
 use super::*;
 
@@ -40,7 +41,7 @@ fn oracle_rows<'a>(report: &FileReport, source: &'a str) -> Vec<(&'static str, u
             )
         })
         .collect();
-    rows.sort();
+    rows.sort_unstable();
     rows
 }
 
@@ -136,7 +137,7 @@ fn nonconst_top_level_read_reports_invalid_constant() {
 /// + `invalid_constant` pair at the RHS `_`, never at the formal's.
 /// Corpus shape `InstanceCreationEvaluatorTest/
 /// test_wildcard_regularInitializer_initializerList#0` (upstream Dart SDK
-/// source, pkg/analyzer/test/src/dart/constant/evaluation_test.dart).
+/// source, `pkg/analyzer/test/src/dart/constant/evaluation_test.dart`).
 #[test]
 fn wildcard_field_read_in_initializer_list_reports_at_the_read() {
     let fixture = "class T {}\n\

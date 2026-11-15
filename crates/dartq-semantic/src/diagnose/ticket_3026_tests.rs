@@ -9,6 +9,7 @@
 //! (type_system.dart:869-879): `FutureOr<S>` of a sealed `S` and
 //! `T extends St` over the enum `St` must split completely.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

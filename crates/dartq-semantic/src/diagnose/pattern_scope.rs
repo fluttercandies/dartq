@@ -14,6 +14,7 @@
 //! scope declared, which is what [`Engine::resolve_bare`] reads to stop
 //! answering a post-scope read as a local.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_scanner::{Keyword, TokenKind};
 
@@ -23,7 +24,7 @@ use dartq_scanner::{Keyword, TokenKind};
 /// belongs to the switch member that declared it, never to an enclosing
 /// `if` case scope it merely shares a spelling with.
 fn arm_scoped(group: u32) -> bool {
-    group >= u32::MAX - u16::MAX as u32
+    group >= u32::MAX - u32::from(u16::MAX)
 }
 
 impl Engine<'_> {
@@ -61,10 +62,10 @@ impl Engine<'_> {
                 is_default: false,
             });
         }
-        if let Some(top) = self.switch_arm_scopes.last_mut() {
-            if !top.shadows.iter().any(|(n, _, _)| *n == name) {
-                top.shadows.push((name, prev, was_local));
-            }
+        if let Some(top) = self.switch_arm_scopes.last_mut()
+            && !top.shadows.iter().any(|(n, _, _)| *n == name)
+        {
+            top.shadows.push((name, prev, was_local));
         }
     }
 
@@ -188,7 +189,7 @@ impl Engine<'_> {
             // read of the spelling walks past the row (the arm is out of
             // scope) while a nested switch's deeper slot and an if-case's
             // group-free rows keep their own closes.
-            if !shadows.is_empty() && depth > 0 && depth <= u16::MAX as usize {
+            if !shadows.is_empty() && depth > 0 && u16::try_from(depth).is_ok() {
                 let sentinel = u32::MAX - depth as u32;
                 let lo = self.frame_local_marks.last().copied().unwrap_or(0);
                 if let Some(rows) = self.locals.get_mut(lo..) {

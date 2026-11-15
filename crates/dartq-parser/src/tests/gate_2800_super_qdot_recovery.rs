@@ -7,10 +7,11 @@
 //! the follower and wraps the member name in empty synthetic parens
 //! (`insertParens(includeIdentifier: false)`). The `invalid_operator_
 //! questionmark_period_for_super` row still rides the expression re-read
-//! (`parseSuperExpression`, parser_impl.dart:7698+). Every pinned span is
+//! (`parseSuperExpression`, `parser_impl.dart:7698`+). Every pinned span is
 //! the frozen oracle row (conformance/expected.tsv,
-//! ConstructorTest/test_constructor_super_qdot_*).
+//! `ConstructorTest/test_constructor_super_qdot`_*).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::ScanConfig;
 
 use super::collector::{Collector, latest_features};
@@ -18,7 +19,7 @@ use crate::ParserFeatures;
 use crate::parser::Parser;
 
 /// Parses `source` and returns the scanner+parser rows as
-/// `(code, start, end)` sorted by offset (gate_bi_name_faces harness shape).
+/// `(code, start, end)` sorted by offset (`gate_bi_name_faces` harness shape).
 fn rows_with(features: ParserFeatures, source: &'static str) -> Vec<(String, u32, u32)> {
     let config = ScanConfig {
         enable_triple_shift: true,
@@ -76,7 +77,7 @@ fn assert_faces(source: &'static str, expected: &[(&str, u32, u32)]) {
 
 /// `super?.}` — synthetic member name before `}`, then the re-run `(` check
 /// reports at `}` and wraps the name in empty parens; the body check
-/// anchors on the same `}` (test_constructor_super_qdot_eof).
+/// anchors on the same `}` (`test_constructor_super_qdot_eof`).
 #[test]
 fn super_qdot_eof_reports_paren_at_the_follower() {
     assert_faces(
@@ -91,7 +92,7 @@ fn super_qdot_eof_reports_paren_at_the_follower() {
 
 /// `super?. var f;` — the reserved `var` is not a member name: a synthetic
 /// name splices in silently, `(` is expected at `var`, and the `var f;`
-/// field parses clean behind the body row (test_constructor_super_qdot_field).
+/// field parses clean behind the body row (`test_constructor_super_qdot_field`).
 #[test]
 fn super_qdot_field_reports_paren_at_var() {
     assert_faces(
@@ -106,7 +107,7 @@ fn super_qdot_field_reports_paren_at_var() {
 
 /// `super?. const f = 0;` — same synthetic-name + `(`-expect pair; the
 /// `const_instance_field` rider is semantic-tier and stays out
-/// (test_constructor_super_qdot_fieldConst).
+/// (`test_constructor_super_qdot_fieldConst`).
 #[test]
 fn super_qdot_field_const_reports_paren_at_const() {
     assert_faces(
@@ -121,7 +122,7 @@ fn super_qdot_field_const_reports_paren_at_const() {
 
 /// `super?. int get a => 0;` — `int` is identifier-kind, so it IS the
 /// member name and the re-run `(` check reports at the `get` follower
-/// (test_constructor_super_qdot_getter).
+/// (`test_constructor_super_qdot_getter`).
 #[test]
 fn super_qdot_getter_reports_paren_after_the_real_name() {
     assert_faces(
@@ -136,7 +137,7 @@ fn super_qdot_getter_reports_paren_after_the_real_name() {
 
 /// `super?. set a(b) {}` — built-in `set` is the member name; the `(` is
 /// expected at `a`, and the trailing `a(b) {}` parses as a member
-/// (test_constructor_super_qdot_setter).
+/// (`test_constructor_super_qdot_setter`).
 #[test]
 fn super_qdot_setter_reports_paren_at_the_method_name() {
     assert_faces(
@@ -151,7 +152,7 @@ fn super_qdot_setter_reports_paren_at_the_method_name() {
 
 /// `super?. @annotation var f;` — the `@` follower takes the synthetic name
 /// and the `(`-expect pair at `@`; the annotated field parses behind the
-/// body row (test_constructor_super_qdot_annotation, the handed-over
+/// body row (`test_constructor_super_qdot_annotation`, the handed-over
 /// annotated-parameter face).
 #[test]
 fn super_qdot_annotation_reports_paren_at_the_annotation() {

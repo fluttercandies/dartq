@@ -5,9 +5,9 @@
 //! `primary_constructors/initializing_declaring.dart` and, for the rider,
 //! `primary_constructors/invalid_primary_constructors_pre_feature.dart`
 //! (`// @dart=3.10`). Decision points mirror the upstream parser (upstream
-//! Dart SDK source, pkg/_fe_analyzer_shared, parser_impl.dart:2212-2226 for
+//! Dart SDK source, pkg/_`fe_analyzer_shared`, parser_impl.dart:2212-2226 for
 //! the declaring faces, :3798-3823 and :3884-3905 for the `const` gate;
-//! message templates pkg/front_end messages.yaml
+//! message templates `pkg/front_end` messages.yaml
 //! `InitializingDeclaringParameter` / `SuperInitializingDeclaringParameter`).
 //!
 //! The parser owns exactly one row per declaring leg: the declaring code at
@@ -17,6 +17,7 @@
 //! `super_formal_parameter_without_associated_positional`,
 //! `duplicate_definition`) are resolver-side and never reach this crate.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::ParserFeatures;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -55,7 +56,7 @@ fn pre_feature_features() -> ParserFeatures {
 
 // —— L1/L2: `var`|`final` this.x → initializing_declaring_parameter ————————
 
-/// Oracle initializing_declaring.dart 1|13 (`var`) and 2|15 (`final`): one
+/// Oracle `initializing_declaring.dart` 1|13 (`var`) and 2|15 (`final`): one
 /// syntactic row each, anchored on the `this` keyword (length 4).
 #[test]
 fn var_final_this_formal_reports_declaring_code_at_this() {
@@ -73,7 +74,7 @@ fn var_final_this_formal_reports_declaring_code_at_this() {
 
 /// Oracle 3|9: `extraneous_modifier` at `const` (length 5) and nothing
 /// else parser-side — the declaring gate is `varFinalOrConst != null &&
-/// !isA(CONST)` (parser_impl.dart:2213), so a const formal never carries a
+/// !isA(CONST)` (`parser_impl.dart:2213`), so a const formal never carries a
 /// declaring code.
 #[test]
 fn const_this_formal_keeps_extraneous_modifier_without_declaring_code() {
@@ -144,7 +145,7 @@ fn initializing_declaring_fixture_parser_rows() {
 
 /// The declaring faces are a primary-constructor posture only: the same
 /// modifier + receiver shapes in an ordinary constructor's formals stay
-/// silent on the declaring codes (parser_impl.dart:2212 keys on
+/// silent on the declaring codes (`parser_impl.dart:2212` keys on
 /// `MemberKind.PrimaryConstructor`).
 #[test]
 fn ordinary_constructor_formals_never_report_declaring_codes() {
@@ -165,7 +166,7 @@ fn ordinary_constructor_formals_never_report_declaring_codes() {
 
 // —— Rider: `const` without a primary constructor at a pre-feature pin ———
 
-/// Oracle invalid_primary_constructors_pre_feature.dart (`// @dart=3.10`)
+/// Oracle `invalid_primary_constructors_pre_feature.dart` (`// @dart=3.10`)
 /// carries zero `const_without_primary_constructor` rows: with the feature
 /// off every per-kind `const` face collapses into `unexpected_token`
 /// (parser_impl.dart:3884-3905), and the parenthesized mixin/extension

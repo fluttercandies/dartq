@@ -12,6 +12,7 @@
 //! dartq engine emits that the pinned registry does not carry) get no row
 //! by design and never warn.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::materialize::LoadedCase;
 use crate::registry::{Entry, Kind, Registry};
 use crate::rows::{Expected, Row};

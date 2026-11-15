@@ -34,6 +34,7 @@
 //! declaration-shape fallback answers the signature's return instead of
 //! dropping the face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// The member verdict on a call result runs on the RETURN type: a

@@ -12,6 +12,7 @@
 //! counts only the augmentations applied after it — later units' fragments
 //! plus this unit's own ones following its head in source order
 //! (`AugTarget::head_range` decides the same-unit pair for constructors).
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{
     CORE_PRELUDE, report_ops_augment, report_ops_augment_intro_experiments, rows,

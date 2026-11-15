@@ -22,6 +22,7 @@
 //! (`DartType.getDisplayString`), which is exactly the instantiation
 //! under test.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

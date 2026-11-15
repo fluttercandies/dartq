@@ -43,6 +43,7 @@
 //!   are declaration-scoped in truth; consumers must not treat them as
 //!   top-level declarations.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_source::{SourceRange, StringId, StringTable, saturate_slot_u32};
 use dartq_types::Variance;
 use rustc_hash::FxHashMap;
@@ -152,7 +153,7 @@ impl Ty {
                 let shape = args.record_shape(shape);
                 let mut text = String::from("(");
                 let mut first = true;
-                for ty in shape.positional.iter() {
+                for ty in &shape.positional {
                     if !first {
                         text.push_str(", ");
                     }
@@ -493,6 +494,7 @@ impl RecordShapeId {
     pub const EMPTY: RecordShapeId = RecordShapeId(0);
 
     /// The pool slot — canonical, equal written shapes share one id.
+    #[must_use]
     pub const fn raw(self) -> u32 {
         self.0
     }
@@ -528,6 +530,7 @@ impl FnShapeId {
     pub const EMPTY: FnShapeId = FnShapeId(0);
 
     /// The pool slot — canonical, equal written shapes share one id.
+    #[must_use]
     pub const fn raw(self) -> u32 {
         self.0
     }
@@ -1096,7 +1099,7 @@ pub struct Formal {
     /// The `covariant` keyword was present (`covariant int x`): the
     /// parameter can narrow an inherited parameter's type, so a
     /// super-forwarding override body over it is not trivially removable
-    /// (unnecessary_overrides.dart `_isCovariant`).
+    /// (`unnecessary_overrides.dart` `_isCovariant`).
     pub covariant: bool,
     /// The default value's verbatim source text (the `= 3` expression, the
     /// legacy `: 3` separator's operand included as written), interned —
@@ -1296,7 +1299,7 @@ impl<'a> FnSig<'a> {
         // target lacks (:141-146); the target may lack nothing (:167-170).
         // Declaration order differs from upstream's sorted walk, so the
         // coverage checks run both ways over name lookups.
-        for s in from.formals.named.iter() {
+        for s in &from.formals.named {
             match self.formals.named_formal(s.name) {
                 None => {
                     if s.required {
@@ -1645,13 +1648,13 @@ pub struct MemberEntry {
     /// The field group's `const` keyword (`const int x = 0;`); false for
     /// every non-`Field` member shape — upstream
     /// `fieldFragment.isConst = node.fields.isConst`
-    /// (element_builder.dart:1685). Kept apart from `is_final` on purpose:
+    /// (`element_builder.dart:1685`). Kept apart from `is_final` on purpose:
     /// the oracle's bits are independent (`isConst`/`isFinal` both read the
     /// group's keyword), and folding `const` into `is_final` would make the
     /// augmentation face's `augments_constant_variable` over-report on a
     /// plain `final` target. Enum constants carry it unconditionally —
     /// upstream marks every constant fragment `isConst = true`
-    /// (element_builder.dart:1469).
+    /// (`element_builder.dart:1469`).
     pub is_const: bool,
     /// The field group's `covariant` keyword (`covariant num x;`; false for
     /// every other member shape — parameter covariance rides
@@ -1803,7 +1806,7 @@ pub struct Container {
     /// [`Self::with_clause`] (`with M<V>` keeps `[V]`; a face that wrote
     /// none carries [`ArgListId::EMPTY`]). Upstream keeps the full argument-
     /// bearing `NamedType` on the clause (`endNamedMixinApplication`,
-    /// upstream Dart SDK source, pkg/analyzer/lib/src/fasta/ast_builder.dart
+    /// upstream Dart SDK source, `pkg/analyzer/lib/src/fasta/ast_builder.dart`
     /// :2499 — the with-clause annotations carry their type arguments into
     /// the element, where the mixin application instantiates through them);
     /// the element face here keeps them as this parallel column. A face
@@ -2226,10 +2229,10 @@ impl AugmentFormal {
     /// `formalParameterErrorEntity`: the name token, else the parameter).
     #[must_use]
     pub fn entity(&self) -> SourceRange {
-        if self.name_range.offset != Self::MISSING_RANGE.offset {
-            self.name_range
-        } else {
+        if self.name_range.offset == Self::MISSING_RANGE.offset {
             self.full_range
+        } else {
+            self.name_range
         }
     }
 }
@@ -2418,7 +2421,7 @@ pub struct FileElements {
     /// by an owner join (see [`FileElements::formal_annotations`]): the
     /// `deprecated_member_use` face's parameter arm reads them — upstream
     /// anchors a use of a deprecated parameter on the call site's
-    /// NamedExpression label, so the model needs the star keyed off the
+    /// `NamedExpression` label, so the model needs the star keyed off the
     /// declaration's own table (`element_usage_detector.dart`'s
     /// `_visitParametersAndArguments`, :381-413).
     ///
@@ -2573,7 +2576,7 @@ impl FileElements {
     /// executable's owner key and the formal's own name (upstream
     /// `element_usage_detector.dart`'s `parameterElement.metadata` read —
     /// the `deprecated_member_use` row anchors on the call site's
-    /// NamedExpression label, so the face is keyed by the declaration's
+    /// `NamedExpression` label, so the face is keyed by the declaration's
     /// own spelling, never by an index). `None` when the owner carries no
     /// table or the formal none (the tag-absent direction).
     ///

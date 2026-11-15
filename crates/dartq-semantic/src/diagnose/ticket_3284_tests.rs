@@ -22,6 +22,7 @@
 //! non-function member), and the always-green implicit-`this`/raw-`Function`
 //! halves that guard the gate's blast radius.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::report_ops;
 

@@ -34,6 +34,7 @@
 //! - exit tiers follow the query faces: 0 on success (zero fixes included;
 //!   stale entries are safe no-ops, not failures), 64 usage, 4 internal.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

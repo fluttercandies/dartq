@@ -9,6 +9,7 @@
 //! nullability, named-member order, and required counts are normalized
 //! before a type becomes observable.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -881,6 +882,7 @@ impl TableState {
     /// context, exactly like upstream's inner-environment substitution).
     /// The original id returns whenever nothing changed, so a binder-free
     /// or signature-free type keeps its canonical sharing.
+    #[expect(clippy::too_many_lines, reason = "the rebind walk")]
     fn rebind(
         &mut self,
         ty: TypeId,

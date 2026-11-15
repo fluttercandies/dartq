@@ -19,6 +19,8 @@
 //! against a single-file collected fixture, since the construction-site
 //! population lands under a different lane.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+
 use super::Receiver;
 use crate::collector::collect;
 use crate::diagnose::{Engine, StrictModes};

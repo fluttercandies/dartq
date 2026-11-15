@@ -15,12 +15,13 @@
 //! `Future`'s own member row — the union typedef's element face resolves
 //! to the Future's interface at the name level.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops_bare, rows};
 
 /// Asserts a diagnostic `code` sits in the report.
 fn assert_code(report: &super::FileReport, code: &str) {
     assert!(
-        code_names(report).iter().any(|&c| c == code),
+        code_names(report).contains(&code),
         "expected {code}: {:?}",
         rows(report)
     );
@@ -29,7 +30,7 @@ fn assert_code(report: &super::FileReport, code: &str) {
 /// Asserts `code` is absent.
 fn assert_no_code(report: &super::FileReport, code: &str) {
     assert!(
-        !code_names(report).iter().any(|&c| c == code),
+        !code_names(report).contains(&code),
         "unexpected {code}: {:?}",
         rows(report)
     );

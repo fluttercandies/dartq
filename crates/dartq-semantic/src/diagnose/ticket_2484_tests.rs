@@ -30,8 +30,11 @@
 //!   `non_constant_record_field` (p4b — pinned green by
 //!   `ticket_2478::non_const_record_field_in_const_declaration_still_fires`,
 //!   the other direction of this selection).
+#![allow(
+    clippy::empty_line_after_doc_comments,
+    clippy::semicolon_if_nothing_returned
+)]
 
-use super::*;
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

@@ -31,6 +31,7 @@
 //! `dartq/debug/*` requests through the same machinery — one engine,
 //! one protocol, two faces.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -952,7 +953,7 @@ fn param_schema(param: &Param) -> Value {
 
 /// Validates one call's arguments against the tool's table: every key
 /// known, every required key present, every value of its advertised type
-/// — `Err` is the INVALID_PARAMS message, naming the parameter.
+/// — `Err` is the `INVALID_PARAMS` message, naming the parameter.
 fn validate_arguments(tool: &Tool, args: &Value) -> Result<(), String> {
     let Some(object) = args.as_object() else {
         return Err("arguments must be an object".to_owned());
@@ -1008,7 +1009,7 @@ fn check_value(param: &Param, value: &Value) -> Result<(), String> {
             |items| {
                 items
                     .iter()
-                    .all(|item| item.is_string())
+                    .all(serde_json::Value::is_string)
                     .then_some(())
                     .ok_or_else(|| "must be an array of strings".to_owned())
             },
@@ -1022,7 +1023,7 @@ fn check_value(param: &Param, value: &Value) -> Result<(), String> {
                     return Err(format!("must not carry the unknown key `{key}`"));
                 }
             }
-            for field in fields.iter() {
+            for field in *fields {
                 if let Some(inner) = object.get(field.name) {
                     check_value(field, inner)
                         .map_err(|reason| format!("key `{}` {reason}", field.name))?;
@@ -1096,10 +1097,7 @@ fn fix_text(answer: Value) -> String {
     answer["files"]
         .as_array()
         .map_or_else(Vec::new, |files| {
-            files
-                .iter()
-                .map(|document| crate::output::lon_line(document))
-                .collect()
+            files.iter().map(crate::output::lon_line).collect()
         })
         .join("\n")
 }
@@ -1360,7 +1358,7 @@ mod tests {
         // serve down mid-drive) — same serialization lock.
         let _serial = crate::session::tests::SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = fixture();
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
@@ -1440,7 +1438,7 @@ mod tests {
             "the workspace status names the package: {status}"
         );
         assert!(status.contains("packages"), "{status}");
-        assert!(answer(6)["error"]["code"].as_i64() == Some(-32602));
+        assert_eq!(answer(6)["error"]["code"].as_i64(), Some(-32602));
         assert!(answer(7)["result"].as_object().is_some(), "ping answers");
 
         // A degraded tree (no session): the engine tools answer isError
@@ -1459,7 +1457,7 @@ mod tests {
                        "params": {"name": "dartq_events", "arguments": {"handle": "progress"}}}),
             ],
         );
-        assert!(answers[0]["result"]["isError"].as_bool() == Some(true));
+        assert_eq!(answers[0]["result"]["isError"].as_bool(), Some(true));
         assert!(
             answers[0]["result"]["content"][0]["text"]
                 .as_str()
@@ -1615,7 +1613,7 @@ mod tests {
     }
 
     /// `tools/call` validates against the table: an unknown parameter,
-    /// a missing required one, and a wrong type each answer INVALID_PARAMS
+    /// a missing required one, and a wrong type each answer `INVALID_PARAMS`
     /// naming the parameter — and a legal call still passes through.
     #[test]
     fn unknown_and_malformed_parameters_answer_invalid_params() {
@@ -1708,9 +1706,9 @@ mod tests {
     /// The impact face's `symbols` narrowing reaches the daemon request
     /// verbatim — every spelling, order kept, the CLI's repeatable
     /// `--symbol` list (#2663) — and the daemon's usage answer for an
-    /// unknown spelling (its InvalidParams tier carrying the face's own
+    /// unknown spelling (its `InvalidParams` tier carrying the face's own
     /// `no such symbol` wording) rides the MCP face as the tool-result
-    /// `isError` text, not the MCP layer's INVALID_PARAMS rejection that
+    /// `isError` text, not the MCP layer's `INVALID_PARAMS` rejection that
     /// answered before the parameter joined the table.
     #[test]
     fn impact_symbols_ride_the_daemon_request_and_usage_errors_flatten() {
@@ -1774,8 +1772,7 @@ mod tests {
         let answer: Value = String::from_utf8(output)
             .expect("utf-8")
             .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .next()
+            .find_map(|line| serde_json::from_str(line).ok())
             .expect("one answer line");
         assert!(
             answer["result"].is_object(),

@@ -18,6 +18,7 @@
 //! bound the oracle consults (`resolution_visitor.dart`'s bound
 //! capture) — and keeps the member face live when the name is captured
 //! as a scope parameter.
+#![allow(unused_must_use, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::report_ops;
 
@@ -171,7 +172,7 @@ fn unbounded_param_uses_object_bound() {
 /// A `T` receiver used from a nested executable still escapes the
 /// invalid bail — `method_exec_bounds` covers the method window.
 #[test]
-fn method_exec_bounds_window_covers_method_scoped_T() {
+fn method_exec_bounds_window_covers_method_scoped_t() {
     let report = report_ops(
         "class C { void m<T extends num>(T t) { t.foo; } }\n\
          void main() {}\n",
@@ -182,7 +183,7 @@ fn method_exec_bounds_window_covers_method_scoped_T() {
 
 /// A top-level generic function's `T` (`exec_bounds` window) reports.
 #[test]
-fn top_level_generic_function_T_reports() {
+fn top_level_generic_function_t_reports() {
     let report = report_ops("void f<T extends num>(T t) { t.foo; }\nvoid main() {}\n");
     let getters = rows_named(&report, "undefined_getter");
     assert_eq!(getters.len(), 1, "top-level generic T: {getters:?}");

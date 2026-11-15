@@ -18,6 +18,7 @@
 //!   declaration-site twin (dartq-resolution `modifiers.rs`) is the L2
 //!   resolution face and must stay out of this parser stream.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::setup;
 
 /// Exact stream for a member head missing its name before a `;`. Oracle
@@ -253,8 +254,8 @@ fn plain_empty_index_single_row() {
 
 /// The spaced face `g[ ];` — the brackets are two REAL table tokens (no
 /// adjacent `[]` to split), so the empty-operand path runs with the closer
-/// being the real `]` itself (upstream Dart SDK source, pkg/_fe_analyzer_shared
-/// parser_impl.dart `parseArgumentOrIndexStar` + `rewriteSquareBrackets`):
+/// being the real `]` itself (upstream Dart SDK source, pkg/_`fe_analyzer_shared`
+/// `parser_impl.dart` `parseArgumentOrIndexStar` + `rewriteSquareBrackets`):
 /// exactly ONE `missing_identifier` anchored on the `]`'s own span — which is
 /// also the index-expression closer span, the report and the closer peeking
 /// the same real token — and no second `expected_token ']'` row. The
@@ -484,13 +485,13 @@ fn well_formed_type_arguments_stay_clean() {
 
 /// `case <int>(b) x:` — re-derived to the official walk (the pre-#1487
 /// model — one unexpected-end row on the type end via the
-/// `parseUnexpectedEnd` OPEN_PAREN arm — encoded the old pattern-head
+/// `parseUnexpectedEnd` `OPEN_PAREN` arm — encoded the old pattern-head
 /// type-args posture and is refuted by the official decision order):
 /// `parsePrimaryPattern` parses the `<...>` group as type arguments only
 /// when the follower is `[`/`{` (upstream Dart SDK source,
 /// parser_impl.dart:11697-11734); a `(` follower backs up, and the head
 /// `<` — a relational operator — takes the relational-pattern arm
-/// (:11805-11815). The type-args unexpected-end face (and its OPEN_PAREN
+/// (:11805-11815). The type-args unexpected-end face (and its `OPEN_PAREN`
 /// latch, type_info_impl.dart:1692-1706) never runs for this snippet; the
 /// relational face is silent. The three official anchors, all reproduced:
 /// the case colon face anchors `expected_token` on the `>` (ensureColon →

@@ -25,6 +25,7 @@
 //! Anchors are asserted as `(offset, length)` triples: `dead_code` carries
 //! a fixed message ("Dead code."), so the span IS the observable.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops_bare;
 
 /// The `dead_code` rows of `report` as `(offset, length)`, source order.

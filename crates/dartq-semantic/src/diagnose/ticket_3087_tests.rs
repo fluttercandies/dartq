@@ -32,6 +32,7 @@
 //! at the null-shorted right side; the resolved-bound control reports
 //! nothing.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 use crate::diagnose::FileReport;
 

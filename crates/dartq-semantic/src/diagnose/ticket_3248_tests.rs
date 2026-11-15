@@ -32,6 +32,7 @@
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs`
 //! and the `assignability.rs` sibling lane are out of this ticket's scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 

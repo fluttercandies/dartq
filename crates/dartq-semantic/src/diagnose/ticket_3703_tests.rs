@@ -20,6 +20,7 @@
 //! `RecordLiteral`). The partition must therefore ask "is THIS field
 //! named?" per window, never "how many named fields trail?".
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 use crate::diagnose::FileReport;
 

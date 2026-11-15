@@ -27,6 +27,9 @@
 //! erases to `R?`, type_system.dart:42-63), so a nullable scrutinee
 //! stays uncovered by a non-nullable head.
 
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

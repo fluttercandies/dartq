@@ -50,6 +50,7 @@
 //! fix belongs to those files' owners; the pins below are the regression
 //! guard they must keep green while closing the gap.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, report_ops_wildcards};
 
 /// No `duplicate_definition` row at all — the negative assertion for the

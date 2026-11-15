@@ -1,6 +1,7 @@
 //! The generation header: the four fields whose equality gates a whole
 //! snapshot generation.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde::{Deserialize, Serialize};
 
 use crate::blake3_128;

@@ -18,6 +18,7 @@
 //! `assertDiagnosticsFromMarkup` contract — plus the rendered message for
 //! expectations that pin one (the line-anchored marker's `: message`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, FeatureSet, LanguageVersion};

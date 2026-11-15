@@ -5,6 +5,7 @@
 //! are semantic-tier and out of `parser.listener.errors`. Upstream
 //! citations live per-test.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -87,7 +88,7 @@ fn extension_extends_resolves_type_after_clause_keyword() {
 }
 
 /// A primary-constructor parameter `a b` reads `a` as the type and `b` as
-/// the name (parser_impl.dart parsePrimaryConstructor →
+/// the name (`parser_impl.dart` parsePrimaryConstructor →
 /// parseFormalParameters) — `a` is a type reference (`handle type`), the
 /// `undefined_class 'a'` head. The `;` body is the constructor's own.
 #[test]
@@ -111,7 +112,7 @@ fn primary_constructor_param_reads_type_and_name() {
 /// (`undefined_identifier`, never a prefixed type). The doc-comment
 /// `[complicated.expression]` reference that yields `undefined_class
 /// 'expression'` is the comment-reference resolver's prefixed-type grammar,
-/// not this statement parse (comment_reference_resolver.dart).
+/// not this statement parse (`comment_reference_resolver.dart`).
 #[test]
 fn if_condition_method_call_keeps_expression_head() {
     let rows = sorted_rows("void f() {\n  if (complicated.expression.foo());\n}\n");

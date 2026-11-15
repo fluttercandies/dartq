@@ -30,6 +30,7 @@
 //! | same-name call still types as its return | negative control — `f(g())` over `int g()` |
 //! | alias-to-class still constructs/reads members | `typedef L = Real; L()` / `L.named` faces |
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, assert_silent, report_ops, report_ops_imports, rows};
 
 /// The shared `Type`-formal sink every fixture drives the literal through.

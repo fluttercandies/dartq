@@ -23,6 +23,7 @@
 //!   ast_builder.dart:1084-1093) and `operator >>>` reports the pair
 //!   once (parser_impl.dart:5786-5800).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;

@@ -6,6 +6,7 @@
 //! receiver's own head, so a bare head writes nothing and stays on the
 //! declared face, and a nested instantiation substitutes one level deep.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

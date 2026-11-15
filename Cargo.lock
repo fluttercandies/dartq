@@ -214,6 +214,7 @@ version = "0.1.26"
 dependencies = [
  "blake3",
  "clap",
+ "rustc-hash",
  "serde_json",
 ]
 
@@ -521,6 +522,7 @@ dependencies = [
  "dartq-snapshot",
  "dartq-source",
  "filetime",
+ "hex",
  "libc",
  "memchr",
  "rayon",
@@ -664,6 +666,7 @@ dependencies = [
  "dartq-language",
  "dartq-source",
  "memchr",
+ "rustc-hash",
 ]
 
 [[package]]

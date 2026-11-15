@@ -47,6 +47,7 @@
 //! doc-comment `deprecated_new_in_comment_reference` face (this crate models
 //! no doc comments). Only the callee-anchored omission shapes ship here.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::annotation::DeprecationKind;
 use crate::model::{Container, ContainerKind, MicroKind};

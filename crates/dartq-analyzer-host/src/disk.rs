@@ -25,6 +25,7 @@
 //! `--disable-file-byte-store` only applies in snapshot-training mode),
 //! so trimming is the whole defense.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -76,15 +77,15 @@ pub(crate) fn statvfs(path: &Path) -> Option<Space> {
     let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `path` is NUL-terminated and `stats` outlives the call; it
     // is read only after a zero return.
-    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
+    if unsafe { libc::statvfs(path.as_ptr(), &raw mut stats) } != 0 {
         return None;
     }
     // The block counts are per-platform unsigned aliases (32-bit on
     // macOS, 64-bit on Linux) in `f_frsize` units.
     let unit = stats.f_frsize as u64;
     Some(Space {
-        free: (stats.f_bavail as u64).saturating_mul(unit),
-        total: (stats.f_blocks as u64).saturating_mul(unit),
+        free: u64::from(stats.f_bavail).saturating_mul(unit),
+        total: u64::from(stats.f_blocks).saturating_mul(unit),
     })
 }
 

@@ -4,6 +4,7 @@
 //! do-not-emit riders (codes with no pinned-oracle corpus surface), recovery
 //! shapes, and the expression termination bombs.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::TokenKind;
 
 use crate::listener::{
@@ -774,7 +775,10 @@ fn assert_expression_parses() {
 fn riders_group_b_never_emitted() {
     // `positional_after_named_argument` is resolution-side; the parser
     // accepts the argument list.
-    assert!(expression_errors("f(a: 1, 2)").is_empty());
+    assert_eq!(
+        expression_errors("f(a: 1, 2)"),
+        [] as [std::string::String; 0]
+    );
     // `expected_list_or_map_literal` is oracle-dead: the recovery family is
     // expected_token.
     assert_eq!(
@@ -1293,7 +1297,7 @@ fn null_aware_dot_index_missing_identifier_anchors_on_bracket() {
     assert_eq!(c.codes(), ["missing_identifier"], "{:?}", c.error_rows());
     assert_eq!(c.error_rows(), [("missing_identifier", 17, 1)]);
     assert_eq!(c.dots, [(true, 15)]);
-    assert!(c.indexes.is_empty());
+    assert_eq!(c.indexes, [] as [(bool, u32); 0]);
 }
 
 #[test]
@@ -1428,7 +1432,7 @@ fn bang_null_aware_dot_bracket_missing_name_anchors_on_bracket() {
     assert_eq!(c.error_rows(), [("missing_identifier", 17, 1)]);
     assert_eq!(c.null_asserts, [14]);
     assert_eq!(c.dots, [(true, 15)]);
-    assert!(c.indexes.is_empty());
+    assert_eq!(c.indexes, [] as [(bool, u32); 0]);
 }
 
 #[test]
@@ -1442,7 +1446,7 @@ fn paren_bang_null_aware_dot_bracket_missing_name_anchors_on_bracket() {
     assert_eq!(c.error_rows(), [("missing_identifier", 19, 1)]);
     assert_eq!(c.null_asserts, [15]);
     assert_eq!(c.dots, [(true, 17)]);
-    assert!(c.indexes.is_empty());
+    assert_eq!(c.indexes, [] as [(bool, u32); 0]);
 }
 
 #[test]
@@ -1519,7 +1523,7 @@ fn new_constructor_references_parse_clean() {
     let c = parse("void f() {\n  var a = const C.new();\n  var b = new C<int>.new();\n}\n");
     assert!(c.codes().is_empty(), "{:?}", c.codes());
     assert_eq!(c.count("begin", "constructor_reference"), 2);
-    assert!(c.dots.is_empty());
+    assert_eq!(c.dots, [] as [(bool, u32); 0]);
 }
 
 #[test]

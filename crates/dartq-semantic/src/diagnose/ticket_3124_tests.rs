@@ -26,6 +26,7 @@
 //! `enum_const_member_dup`, `enum_const_vs_*`, `t_enum_static`,
 //! `t_enum_const_get`, `exttype_static_inst`, `cls_mix`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops};
 
 fn conflicts(report: &crate::diagnose::FileReport) -> Vec<(u32, u32, String)> {

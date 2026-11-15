@@ -139,7 +139,7 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # Hot-path hashing policy (see clippy.toml for the ban list): std hash
 # collections are banned workspace-wide; use rustc-hash's FxHashMap/FxHashSet.
-disallowed-types = "deny"
+disallowed_types = "deny"
 
 # The release posture (#4220): the resident daemon's RSS floor includes
 # the binary's resident code pages — thin LTO + one codegen unit let

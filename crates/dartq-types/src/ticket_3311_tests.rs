@@ -26,6 +26,7 @@
 //!   under the formal column's contravariant flip), never stopping at the
 //!   head.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
 use crate::instantiate_to_bound::instantiate_type_formals_to_bounds_with;
 use crate::table::TypeTable;

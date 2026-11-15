@@ -10,7 +10,16 @@
 //! order, so once the barrier RPC returns, every prelude event is
 //! already queued in the client's event feed.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::cast_possible_wrap,
+    clippy::match_wild_err_arm,
+    clippy::unnecessary_debug_formatting,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::ignore_without_reason,
+    clippy::semicolon_if_nothing_returned
+)]
 
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};

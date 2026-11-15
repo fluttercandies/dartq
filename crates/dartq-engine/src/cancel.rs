@@ -1,5 +1,6 @@
 //! Cooperative cancellation.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

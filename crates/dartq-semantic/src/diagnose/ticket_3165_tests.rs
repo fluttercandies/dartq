@@ -8,6 +8,7 @@
 //! MetricUnits>` — the binder reads the receiver-instantiated face
 //! `Unit<MetricUnits>`). Every expectation is a verbatim oracle 3.13.7 row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops_bare;
 
 /// The `undefined_operator` rows of `report_ops_bare`, as (offset, length,

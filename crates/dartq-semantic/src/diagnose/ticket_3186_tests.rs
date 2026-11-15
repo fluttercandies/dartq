@@ -20,6 +20,7 @@
 //! - `Nope.new();` → "The method 'new' isn't defined for the type
 //!   '<unknown>'." (plus `undefined_identifier` on the head)
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

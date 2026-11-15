@@ -3,6 +3,7 @@
 //! literal-head initializer rejection (oracle 3.13.7). Upstream citations
 //! live per-test.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -23,7 +24,7 @@ fn code(c: &str, start: u32, end: u32) -> (String, u32, u32) {
 /// The `=`/`(`/`?.` dispatch after `super.` reads the token FOLLOWING the
 /// name slot. A name spliced at a keyword head sits at that keyword's own
 /// offset, so its follower is the keyword itself — `insertParens(
-/// includeIdentifier: false)` (parser_impl.dart:4918) makes the spliced
+/// includeIdentifier: false)` (`parser_impl.dart:4918`) makes the spliced
 /// identifier's `next` `var`, never the `=` after it. `super. var = 0`
 /// therefore routes to the `(`-expect arm (never the `=` declaring-class
 /// rider, which fires only for a real name), producing `super.<syn>()` and
@@ -74,7 +75,7 @@ fn super_dot_real_name_eq_keeps_declaring_class_rider() {
 /// (ast_builder.dart:786-800) and the `;` body position carries
 /// `missing_function_body` (the rejected initializer leaves no valid
 /// constructor body). The operand itself is consumed (`doDotExpression`,
-/// ast_builder.dart:918) with the `missing_identifier` row, and the
+/// `ast_builder.dart:918`) with the `missing_identifier` row, and the
 /// `(`-expect anchors on the `;` follower.
 #[test]
 fn super_dot_literal_head_reports_invalid_super_and_body() {

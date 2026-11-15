@@ -8,6 +8,7 @@
 //! expectation below is a verbatim oracle 3.13.7 row
 //! (`dart analyze --format=machine`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use crate::FileReport;
 

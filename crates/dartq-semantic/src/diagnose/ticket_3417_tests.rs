@@ -25,7 +25,7 @@
 //! - An INTERFACE-typed type alias (`typedef A = C;`): upstream hands the
 //!   ALIASED element to the static face
 //!   (`_resolveTargetInterfaceElement`,
-//!   pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart:
+//!   `pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart`:
 //!   507-517; `_resolveReceiverTypeLiteral`,
 //!   method_invocation_resolver.dart:168-179), so `A.sm()` resolves `C`'s
 //!   statics instead of reading `A` as a `Type` instance.
@@ -36,6 +36,7 @@
 //! position reported `undefined_class 'dynamic'` — the export scope never
 //! carries the synthetic element.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{
     RigImport, assert_silent, code_names, report_ops, report_ops_imports, report_ops_with,
 };

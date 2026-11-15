@@ -13,6 +13,7 @@
 //!   so two uses of one alias template carry distinct binders and the
 //!   caller can key each use's `ParamFacts.bound` separately.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ids::{TypeDeclId, TypeParamId};
 use crate::table::TypeTable;
 use crate::ty::{TypeKind, UninternedFunction, UninternedType};
@@ -111,5 +112,5 @@ fn rebind_function_params_mints_fresh_binders_and_renames() {
     // A binder-free type comes back unchanged with no pairs.
     let (same, empty) = table.rebind_function_params(x_ty, &mut || TypeParamId::from_raw(500));
     assert_eq!(same, x_ty);
-    assert!(empty.is_empty());
+    assert_eq!(empty, Vec::<(TypeParamId, TypeParamId)>::new());
 }

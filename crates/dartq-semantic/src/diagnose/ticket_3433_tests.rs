@@ -40,6 +40,7 @@
 //! 2394-2395, 2423` — the row anchors the SELECTOR span with the
 //! context display in slot two.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, RigImport, code_names, report_ops, report_ops_imports, rows};
 use crate::diagnose::FileReport;
 

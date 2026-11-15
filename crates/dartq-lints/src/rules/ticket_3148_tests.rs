@@ -17,6 +17,7 @@
 //! `visitForStatement` and reports the loop variable at every language
 //! version, while the collection for-element (`ForElement`) stays unvisited.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
 /// The UTF-16 offset of the `nth` occurrence of `needle` in `f`.

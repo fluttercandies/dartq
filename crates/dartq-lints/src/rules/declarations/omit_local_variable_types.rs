@@ -349,90 +349,90 @@ mod oracle_corpus_pins {
         // (case, source, oracle rows as (line, column, length)).
         let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_field#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_field#0",
+                r"
 class C {
   int a = 3;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_forEach_ok#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_forEach_ok#0",
+                r"
 f() {
   for (var i in [1, 2, 3]) { }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_forIn_rightSideIsIterableOfDynamic_typedWithString#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_forIn_rightSideIsIterableOfDynamic_typedWithString#0",
+                r"
 void f(Iterable<dynamic> items) {
   for (String item in items) {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_forIn_rightSideIsIterableOfString_typedWithDynamic#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_forIn_rightSideIsIterableOfString_typedWithDynamic#0",
+                r"
 abstract class StringIterator<E> implements Iterable<E> {}
 void f(StringIterator<String> items) {
   for (dynamic item in items) {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_listPattern_destructured#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_listPattern_destructured#0",
+                r"
 f() {
   var [int a] = <int>[1];
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_local_multiple#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_local_multiple#0",
+                r"
 f() {
   String a = 'a', b = 'b';
 }
-"#,
+",
                 &[(3, 3, 6)],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_local_multiple_ok#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_local_multiple_ok#0",
+                r"
 f() {
   var a = 'a', b = 'b';
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_mapPattern_destructured#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_mapPattern_destructured#0",
+                r"
 f() {
   var {'a': int a} = <String, int>{'a': 1};
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_multipleLocalVariables_rightSideIsList_typedWithRawIterable#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_multipleLocalVariables_rightSideIsList_typedWithRawIterable#0",
+                r"
 void f() {
   Iterable a = [], b = new Iterable.empty();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_objectPattern_destructured#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_objectPattern_destructured#0",
+                r"
 class A {
   int a;
   A(this.a);
@@ -440,12 +440,12 @@ class A {
 f() {
   final A(a: int _b) = A(1);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_objectPattern_switch#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_objectPattern_switch#0",
+                r"
 class A {
   int a;
   A(this.a);
@@ -456,85 +456,85 @@ f() {
     case A(a: >0 && int b):
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_paramIsType#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_paramIsType#0",
+                r"
 T bar<T>(T d) => d;
 
 String f() {
   String h = bar('');
   return h;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_recordPattern_switch#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_recordPattern_switch#0",
+                r"
 f() {
   switch ((1, 2)) {
     case (int a, final int b):
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_record_destructured#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_record_destructured#0",
+                r"
 f(Object o) {
   switch (o) {
     case (int x, String s):
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_rightSideIsInt_typedWithDouble#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_rightSideIsInt_typedWithDouble#0",
+                r"
 void f() {
   double x = 0;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_rightSideIsInt_typedWithDynamic#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_rightSideIsInt_typedWithDynamic#0",
+                r"
 void f() {
   dynamic x = 0;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_rightSideIsNull_typedWithNull#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_rightSideIsNull_typedWithNull#0",
+                r"
 void f() {
   const Null a = null;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_typeNeededForInference#0"#,
-                r#"
+                r"lints/omit_local_variable_types/OmitLocalVariableTypesTest/test_typeNeededForInference#0",
+                r"
 T bar<T>(dynamic d) => d;
 
 String f() {
   String h = bar('');
   return h;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/omit_local_variable_types/doc_bad_0"#,
-                r#"List<List<Ingredient>> possibleDesserts(Set<Ingredient> pantry) {
+                r"lints/omit_local_variable_types/doc_bad_0",
+                r"List<List<Ingredient>> possibleDesserts(Set<Ingredient> pantry) {
   List<List<Ingredient>> desserts = <List<Ingredient>>[];
   for (final List<Ingredient> recipe in cookbook) {
     if (pantry.containsAll(recipe)) {
@@ -544,12 +544,12 @@ String f() {
 
   return desserts;
 }
-"#,
+",
                 &[(2, 3, 22)],
             ),
             (
-                r#"lints/omit_local_variable_types/doc_good_0"#,
-                r#"List<List<Ingredient>> possibleDesserts(Set<Ingredient> pantry) {
+                r"lints/omit_local_variable_types/doc_good_0",
+                r"List<List<Ingredient>> possibleDesserts(Set<Ingredient> pantry) {
   var desserts = <List<Ingredient>>[];
   for (final recipe in cookbook) {
     if (pantry.containsAll(recipe)) {
@@ -559,7 +559,7 @@ String f() {
 
   return desserts;
 }
-"#,
+",
                 &[],
             ),
         ];

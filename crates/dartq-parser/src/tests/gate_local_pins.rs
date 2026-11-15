@@ -18,6 +18,7 @@
 //! therefore nail dartq's own emission (the tripwire contract:
 //! the emitter must not silently change), not oracle parity.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::setup;
 
 /// Whole-unit parse, diagnostic-code sequence only.

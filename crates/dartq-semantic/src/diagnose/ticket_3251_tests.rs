@@ -5,15 +5,16 @@
 //!
 //! Upstream `checkForFieldInitializerNotAssignable` asks assignability
 //! FIRST and only then the void use (`if (fieldType is! VoidType)
-//! checkForUseOfVoidResult(expression)` — error_detection_helpers.dart), so
+//! checkForUseOfVoidResult(expression)` — `error_detection_helpers.dart`), so
 //! an object-typed field answers `field_initializer_not_assignable` while
 //! the hosts that accept `void` (`dynamic`, `Object?`) answer
 //! `use_of_void_result`; `_checkForDefaultValueAssignableAtType`
-//! (error_verifier.dart) runs `checkForAssignableExpressionAtType` over the
+//! (`error_verifier.dart`) runs `checkForAssignableExpressionAtType` over the
 //! formal's declared type with the assignment reporter; and a `for`-part
 //! declaration initializer is an ordinary declaration initializer
 //! (`variable_declaration_resolver.dart`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{report_ops, rows};
 
 /// The message the oracle spells for the void face — parameterless

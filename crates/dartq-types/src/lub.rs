@@ -12,6 +12,7 @@
 //! layer must supply one; Dart always has it) take the official fallback
 //! `UP(Object, T2)` (least_upper_bound.dart:652-659).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cmp::Ordering;
 
 use rustc_hash::FxHashSet;

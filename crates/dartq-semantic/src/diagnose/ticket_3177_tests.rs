@@ -8,6 +8,7 @@
 //! Every expectation is a verbatim oracle 3.13.7 row on `undefined_operator`'s
 //! type face, which `check_operator_expr_in` renders through `ty.render`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops_bare;
 
 /// The `undefined_operator` rows of `report_ops_bare`, as (offset, length,
@@ -47,7 +48,7 @@ fn generic_function_tearoff_spells_type_param_group() {
 /// The bound spells a custom class — the bare rig seeds no core types, so
 /// a `num` bound reads `undefined_class` and the group's face never
 /// renders (the module's own custom-types-only rule). Oracle-pinned,
-/// dart analyze 3.13.7 on the custom-bound shape: UNDEFINED_OPERATOR
+/// dart analyze 3.13.7 on the custom-bound shape: `UNDEFINED_OPERATOR`
 /// "The operator '<' isn't defined for the type 'void Function<T extends
 /// Num>(T)'."
 #[test]

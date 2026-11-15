@@ -10,7 +10,7 @@
 //! # The defect this ticket fixes
 //!
 //! The existing gate (`Engine::push_type_parameter`'s `declares_nothing`
-//! skip, ticket_3297's pins) covers the declaration-site `type_params` /
+//! skip, `ticket_3297`'s pins) covers the declaration-site `type_params` /
 //! `pending_type_params` stack, but a generic declaration's `_` ALSO
 //! enters the per-executable bound window (`exec_bounds` /
 //! `method_exec_bounds` — the `(param, bound)` pairs
@@ -27,6 +27,7 @@
 //! an unresolvable callee would fold the argument row into the callee's
 //! miss and hide the binding face under test.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{assert_silent, code_names, report_ops, report_ops_wildcards};
 
@@ -175,7 +176,7 @@ fn wildcard_type_param_on_a_mixin_binds_nothing_in_member_bodies() {
 /// `fn_type_capture` machinery itself (`fn_capture_type_variable` pushes
 /// the spelling into `capture.scope`/`capture.params` unchecked, and the
 /// capture's own tree path answers it before the type-use row reaches
-/// `type_resolution`'s now-gated scope arm) — type_capture.rs /
+/// `type_resolution`'s now-gated scope arm) — `type_capture.rs` /
 /// listener.rs, outside this lane's scope.
 #[ignore = "signature capture binds `_` before type_resolution (type_capture.rs) — outside this lane's scope"]
 #[test]

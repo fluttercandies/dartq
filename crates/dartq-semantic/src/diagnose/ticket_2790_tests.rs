@@ -17,6 +17,7 @@
 //!   function/method tear-offs (the `function_type` suites, ~19 oracle
 //!   entries per case) stayed informative.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, report_ops_bare};
 use super::*;
 
@@ -35,7 +36,7 @@ fn type_check_rows(report: &FileReport) -> Vec<(u32, u32)> {
     rows(report, "unnecessary_type_check")
 }
 
-/// —— A1: the covariant argument leg is the strict ask ——
+// —— A1: the covariant argument leg is the strict ask ——
 
 /// `const <Null>[] is List<Object>` (the inlined co19 `Utils/expect.dart`
 /// `hasUnsoundNullSafety` getter, 1,755 solo cases): the covariant
@@ -140,7 +141,7 @@ fn raw_set_operand_is_raw_set_reports() {
     );
 }
 
-/// —— A1: the top-type edges ——
+// —— A1: the top-type edges ——
 
 /// `o is T` over an unannotated (dynamic) formal: `dynamic <: T` is no
 /// fit (Left Top — only the tops fit), the oracle stays silent.
@@ -186,7 +187,7 @@ fn nullable_num_is_not_nullable_int() {
     );
 }
 
-/// —— A2: the alias fold + tear-off operand faces ——
+// —— A2: the alias fold + tear-off operand faces ——
 
 /// A top-level function tear-off against its own alias type:
 /// `f0`'s static type is the declared signature; `F0<int>` folds to
@@ -295,7 +296,7 @@ fn invocation_operand_stays_live() {
     );
 }
 
-/// —— polarity complements ——
+// —— polarity complements ——
 
 /// A constant-true check under `is!` maps to the 'false' row — the
 /// polarity pair shares the one registry code, the tier lives in the

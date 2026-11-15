@@ -16,6 +16,7 @@
 //! Anchors locate themselves with `find` over the prelude-prefixed
 //! source. Registered through `diagnose/tests.rs`'s `#[path]` tail.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// Every `body_might_complete_normally*` row as `(code, offset)`,

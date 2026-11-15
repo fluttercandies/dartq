@@ -2,13 +2,14 @@
 //! bounded streaming copy, and streamed content hashing.
 //!
 //! Placement of store blobs into a project worktree must never use
-//! hardlinks: flutter_tools rewrites some outputs in place, and a
+//! hardlinks: `flutter_tools` rewrites some outputs in place, and a
 //! hardlink would corrupt the shared store. `clonefile(2)` produces an
 //! independent copy-on-write snapshot (measured on APFS: 4.4 GB
 //! materializes in 0.379 s, orders of magnitude faster than a plain
 //! copy), so it is the mandatory fast path on macOS, with a bounded
 //! streaming copy as the universal fallback.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -306,7 +307,7 @@ pub(crate) fn hash_files_parallel(paths: &[PathBuf]) -> Vec<io::Result<BlobId>> 
 /// escapes to a caller.
 #[cfg(unix)]
 fn unreached() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, "parallel hash slot unfilled")
+    io::Error::other("parallel hash slot unfilled")
 }
 
 /// An exclusive advisory lock serializing cache mutations on one
@@ -398,7 +399,7 @@ pub(crate) fn touch(path: &Path) -> io::Result<()> {
         if unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), std::ptr::null(), 0) } == 0 {
             return Ok(());
         }
-        return Err(io::Error::last_os_error());
+        Err(io::Error::last_os_error())
     }
     #[cfg(not(unix))]
     {
@@ -438,15 +439,15 @@ pub(crate) fn volume_space(path: &Path) -> io::Result<VolumeSpace> {
     // SAFETY: statvfs(3) reads the NUL-terminated path and fills `stats`
     // through pointers that both outlive the call; `stats` is read only
     // after a zero return.
-    if unsafe { libc::statvfs(cpath.as_ptr(), &mut stats) } != 0 {
+    if unsafe { libc::statvfs(cpath.as_ptr(), &raw mut stats) } != 0 {
         return Err(io::Error::last_os_error());
     }
     // The field types are per-platform aliases (`u32` block counts on
     // macOS, `u64` on Linux), all unsigned and at most 64 bits wide.
     let fragment = stats.f_frsize as u64;
     Ok(VolumeSpace {
-        available: (stats.f_bavail as u64).saturating_mul(fragment),
-        total: (stats.f_blocks as u64).saturating_mul(fragment),
+        available: u64::from(stats.f_bavail).saturating_mul(fragment),
+        total: u64::from(stats.f_blocks).saturating_mul(fragment),
     })
 }
 
@@ -582,8 +583,8 @@ mod tests {
     /// A18's fallback chain on the generic path: a source no clone
     /// implementation accepts (a character device) must fall through to
     /// the plain copy rung and still produce a valid destination. On
-    /// macOS this exercises clonefile→copy_stream; on Linux,
-    /// FICLONE→copy_file_range→read/write all refuse or handle it.
+    /// macOS this exercises `clonefile→copy_stream`; on Linux,
+    /// `FICLONE→copy_file_range→read/write` all refuse or handle it.
     #[cfg(unix)]
     #[test]
     fn clone_file_falls_back_when_the_clone_is_refused() {
@@ -598,7 +599,7 @@ mod tests {
     /// with the digest of exactly those bytes, and the plain copy path
     /// lands the same digest. The clone mechanism is asserted, not
     /// timed: `CloneStatus::Cloned` means clonefile/FICLONE returned
-    /// success — an atomic CoW clone with no hidden copy inside — which
+    /// success — an atomic `CoW` clone with no hidden copy inside — which
     /// is the structural one-write-less win over copy-then-hash. A
     /// wall-clock beats-copy assertion lived here briefly and flapped
     /// under parallel test load (scheduler and page-cache noise invert
@@ -724,10 +725,9 @@ mod tests {
         // The second acquirer queues behind the first's release.
         let queued_tree = tree.clone();
         let releaser = std::thread::spawn(move || {
-            let second = TreeLock::acquire(&queued_tree, Duration::from_secs(5))
+            TreeLock::acquire(&queued_tree, Duration::from_secs(5))
                 .expect("second acquire")
-                .expect("lock after release");
-            second
+                .expect("lock after release")
         });
         std::thread::sleep(Duration::from_millis(100));
         drop(first);

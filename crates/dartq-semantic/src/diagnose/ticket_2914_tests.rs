@@ -35,6 +35,8 @@
 //! `ExtensionTest` and co19 `enhanced_enums_error_test` (`dart analyze`,
 //! Dart 3.13.7).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{assert_silent, code_names, report_ops, report_ops_wildcards, rows};
 
 fn dup_messages(report: &crate::diagnose::FileReport) -> Vec<String> {
@@ -245,7 +247,7 @@ fn wildcard_formal_parameters_pre_feature_duplicate() {
     );
 }
 
-/// `this._` is a FieldFormalParameterElement — never a wildcard, so the
+/// `this._` is a `FieldFormalParameterElement` — never a wildcard, so the
 /// second `this._` duplicates even under the feature (upstream :444-457).
 /// Two initializing formals pair on `duplicate_field_formal_parameter`, not
 /// `duplicate_definition` (`getDiagnostic` reads both nodes' kinds,

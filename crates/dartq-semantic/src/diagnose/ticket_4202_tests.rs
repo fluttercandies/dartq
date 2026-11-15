@@ -11,6 +11,7 @@
 //! receiver-nullability verdict flipped with it. The lookups now read one
 //! declaration-ordered list and narrow to the nearest declaring window at
 //! or before the reference, so each reference sees its own scope.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
@@ -86,11 +87,10 @@ fn at(source: &str, needle: &str) -> u32 {
 
 /// The `nth` (0-based) occurrence of `needle`, an offset.
 fn at_nth(source: &str, needle: &str, nth: usize) -> u32 {
-    let index = source
-        .match_indices(needle)
-        .nth(nth)
-        .map(|(index, _)| index)
-        .unwrap_or_else(|| panic!("{needle:?} #{nth} not in {source:?}"));
+    let index = source.match_indices(needle).nth(nth).map_or_else(
+        || panic!("{needle:?} #{nth} not in {source:?}"),
+        |(index, _)| index,
+    );
     u32::try_from(index).expect("offset fits u32")
 }
 

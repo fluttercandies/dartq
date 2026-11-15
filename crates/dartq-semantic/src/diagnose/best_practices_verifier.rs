@@ -55,6 +55,7 @@
 //! labels, object-pattern fields, and the binary-operator face
 //! (`verifyBinary`, :1690-1714) stay under-reports this round.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::model::Annotation;
 use dartq_resolution::LocalLookup;
@@ -614,7 +615,7 @@ impl<'a> Engine<'a> {
 
     /// The access face of one type position: a creation head
     /// (`A()`, `A.named()`, `@A()`) resolves the CONSTRUCTOR element —
-    /// `_getIdentifierNameAndErrorEntity`'s ConstructorName join
+    /// `_getIdentifierNameAndErrorEntity`'s `ConstructorName` join
     /// (:2011-2032) — while every other named type resolves its container.
     fn type_reference_face(
         &self,
@@ -837,11 +838,11 @@ impl<'a> Engine<'a> {
 /// The member annotations an edge's target carries: the declaring
 /// container's member row, else a same-named extension face (the
 /// `check_target_annotations` lookup, narrowed to the write face).
-fn member_entry_annotations<'e>(
-    elements: &'e crate::model::FileElements,
+fn member_entry_annotations(
+    elements: &crate::model::FileElements,
     container: StringId,
     name: StringId,
-) -> Option<&'e [Annotation]> {
+) -> Option<&[Annotation]> {
     elements
         .container(container)
         .and_then(|decl| decl.members.get(&name))
@@ -1210,12 +1211,12 @@ impl Engine<'_> {
     /// `element_usage_detector.dart` `_visitParametersAndArguments`,
     /// :381-413): a call site's `name:`-labeled argument whose bound
     /// formal carries the tag reports at the LABEL — the
-    /// NamedExpression's own anchor, not the callee's.
+    /// `NamedExpression`'s own anchor, not the callee's.
     ///
     /// `owner` is the collector's `formal_annotations` join spelling (a
     /// top-level `f`, a member `C.m`, a constructor `C.<key>`); `name` the
     /// label as written (the public formal spelling —
-    /// `correspondingPublicName`, token_impl.dart:364).
+    /// `correspondingPublicName`, `token_impl.dart:364`).
     pub(crate) fn check_formal_arg_annotations(
         &mut self,
         range: SourceRange,
@@ -1352,7 +1353,7 @@ impl Engine<'_> {
         for site in &self.decl_sites {
             let mut deprecated = false;
             let mut experimental = false;
-            for name in site.annotations.iter() {
+            for name in &site.annotations {
                 let spelling = self.strings.resolve(*name);
                 if crate::annotation::is_core_deprecated_spelling(
                     spelling,
@@ -1405,10 +1406,10 @@ impl Engine<'_> {
         for token in &tokens[start..] {
             match token.kind {
                 dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
-                    group_depth += 1
+                    group_depth += 1;
                 }
                 dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
-                    group_depth -= 1
+                    group_depth -= 1;
                 }
                 dartq_scanner::TokenKind::OpenCurly
                 | dartq_scanner::TokenKind::StringInterpolationExpression => {
@@ -1620,7 +1621,7 @@ impl Engine<'_> {
         let tokens = self.tokens.as_slice();
         while matches!(
             tokens.get(cursor).map(|t| t.kind),
-            Some(TokenKind::Keyword(Keyword::Async)) | Some(TokenKind::Keyword(Keyword::Sync))
+            Some(TokenKind::Keyword(Keyword::Async | Keyword::Sync))
         ) {
             cursor += 1;
             if tokens
@@ -1771,11 +1772,9 @@ impl Engine<'_> {
                         conditional_open = true;
                     }
                 }
-                TokenKind::Colon if depth == 0 => {
-                    if !conditional_open {
-                        // A map-entry colon.
-                        return None;
-                    }
+                TokenKind::Colon if depth == 0 && !conditional_open => {
+                    // A map-entry colon.
+                    return None;
                 }
                 _ => {}
             }

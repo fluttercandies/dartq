@@ -25,6 +25,7 @@
 //! `dotShorthandUndefinedGetter`/`dotShorthandUndefinedInvocation` at the
 //! selector span, context display in slot two.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 use crate::diagnose::FileReport;
 

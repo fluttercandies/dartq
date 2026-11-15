@@ -254,7 +254,7 @@ impl<'a> Engine<'a> {
 
     /// Whether the constructor head starting at `head` (its class-name
     /// token) was declared `external` — the upstream `_addConstructor`
-    /// `externalKeyword` exclusion (constructor_fields_verifier.dart:57).
+    /// `externalKeyword` exclusion (`constructor_fields_verifier.dart:57`).
     /// `external` precedes `const` (`external const C()`); any other
     /// modifier or a member boundary stops the walk.
     fn ctor_head_is_external(&self, head: SourceRange) -> bool {
@@ -377,7 +377,7 @@ impl<'a> Engine<'a> {
                         let start = container_name.map_or(head.offset, |n| n.offset);
                         let end = self
                             .token_after(head.offset)
-                            .map_or(head.end(), |token| token.end());
+                            .map_or(head.end(), dartq_diagnostics::SourceRange::end);
                         SourceRange {
                             offset: start,
                             // `end` is the head's next-token end; `start` is the
@@ -743,15 +743,13 @@ impl<'a> Engine<'a> {
                             .and_then(|decl| decl.ctor_formals.get(&self.decl_sites[*site].name))
                             .map(|formals| &**formals);
                         let super_forward = self.intern("super.forward");
-                        let supplied_positional = supplies
-                            .map(|formals| {
-                                formals
-                                    .positional
-                                    .iter()
-                                    .filter(|formal| formal.default_value == Some(super_forward))
-                                    .count()
-                            })
-                            .unwrap_or(0);
+                        let supplied_positional = supplies.map_or(0, |formals| {
+                            formals
+                                .positional
+                                .iter()
+                                .filter(|formal| formal.default_value == Some(super_forward))
+                                .count()
+                        });
                         if let Some(formals) = supplies {
                             for formal in
                                 formals.named.iter().filter(|formal| formal.ty == Ty::Never)
@@ -1075,7 +1073,7 @@ impl<'a> Engine<'a> {
         let mut at = prev.offset;
         while let Some(before) = self.dup_token_before(at) {
             match self.lexeme_at(before.offset) {
-                Some("const") | Some("external") => at = before.offset,
+                Some("const" | "external") => at = before.offset,
                 Some("augment") => return None,
                 _ => break,
             }
@@ -1157,9 +1155,9 @@ impl<'a> Engine<'a> {
                                 break false;
                             };
                             match self.lexeme_at(prev.offset) {
-                                Some("external") | Some("const") => at = prev.offset,
+                                Some("external" | "const") => at = prev.offset,
                                 Some("augment") => break false,
-                                Some("{") | Some("}") | Some(";") => break true,
+                                Some("{" | "}" | ";") => break true,
                                 _ => break false,
                             }
                         };
@@ -1204,8 +1202,7 @@ impl<'a> Engine<'a> {
     /// re-decides at the teardown ([`Engine::finalize_mixin_uses`]).
     pub(crate) fn drain_with_clause_spans(&mut self) {
         if let Some(deferred) = self.deferred_modifier.as_mut() {
-            self.pending_mixin_uses
-                .extend(deferred.spans.buffered.drain(..));
+            self.pending_mixin_uses.append(&mut deferred.spans.buffered);
         }
     }
 
@@ -1215,7 +1212,7 @@ impl<'a> Engine<'a> {
     /// clause's own entries — their unresolvable heads code
     /// `extends_non_class`, never the bare `undefined_class` (upstream
     /// Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-    /// scope_analyzer.dart `_resolveType`, the `ExtendsClause` arm). A
+    /// `scope_analyzer.dart` `_resolveType`, the `ExtendsClause` arm). A
     /// tail head that took the super slot directly (nothing buffered)
     /// rides the committed extends span instead.
     pub(crate) fn header_extends_tail_feed(&mut self) {
@@ -1945,7 +1942,7 @@ impl<'a> Engine<'a> {
             match capture.section {
                 FnFormalSection::Named => capture.poisoned = true,
                 FnFormalSection::Required | FnFormalSection::OptionalPositional => {
-                    capture.positional.push(ty)
+                    capture.positional.push(ty);
                 }
             }
         }
@@ -2853,7 +2850,7 @@ impl<'a> Engine<'a> {
                                 params,
                                 bounds,
                             } => {
-                                frontier.extend(ret.iter().map(|ret| ret.as_ref()));
+                                frontier.extend(ret.iter().map(std::convert::AsRef::as_ref));
                                 frontier.extend(params.iter().chain(bounds.iter()));
                             }
                             VarTreeKind::Record { fields } => {
@@ -3634,7 +3631,7 @@ impl<'a> Engine<'a> {
     /// * **context-pushed composite** — `f((c ? a : b)..m<T>())`,
     ///   `f((x ??= y)..m<T>())`: upstream's `?:`/`??`/`??=` static type
     ///   is `T` when `UP <: S` else `S = greatestClosure(K)` where `K` is
-    ///   the composite's downward context (inference_update_3's
+    ///   the composite's downward context (`inference_update_3`'s
     ///   documented rule). The frozen face is the context-free UP, so a
     ///   send inside `contextB1(...)`/`contextIterable(...)`/`context<..>`
     ///   checks `Exactly<A>` where the oracle checks `Exactly<B1<Object?>>`.
@@ -3651,10 +3648,11 @@ impl<'a> Engine<'a> {
         // promotion latch excludes invoked callees, so a member CALL
         // receiver keeps its declared face here and only a non-invoked
         // read (`x.expectStaticType<Exactly<int>>` tear-off) moves.
-        if let Some(ty) = self.recv_expression_ty(recv_span) {
-            if ty != Ty::UNKNOWN && ty != frozen {
-                out.push(ty);
-            }
+        if let Some(ty) = self.recv_expression_ty(recv_span)
+            && ty != Ty::UNKNOWN
+            && ty != frozen
+        {
+            out.push(ty);
         }
         if let Some(ty) = self.await_flattened_recv_ty(recv_span) {
             out.push(ty);
@@ -3671,10 +3669,11 @@ impl<'a> Engine<'a> {
         // promoted override, the `(local ??= value)` join over a promoted
         // left) reaches the verdict here; an unjoinable pair answers no
         // candidate (the keep direction).
-        if let Some(ty) = self.composite_self_ty(recv_span) {
-            if ty != Ty::UNKNOWN && ty != frozen {
-                out.push(ty);
-            }
+        if let Some(ty) = self.composite_self_ty(recv_span)
+            && ty != Ty::UNKNOWN
+            && ty != frozen
+        {
+            out.push(ty);
         }
         out
     }
@@ -3827,18 +3826,19 @@ impl<'a> Engine<'a> {
         use dartq_scanner::TokenKind as K;
         let tokens = self.tokens.as_slice();
         let mut first = tokens.partition_point(|t| t.utf16_offset < recv_span.offset);
-        let mut last = tokens.partition_point(|t| t.utf16_offset < recv_span.end());
+        let last = tokens.partition_point(|t| t.utf16_offset < recv_span.end());
         // A tail-anchored receiver row (`(x ??= A())` — the if-null join
         // stages nothing, so the cascade target's read anchors at the
         // paren close) spans one closer token; expand it to the matched
         // group so the composite window is the whole parenthesized
         // expression rather than its final `)`.
-        if last == first + 1 && tokens[first].kind == K::CloseParen {
-            if let Some(opener) = (0..first).rev().find(|&i| {
+        if last == first + 1
+            && tokens[first].kind == K::CloseParen
+            && let Some(opener) = (0..first).rev().find(|&i| {
                 tokens[i].kind == K::OpenParen && self.tokens.matching_end(i) == Some(first)
-            }) {
-                first = opener;
-            }
+            })
+        {
+            first = opener;
         }
         if last <= first {
             return None;
@@ -3872,11 +3872,11 @@ impl<'a> Engine<'a> {
                 | K::OpenParen
                 | K::OpenSquare
                 | K::Lt => {
-                    if let Some(close) = self.tokens.matching_end(at) {
-                        if close < hi {
-                            at = close + 1;
-                            continue;
-                        }
+                    if let Some(close) = self.tokens.matching_end(at)
+                        && close < hi
+                    {
+                        at = close + 1;
+                        continue;
                     }
                     at += 1;
                 }
@@ -4026,11 +4026,11 @@ impl<'a> Engine<'a> {
                 | K::OpenParen
                 | K::OpenSquare
                 | K::Lt => {
-                    if let Some(close) = self.tokens.matching_end(at) {
-                        if close < hi {
-                            at = close + 1;
-                            continue;
-                        }
+                    if let Some(close) = self.tokens.matching_end(at)
+                        && close < hi
+                    {
+                        at = close + 1;
+                        continue;
                     }
                     at += 1;
                 }
@@ -4076,11 +4076,11 @@ impl<'a> Engine<'a> {
                             | K::OpenParen
                             | K::OpenSquare
                             | K::Lt => {
-                                if let Some(close) = self.tokens.matching_end(probe) {
-                                    if close < hi {
-                                        probe = close + 1;
-                                        continue;
-                                    }
+                                if let Some(close) = self.tokens.matching_end(probe)
+                                    && close < hi
+                                {
+                                    probe = close + 1;
+                                    continue;
                                 }
                                 probe += 1;
                             }
@@ -4112,13 +4112,14 @@ impl<'a> Engine<'a> {
             // local's declared face); any other lvalue's setter write
             // type is outside this face's reach, so the right face
             // stands as inferred.
-            if tokens[op_at].kind == K::QuestionQuestionEq {
-                if op_at == lo + 1 && tokens[lo].kind == K::Identifier {
-                    let name = self.strings.intern(self.tokens.lexeme(self.source, lo));
-                    let j_prime = self.local_declared_ty(name)?;
-                    if self.assignable(rhs, j_prime, false) != Some(true) {
-                        return None;
-                    }
+            if tokens[op_at].kind == K::QuestionQuestionEq
+                && op_at == lo + 1
+                && tokens[lo].kind == K::Identifier
+            {
+                let name = self.strings.intern(self.tokens.lexeme(self.source, lo));
+                let j_prime = self.local_declared_ty(name)?;
+                if self.assignable(rhs, j_prime, false) != Some(true) {
+                    return None;
                 }
             }
             let (left, right) = self.coerce_if_null_callable(Self::non_null_form(lhs), rhs);
@@ -4135,10 +4136,10 @@ impl<'a> Engine<'a> {
             };
             return Some(operand);
         }
-        if let Some(op_at) = compound_at {
-            if op_at > lo {
-                return self.prune_operand_ty(lo, op_at);
-            }
+        if let Some(op_at) = compound_at
+            && op_at > lo
+        {
+            return self.prune_operand_ty(lo, op_at);
         }
         None
     }
@@ -4152,12 +4153,13 @@ impl<'a> Engine<'a> {
         let tokens = self.tokens.as_slice();
         let mut first = tokens.partition_point(|t| t.utf16_offset < recv_span.offset);
         let mut last = tokens.partition_point(|t| t.utf16_offset < recv_span.end());
-        if last == first + 1 && tokens[first].kind == K::CloseParen {
-            if let Some(opener) = (0..first).rev().find(|&i| {
+        if last == first + 1
+            && tokens[first].kind == K::CloseParen
+            && let Some(opener) = (0..first).rev().find(|&i| {
                 tokens[i].kind == K::OpenParen && self.tokens.matching_end(i) == Some(first)
-            }) {
-                first = opener;
-            }
+            })
+        {
+            first = opener;
         }
         if last <= first {
             return None;
@@ -4394,7 +4396,7 @@ impl<'a> Engine<'a> {
         // callable-expression tails (`f()()`— a `)`/`]` tail) stay out
         // — only the bare top-level function resolves cleanly here.
         let mut callee_at = arglist;
-        while callee_at > 0 && matches!(tokens[callee_at - 1].kind, K::Identifier) == false {
+        while callee_at > 0 && !matches!(tokens[callee_at - 1].kind, K::Identifier) {
             // Written type-argument group `f<W0..>(` — walk back over
             // the matched `<...>`: the closer before `(` is `>`; its
             // opener is a `<` at angle-depth 0.
@@ -4476,12 +4478,13 @@ impl<'a> Engine<'a> {
                         arg_start = i + 1;
                         named = None;
                     }
-                    K::Identifier if depth == 0 && arg_start == i => {
+                    K::Identifier
+                        if depth == 0 && arg_start == i
                         // `name:` — a named-argument label: the next
                         // token is `:`.
-                        if tokens.get(i + 1).is_some_and(|t| t.kind == K::Colon) {
-                            named = Some(self.strings.intern(self.tokens.lexeme(self.source, i)));
-                        }
+                        && tokens.get(i + 1).is_some_and(|t| t.kind == K::Colon) =>
+                    {
+                        named = Some(self.strings.intern(self.tokens.lexeme(self.source, i)));
                     }
                     _ => {}
                 }
@@ -4576,12 +4579,12 @@ impl<'a> Engine<'a> {
                 }
                 let ret = self.prune_greatest_closure(shape.return_ty, params, subst, covariant)?;
                 let mut positional = Vec::with_capacity(shape.positional.len());
-                for param in shape.positional.iter() {
+                for param in &shape.positional {
                     positional
                         .push(self.prune_greatest_closure(*param, params, subst, !covariant)?);
                 }
                 let mut named = Vec::with_capacity(shape.named.len());
-                for (name, formal) in shape.named.iter() {
+                for (name, formal) in &shape.named {
                     named.push((
                         *name,
                         self.prune_greatest_closure(*formal, params, subst, !covariant)?,
@@ -4599,11 +4602,11 @@ impl<'a> Engine<'a> {
             Ty::Record { shape, nullable } => {
                 let shape = self.boundary.pool().record_shape(shape).clone();
                 let mut positional = Vec::with_capacity(shape.positional.len());
-                for field in shape.positional.iter() {
+                for field in &shape.positional {
                     positional.push(self.prune_greatest_closure(*field, params, subst, covariant)?);
                 }
                 let mut named = Vec::with_capacity(shape.named.len());
-                for (name, field) in shape.named.iter() {
+                for (name, field) in &shape.named {
                     named.push((
                         *name,
                         self.prune_greatest_closure(*field, params, subst, covariant)?,
@@ -4823,13 +4826,6 @@ impl<'a> Engine<'a> {
         })
     }
 }
-
-// The #3464 pins (the `duplicate_constructor` head-shape pass). Registered
-// here, in the face's own file, via `#[path]`: the module stays inside the
-// `diagnose` subtree so the test rig's `pub(super)` items remain visible.
-#[cfg(test)]
-#[path = "ticket_3464_tests.rs"]
-mod ticket_3464_tests;
 
 #[cfg(test)]
 mod exec_bounds_pairing_tests {

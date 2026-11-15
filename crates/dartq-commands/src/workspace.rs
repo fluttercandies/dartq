@@ -4,6 +4,7 @@
 //! consume these — the daemon face takes the assembled [`EngineConfig`]
 //! into `Session::new` (#328).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -495,6 +496,7 @@ pub fn engine_config_with_overrides_phased(
 /// route their `SdkSnapshot::load` through this locator so a `sky_engine`
 /// resolution replaces the `dart:` table on those faces too, not only the
 /// default context.
+#[must_use]
 pub fn embedder_lib_dir(config: &PackageConfig, config_dir: &Path) -> Option<PathBuf> {
     let mut generic = None;
     for entry in &config.packages {
@@ -1078,6 +1080,7 @@ fn with_context_identities(packages: PackageTable, roots: &[PathBuf]) -> Package
 /// analysis covers (a pub workspace member's own package directory, not the
 /// workspace root — the analyzer includes just the member in its
 /// workspace-rooted context).
+#[must_use]
 pub fn nearest_pubspec_dir(from: &Path) -> Option<PathBuf> {
     let mut dir = from.to_path_buf();
     loop {
@@ -1249,10 +1252,9 @@ fn config_self_name(config: &PackageConfig, config_dir: &Path, root: &Path) -> O
         .find(|entry| {
             entry
                 .resolve_root(config_dir)
-                .map(|resolved| normalize(&resolved) == target)
-                .unwrap_or(false)
+                .is_ok_and(|resolved| normalize(&resolved) == target)
         })
-        .map(|entry| entry.name.to_string())
+        .map(|entry| entry.name.clone())
 }
 
 /// Reads `<dir>/pubspec.yaml` plus its optional `pubspec_overrides.yaml`
@@ -1447,7 +1449,7 @@ fn extend_config_with_nested_roots(
         let mut children: Vec<PathBuf> = fs::read_dir(&current)
             .map(|listing| {
                 listing
-                    .filter_map(|entry| entry.ok())
+                    .filter_map(std::result::Result::ok)
                     .map(|entry| entry.path())
                     .filter(|path| path.is_dir())
                     .collect()
@@ -2194,7 +2196,10 @@ mod tests {
         assert_eq!(dir, bare);
         assert_eq!(config.packages.len(), 0, "no self package");
         assert!(config.packages.root().is_none());
-        assert!(config.pub_config.packages.is_empty());
+        assert_eq!(
+            config.pub_config.packages,
+            [] as [dartq_pub::PackageConfigEntry; 0]
+        );
         assert_eq!(
             advisory.expect("advisory").config_path(),
             bare.join(".dart_tool/package_config.json")
@@ -2214,7 +2219,7 @@ mod tests {
     /// into `uri_does_not_exist`. Pins the merged resolution: both roots'
     /// entries join the URI face with the absolute roots decoded back to the
     /// mock directories, the alphabetically first root claims the duplicated
-    /// self name against its own root (the rebase), and the MissingConfig
+    /// self name against its own root (the rebase), and the `MissingConfig`
     /// advisory stays (the analyzed root itself has no config).
     #[test]
     fn bare_floor_merges_nested_case_root_resolutions() {
@@ -2474,7 +2479,7 @@ mod tests {
     /// files attribute to the nested package at the nested pubspec's sdk
     /// lower bound, not the enclosing package's version, and its
     /// `package:` face joins the context universe (the single-context
-    /// stand-in for the oracle's separate root, context_locator.dart
+    /// stand-in for the oracle's separate root, `context_locator.dart`
     /// `_createContextRoots`).
     #[test]
     fn nested_self_resolved_package_gets_its_own_language_version() {
@@ -2938,8 +2943,8 @@ mod tests {
     }
 
     /// The locator honors the config's `packageUri` anchor (absolute
-    /// `file://` rootUri spellings — a real Flutter config's sky_engine
-    /// entry) and prefers the sky_engine entry over a generic embedder
+    /// `file://` rootUri spellings — a real Flutter config's `sky_engine`
+    /// entry) and prefers the `sky_engine` entry over a generic embedder
     /// wherever it sits in the config.
     #[test]
     fn embedder_locator_prefers_sky_engine_over_generic_embedders() {
@@ -2996,7 +3001,7 @@ mod tests {
         fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;").expect("embedder ui");
     }
 
-    /// The fixture config plus one sky_engine entry (config-relative
+    /// The fixture config plus one `sky_engine` entry (config-relative
     /// `rootUri`, the pub-writer spelling).
     fn write_package_config_with_sky_engine(root: &Path) {
         fs::write(
@@ -3093,7 +3098,7 @@ mod tests {
         fs::write(root.join("dartq.yaml"), "version: 1\nsdk: \"fvm:\"\n").expect("bad locator");
         match config_sdk_root(&root) {
             Err(ResolveSdkError::Config(message)) => {
-                assert!(message.contains("empty fvm version"), "{message}")
+                assert!(message.contains("empty fvm version"), "{message}");
             }
             other => panic!("the bad locator is the config tier, got {other:?}"),
         }

@@ -33,6 +33,7 @@
 //! on-name behind a broken export: oracle silent), `ua`/`ub`/`va`/`ta`
 //! (operator-merged arm parity on the on-face walk).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;
@@ -202,7 +203,7 @@ fn code_names(report: &FileReport) -> Vec<&'static str> {
         .collect::<Vec<_>>()
 }
 
-fn member_miss<'a>(report: &'a FileReport, needle: &str) -> String {
+fn member_miss(report: &FileReport, needle: &str) -> String {
     report
         .diagnostics
         .iter()
@@ -283,7 +284,7 @@ extension E on C {
 ",
     );
     assert!(
-        member_miss(&report, "'nope' isn't defined for the type 'C'").len() > 0,
+        !member_miss(&report, "'nope' isn't defined for the type 'C'").is_empty(),
         "{:?}",
         report
             .diagnostics
@@ -406,7 +407,7 @@ extension E on C {
 ",
     );
     assert!(
-        member_miss(&report, "'nope' isn't defined for the type 'C'").len() > 0,
+        !member_miss(&report, "'nope' isn't defined for the type 'C'").is_empty(),
         "{:?}",
         report
             .diagnostics

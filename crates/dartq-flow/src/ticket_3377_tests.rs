@@ -29,6 +29,7 @@
 //! on `type.isDartCoreNull` before any suffix check, and `Null?` normalizes
 //! to `Null`), so `null <: Null` must hold at the name level.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, TokenTable};

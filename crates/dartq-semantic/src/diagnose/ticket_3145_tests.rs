@@ -6,7 +6,7 @@
 //!
 //! Upstream premises: `checkForInvalidAssignment` reads
 //! `AssignmentExpression.rightHandSide.staticType`
-//! (error_verifier.dart's `InvalidAssignment` arm —
+//! (`error_verifier.dart`'s `InvalidAssignment` arm —
 //! assignment_expression_resolver.dart:694-703 feeds the flow-promoted
 //! `valueType` the staged re-decision mirrors); `isAssignableTo`'s
 //! callable-class acceptance (type_system.dart:906-916 —
@@ -17,6 +17,7 @@
 //! heads); `handleValuedFormalParameter`'s default-value ask
 //! (`checkForInvalidAssignment(defaultValue, paramType)`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::super::types::FileReport;
 use super::async_return_tests::{code_names, report};
 

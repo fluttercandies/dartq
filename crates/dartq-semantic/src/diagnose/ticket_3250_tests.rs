@@ -21,6 +21,7 @@
 //! shape the recon ticket mis-attributed to this family (probed against
 //! the oracle: `void Function() f = () {}; void g() { f(); }` → silent).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// The message the oracle spells for every face (messages.yaml

@@ -9,6 +9,7 @@
 //! Left Top rule: `Object? <: double?` and `Object? <: int?` both fail),
 //! so the `int` AND `double` sinks report with 'num' in the message.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;
@@ -87,7 +88,7 @@ fn messages(report: &FileReport, name: &str) -> Vec<String> {
 }
 
 fn assignability_codes(report: &FileReport) -> Vec<&str> {
-    codes(&report)
+    codes(report)
         .into_iter()
         .filter(|c| matches!(*c, "argument_type_not_assignable" | "invalid_assignment"))
         .collect()
@@ -96,7 +97,7 @@ fn assignability_codes(report: &FileReport) -> Vec<&str> {
 /// The archive corpus shape (`bzip2_encoder.dart`: `static const
 /// _bzNOvershoot = (_bzNRadix + _bzNQSort + _bzNShell + 2);` declared at
 /// the class tail, read in the bodies above it): the untyped field is a
-/// gap, not an InvalidType, so `n + _n` never folds to `double` and the
+/// gap, not an `InvalidType`, so `n + _n` never folds to `double` and the
 /// `int` sinks stay silent — bare, qualified, compound, declared before
 /// AND after the reads alike.
 #[test]
@@ -157,7 +158,7 @@ void f(Node node, int n) {
     );
 }
 
-/// The resolution failures keep the oracle's InvalidType face: an
+/// The resolution failures keep the oracle's `InvalidType` face: an
 /// undefined bare name and a member read through an unresolvable written
 /// head both decide the `double` branch, and the `int` sinks report.
 #[test]

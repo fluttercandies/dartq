@@ -33,6 +33,7 @@
 //! has since gained an example fails the gate — the list shrinks, never
 //! lingers.
 
+#![allow(clippy::too_many_lines)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -369,7 +370,8 @@ fn fix_examples_round_trip() {
             continue;
         };
         // The apply run's own selection: `--code`, then the primary role.
-        let selected = fix::select_by_codes(vec![(*set).clone()], &[example.code.clone()]);
+        let selected =
+            fix::select_by_codes(vec![(*set).clone()], std::slice::from_ref(&example.code));
         let selected = fix::select_by_role(selected, FixRole::Primary);
         let Some(file) = selected.first() else {
             failures.push(format!(
@@ -470,7 +472,7 @@ fn fix_table_every_row_has_an_example() {
     }
     for code in covered.keys() {
         assert!(
-            rows.contains(&code),
+            rows.contains(code),
             "example `{code}` names a code no fix-table row carries",
         );
     }

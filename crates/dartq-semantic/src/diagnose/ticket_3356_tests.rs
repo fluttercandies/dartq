@@ -2,7 +2,7 @@
 //! operand-static-type coverage pins.
 //!
 //! Both verdicts read the operand's static type (`leftNode.typeOrThrow`,
-//! best_practices_verifier.dart:879 / binary_expression_resolver.dart:163-175)
+//! `best_practices_verifier.dart:879` / binary_expression_resolver.dart:163-175)
 //! through the row-shape faces [`Engine::type_check_operand_ty`] and
 //! [`Engine::null_comparison`] consult. Before this ticket the untyped-row
 //! face ([`Engine::untyped_operand_ty`]) never reached either walk: a
@@ -16,6 +16,7 @@
 //! window (the `<int>`/`{String,int}` argument rows) failed every arm, so a
 //! `var c = C<int>` never bound `c`'s static type.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::diagnose::test_rig::{RigImport, report_ops, report_ops_imports};
 
@@ -86,7 +87,7 @@ fn null_checked_family_reports() {
 
 // —— the untyped-row faces this ticket opens ——
 
-/// A bare container name in value position is a TypeLiteral — `C is Type`
+/// A bare container name in value position is a `TypeLiteral` — `C is Type`
 /// reports constant-true (`Type <: Type`). Before the untyped-row face
 /// reached the verdict, the `Bare(Container)` operand answered `Unknown`.
 #[test]
@@ -100,7 +101,7 @@ fn container_literal_is_type_reports() {
     );
 }
 
-/// `C is C` — the TypeLiteral's static type `Type` is NOT `C`, so the check
+/// `C is C` — the `TypeLiteral`'s static type `Type` is NOT `C`, so the check
 /// is informative and stays silent (upstream's
 /// `isSubtypeOf(Type, C)` answers false).
 #[test]
@@ -139,7 +140,7 @@ fn container_neq_null_reports() {
     );
 }
 
-/// The prefixed `p.C` TypeLiteral — `p.C is Type` reports. The
+/// The prefixed `p.C` `TypeLiteral` — `p.C is Type` reports. The
 /// `Member{recv:Prefix}` row's untyped face resolves the scoped container.
 #[test]
 fn prefixed_container_is_type_reports() {

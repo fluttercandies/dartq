@@ -36,6 +36,9 @@
 //! `$1` reads `Object` instead of the refined `int`). Closing that shape
 //! needs a record base in this lattice, not a fix in the member face.
 
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::cast_possible_truncation)]
+
 #[cfg(test)]
 mod tests {
     use crate::facts::FlowFact;
@@ -89,6 +92,7 @@ mod tests {
     /// Every read row as `(identifier text, flow face)` in fact order, plus
     /// the promoted rows alone. Offsets index the ASCII fixtures byte-wise,
     /// which is also their UTF-16 offset.
+    #[allow(clippy::type_complexity)]
     fn trace(source: &str) -> (Vec<(String, String)>, Vec<(String, String)>) {
         let (flow, facts) = analyze(source);
         let flow = flow.0.borrow();

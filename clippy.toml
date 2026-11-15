@@ -2,7 +2,7 @@
 # measurably more per lookup than Fx and makes iteration order
 # nondeterministic per process. Every hash collection must use
 # rustc-hash's FxHashMap/FxHashSet (see [workspace.lints.clippy]
-# `disallowed-types` in the root Cargo.toml, which bans these types).
+# `disallowed_types` in the root Cargo.toml, which bans these types).
 disallowed-types = [
     "std::collections::HashMap",
     "std::collections::HashSet",

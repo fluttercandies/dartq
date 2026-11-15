@@ -14,6 +14,7 @@
 //! set foo(int _); augment int foo = 1;       -> AUGMENTATION_WITHOUT_GETTER_DECLARATION + INDUCED_SETTER_ALREADY_COMPLETE
 //! ```
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::FileReport;
 use crate::diagnose::test_rig::{
     CORE_PRELUDE, RigImport, report_ops_augment_experiments, report_ops_augment_intro_experiments,

@@ -5,6 +5,7 @@
 //!
 //! Registered through `diagnose/tests.rs`'s `#[path]` block.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{RigImport, report_ops, report_ops_imports};
 use crate::diagnose::types::FileReport;
 
@@ -32,7 +33,7 @@ fn ui_rows(report: &FileReport) -> Vec<(u32, String)> {
 
 /// co19 `Extension-methods/call_member_t02`: literal receivers invoke the
 /// extension `call` (`1(10)` → `on int`, `1.0(10)` → `on num`); the oracle
-/// keeps both members used (unused_local_elements_verifier.dart
+/// keeps both members used (`unused_local_elements_verifier.dart`
 /// `visitFunctionExpressionInvocation`).
 #[test]
 fn literal_implicit_call_credits_the_applicable_extension() {
@@ -81,7 +82,7 @@ void main() {
 #[test]
 fn ambiguous_call_resolution_credits_each_unambiguous_application() {
     let report = report_ops(
-        r#"
+        r"
 class A {}
 class B {}
 class C extends A implements B {}
@@ -94,7 +95,7 @@ extension on List<B> {
 int f(List<C> x) => x();
 int g(List<A> x) => x();
 int h(List<B> x) => x();
-"#,
+",
     );
     assert_eq!(ue_rows(&report), Vec::<(u32, String)>::new());
 }
@@ -104,7 +105,7 @@ int h(List<B> x) => x();
 /// co19 `Constructor-tear-offs/ambiguities_A27_t02` family: `f(a<b, c> {})`
 /// parses as comma-separated operator invocations (the `{` follower is not
 /// a type-argument continuation), so `operator<` on `Function` and
-/// `operator>` on `Type` stay used (unused_local_elements_verifier.dart
+/// `operator>` on `Type` stay used (`unused_local_elements_verifier.dart`
 /// `visitBinaryExpression`).
 #[test]
 fn glued_comparison_followed_by_brace_credits_both_operators() {
@@ -166,14 +167,14 @@ void main() {
 #[test]
 fn record_operand_credits_extension_operator() {
     let report = report_ops(
-        r#"
+        r"
 void f((String,) a) {
   a + 0;
 }
 extension on (String,) {
   int operator +(int other) => 0;
 }
-"#,
+",
     );
     assert_eq!(ue_rows(&report), Vec::<(u32, String)>::new());
 }
@@ -186,13 +187,13 @@ extension on (String,) {
 #[test]
 fn ambiguous_bare_name_credits_every_exporting_edge() {
     let report = report_ops_imports(
-        r#"
+        r"
 import 'package:t/lib1.dart';
 import 'package:t/lib2.dart';
 void f(p) {
   p is N;
 }
-"#,
+",
         &[
             RigImport {
                 uri: "package:t/lib1.dart",
@@ -215,13 +216,13 @@ void f(p) {
 #[test]
 fn unambiguous_bare_name_leaves_the_other_edge_unused() {
     let report = report_ops_imports(
-        r#"
+        r"
 import 'package:t/lib1.dart';
 import 'package:t/lib2.dart';
 void f(p) {
   p is N;
 }
-"#,
+",
         &[
             RigImport {
                 uri: "package:t/lib1.dart",
@@ -246,11 +247,11 @@ void f(p) {
 #[test]
 fn prefixed_annotation_head_credits_the_import() {
     let report = report_ops_imports(
-        r#"
+        r"
 import 'package:t/lib.dart' as p;
 @p.V
 void main() {}
-"#,
+",
         &[RigImport {
             uri: "package:t/lib.dart",
             prefix: Some("p"),

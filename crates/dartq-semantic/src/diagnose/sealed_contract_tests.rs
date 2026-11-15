@@ -1,3 +1,5 @@
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+
 use super::Receiver;
 use crate::collector::collect;
 use crate::diagnose::{Engine, FileReport, StrictModes, Walk, diagnose_with};
@@ -220,8 +222,8 @@ fn cross_library_sealed_scrutinee_reports_the_missing_subclass() {
 /// same shared code — "The enum 'E' isn't exhaustively matched by the
 /// switch cases because some of the enum constants are private." at the
 /// `switch` keyword (oracle-pinned, dart analyze 3.13.7 on the two-file
-/// rig: NON_EXHAUSTIVE_SWITCH_EXPRESSION, the private variant of
-/// constant_verifier.dart:1110; the earlier silence expectation misread
+/// rig: `NON_EXHAUSTIVE_SWITCH_EXPRESSION`, the private variant of
+/// `constant_verifier.dart:1110`; the earlier silence expectation misread
 /// the private arm as a suppress — it reports with its own text, and the
 /// re-pin records the disproof).
 #[test]
@@ -421,7 +423,7 @@ fn cyclic_hierarchy_reports_each_node_once() {
 /// The meta stand-in the rig analyzes like any dependency: the
 /// `UseResult` class the annotation resolves through (`check_annotation`'s
 /// namespace face, the import-use credit, the exported probe). The
-/// package_meta stand-in it mirrors (formerly vendored, now a pub-cache
+/// `package_meta` stand-in it mirrors (formerly vendored, now a pub-cache
 /// package) carries the full class; the rig needs the declaration face only —
 /// the meta-face lanes key the uri, and the `unless` value rides the
 /// source walk, never the element shapes.
@@ -723,7 +725,7 @@ fn unused_meta_import_still_reports() {
 /// initializer and the updater both discard, and the int-typed
 /// condition additionally reports `non_bool_condition` (the
 /// `test_for` fixture face, upstream Dart SDK source,
-/// pkg/analyzer/test/src/diagnostics/non_bool_condition_test.dart).
+/// `pkg/analyzer/test/src/diagnostics/non_bool_condition_test.dart`).
 #[test]
 fn for_initializer_and_condition_silent_updater_fires() {
     let src = "import 'package:meta/meta.dart';\n\
@@ -824,7 +826,7 @@ fn foreign_unit_report(main_source: &str, dependency: &str) -> FileReport {
 /// dependency declares its own `int`/`List` spellings so `S.m`'s
 /// formal carries a real declared type — an undeclared spelling is a
 /// genuine `InvalidType` there, and the #2192 leniency (the oracle's
-/// own InvalidType posture) leaves that member mismatch silent.
+/// own `InvalidType` posture) leaves that member mismatch silent.
 #[test]
 fn foreign_member_surfaces_once_across_two_faces() {
     let report = foreign_unit_report(
@@ -876,7 +878,7 @@ fn foreign_property_target_renders_in_assignment_verdict() {
 /// definite `C`-against-`D` miss through the subtype walk. The target
 /// must resolve in the asking scope: an unresolvable formal type (the
 /// SDK spellings this bare harness cannot see) is the oracle's
-/// InvalidType target — the faces stay silent (CLI-probed identical to
+/// `InvalidType` target — the faces stay silent (CLI-probed identical to
 /// the oracle on the `A.m(c)`-into-`List<int>` shape).
 #[test]
 fn foreign_static_call_column_resolves_through_the_boundary() {
@@ -1081,7 +1083,7 @@ fn prefixed_top_level_call_checks_positional_arguments() {
 /// silent, and a callee the prefix table does not name carries the
 /// invocation face's own row — `undefined_function`, the oracle's
 /// prefixed invocation-miss face (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/error/lookup_failure_reporter.dart,
+/// `pkg/analyzer/lib/src/error/lookup_failure_reporter.dart`,
 /// `PrefixedLookupDomain._readFailure`: a prefixed lookup miss with
 /// `ReadSyntax.invocation` reports `undefinedFunction`) — while the
 /// argument verdict stays suppressed (the argument-bearing prefixed

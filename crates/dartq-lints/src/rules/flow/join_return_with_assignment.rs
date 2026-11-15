@@ -199,7 +199,7 @@ fn equal(c: &Check<'_>, left: &Range<usize>, right: Option<&Range<usize>>) -> bo
         c.unit
             .source
             .get(span.clone())
-            .is_some_and(|spelling| is_identifier_chain(spelling))
+            .is_some_and(is_identifier_chain)
     };
     is_chain(left) && is_chain(right) && c.unit.source[left.clone()] == c.unit.source[right.clone()]
 }

@@ -9,7 +9,7 @@
 //!    `emit_unchecked_nullable(_, "", Function)` — because
 //!    `x.first()` over `List<T?>` (`T extends Function`) resolves the
 //!    accessor through the core face, never through a walked entry
-//!    (function_expression_invocation_resolver.dart's nullable-function
+//!    (`function_expression_invocation_resolver.dart`'s nullable-function
 //!    arm; the oracle rewrites the section to a `FunctionExpressionInvocation`
 //!    and reports on its whole `function` node).
 //! 2. The callee's type on that miss path: `callee_return_ty` projects
@@ -35,6 +35,7 @@
 //! for the callee face, ZERO rows for the InvalidType-bearing pair, and
 //! `ARGUMENT_TYPE_NOT_ASSIGNABLE|1|54|1` for the decided mismatch.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use crate::diagnose::FileReport;
 

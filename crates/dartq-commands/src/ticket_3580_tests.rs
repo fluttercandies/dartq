@@ -20,6 +20,7 @@
 //! row), and the controls that a genuinely absent target still reports — an
 //! unregistered package name and a registered package's missing file.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::path::{Path, PathBuf};
 

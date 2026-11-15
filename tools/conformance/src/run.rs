@@ -4,6 +4,7 @@
 //! `conformance/status.tsv`; a filtered run only produces the per-case
 //! report, since the board needs the whole corpus.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::materialize::{self, LoadedCase};
 use crate::registry::Registry;
 use crate::rows::{Expected, Row, diff_sorted};
@@ -44,15 +45,14 @@ pub fn run_command(args: &RunArgs) -> i32 {
         eprintln!("error: dartq binary {} not found", args.dartq_bin.display());
         return 2;
     }
-    let expected = match std::fs::read_to_string(&args.expected_path) {
-        Ok(text) => parse_expected(&text),
-        Err(_) => {
-            eprintln!(
-                "error: {} not found; run `conformance oracle` first",
-                args.expected_path.display()
-            );
-            return 2;
-        }
+    let expected = if let Ok(text) = std::fs::read_to_string(&args.expected_path) {
+        parse_expected(&text)
+    } else {
+        eprintln!(
+            "error: {} not found; run `conformance oracle` first",
+            args.expected_path.display()
+        );
+        return 2;
     };
     let all_cases = match materialize::load_corpus(&args.cases_dir, args.manual_dir.as_deref()) {
         Ok(cases) => cases,

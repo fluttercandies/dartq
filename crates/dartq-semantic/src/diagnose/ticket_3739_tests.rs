@@ -1,7 +1,7 @@
 //! Ticket #3739 pins: `const_with_type_parameters` — a type-parameter
 //! type argument on a const creation's head reports at the argument leaf.
 //!
-//! Upstream `_checkForConstWithTypeParameters` (constant_verifier.dart
+//! Upstream `_checkForConstWithTypeParameters` (`constant_verifier.dart`
 //! :591-660) runs for every const-context constructor reference the
 //! verifier visits — explicit `const C<T>(...)` and the implicit
 //! `const x = C<T>(...)`/`const x = C<T>.named(...)` alike — before the
@@ -10,6 +10,7 @@
 //! reports at its own span; a function-type argument's OWN declared
 //! parameter (`void Function<U>`) is exempt.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

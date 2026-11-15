@@ -15,6 +15,7 @@
 //!   operand never saw `final x = 0;` as non-null: `final y = x ?? 1;`
 //!   reported nothing where the oracle rows `?? 1`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

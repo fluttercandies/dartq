@@ -6,7 +6,7 @@
 //! (`preferSetter`) and checks the right operand against that element's
 //! type — `AssignmentExpressionImpl.writeType`
 //! (upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-//! assignment_expression_resolver.dart:54/:83, `_checkForInvalidAssignment`
+//! `assignment_expression_resolver.dart:54/:83`, `_checkForInvalidAssignment`
 //! at :361). The setter's type IS its single value formal, so a source that
 //! does not subtype it reports `invalid_assignment`.
 //!
@@ -36,6 +36,7 @@
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (the module
 //! lives outside this ticket's write scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 

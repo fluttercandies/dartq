@@ -15,6 +15,7 @@
 //! (`default_types_builder.dart:164-180`) performs. The oracle answers
 //! `Y = A<dynamic>`; dartq answered `Y = dynamic`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
 use crate::instantiate_to_bound::instantiate_type_formals_to_bounds_with;
 use crate::table::TypeTable;

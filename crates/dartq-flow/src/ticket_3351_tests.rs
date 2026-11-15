@@ -2,7 +2,7 @@
 //! bail.
 //!
 //! Upstream decides a type test in three ordered arms (upstream Dart SDK
-//! source, pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart
+//! source, pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart`
 //! `isExpression_end`, :7178-7210):
 //!
 //! 1. a bottom checked type or a nullability-disjoint pair folds to the
@@ -21,11 +21,12 @@
 //! oracle does not emit. Oracle evidence (Dart 3.13.1 `dart analyze
 //! --format machine`): `int x` write-captured keeps BOTH arms live for
 //! `x is! int` and for `x is num`, while the static `unnecessary_type_check`
-//! warning still fires; an UNcaptured `int x` deads the then-arm of
+//! warning still fires; an `UNcaptured` `int x` deads the then-arm of
 //! `x is! int` (arm 2's bottom `factor(int, int)` remainder,
 //! `ifFalseIsUnreachable` at :4158-4166), and the arm-1 folds still fire
 //! over a write-captured receiver (`x is Null` on `int x`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

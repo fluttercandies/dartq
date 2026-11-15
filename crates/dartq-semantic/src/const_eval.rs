@@ -60,6 +60,7 @@
 //! entity); a `constEval*` fault keeps its own span and code through
 //! enclosing nodes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::rc::Rc;
 
 use dartq_source::{SourceRange, StringId};
@@ -101,7 +102,7 @@ pub enum ConstantValue {
     /// (`list1_n = [list1_{n-1}, list1_{n-1}]`) clones in O(1), not by
     /// deep-copying the subtree — the deep clone doubled per level and
     /// blew past 9 GB on the SDK's own 44-level sharing test
-    /// (canonicalize/hashing_memoize_array_test).
+    /// (`canonicalize/hashing_memoize_array_test`).
     List(Rc<[ConstantValue]>),
     /// A const set by its element values in source order (the upstream
     /// `SetState` equality is order-insensitive; source order is the
@@ -1970,7 +1971,7 @@ const LEVELS: [&[&str]; 10] = [
     &["*", "/", "~/", "%"],
 ];
 
-impl<'t> Written<'t> {
+impl Written<'_> {
     /// Runs `step` one nesting level deeper, `None` past the cap (the
     /// caller's `NotEvaluable`).
     fn nested<T>(&mut self, step: fn(&mut Self) -> Option<T>) -> Option<T> {
@@ -2765,7 +2766,7 @@ impl ConstCapture {
     /// the `#` token's range (the name's identifier parts sit on the token
     /// stream, which the capture cannot see), so a recovered `const #a`
     /// would anchor its never-matches row at `const #` — one short of the
-    /// ConstantPattern node's true end. The caller computes the literal's
+    /// `ConstantPattern` node's true end. The caller computes the literal's
     /// end from the source bytes and passes it here; a non-symbol root or a
     /// root already reaching `end` is a no-op.
     pub(crate) fn respan_constant_pattern_root(&mut self, end: u32) {
@@ -3071,9 +3072,10 @@ impl ConstCapture {
 
     /// Whether the top window is an enum-constant element's capture: its
     /// own argument list runs `_validateConstantArguments` upstream
-    /// (constant_verifier.dart — `constWithNonConstantArgument` is the
-    /// *default* code there), unlike a const ConstructorInvocation's args
+    /// (`constant_verifier.dart` — `constWithNonConstantArgument` is the
+    /// *default* code there), unlike a const `ConstructorInvocation`'s args
     /// whose failing leaf reports its own `genericError` code.
+    #[must_use]
     pub fn top_is_enum_element(&self) -> bool {
         self.windows
             .last()
@@ -3782,6 +3784,7 @@ impl ConstCapture {
     }
 
     /// Whether any annotation window is open.
+    #[must_use]
     pub fn annotation_open(&self) -> bool {
         self.windows
             .iter()
@@ -3813,6 +3816,7 @@ impl ConstCapture {
     /// argument row folding there belongs to the creation's own
     /// evaluation — the resolution-side faces read the creation's
     /// container type, never the inner literal's.
+    #[must_use]
     pub fn creation_covers(&self, offset: u32) -> bool {
         self.creation_spans
             .iter()
@@ -3847,7 +3851,7 @@ impl ConstCapture {
     /// balances the open. An INNER argument list's close (`@T(g())`)
     /// shares the window and must leave both stacks be — the same
     /// no-older-level-of-this-window test the generic close applies to
-    /// the creation kinds (end_arguments).
+    /// the creation kinds (`end_arguments`).
     pub fn take_annotation_args(&mut self) -> Option<(Vec<Node>, Vec<bool>)> {
         if !self
             .windows
@@ -5817,7 +5821,7 @@ mod tests {
         let nested = |depth: usize| {
             let mut lexemes = vec!["("; depth];
             lexemes.push("1");
-            lexemes.extend(std::iter::repeat(")").take(depth));
+            lexemes.extend(std::iter::repeat_n(")", depth));
             lexemes
         };
         assert_eq!(
@@ -5934,7 +5938,7 @@ mod equal_keys_2187 {
 
     /// F1 (the census #6 repro, minimized): named-argument values of `new`
     /// creations are not map keys — a repeated NAME across blocks stays
-    /// silent. The date_symbol_data_local shape (const list arguments).
+    /// silent. The `date_symbol_data_local` shape (const list arguments).
     #[test]
     fn f1_named_arg_values_are_not_map_keys() {
         let rows = duplicate_rows(
@@ -5951,7 +5955,7 @@ final m = <String, Object>{
         assert_eq!(rows, [], "named-argument values must never dup-check");
     }
 
-    /// F1 variant (the DateSymbols shape): `const [...]` nested argument
+    /// F1 variant (the `DateSymbols` shape): `const [...]` nested argument
     /// literals under the same non-const map.
     #[test]
     fn f1_named_arg_with_const_list_argument_silent() {
@@ -5969,7 +5973,7 @@ final m = <String, Object>{
         assert_eq!(rows, [], "const list arguments must not shift the pairing");
     }
 
-    /// F2 (the date_time_patterns shape): nested const-map values under a
+    /// F2 (the `date_time_patterns` shape): nested const-map values under a
     /// non-const parent map — the parent's own unique keys stay silent.
     #[test]
     fn f2_nested_const_map_values_silent() {
@@ -5996,7 +6000,7 @@ final m = <String, Object>{
             "the plain map's later duplicate key must report at its own span"
         );
 
-        let set_rows = duplicate_rows(r#"var s = {1, 2, 1};"#);
+        let set_rows = duplicate_rows(r"var s = {1, 2, 1};");
         assert_eq!(
             set_rows,
             [("equal_elements_in_set", String::from("1"))],
@@ -6370,7 +6374,7 @@ mod equal_const_refs_2455 {
     #[test]
     fn invalid_super_chain_collapses_equal_constants() {
         let rows = const_rows(
-            r#"
+            r"
 import 'missing_dep.dart';
 
 class Mid extends MissingBase {
@@ -6386,7 +6390,7 @@ const NoArgsImpl b = NoArgsImpl(name: 'b');
 const NoArgsImpl c = NoArgsImpl(name: 'c');
 
 const set = {a, b, c};
-"#,
+",
         );
         assert_eq!(rows, ["b", "c"], "the later two references report");
     }
@@ -6397,7 +6401,7 @@ const set = {a, b, c};
     #[test]
     fn resolved_super_chain_keeps_constants_distinct() {
         let rows = const_rows(
-            r#"
+            r"
 class MissingBase {
   const MissingBase({required this.name});
   final String name;
@@ -6416,7 +6420,7 @@ const NoArgsImpl b = NoArgsImpl(name: 'b');
 const NoArgsImpl c = NoArgsImpl(name: 'c');
 
 const set = {a, b, c};
-"#,
+",
         );
         assert!(rows.is_empty(), "distinct resolved values stay silent");
     }
@@ -6428,7 +6432,7 @@ const set = {a, b, c};
     #[test]
     fn surviving_own_field_text_decides() {
         let matching = const_rows(
-            r#"
+            r"
 import 'missing_dep.dart';
 
 class Mid extends MissingBase {
@@ -6444,12 +6448,12 @@ const NoArgsImpl a = NoArgsImpl(name: 'a');
 const NoArgsImpl b = NoArgsImpl(name: 'b');
 
 const same = {a, b};
-"#,
+",
         );
         assert_eq!(matching, ["b"], "matching text reports");
 
         let differing = const_rows(
-            r#"
+            r"
 import 'missing_dep.dart';
 
 class Mid extends MissingBase {
@@ -6465,7 +6469,7 @@ const NoArgsImpl a = NoArgsImpl(name: 'a');
 const NoArgsImpl c = NoArgsImpl(name: 'c', tags: const [1]);
 
 const other = {a, c};
-"#,
+",
         );
         assert!(differing.is_empty(), "differing text defers");
     }

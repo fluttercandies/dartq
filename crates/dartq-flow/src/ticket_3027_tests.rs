@@ -31,6 +31,9 @@
 //! model's potentially-unassigned posture beneath the mask is what these
 //! rows pin).
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -89,6 +92,7 @@ fn unassigned_rows(source: &str) -> Vec<(String, bool, bool, bool, bool)> {
 }
 
 /// One expected row, spelled out for readability.
+#[allow(clippy::fn_params_excessive_bools)]
 fn row(
     snippet: &str,
     late: bool,

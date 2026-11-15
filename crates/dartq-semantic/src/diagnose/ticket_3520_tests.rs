@@ -36,6 +36,7 @@
 //! with `conformance/expected.tsv` (`invalid_const_pattern_test` /
 //! `invalid_const_pattern_binary_test` rows).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -155,7 +156,7 @@ fn bitnot_zero_over_int_reports_unary_only() {
 }
 
 /// `case !0:` is the fault-side suppression: the oracle's evaluation
-/// produces `const_eval_type_bool` (no DartObject), so never-matches
+/// produces `const_eval_type_bool` (no `DartObject`), so never-matches
 /// never runs even though the unary parse error and the `!` operand's
 /// own `non_bool` verdict still report. The literal `0` arms `int`
 /// either way, which is why this pin also proves the arming alone could
@@ -305,7 +306,7 @@ fn const_prefixed_double_over_int_reports_prefix_only() {
 
 /// The armed-but-wrong composite: `case const 1 == 2:` arms `int` at the
 /// last literal while the parsed expression evaluates to `bool` — the
-/// oracle reads `value.type` on the DartObject, so never-matches spells
+/// oracle reads `value.type` on the `DartObject`, so never-matches spells
 /// `bool`. Under the `const` prefix the parse error is
 /// `invalid_constant_const_prefix` at the operand `1` (the
 /// `invalid_constant_pattern_binary` face is the BARE binary's; the
@@ -351,7 +352,7 @@ fn const_equality_composite_recovers_bool_not_the_armed_operand() {
 
 /// `case ++v:` — a non-constant shape: the parser's own
 /// `constant_pattern_with_non_constant_expression` is the only row. The
-/// recovered expression yields no DartObject (`NotConstant`), so
+/// recovered expression yields no `DartObject` (`NotConstant`), so
 /// never-matches stays silent.
 ///
 /// Oracle (`invalid_const_pattern_test` :180 — `case ++variable:` the row

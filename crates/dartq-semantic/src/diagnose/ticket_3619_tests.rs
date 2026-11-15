@@ -11,6 +11,7 @@
 //! answers; the `B1<Object?>`/`Iterable<num>` SITE answers are the
 //! context-rule `S`, surfaced by the receiver face #3635 owns).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 
 /// The `invalid_assignment` rows alone — the face the join feeds

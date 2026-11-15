@@ -8,12 +8,13 @@
 //! `Patterns/execution_pattern_for_*` family; the oracle rows for
 //! `execution_pattern_for_element_A01_t01` are empty).
 //!
-//! Upstream: for_resolver.dart resolves the pattern initializer/updater
+//! Upstream: `for_resolver.dart` resolves the pattern initializer/updater
 //! through the ordinary assignment machinery (the pattern head inside
 //! `parseExpressionStatementOrDeclarationAfterModifiers`, and
 //! `patternAssignment_end`'s writes), so the loop head's conservative
 //! join sees the updater's write and the condition keeps both arms.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -62,7 +63,7 @@ fn dead_of(source: &str) -> Vec<String> {
 /// loop and every later statement stay live.
 #[test]
 fn pattern_for_element_terminates() {
-    let source = r#"
+    let source = r"
 main() {
   var list1 = [
     0,
@@ -79,7 +80,7 @@ main() {
   use(list2);
 }
 void use(Object? x) {}
-"#;
+";
     assert_eq!(dead_of(source), Vec::<String>::new());
 }
 

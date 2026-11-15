@@ -18,6 +18,7 @@
 //! (member faces `void Function<T 5 6>()? f;` = 7 rows and
 //! `List<void Function<T 5 6>()>? x;` = 5 rows).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -101,8 +102,14 @@ fn broken_gft_type_var_head_in_type_args_cascades() {
 /// type-argument face whose `compute_rest` continues past the group.
 #[test]
 fn valid_gft_type_var_chains_stay_silent() {
-    assert!(sorted_rows("class A {\n  void Function<T>()? f;\n}\n").is_empty());
-    assert!(sorted_rows("class A {\n  List<void Function<T>()>? x;\n}\n").is_empty());
+    assert_eq!(
+        sorted_rows("class A {\n  void Function<T>()? f;\n}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
+    assert_eq!(
+        sorted_rows("class A {\n  List<void Function<T>()>? x;\n}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
 }
 
 /// The `(` after a type-argument group is not a `Function` intro: the chain
@@ -115,7 +122,7 @@ fn valid_gft_type_var_chains_stay_silent() {
 /// oracle 3.13.1 row set for `Map<String, B<C>>()? x;` — the type-variable
 /// list breaks at `B<C>` (type_info_impl.dart:512-522), the `>` row anchors
 /// on `B` via `parseUnexpectedEnd` (:1658-1690), and the operator cluster
-/// (parser_impl.dart:11204/:6288) re-enters at the `?`.
+/// (`parser_impl.dart:11204/:6288`) re-enters at the `?`.
 #[test]
 fn paren_after_type_args_is_not_a_function_intro() {
     assert_eq!(

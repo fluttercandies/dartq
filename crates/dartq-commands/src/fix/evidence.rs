@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    DEFAULT_LANGUAGE_VERSION, DeclRow, Diagnostic, Features, FileCapture, FileId, FxHashMap,
+    ImportContext, PackageTable, Path, PathBuf, PlannerFuse, SCHEMA_VERSION, features_for,
+    import_arm, import_contexts, normalize_path, switch_case_arm, utf16_offset_to_byte,
+};
 
 /// The engine sources' check pass: one throwaway engine over the
 /// discovered targets (`sdk` assembles it; `None` resolves through the
@@ -95,13 +99,13 @@ pub(crate) fn semantic_fix_diagnostics(
         if crate::fix_table::synthesis_arm(diagnostic.code.name).is_some() {
             synthesis_rows
                 .entry(path.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(diagnostic.clone());
         }
         if import_arm(diagnostic.code.name).is_some() {
             import_rows
                 .entry(path.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(diagnostic);
         }
     }
@@ -303,7 +307,7 @@ pub(crate) fn evidence_rows(
             {
                 return None;
             }
-            let (insertion, container) = insertion_point(&text, &capture, d.range.offset, arm);
+            let (insertion, container) = insertion_point(text, capture, d.range.offset, arm);
             Some(FixEvidence {
                 code: d.code.name,
                 range: d.range.offset..d.range.offset + d.range.length,

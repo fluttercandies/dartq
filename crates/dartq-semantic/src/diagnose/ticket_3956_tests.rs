@@ -28,6 +28,7 @@
 //! context type the model cannot resolve keeps the creation face and stays
 //! silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

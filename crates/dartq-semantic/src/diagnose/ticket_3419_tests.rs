@@ -52,6 +52,7 @@
 //! `expectStaticType<Exactly<T>>` generic extension tear-off shape
 //! present in non-anonymous conformance cases too.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops_experiments_with;
 use crate::diagnose::types::FileReport;
 use dartq_language::Feature;

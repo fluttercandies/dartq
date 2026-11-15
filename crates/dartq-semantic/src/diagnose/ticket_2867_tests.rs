@@ -8,6 +8,7 @@
 //! `augment` executable's `formals` drained empty — every parameter-check
 //! row read "augmentation has 0 …" — and the accessor-family unification
 //! (variable element owning its induced getter/setter chains) never ran.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
@@ -61,7 +62,7 @@ fn assert_row(report: &FileReport, name: &str, offset: usize, len: u32, message:
     assert_eq!(
         hits,
         1,
-        "expected one {name} @{offset}:{len}; got {:#?}",
+        "expected one {name} @{offset}:{len} carrying {message:?}; got {:#?}",
         rows(report)
     );
 }
@@ -74,18 +75,18 @@ fn assert_row(report: &FileReport, name: &str, offset: usize, len: u32, message:
 /// `void f(int _); augment void f(int x); augment void f(int _) {}`
 ///
 /// Oracle: SILENT. `test_topLevelFunction_rP__wildcard__x__wildcard`
-/// (AugmentationFormalParameterNameTest) expects no rows — a `_` wildcard
+/// (`AugmentationFormalParameterNameTest`) expects no rows — a `_` wildcard
 /// on either side skips the name check, and the count checks see the real
 /// (non-zero) formals. Pre-repair emission: two spurious
 /// `augmentation_required_positional_formal_parameter_count` rows reading
 /// "augmentation has 0" (report.tsv `extra` column).
 #[test]
 fn wildcard_formals_on_both_sides_are_silent() {
-    let src = r#"
+    let src = r"
 void f(int _);
 augment void f(int x);
 augment void f(int _) {}
-"#;
+";
     let report = report_ops(src);
     assert!(aug_rows(&report).is_empty(), "{:#?}", aug_rows(&report));
 }
@@ -97,10 +98,10 @@ augment void f(int _) {}
 /// `augmentationPositionalFormalParameterName` at `y`.
 #[test]
 fn positional_name_mismatch_reports_only_the_name_row() {
-    let src = r#"
+    let src = r"
 void f(int x);
 augment void f(int y) {}
-"#;
+";
     let report = report_ops(src);
     let count = named_rows(
         &report,
@@ -119,10 +120,10 @@ augment void f(int y) {}
 /// `void f(int p); augment void f(int p) {}` — identical signature, silent.
 #[test]
 fn identical_top_level_signature_is_silent() {
-    let src = r#"
+    let src = r"
 void f(int p);
 augment void f(int p) {}
-"#;
+";
     let report = report_ops(src);
     assert!(aug_rows(&report).is_empty(), "{:#?}", aug_rows(&report));
 }
@@ -141,10 +142,10 @@ augment void f(int p) {}
 /// fired the row because the intro's completeness bit was hard-wired true).
 #[test]
 fn bodiless_intro_body_augment_is_silent() {
-    let src = r#"
+    let src = r"
 void foo();
 augment void foo() {}
-"#;
+";
     let report = report_ops(src);
     assert!(
         named_rows(&report, "declaration_already_complete").is_empty(),
@@ -158,10 +159,10 @@ augment void foo() {}
 /// (`ExecutableBodyTest test_topLevel_getter_augmentation_hasBody`).
 #[test]
 fn bodiless_getter_intro_body_augment_is_silent() {
-    let src = r#"
+    let src = r"
 int get foo;
 augment int get foo => 0;
-"#;
+";
     let report = report_ops(src);
     assert!(
         named_rows(&report, "declaration_already_complete").is_empty(),
@@ -186,13 +187,13 @@ augment int get foo => 0;
 /// ("Can't augment a field with a getter") + a "has 0" count row.
 #[test]
 fn static_field_augments_its_induced_accessors() {
-    let src = r#"
+    let src = r"
 class A {
   static abstract int foo;
   augment static int get foo => 0;
   augment static set foo(int _) {}
 }
-"#;
+";
     let report = report_ops(src);
     let diff = named_rows(&report, "augmentation_of_different_declaration_kind");
     assert!(diff.is_empty(), "{:#?}", rows(&report));
@@ -221,14 +222,14 @@ class A {
 /// `augmentation_of_different_declaration_kind` + `final_not_initialized`.
 #[test]
 fn field_augmentation_induces_getter_return_mismatch() {
-    let src = r#"
+    let src = r"
 class A {
   int? get foo => 0;
 }
 augment class A {
   augment abstract final String? foo;
 }
-"#;
+";
     let report = report_ops(src);
     let diff = named_rows(&report, "augmentation_of_different_declaration_kind");
     assert!(diff.is_empty(), "{:#?}", rows(&report));
@@ -251,14 +252,14 @@ augment class A {
 /// setter's `previousFragment` is null when no setter exists.)
 #[test]
 fn getter_only_variable_field_augment_reports_the_setter_row() {
-    let src = r#"
+    let src = r"
 class A {
   int get foo => 0;
 }
 augment class A {
   augment int foo = 0;
 }
-"#;
+";
     let report = report_ops(src);
     assert_row(
         &report,

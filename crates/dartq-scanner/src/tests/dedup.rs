@@ -10,6 +10,7 @@
 //! side: if any input ever makes identical rows non-adjacent, the adjacent
 //! dedup leaks the surplus row and the duplicate-check fails.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::scan_src;
 
 /// The emission invariant that makes adjacent dedup equal set semantics
@@ -102,7 +103,7 @@ fn dedup_matches_oracle_set_semantics_across_multi_emission_shapes() {
     ];
     for src in inputs {
         let r = scan_src(src);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         for d in &r.diagnostics {
             let key = (
                 d.code.name,

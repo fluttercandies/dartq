@@ -21,6 +21,7 @@
 //!   `this` is the oracle's `InvalidType`; the `undefined_class` on the
 //!   header is the only report).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -430,7 +431,7 @@ fn extension_invalid_receiver_credits_nothing() {
     assert!(names.contains(&"unused_element"), "{names:?}");
 }
 
-/// The resolved-`on` twin of the InvalidType gate: a resolved receiver
+/// The resolved-`on` twin of the `InvalidType` gate: a resolved receiver
 /// head whose TYPE ARGUMENT does not resolve (`List<Missing>`) is
 /// still an `InvalidType`, so `x.used` reports the receiver's own miss
 /// rows and never reaches the extension's member face — the `on` list
@@ -490,7 +491,7 @@ fn extension_nullable_on_credits_member() {
 
 /// A named-selector implicit creation folds to its class: `final c =
 /// Ctr.broadcast(sync: true)` types `c` as `Ctr` (the oracle's
-/// InstanceCreationExpression static type), so `c.ping()` resolves —
+/// `InstanceCreationExpression` static type), so `c.ping()` resolves —
 /// the constructor-reference posture pushes no callee row (the
 /// resolving head is a type use, the selector none) and the argument
 /// rows used to stand as the initializer's window, binding the LAST
@@ -577,9 +578,9 @@ fn local_head_named_send_stays_member_miss() {
 
 /// Value-position built-in reads never report an
 /// `undefined_identifier`: `T != dynamic` resolves both sides (the
-/// oracle resolves the TypeLiteral/`dynamic` top type — dio
-/// dio_mixin.dart:419/644). The value-position row rides the keyword
-/// gate; the same skip guards the recovery-routed PrefixHead face
+/// oracle resolves the `TypeLiteral`/`dynamic` top type — dio
+/// `dio_mixin.dart:419/644`). The value-position row rides the keyword
+/// gate; the same skip guards the recovery-routed `PrefixHead` face
 /// whose `UndefinedIdentifier` emit lacked it. The SDK-spelled type
 /// positions in this rig world report `undefined_class` beside the
 /// gate's scope (the rig has no dart:core faces) — the CLI/oracle
@@ -871,7 +872,7 @@ fn broken_chain_member_select_keeps_the_cascade_silence() {
 }
 
 /// `const fb.C<int>()` with `fb` in no scope: the head is the
-/// NamedType's import prefix and its element is null — the oracle
+/// `NamedType`'s import prefix and its element is null — the oracle
 /// reports `undefined_identifier` over the whole `fb.C` span and the
 /// creation/type-argument faces never fire (probe: 1:17 length 4; the
 /// head used to read `creation_with_non_type` at the prefix token).
@@ -934,7 +935,7 @@ fn dead_prefix_annotation_group_counts_against_nothing() {
 // arity (`new Map.fromIterables<int, int>` reports).
 
 /// The analyzer-corpus twin (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/dart/element/type_algebra.dart:217 —
+/// `pkg/analyzer/lib/src/dart/element/type_algebra.dart:217` —
 /// `Map<TypeParameterElement, DartType>.fromIterables(parameters,
 /// types)`): the class-segment group accounts against the class's
 /// declared count — `Map` declares 2, the group writes 2 → silent. The
@@ -951,7 +952,7 @@ fn map_class_segment_matching_arity_is_silent() {
 /// The class-segment mismatch keeps the base code and the class message —
 /// `Map` written with 3 arguments reports `wrong_number_of_type_arguments`
 /// ("The type 'Map' is declared with 2 …"), never the constructor variant
-/// (the NamedType resolution face owns the group).
+/// (the `NamedType` resolution face owns the group).
 #[test]
 fn map_class_segment_mismatch_reports_base_code() {
     let report = report(

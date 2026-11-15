@@ -20,6 +20,7 @@
 //! count against [`super::deps::DEP_FILE_CAP`]: the cap bounds the open
 //! pub-cache closure, the SDK closure is bounded by the SDK itself.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

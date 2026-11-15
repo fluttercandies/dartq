@@ -111,6 +111,7 @@
 //! wiring layer passes the current `EngineSemanticVersion` when it builds
 //! the header and entry keys.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 mod entry;
 mod header;
 mod remap;

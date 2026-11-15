@@ -34,6 +34,7 @@
 //! trace-only rows: a residency-pairing miss a derived pass salvaged
 //! over, one line per (file, face) pair per engine.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;

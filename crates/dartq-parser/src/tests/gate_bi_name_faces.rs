@@ -7,6 +7,7 @@
 //! faces re-clustered in wave-3 (extension missing-`on` expectedAfterButGot
 //! anchor, combinator and local-variable reserved-name inserts).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::ScanConfig;
 
 use super::collector::{Collector, latest_features};
@@ -15,7 +16,7 @@ use crate::parser::Parser;
 
 /// Parses `source` with `features` and returns the scanner+parser rows as
 /// `(code, start, end)` sorted by offset plus the problem texts in emission
-/// order (gate_ppin harness shape).
+/// order (`gate_ppin` harness shape).
 fn rows_and_texts_with(
     features: ParserFeatures,
     source: &'static str,
@@ -70,7 +71,7 @@ fn leaked(source: &str) -> &'static str {
 // —— the six templates ————————————————————————————————————————————————
 
 /// Class names take the type-name face (visitClassDeclaration,
-/// error_verifier.dart:573; oracle BuiltInIdentifierAsTypeNameTest).
+/// `error_verifier.dart:573`; oracle `BuiltInIdentifierAsTypeNameTest`).
 #[test]
 fn bi_name_class_type_template() {
     let source = leaked("class Function {}");
@@ -87,8 +88,8 @@ fn bi_name_class_type_template() {
 }
 
 /// A named mixin application's name takes the typedef-name face
-/// (visitClassTypeAlias, error_verifier.dart:635; oracle
-/// issue_46346_prime_1 `class abstract = A with B;`). The `=` follower
+/// (visitClassTypeAlias, `error_verifier.dart:635`; oracle
+/// `issue_46346_prime_1` `class abstract = A with B;`). The `=` follower
 /// decides, with type parameters skipped (`class as<T> = A with B;`).
 #[test]
 fn bi_name_class_type_alias_typedef_template() {
@@ -107,7 +108,7 @@ fn bi_name_class_type_alias_typedef_template() {
 }
 
 /// Mixin names take the type-name face (visitMixinDeclaration,
-/// error_verifier.dart:1840).
+/// `error_verifier.dart:1840`).
 #[test]
 fn bi_name_mixin_type_template() {
     let (rows, texts) = rows_and_texts(leaked("mixin as {}"));
@@ -123,7 +124,7 @@ fn bi_name_mixin_type_template() {
 }
 
 /// Enum names take the type-name face (visitEnumDeclaration,
-/// error_verifier.dart:1019).
+/// `error_verifier.dart:1019`).
 #[test]
 fn bi_name_enum_type_template() {
     let (rows, texts) = rows_and_texts(leaked("enum as { x }"));
@@ -139,7 +140,7 @@ fn bi_name_enum_type_template() {
 }
 
 /// Extension names take the extension-name face (visitExtensionDeclaration,
-/// error_verifier.dart:1124).
+/// `error_verifier.dart:1124`).
 #[test]
 fn bi_name_extension_template() {
     let (rows, texts) = rows_and_texts(leaked("extension as on int {}"));
@@ -155,7 +156,7 @@ fn bi_name_extension_template() {
 }
 
 /// Extension-type names take the extension-type-name face
-/// (visitExtensionTypeDeclaration, error_verifier.dart:1150).
+/// (visitExtensionTypeDeclaration, `error_verifier.dart:1150`).
 #[test]
 fn bi_name_extension_type_template() {
     let (rows, texts) = rows_and_texts(leaked("extension type as(int x) {}"));
@@ -171,7 +172,7 @@ fn bi_name_extension_type_template() {
 }
 
 /// Import prefixes take the prefix-name face (visitImportDirective,
-/// error_verifier.dart:1562).
+/// `error_verifier.dart:1562`).
 #[test]
 fn bi_name_prefix_template() {
     let (rows, texts) = rows_and_texts(leaked("import 'a.dart' as as;"));
@@ -187,7 +188,7 @@ fn bi_name_prefix_template() {
 }
 
 /// Type parameters take the type-parameter-name face (visitTypeParameter,
-/// error_verifier.dart:2478; oracle issue_45703 line 2).
+/// `error_verifier.dart:2478`; oracle `issue_45703` line 2).
 #[test]
 fn bi_name_type_parameter_template() {
     let (rows, texts) = rows_and_texts(leaked("class C<as> {}"));
@@ -212,7 +213,7 @@ fn bi_name_type_parameter_template() {
 
 /// Typedef names (both styles) keep the typedef-name face
 /// (visitFunctionTypeAlias :1480 / visitGenericTypeAlias :1493; oracle
-/// keyword_named_typedefs.dart).
+/// `keyword_named_typedefs.dart`).
 #[test]
 fn bi_name_typedef_template() {
     for source in ["typedef as = int;", "typedef void as();"] {
@@ -265,7 +266,7 @@ fn bi_name_variance_pseudo_pair() {
 
 /// Extension missing-`on`: the expectedAfterButGot row anchors on the last
 /// consumed header token — the extension name — not the junk body opener
-/// (parser_impl.dart:3720-3728; oracle test_missing_on_withBlock anchors at
+/// (parser_impl.dart:3720-3728; oracle `test_missing_on_withBlock` anchors at
 /// 2:11 on `E`, with the type-name row on the `{`).
 #[test]
 fn extension_missing_on_anchor() {
@@ -283,7 +284,7 @@ fn extension_missing_on_anchor() {
 }
 
 /// `show`/`hide` combinator names reject reserved words with the
-/// insert-synthetic face (CombinatorIdentifierContext,
+/// insert-synthetic face (`CombinatorIdentifierContext`,
 /// identifier_context_impl.dart:133-165): the keyword stays current, the
 /// `;` walk-back anchors on `show`.
 #[test]
@@ -308,7 +309,7 @@ fn combinator_reserved_name_insert_face() {
 }
 
 /// Local-variable names reject statement-starting reserved words with the
-/// insert-synthetic face (LocalVariableDeclarationIdentifierContext,
+/// insert-synthetic face (`LocalVariableDeclarationIdentifierContext`,
 /// identifier_context_impl.dart:1011-1050); the for-initializer `;`
 /// walk-back then anchors on `var` (upstream `ensureSemicolon`).
 #[test]

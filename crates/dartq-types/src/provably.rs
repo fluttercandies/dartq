@@ -41,6 +41,7 @@
 //! int-constant-vs-double-value cross in front of
 //! [`TypeSystem::can_be_equal`].
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ids::TypeId;
 use crate::system::TypeSystem;
 use crate::ty::{NamedMember, TypeKind, UninternedFunction, UninternedRecord, UninternedType};
@@ -495,8 +496,9 @@ mod tests {
     /// required-named vs optional-named, required-positional vs optional,
     /// and named-parameter reorder (which canonical interning already
     /// absorbs). Oracle-pinned: `typedef A = T Function<T>(T); typedef B =
-    /// U Function<U>(U); a as B` fires UNNECESSARY_CAST on 3.13.7.
+    /// U Function<U>(U); a as B` fires `UNNECESSARY_CAST` on 3.13.7.
     #[test]
+    #[expect(clippy::too_many_lines, reason = "the alpha-equivalence pin table")]
     fn structural_equality_alpha_equivalence_pins() {
         let (table, hierarchy) = fixture();
         let sys = TypeSystem::new(&table, &hierarchy);

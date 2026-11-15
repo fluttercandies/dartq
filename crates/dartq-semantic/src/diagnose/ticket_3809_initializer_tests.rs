@@ -34,6 +34,7 @@
 //! computed in the prefixed source — the fixtures below carry no line-number
 //! arithmetic.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 
 /// The `initializer_for_non_existent_field` rows of `source` as

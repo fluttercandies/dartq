@@ -9,6 +9,7 @@
 //! skipped structurally. This is NOT a general YAML parser — messages.yaml is
 //! machine-generated and regular.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// One parsed message entry.
 #[derive(Debug, Default, Clone)]
 pub struct MessageEntry {
@@ -180,7 +181,7 @@ fn read_block(lines: &[&str], start: usize, key_indent: usize) -> (String, usize
         collected.push(line[take..].to_string());
         i += 1;
     }
-    while collected.last().is_some_and(|l| l.is_empty()) {
+    while collected.last().is_some_and(std::string::String::is_empty) {
         collected.pop();
     }
     (collected.join("\n"), i)

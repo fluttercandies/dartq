@@ -14,6 +14,7 @@
 //! bottom type, not a class); the remaining stub heads ride `Class`, the
 //! posture every pre-kind rig kept.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, rows};
 use super::{FileReport, StrictModes, fold_unit_with_ops, merge_source_ordered};
 use crate::collector::collect;
@@ -150,7 +151,7 @@ fn report_face_kinds(source: &str) -> FileReport {
 #[test]
 fn typedef_face_implements_reports_and_class_face_stays_silent() {
     let report = report_face_kinds(
-        r#"
+        r"
 class SubFuture implements Future<int> {
   SubFuture();
 }
@@ -158,7 +159,7 @@ class SubFuture implements Future<int> {
 class SubComparator implements Comparator<int> {
   SubComparator();
 }
-"#,
+",
     );
     let hits: Vec<_> = report
         .diagnostics
@@ -178,11 +179,11 @@ class SubComparator implements Comparator<int> {
 #[test]
 fn never_face_implements_reports() {
     let report = report_face_kinds(
-        r#"
+        r"
 class SubNever implements Never {
   SubNever();
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(
@@ -197,7 +198,7 @@ class SubNever implements Never {
 #[test]
 fn mixin_face_answers_per_clause() {
     let report = report_face_kinds(
-        r#"
+        r"
 class UsesMixin implements PlainMixin {
   UsesMixin();
 }
@@ -205,7 +206,7 @@ class UsesMixin implements PlainMixin {
 class ExtendsMixin extends PlainMixin {
   ExtendsMixin();
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(
@@ -224,11 +225,11 @@ class ExtendsMixin extends PlainMixin {
 #[test]
 fn comparator_clause_row_names_the_code() {
     let report = report_face_kinds(
-        r#"
+        r"
 class SubComparator implements Comparator<int> {
   SubComparator();
 }
-"#,
+",
     );
     let rows = rows(&report);
     assert!(

@@ -21,6 +21,10 @@ enum ShorthandCallee {
     /// the shorthand is a `DotShorthandConstructorInvocation`, a valid
     /// constant creation whose initializer walk still runs. Carries the
     /// context container the walk keys on.
+    #[expect(
+        dead_code,
+        reason = "carries the context container for the initializer walk; the walk reads it through the enum's other arms"
+    )]
     Ctor(StringId),
     /// The context type is undecidable here (no written annotation, an
     /// unresolved head, a broken member climb) or answers neither arm —
@@ -790,15 +794,13 @@ impl<'a> Engine<'a> {
             // `visitVariableDeclaration` `_reportError` carries the
             // element's `InvalidConstant` verbatim — the allow-list swaps
             // the code at the element, no twin fires (nothing more to do).
-            if !local {
-                if let Some(span) = root.as_ref().map(|node| node.span) {
-                    self.emit(
-                        SemanticCode::ConstInitializedWithNonConstantValue,
-                        span,
-                        "",
-                        "",
-                    );
-                }
+            if !local && let Some(span) = root.as_ref().map(|node| node.span) {
+                self.emit(
+                    SemanticCode::ConstInitializedWithNonConstantValue,
+                    span,
+                    "",
+                    "",
+                );
             }
         } else {
             self.resolve_const_verdict(&verdict);
@@ -842,7 +844,7 @@ impl<'a> Engine<'a> {
             fault_spans
                 .iter()
                 .any(|f| f.offset <= span.offset && span.end() <= f.end())
-                && !named_spans.iter().any(|&s| s == span)
+                && !named_spans.contains(&span)
         };
         for (init, span, kind) in std::mem::take(&mut self.open_const_creations) {
             if !matches!(verdict, Verdict::Value(_) | Verdict::Constant) {
@@ -1112,7 +1114,7 @@ impl<'a> Engine<'a> {
                     | b':' | b'-' | b'~' | b'!'
                         if depth == 0 =>
                     {
-                        composite = true
+                        composite = true;
                     }
                     _ => {}
                 }
@@ -1477,8 +1479,9 @@ impl<'a> Engine<'a> {
         let selector = text
             .strip_prefix(head)
             .and_then(|rest| rest.strip_prefix('.'))
-            .map(|rest| rest.split(['(', ' ', '?', '\n', '\t']).next().unwrap_or(""))
-            .unwrap_or("");
+            .map_or("", |rest| {
+                rest.split(['(', ' ', '?', '\n', '\t']).next().unwrap_or("")
+            });
         if selector.is_empty() || selector == "new" {
             return true;
         }
@@ -1521,8 +1524,9 @@ impl<'a> Engine<'a> {
             let selector = text
                 .strip_prefix(head)
                 .and_then(|rest| rest.strip_prefix('.'))
-                .map(|rest| rest.split(['(', ' ', '?', '\n', '\t']).next().unwrap_or(""))
-                .unwrap_or("");
+                .map_or("", |rest| {
+                    rest.split(['(', ' ', '?', '\n', '\t']).next().unwrap_or("")
+                });
             (container, selector)
         } else {
             let head_text = text.split('(').next().unwrap_or("");
@@ -1885,7 +1889,7 @@ impl<'a> Engine<'a> {
                         let selector = self.strings.resolve(name);
                         CORE_CONST_CTOR
                             .iter()
-                            .any(|(c, sels)| *c == container && sels.iter().any(|s| *s == selector))
+                            .any(|(c, sels)| *c == container && sels.contains(&selector))
                     };
                     if decl_type && !is_const_ctor {
                         // The `const_with_non_const` face fires when the
@@ -2101,7 +2105,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Whether the name expression at `offset` is a leading-dot shorthand
-    /// (`.name`/`.new` — upstream `_isDotShorthand`, parser_impl.dart:6499):
+    /// (`.name`/`.new` — upstream `_isDotShorthand`, `parser_impl.dart:6499)`:
     /// the byte before the name's span is a `.` no receiver expression
     /// precedes. `recv.name` never reaches this probe's callers — the
     /// member fold merges it — so the qualified shapes left are the
@@ -2337,14 +2341,12 @@ impl<'a> Engine<'a> {
             .last()
             .and_then(|slot| *slot)
             .and_then(|index| self.rows.get(index))
-            .map(|row| row.range.end())
-            .unwrap_or(recv.end());
+            .map_or(recv.end(), |row| row.range.end());
         let close = self
             .arg_levels
             .last()
             .and_then(|level| level.args.last())
-            .map(|arg| arg.3.end() + 1)
-            .unwrap_or(callee_end + 2);
+            .map_or(callee_end + 2, |arg| arg.3.end() + 1);
         SourceRange {
             offset: recv.offset,
             length: close.saturating_sub(recv.offset),
@@ -2432,7 +2434,7 @@ impl<'a> Engine<'a> {
     /// argument's own expression and collect `invalidConstant` at the
     /// leaf instead. Enum-constant arguments run the
     /// `_validateConstantArguments` path instead
-    /// (constant_verifier.dart): `constWithNonConstantArgument` is the
+    /// (`constant_verifier.dart)`: `constWithNonConstantArgument` is the
     /// *default* code for every non-allow-listed leaf there, whatever the
     /// argument's shape.
     fn const_arg_code(
@@ -4193,7 +4195,7 @@ impl<'a> Engine<'a> {
         };
         if labels.len() != args.len() {
             return;
-        };
+        }
         let Some(decl) = self.const_ctor_decl(head_name) else {
             return;
         };
@@ -4744,11 +4746,7 @@ mod face_tests {
     }
 
     fn code_names(report: &FileReport) -> Vec<&'static str> {
-        report
-            .diagnostics
-            .iter()
-            .map(|d| d.code.name.as_ref())
-            .collect()
+        report.diagnostics.iter().map(|d| d.code.name).collect()
     }
 
     /// `!`/`-`/`~` on `null` and on a created primitive instance
@@ -4894,7 +4892,7 @@ mod face_tests {
             .into_iter()
             .filter(|c| c.starts_with("const_") || c.starts_with("non_constant"))
             .collect();
-        assert!(rows.is_empty(), "{:?}", rows);
+        assert!(rows.is_empty(), "{rows:?}");
         // A non-const variable reference reports at the variable.
         let rep = unit_report("var v = 1;\nconst x = v;\n");
         let rows: Vec<(u32, u32)> = rep
@@ -5105,7 +5103,7 @@ mod face_tests {
     /// selectors, parenthesized operands and composites collect
     /// `invalid_constant` at the leaf instead. Enum-constant arguments
     /// keep `const_with_non_constant_argument` for every non-allow-listed
-    /// leaf (constant_verifier.dart `_validateConstantArguments` passes it
+    /// leaf (`constant_verifier.dart` `_validateConstantArguments` passes it
     /// as the default code).
     #[test]
     fn const_arg_code_parent_rule() {

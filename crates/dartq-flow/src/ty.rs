@@ -8,6 +8,7 @@
 //! type *names* plus nullability; a resolved back-end (dartq-types) replaces
 //! it through the same [`TypeOps`] seam.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// The base of a [`Ty`]: an interned type name or one of the special bases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Base {
@@ -194,7 +195,7 @@ pub(crate) struct Boundary {
 #[derive(Default)]
 pub(crate) struct ClosedNames {
     /// Interned name ids of the unit's `sealed` classes and enums (enums
-    /// are sealed by construction, static_type.dart:67).
+    /// are sealed by construction, `static_type.dart:67`).
     pub(crate) names: rustc_hash::FxHashSet<u32>,
     /// The unit's extension-type declarations: the declared name's id →
     /// its representation type as written, beside the representation's
@@ -222,7 +223,7 @@ pub(crate) struct ClosedNames {
     /// level; `None` until the recorder interns it.
     pub(crate) bool_name: Option<u32>,
     /// `FutureOr`'s interned id — the verdict recurses into its single
-    /// argument (type_system.dart:865); `None` until interned.
+    /// argument (`type_system.dart:865`); `None` until interned.
     pub(crate) future_or: Option<u32>,
     /// The leaf literal types' interned ids — `int`, `double`, `String`.
     /// A literal's static type feeds the promotion write's `matchedType`
@@ -403,7 +404,7 @@ pub trait TypeOps {
     /// cannot — `factor(Response, Response<T>)`: the bare `Ty`s compare
     /// equal (same name, same nullability) yet the instantiated forms
     /// `Response<dynamic>` vs `Response<T>` are not mutual subtypes, so the
-    /// remainder is `Response`, not `Never` (factor_type.dart's
+    /// remainder is `Response`, not `Never` (`factor_type.dart`'s
     /// instantiated-type arm). The default delegates to
     /// [`TypeOps::factor`] — identical answers to the pre-hook behavior.
     fn factor_typed(
@@ -497,7 +498,7 @@ pub trait TypeOps {
     }
 
     /// The object pattern's downward-inferred required type (official
-    /// `analyzeObjectPattern`'s inference — shared type_analyzer.dart
+    /// `analyzeObjectPattern`'s inference — shared `type_analyzer.dart`
     /// :1749-1772 — with the matched value's static type as the context):
     /// a RAW pattern spelling's own type parameters solve along its
     /// superclass chain, so `case AL():` over an `AV<int>` scrutinee tests
@@ -557,11 +558,9 @@ fn name_entry_subtype(a: &ArgTy, b: &ArgTy, arena: &[Vec<ArgTy>]) -> bool {
         // steps (`Expression<DateTime>` over the dynamic-padded declared
         // `Expression`, #2285 item 5: the no-step check `from <: to`
         // passed and the `is` test promoted nothing).
-        (_, Base::Dynamic | Base::Unknown | Base::Void) => true,
-        (Base::Unknown, _) => true,
-        (Base::Dynamic | Base::Void, _) => false,
+        (Base::Unknown, _) | (_, Base::Dynamic | Base::Unknown | Base::Void) => true,
         (Base::Null, _) => b.nullable,
-        (_, Base::Null) => false,
+        (Base::Dynamic | Base::Void, _) | (_, Base::Null) => false,
         _ => {
             a.base == b.base
                 && (!a.nullable || b.nullable)

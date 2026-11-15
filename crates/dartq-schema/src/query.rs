@@ -23,6 +23,7 @@
 //! are optional and absent-tolerant at every tier, so a producer lands
 //! without unfreezing v1.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};
@@ -216,7 +217,7 @@ fn validate_declaration_row(
             .iter()
             .enumerate()
         {
-            string(annotation, &format!("{}.annotations[{i}]", p))?;
+            string(annotation, &format!("{p}.annotations[{i}]"))?;
         }
     }
     Ok(())

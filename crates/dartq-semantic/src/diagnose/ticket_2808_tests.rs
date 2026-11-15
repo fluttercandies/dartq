@@ -6,9 +6,10 @@
 //! own: `applicableTo` instantiates the extended type from the receiver
 //! (`T := ET<Never>?`), so the application over the nullable receiver is
 //! safe (upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-//! extension_member_resolver.dart's `applicableTo` against the nullable
+//! `extension_member_resolver.dart`'s `applicableTo` against the nullable
 //! receiver type).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, report_ops, report_ops_imports, rows};
 use super::*;
 
@@ -27,7 +28,7 @@ fn unchecked_count(report: &FileReport) -> usize {
 #[test]
 fn imported_own_param_on_type_extension_member_invocation_stays_silent() {
     let report = report_ops_imports(
-        r#"
+        r"
 extension type ET<X>(X _) {}
 void f() {
   ET<Never>? et1;
@@ -35,17 +36,17 @@ void f() {
   ET<Never>? et2;
   et2.expectStaticType<ET<Never>?>();
 }
-"#,
+",
         &[RigImport {
             uri: "package:t/static_type_helper.dart",
             prefix: None,
-            source: r#"
+            source: r"
 extension StaticType<T> on T {
   T expectStaticType<R>() {
     return this;
   }
 }
-"#,
+",
         }],
     );
     assert_eq!(
@@ -61,7 +62,7 @@ extension StaticType<T> on T {
 #[test]
 fn in_file_own_param_on_type_extension_member_invocation_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 extension type ET<X>(X _) {}
 extension StaticType<T> on T {
   T expectStaticType<R>() {
@@ -72,7 +73,7 @@ void f() {
   ET<Never>? et1;
   et1.expectStaticType<ET<Never>?>();
 }
-"#,
+",
     );
     assert_eq!(unchecked_count(&report), 0);
 }
@@ -82,7 +83,7 @@ void f() {
 #[test]
 fn named_nullable_on_extension_member_invocation_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 class C {}
 extension Helper on C? {
   void m() {}
@@ -91,7 +92,7 @@ void f() {
   C? c;
   c.m();
 }
-"#,
+",
     );
     assert_eq!(unchecked_count(&report), 0);
 }
@@ -101,7 +102,7 @@ void f() {
 #[test]
 fn nullable_receiver_instance_member_still_reports() {
     let report = report_ops(
-        r#"
+        r"
 class C {
   void m() {}
 }
@@ -109,7 +110,7 @@ void f() {
   C? c;
   c.m();
 }
-"#,
+",
     );
     assert_eq!(unchecked_count(&report), 1);
 }
@@ -119,7 +120,7 @@ void f() {
 #[test]
 fn non_nullable_on_extension_reports_unsafe() {
     let report = report_ops(
-        r#"
+        r"
 class C {}
 extension E on C {
   void m() {}
@@ -128,7 +129,7 @@ void f() {
   C? c;
   c.m();
 }
-"#,
+",
     );
     assert_eq!(unchecked_count(&report), 1);
 }
@@ -139,7 +140,7 @@ void f() {
 #[test]
 fn bounded_own_param_on_type_extension_reports_unsafe() {
     let report = report_ops(
-        r#"
+        r"
 class C {}
 extension E<T extends C> on T {
   void m() {}
@@ -148,7 +149,7 @@ void f() {
   C? c;
   c.m();
 }
-"#,
+",
     );
     assert_eq!(unchecked_count(&report), 1);
 }
@@ -160,21 +161,21 @@ void f() {
 #[test]
 fn imported_unnamed_extension_never_applies() {
     let report = report_ops_imports(
-        r#"
+        r"
 extension type ET<X>(X _) {}
 void f() {
   ET<Never>? et1;
   et1.expectStaticType<ET<Never>?>();
 }
-"#,
+",
         &[RigImport {
             uri: "package:t/static_type_helper.dart",
             prefix: None,
-            source: r#"
+            source: r"
 extension on Object? {
   void expectStaticType<T>() {}
 }
-"#,
+",
         }],
     );
     assert_eq!(unchecked_count(&report), 1);
@@ -186,21 +187,21 @@ extension on Object? {
 #[test]
 fn imported_non_nullable_on_extension_reports_unsafe() {
     let report = report_ops_imports(
-        r#"
+        r"
 class C {}
 void f() {
   C? c;
   c.m();
 }
-"#,
+",
         &[RigImport {
             uri: "package:t/helper.dart",
             prefix: None,
-            source: r#"
+            source: r"
 extension E on C {
   void m() {}
 }
-"#,
+",
         }],
     );
     assert_eq!(unchecked_count(&report), 1);

@@ -20,11 +20,12 @@
 //! formals `()`. The body face (`parseFunctionBody` → `expectedBody`) lands
 //! on `?`, the class-body loop re-enters there with the operator face
 //! (`parseInvalidOperatorDeclaration` → `missingOperatorKeyword`,
-//! parser_impl.dart:11204; `parseOperatorName` → `invalidOperator`,
+//! `parser_impl.dart:11204`; `parseOperatorName` → `invalidOperator`,
 //! :6288; formals recovery → `missing_method_parameters`, :1684), and the
 //! `x` head closes with `missing_function_body` +
 //! `missing_const_final_var_or_type`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -103,5 +104,8 @@ fn non_compound_nameless_faces_stay_oracle_exact() {
 /// break-posture route cannot reach it.
 #[test]
 fn clean_nested_compound_field_stays_silent() {
-    assert!(sorted_rows("class A {\n  Map<String, B<C>>? x;\n}\n").is_empty());
+    assert_eq!(
+        sorted_rows("class A {\n  Map<String, B<C>>? x;\n}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
 }

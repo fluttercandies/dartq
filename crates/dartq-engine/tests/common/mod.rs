@@ -2,6 +2,19 @@
 //! VM-segment SDK, assembled through the real dartq-pub/dartq-package/
 //! dartq-sdk faces.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::format_push_string,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::semicolon_if_nothing_returned
+)]
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};

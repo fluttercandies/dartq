@@ -20,11 +20,12 @@
 //!
 //! The pinned reader guards: a trailing `?` already spans past the group
 //! (`List<B>?` is green at HEAD), `unnecessary_cast_pattern` anchors the
-//! `as` token (upstream shared_type_analyzer.dart:151), the is-verdict
+//! `as` token (upstream `shared_type_analyzer.dart:151`), the is-verdict
 //! span takes the max over the armed/group/written ends, and the record
 //! field-names walk reads the last field's head span at the record's own
 //! close — the widened closures must never move those.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops, rows};
 
@@ -101,7 +102,7 @@ fn future_or_type_args_anchor_full_node() {
     );
 }
 
-/// `case List<B> y`: the DeclaredVariable kind anchors `pattern.type` the
+/// `case List<B> y`: the `DeclaredVariable` kind anchors `pattern.type` the
 /// same way (resolver.dart:637-639). Oracle `…|4|14|7`. **Red at HEAD**.
 #[test]
 fn declared_type_args_anchor_full_node() {
@@ -247,7 +248,7 @@ fn nullable_wildcard_keeps_question_extent() {
 }
 
 /// `case _ as int` over an `int` scrutinee: `unnecessary_cast_pattern`
-/// anchors `pattern.asToken` (upstream shared_type_analyzer.dart:151) —
+/// anchors `pattern.asToken` (upstream `shared_type_analyzer.dart:151`) —
 /// never the written type. Oracle `…|3|16|2`. Green at HEAD.
 #[test]
 fn unnecessary_cast_pattern_keeps_as_token() {

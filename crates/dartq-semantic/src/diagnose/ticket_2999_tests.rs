@@ -13,6 +13,7 @@
 //! `test_variableDeclarationStatement_isNullAssigned` (SILENT) pin the
 //! statement-position verdicts verbatim.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, assert_silent, code_names, report_ops, rows};
 
 /// The `unused_local_variable` rows of `source`, as (offset, length)
@@ -57,7 +58,7 @@ fn compound_assign_statement_reports() {
 }
 
 /// A compound assignment in a NON-statement position reads the LHS —
-/// the discard is the ExpressionStatement arm only — so `(l += 1)` as
+/// the discard is the `ExpressionStatement` arm only — so `(l += 1)` as
 /// an argument spares the declaration.
 #[test]
 fn compound_assign_nested_spares() {
@@ -112,7 +113,7 @@ fn if_null_assign_statement_spares() {
 
 /// `++`/`--` in a NON-statement position reads the variable upstream —
 /// the for-updater's parent is the loop's updater list, never an
-/// ExpressionStatement — so `for (; l < 10; l++) {}` spares the
+/// `ExpressionStatement` — so `for (; l < 10; l++) {}` spares the
 /// declaration.
 #[test]
 fn for_updater_increment_spares() {

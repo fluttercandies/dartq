@@ -1,6 +1,6 @@
 //! Ticket #3745 — `X extension`/pseudo-modifier top-level dispatch: sealed,
 //! base and interface are NOT declaration modifiers (upstream `isModifier`,
-//! modifier_context.dart:13 — the modifier keyword set is abstract/augment/
+//! `modifier_context.dart:13` — the modifier keyword set is abstract/augment/
 //! const/covariant/external/final/late/required/static/var). In
 //! `parseTopLevelDeclarationImpl` (parser_impl.dart:591-626) the pseudo
 //! capture only applies when the keyword is followed by class/mixin/enum
@@ -35,6 +35,7 @@
 //! keeps the row because `abstract` is not a declaration-head keyword and
 //! does become the mixin name.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;
@@ -43,7 +44,7 @@ use dartq_language::{Feature, FeatureSet};
 use dartq_scanner::ScanConfig;
 
 /// Parses `source` at `set` and returns the scanner+parser rows as
-/// `(code, start, end)` — UTF-16 offsets, matching the ticket_3740 harness.
+/// `(code, start, end)` — UTF-16 offsets, matching the `ticket_3740` harness.
 fn rows_at(source: &'static str, set: FeatureSet) -> BTreeSet<(String, u32, u32)> {
     let config = ScanConfig::from_feature_set(set);
     let features = crate::ParserFeatures::from_feature_set(set);

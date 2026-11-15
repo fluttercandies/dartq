@@ -40,6 +40,7 @@
 //! across these four faces plus a handful of already-passing
 //! non-closure returns.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 /// `return_of_invalid_type_from_closure` rows for `report`.

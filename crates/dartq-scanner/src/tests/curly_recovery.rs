@@ -4,6 +4,7 @@
 //! family (`typing_01` / `typing_04` / `typing_string_interpolation_1`/2,
 //! condensed to their recovery-bearing lines).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::{assert_codes, codes, scan_src, u32_of};
 use crate::TokenKind as K;
 
@@ -219,7 +220,7 @@ fn corpus_typing_files_recover_to_single_expected_token() {
     ];
     for (rel, closer_pattern) in cases {
         let src = corpus_file(rel);
-        let r = scan_src(&src);
+        let r = scan_src(src);
         let closer = src
             .find(closer_pattern)
             .unwrap_or_else(|| panic!("{rel}: closer pattern {closer_pattern:?} not found"))
@@ -326,7 +327,7 @@ fn corpus_string_interpolation_2_recovers() {
 #[test]
 fn corpus_bracket_mismatch_01_deep_match_drops() {
     let src = corpus_file("bracket_mismatch_01.dart");
-    let r = scan_src(&src);
+    let r = scan_src(src);
     assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
     // Every begin pairs with a real closer; nothing synthetic anywhere.
     let t = &r.tokens;

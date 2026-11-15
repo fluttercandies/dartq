@@ -1,5 +1,6 @@
 //! Opaque identifiers allocated by the type table and hierarchy snapshots.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use core::fmt;
 
 /// Identity of an interned type inside a [`crate::TypeTable`].

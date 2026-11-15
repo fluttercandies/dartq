@@ -22,6 +22,7 @@
 //!   the literal dispatch is read after the type-argument group
 //!   (:8291-8300).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::setup;
 
 /// Sorted diagnostic-code multiset of one whole-unit parse.

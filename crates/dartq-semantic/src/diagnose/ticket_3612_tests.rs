@@ -29,7 +29,7 @@
 //!   `if (c == x ? .a : y)` arms `bool`; a declaration initializer's
 //!   conditional arms the annotation.
 //!
-//! Oracle provenance: `dart analyze` 3.13.7 — dot_shorthands
+//! Oracle provenance: `dart analyze` 3.13.7 — `dot_shorthands`
 //! `equality_A02_t01/t02` (conditionals, collections, map values),
 //! `grammar_A05_t01/t02` (negation, unary), `no_context`
 //! `simple_identifier_no_context_error_test` (statement shapes),
@@ -38,6 +38,8 @@
 //! displays), `DotShorthandConstructorInvocationResolutionTest/
 //! test_postfixOperator` (`++`/`--` chains), `patterns_A02_t01` (a
 //! `case` pattern's logical operands read the scrutinee, not `bool`).
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{CORE_PRELUDE, RigImport, code_names, report_ops, report_ops_imports, rows};
 use crate::diagnose::FileReport;

@@ -234,9 +234,7 @@ fn assignment_divider(c: &Check<'_>, op: u32) -> Option<u32> {
     let mut i = op;
     while i > 0 {
         i -= 1;
-        if c.token(i).is_none() {
-            return None;
-        }
+        c.token(i)?;
         match c.lexeme(i) {
             ")" | "]" | "}" => {
                 if depth == 0 && c.lexeme(i) == "}" {
@@ -251,10 +249,11 @@ fn assignment_divider(c: &Check<'_>, op: u32) -> Option<u32> {
                 depth -= 1;
             }
             ";" if depth == 0 => return None,
-            lex if depth == 0 => {
-                if lex == "=" || (lex.ends_with('=') && !matches!(lex, "==" | "!=" | "<=" | ">=")) {
-                    return Some(i);
-                }
+            lex if depth == 0
+                && (lex == "="
+                    || (lex.ends_with('=') && !matches!(lex, "==" | "!=" | "<=" | ">="))) =>
+            {
+                return Some(i);
             }
             _ => {}
         }
@@ -278,10 +277,8 @@ fn chain_operand_end(c: &Check<'_>, op: u32, fallback: u32) -> u32 {
                 }
                 depth -= 1;
             }
-            ";" | "," => {
-                if depth == 0 {
-                    return c.utf16_end_of_token(previous).unwrap_or(fallback);
-                }
+            ";" | "," if depth == 0 => {
+                return c.utf16_end_of_token(previous).unwrap_or(fallback);
             }
             _ => {}
         }

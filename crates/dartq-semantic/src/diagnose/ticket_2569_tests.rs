@@ -12,6 +12,7 @@
 //! enclosing close folds out to the loop's end. Both statement and
 //! collection-element forms share the face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 

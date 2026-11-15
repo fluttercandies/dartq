@@ -18,6 +18,7 @@
 //! declared type on an invoked member row, a pre-existing under-report
 //! boundary that predates this family.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -218,7 +219,7 @@ fn double_null_aware_chain_stays_silent() {
 
 /// The R1 exemplar: `x?.m == true` — the equality asks no nullability
 /// question and the result feeds a `bool` return cleanly (probed: the
-/// webview_flutter_android shape is silent on the oracle).
+/// `webview_flutter_android` shape is silent on the oracle).
 #[test]
 fn null_aware_member_equality_stays_silent() {
     let source = "class X { bool get m => true; }\n\

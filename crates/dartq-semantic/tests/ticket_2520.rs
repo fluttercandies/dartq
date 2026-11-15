@@ -5,7 +5,7 @@
 //! (upstream Dart SDK source,
 //! pkg/analyzer/lib/src/dart/resolver/extension_member_resolver.dart:484-497
 //! — the receiver-inferred form `applicableTo` builds in
-//! resolver/applicable_extensions.dart) before it falls to the
+//! `resolver/applicable_extensions.dart`) before it falls to the
 //! instantiate-to-bounds projections (:500-506).
 //!
 //! Steps 3-4 read the `on` types at the name level, where a parameter leaf

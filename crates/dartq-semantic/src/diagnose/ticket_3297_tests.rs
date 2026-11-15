@@ -48,6 +48,7 @@
 //! — the marked sites are the reported rows, the unmarked ones the silent
 //! reads.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, report_ops_wildcards};
 
 /// Every `undefined_identifier` message of `report`, in emission order.
@@ -92,7 +93,7 @@ fn wildcard_type_parameter_on_a_class_declares_nothing() {
     assert_identifier_rows(&report, &["Undefined name '_'."]);
 }
 
-/// The silent-negative: a named type parameter is a TypeParameterScope
+/// The silent-negative: a named type parameter is a `TypeParameterScope`
 /// entry, so its bare read answers the `Type` literal and reports nothing.
 #[test]
 fn named_type_parameter_still_resolves() {

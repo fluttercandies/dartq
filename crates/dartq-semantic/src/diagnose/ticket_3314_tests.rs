@@ -21,6 +21,7 @@
 //! /`t02`, `A06_t01`/`t02` (pinned 3.13.7 corpus), the marked sites being
 //! the reported rows.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// Every `undefined_identifier` message of `report`, in emission order.

@@ -15,6 +15,7 @@
 //!   `p.Name`, not the bare name; and `dynamic` resolves through an
 //!   import prefix whose library re-exports dart:core's face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

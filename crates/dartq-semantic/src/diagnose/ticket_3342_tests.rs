@@ -40,6 +40,7 @@
 //! the module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, code_names, report_ops_experiments_with, rows};
 use super::types::FileReport;
 
@@ -54,7 +55,7 @@ fn report(source: &str, imports: &[RigImport<'_>]) -> FileReport {
 }
 
 /// The single-sibling mount every fixture below shares.
-fn with_sibling<'a>(source: &'a str) -> FileReport {
+fn with_sibling(source: &str) -> FileReport {
     report(
         source,
         &[RigImport {

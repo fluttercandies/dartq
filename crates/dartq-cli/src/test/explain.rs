@@ -9,6 +9,7 @@
 //! refuses: fixing (or attesting) the top entry is what turns the most
 //! suites cacheable.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 

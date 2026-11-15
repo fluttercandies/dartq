@@ -12,6 +12,7 @@
 //! The regression arm pins the opposite direction: a private-named
 //! container with no references still reports `unused_element`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

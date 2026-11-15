@@ -20,6 +20,7 @@
 //!   (`typeSystem.isNullable` delegates to the argument), so
 //!   `FutureOr<int?>`/`FutureOr<Object?>` reach the NULLABLE twin.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

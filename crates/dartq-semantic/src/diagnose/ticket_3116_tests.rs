@@ -14,6 +14,7 @@
 //! decision (the flow's answer is the same); only the walk-miss rides the
 //! staged join.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// Asserts one `dead_null_aware_expression` sits at `offset`, tolerating
@@ -76,9 +77,7 @@ fn unpromoted_nullable_lhs_stays_silent() {
     let fixture = "void f(int? x, int d) {\n  var y = x ?? d;\n}";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|&c| c == "dead_null_aware_expression"),
+        !code_names(&report).contains(&"dead_null_aware_expression"),
         "{:?}",
         rows(&report)
     );
@@ -92,9 +91,7 @@ fn invalidated_promotion_lhs_stays_silent() {
     let fixture = "void f(int? x, int d, int? source) {\n  if (x != null) {\n    x = source;\n    var y = x ?? d;\n  }\n}";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|&c| c == "dead_null_aware_expression"),
+        !code_names(&report).contains(&"dead_null_aware_expression"),
         "{:?}",
         rows(&report)
     );
@@ -145,9 +142,7 @@ fn if_null_assignment_nullable_target_stays_silent() {
     let fixture = "void f(int? x, int v) {\n  x ??= v;\n}";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|&c| c == "dead_null_aware_expression"),
+        !code_names(&report).contains(&"dead_null_aware_expression"),
         "{:?}",
         rows(&report)
     );
@@ -171,9 +166,7 @@ fn if_null_assignment_member_target_stays_silent() {
     let fixture = "class C { int? f = 0; }\nvoid f(C c, int v) {\n  c.f ??= v;\n}";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|&c| c == "dead_null_aware_expression"),
+        !code_names(&report).contains(&"dead_null_aware_expression"),
         "{:?}",
         rows(&report)
     );

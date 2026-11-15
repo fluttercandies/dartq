@@ -43,6 +43,7 @@
 //! `--stats` (one line on stderr saying where suites ran), `--no-queue`
 //! (run outside the machine-wide job gate).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
@@ -69,7 +70,7 @@ const NO_TESTS: u8 = 79;
 /// unless `DARTQ_TEST_IDLE_TIMEOUT` (seconds) says otherwise. A runner that
 /// keeps reporting is never cut short: each test's own timeout is the
 /// runner's to enforce.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 
 #[derive(Args)]
 #[command(disable_help_flag = true)]
@@ -451,23 +452,22 @@ fn parse(args: &[String], flutter: bool) -> Result<Invocation, ()> {
                 }
                 continue;
             }
-            match table.iter().find(|option| option.0 == name) {
-                Some(option) => (option, inline.map(Some).unwrap_or(None)),
-                None => {
-                    let negated = name.strip_prefix("no-").and_then(|base| {
-                        table
-                            .iter()
-                            .find(|option| option.0 == base && option.2 == Shape::Flag(true))
-                    });
-                    let Some(option) = negated else {
-                        return Err(());
-                    };
-                    if inline.is_some() {
-                        return Err(());
-                    }
-                    apply(&mut inv, option, None, false)?;
-                    continue;
+            if let Some(option) = table.iter().find(|option| option.0 == name) {
+                (option, inline)
+            } else {
+                let negated = name.strip_prefix("no-").and_then(|base| {
+                    table
+                        .iter()
+                        .find(|option| option.0 == base && option.2 == Shape::Flag(true))
+                });
+                let Some(option) = negated else {
+                    return Err(());
+                };
+                if inline.is_some() {
+                    return Err(());
                 }
+                apply(&mut inv, option, None, false)?;
+                continue;
             }
         } else if let Some(short) = arg.strip_prefix('-').filter(|rest| !rest.is_empty()) {
             let mut chars = short.chars();
@@ -505,13 +505,12 @@ fn parse(args: &[String], flutter: bool) -> Result<Invocation, ()> {
                 apply(&mut inv, spec, None, true)?;
             }
             Shape::Single | Shape::Multi => {
-                let value = match value {
-                    Some(value) => value,
-                    None => {
-                        let next = args.get(index).ok_or(())?.clone();
-                        index += 1;
-                        next
-                    }
+                let value = if let Some(value) = value {
+                    value
+                } else {
+                    let next = args.get(index).ok_or(())?.clone();
+                    index += 1;
+                    next
                 };
                 apply(&mut inv, spec, Some(value), true)?;
             }
@@ -1628,43 +1627,40 @@ fn stats_verbose_text(
     let mut out = String::new();
     let mut trigger_counts: FxHashMap<String, usize> = FxHashMap::default();
     for (index, (display, abs)) in suites.iter().enumerate() {
-        let line = match details.get(index).and_then(Option::as_ref) {
-            Some(detail) => {
-                let mut evidence: Vec<String> = Vec::new();
-                if let Some(file) = &detail.file
-                    && file != abs
-                {
-                    evidence.push(display_path(root, file));
-                }
-                evidence.extend(detail.triggers.iter().cloned());
-                if detail.triggers.is_empty() {
-                    *trigger_counts
-                        .entry(detail.refusal.label().to_owned())
-                        .or_default() += 1;
-                } else {
-                    for trigger in &detail.triggers {
-                        *trigger_counts.entry(trigger.clone()).or_default() += 1;
-                    }
-                }
-                let evidence = evidence.join("; ");
-                if evidence.is_empty() {
-                    format!("{display} → uncertain: {}", detail.refusal.label())
-                } else {
-                    format!(
-                        "{display} → uncertain: {} — {evidence}",
-                        detail.refusal.label()
-                    )
+        let line = if let Some(detail) = details.get(index).and_then(Option::as_ref) {
+            let mut evidence: Vec<String> = Vec::new();
+            if let Some(file) = &detail.file
+                && file != abs
+            {
+                evidence.push(display_path(root, file));
+            }
+            evidence.extend(detail.triggers.iter().cloned());
+            if detail.triggers.is_empty() {
+                *trigger_counts
+                    .entry(detail.refusal.label().to_owned())
+                    .or_default() += 1;
+            } else {
+                for trigger in &detail.triggers {
+                    *trigger_counts.entry(trigger.clone()).or_default() += 1;
                 }
             }
-            None => {
-                let verdict = match verdicts.get(index).copied().flatten() {
-                    Some(SuiteVerdict::Cached) => "cached",
-                    Some(SuiteVerdict::Grouped) => "grouped",
-                    Some(SuiteVerdict::Stock) => "stock",
-                    None => "ran",
-                };
-                format!("{display} → {verdict}")
+            let evidence = evidence.join("; ");
+            if evidence.is_empty() {
+                format!("{display} → uncertain: {}", detail.refusal.label())
+            } else {
+                format!(
+                    "{display} → uncertain: {} — {evidence}",
+                    detail.refusal.label()
+                )
             }
+        } else {
+            let verdict = match verdicts.get(index).copied().flatten() {
+                Some(SuiteVerdict::Cached) => "cached",
+                Some(SuiteVerdict::Grouped) => "grouped",
+                Some(SuiteVerdict::Stock) => "stock",
+                None => "ran",
+            };
+            format!("{display} → {verdict}")
         };
         let _ = writeln!(out, "{line}");
     }
@@ -1860,11 +1856,9 @@ fn execute(plan: &Plan) -> io::Result<u8> {
                       slots: &mut Vec<Option<Vec<Json>>>,
                       cache: &mut Option<dartq_test::Cache>|
      -> io::Result<()> {
-        if verdict_ok {
-            if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
-                cache.stage(key, &block.events)?;
-                staged_keys.insert(index, key.to_owned());
-            }
+        if verdict_ok && let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
+            cache.stage(key, &block.events)?;
+            staged_keys.insert(index, key.to_owned());
         }
         slots[index] = Some(block.events);
         Ok(())
@@ -1883,7 +1877,9 @@ fn execute(plan: &Plan) -> io::Result<u8> {
             plan.suites.len()
         );
     }
-    if !skip_group {
+    if skip_group {
+        stock.extend(&grouped);
+    } else {
         let out_dir = root.join(".dart_tool").join("dartq").join("group");
         let files: Vec<PathBuf> = grouped
             .iter()
@@ -1953,12 +1949,10 @@ fn execute(plan: &Plan) -> io::Result<u8> {
                 emit(&mut slots, &mut outputs, &mut totals)?;
             }
         }
-    } else {
-        stock.extend(&grouped);
     }
 
     // Everything not proven grouped runs stock, which reports it.
-    stock.extend(rerun.drain(..));
+    stock.append(&mut rerun);
     stock.sort_unstable();
     stock.dedup();
     if !stock.is_empty() {

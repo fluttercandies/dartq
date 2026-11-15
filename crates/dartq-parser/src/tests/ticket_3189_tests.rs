@@ -16,6 +16,7 @@
 //! `NoType`/`void` keep their own recovery rows (`expected_type_name` /
 //! `invalid_void`) and stay named here.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 struct Rows {
@@ -143,7 +144,7 @@ fn ticket_3189_void_is_not_a_named_type_miss() {
 }
 
 /// The named-mixin-application head (`class C = (int, int) with M;`) takes the
-/// same extends face (`endNamedMixinApplication`, ast_builder.dart:2524).
+/// same extends face (`endNamedMixinApplication`, `ast_builder.dart:2524`).
 #[test]
 fn ticket_3189_named_mixin_application_head() {
     let parsed = parse("class C = (int, int) with M;\n");

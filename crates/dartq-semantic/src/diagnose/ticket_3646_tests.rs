@@ -22,6 +22,7 @@
 //! oracle's message and span) and the forward-reference control (a local
 //! variable read before its declaration is never rescued).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::diagnose::test_rig::report_ops;
 

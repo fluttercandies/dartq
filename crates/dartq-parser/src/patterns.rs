@@ -11,6 +11,7 @@
 //! construction); with the feature off the entry points report
 //! `experiment_not_enabled` and consume nothing.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind};
 
 use crate::expr_const::SELECTOR_PRECEDENCE;
@@ -245,7 +246,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// `const` keyword through the operand (`final (o.f) = v;` anchors at
     /// `o.f`, `final (const c) = c;` at `const c`; the enclosing
     /// parenthesized/list/record container adds no row of its own — oracle
-    /// probes, pinned in the semantic crate's ticket_2231 suite). Matching
+    /// probes, pinned in the semantic crate's `ticket_2231` suite). Matching
     /// contexts (switch cases, if-case) are refutable and stay silent.
     fn report_refutable_constant_pattern(
         &mut self,

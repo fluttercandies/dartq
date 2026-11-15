@@ -33,6 +33,7 @@
 //! Oracle rows: dart 3.13.7 (`dart analyze --format=machine`) over the
 //! fixtures below — verbatim messages pinned where they are the verdict.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// The `const_eval_throws_exception` rows of `source`'s report, in source
@@ -284,9 +285,7 @@ fn all_silent_fixtures_report_zero_throws_rows() {
     ] {
         let report = report_ops(fixture);
         assert!(
-            !code_names(&report)
-                .iter()
-                .any(|name| *name == "const_eval_throws_exception"),
+            !code_names(&report).contains(&"const_eval_throws_exception"),
             "{fixture:?} reported {:?}",
             code_names(&report)
         );

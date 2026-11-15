@@ -15,9 +15,9 @@
 //! occurrence reports at its own label span, keeping the FIRST occurrence
 //! as the `The first ` context anchor. The type-annotation side's walk
 //! lives in `check_record_type_field_names`
-//! (diagnose/engine_core.rs:3228) — same span contract through
+//! (`diagnose/engine_core.rs:3228`) — same span contract through
 //! `check_record_field_name`'s sibling path — **ROUTED to #4129**
-//! (engine_core.rs is that ticket's reserved file; this lane's
+//! (`engine_core.rs` is that ticket's reserved file; this lane's
 //! editable-side contribution is the `SemanticCode::DuplicateFieldName`
 //! variant + message/correction arms in codes.rs).
 //!
@@ -42,6 +42,7 @@
 //! **TREE-FIXED**: the mechanism already lands these rows; the pins below
 //! guard the oracle-verified spans.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{report_ops_bare, rows};
 
@@ -141,7 +142,7 @@ fn record_literal_triple_duplicate_reports_each_later_occurrence() {
 /// `({int x, int x})` — the type-annotation side's twin. Oracle
 /// `DUPLICATE_FIELD_NAME …|1|21|1`. **ROUTED**: the type-side walk's
 /// natural home is `check_record_type_field_names`
-/// (diagnose/engine_core.rs:3228) — #4129's reserved file — so the
+/// (`diagnose/engine_core.rs:3228`) — #4129's reserved file — so the
 /// emission itself is not this lane's to land; the `SemanticCode`
 /// variant + message/correction arms in codes.rs are the editable-side
 /// companion this lane owns.

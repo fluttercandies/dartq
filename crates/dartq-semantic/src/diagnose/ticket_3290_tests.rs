@@ -14,6 +14,7 @@
 //! site whose bit is false. The pins below hold the enum posture silent and
 //! re-assert the class faces the gate owns.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 

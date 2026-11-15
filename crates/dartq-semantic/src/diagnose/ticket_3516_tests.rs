@@ -29,6 +29,7 @@
 //! and the fragments in a real `part`/`part of` pair); each pin names the
 //! verdict it encodes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops_augment_intro_experiments, rows};
 
 /// One two-unit fixture with the `augmentations` experiment enabled,
@@ -188,8 +189,7 @@ fn a_name_in_neither_unit_still_reports() {
         reported
             .iter()
             .any(|row| row.contains("undefined_identifier") && row.contains("'nowhere'")),
-        "{:#?}",
-        reported
+        "{reported:#?}"
     );
     assert_eq!(
         code_names(&report)
@@ -197,8 +197,7 @@ fn a_name_in_neither_unit_still_reports() {
             .filter(|name| name.starts_with("undefined_"))
             .count(),
         1,
-        "{:#?}",
-        reported
+        "{reported:#?}"
     );
 }
 

@@ -38,6 +38,7 @@
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs`
 //! is a live-lane file out of this ticket's write scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::Path;
 
 use dartq_flow::ty::{Base, Classification, Ty as FlowTy, TypeOps};

@@ -3,7 +3,7 @@
 //!
 //! Upstream anchors (Dart SDK 3.13.7, the pinned oracle):
 //!
-//! * `_mixinDeclaration` (pkg/analyzer/lib/src/summary2/types_builder.dart
+//! * `_mixinDeclaration` (`pkg/analyzer/lib/src/summary2/types_builder.dart`
 //!   :371-384): every fragment's `onClause.superclassConstraints` APPENDS to
 //!   the element's `superclassConstraints` — an `augment mixin M on X` adds
 //!   `X` to the merged constraint set, it never replaces and is never
@@ -20,6 +20,7 @@
 //!   checks `M` at index 0 of ITS OWN clause (the prior-mixin probe reads
 //!   `enclosingClass.mixins[0..0]`, never a sibling fragment's entries).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, report_ops_augment};
 
 const NOT_IMPLEMENTED: &str = "mixin_application_not_implemented_interface";
@@ -53,7 +54,7 @@ fn offset_of(source: &str, needle: &str) -> u32 {
 /// raw per-file row — instead of the merged element face
 /// (`library::resolve_container` / `ElementIndex::element_face`). A
 /// fragment-unit row has no `superclass`, so it probes `Object` and mints
-/// the extra row. Owning layer: enum_verifier.rs (the check must read the
+/// the extra row. Owning layer: `enum_verifier.rs` (the check must read the
 /// merged face while iterating each fragment's own `with` list).
 #[test]
 #[ignore = "enum_verifier.rs verify_mixin_application reads the raw unit row, not the merged element face — owning layer outside this ticket's scope"]
@@ -98,7 +99,7 @@ fn augment_mixin_on_appends_constraint() {
 /// prior mixin `M1` (`enclosingClass.mixins[0..1]`), where upstream walks
 /// the augment fragment's own `withClause` at index 0 (`mixins[0..0]`).
 /// Owning layer: a per-fragment `with` list in the model plus
-/// enum_verifier.rs iterating it — the same merged-context fix as the
+/// `enum_verifier.rs` iterating it — the same merged-context fix as the
 /// cross-unit arm above.
 #[test]
 #[ignore = "fragment-local with index needs a per-fragment clause list in the model + enum_verifier iteration — owning layer outside this ticket's scope"]

@@ -32,6 +32,7 @@
 //! outside this module's files; the cluster table for both codes ships
 //! with the ticket.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops;
 
 /// Whether the fixture reports `body_might_complete_normally` at all —

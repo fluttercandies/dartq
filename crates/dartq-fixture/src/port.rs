@@ -32,6 +32,7 @@
 //! all); the analyzed file block is written first, the `newFile` support
 //! blocks after.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_language::LanguageVersion;
 
 /// One ported case: the verbatim marked body of the analyzed unit plus its
@@ -209,7 +210,7 @@ fn port_body(body: &str, rule: &str, name: &str) -> BodyWalk {
             };
         }
         let offset = cursor + (rest.len() - trimmed.len());
-        if trimmed.starts_with("}") {
+        if trimmed.starts_with('}') {
             // The method's own closing brace: body complete.
             return BodyWalk {
                 consumed: offset,

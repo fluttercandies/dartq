@@ -24,11 +24,12 @@
 //! # The contract
 //!
 //! Upstream Dart SDK source: pkg/analyzer/lib/src/dart/constant/
-//! constant_verifier.dart (the pass and its gate),
-//! pkg/_fe_analyzer_shared/lib/src/exhaustiveness/{shared,types}.dart (the
+//! `constant_verifier.dart` (the pass and its gate),
+//! pkg/_`fe_analyzer_shared/lib/src/exhaustiveness/{shared,types}.dart` (the
 //! spaces and the witness text), and pkg/analyzer/messages.yaml (the
 //! templates).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, report_ops_bare};
 
 /// The covering rows of `report` as `message` texts, in source order. The
@@ -139,7 +140,7 @@ fn sealed_split_carries_the_scrutinee_instantiation() {
 /// A map pattern cannot prove coverage (a map may carry extra keys), so the
 /// gap witnesses the scrutinee's own static type with the property column
 /// its pattern constrained at the column's static type
-/// (`Map<bool, bool>(length: int())`, co19 exhaustiveness_map_A01_t02; the
+/// (`Map<bool, bool>(length: int())`, co19 `exhaustiveness_map_A01_t02`; the
 /// arguments ride the display, static_type.dart:214-239).
 ///
 /// Baseline (pre-fix): the relational field degraded the whole pattern to

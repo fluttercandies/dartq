@@ -13,6 +13,7 @@
 //! it cannot discriminate by itself). Each fixture was probed against
 //! oracle `dart analyze` (fvm default).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

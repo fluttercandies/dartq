@@ -14,6 +14,7 @@
 //! [`CORE_PRELUDE`] (pure ASCII, so its byte length is its UTF-16 length);
 //! all expected offsets are `PRELUDE + <in-fixture units>`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::{Diagnostic, FileReport};
 

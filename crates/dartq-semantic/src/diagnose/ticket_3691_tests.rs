@@ -14,6 +14,7 @@
 //! Each pin carries the oracle's verdict for the same fixture
 //! (`dart analyze` 3.13.7).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 
 /// `report_ops` mounts [`CORE_PRELUDE`] ahead of the fixture — every

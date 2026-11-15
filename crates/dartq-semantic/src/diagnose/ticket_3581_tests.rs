@@ -9,21 +9,22 @@
 //! (an annotation site) re-checks the inverted type — `replaceTopAndBottom`
 //! — with `invertedSubstitution = Substitution.fromPairs2(typeParameters,
 //! invertedTypeArguments)` (pkg/analyzer/lib/src/error/
-//! type_arguments_verifier.dart), reporting the inverted argument against
+//! `type_arguments_verifier.dart`), reporting the inverted argument against
 //! the bound substituted by the inverted arguments. The alias face takes
 //! the same route (`TypeBoundedHelper._isSuperBounded` →
 //! `_isRegularBounded(invertedType)`, pkg/analyzer/lib/src/dart/element/
-//! well_bounded.dart). The inversion is variance-directed over an alias
+//! `well_bounded.dart`). The inversion is variance-directed over an alias
 //! head: a parameter the alias body uses contravariantly (`X Function(Y)`'s
 //! `Y`) flips `Never` to `Object?`, a covariant one flips `dynamic` to
 //! `Never` (`ReplaceTopBottomVisitor._instantiatedTypeAlias`,
-//! pkg/analyzer/lib/src/dart/element/replace_top_bottom_visitor.dart).
+//! `pkg/analyzer/lib/src/dart/element/replace_top_bottom_visitor.dart`).
 //!
 //! The rows below are the oracle's own on the co19 instantiate-to-bound
 //! typedef suite (`typedef_l2_01_t01`, `typedef_l2_02_t01`,
 //! `typedef_l2_06_t01`, the `test(G g)` annotation), quoted verbatim from
 //! `conformance/expected.tsv`; every expectation is the full row set.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 
 /// `typedef G<X extends A<X>, Y extends A<Y>> = X Function(Y)` raw: the

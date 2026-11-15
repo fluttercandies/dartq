@@ -22,6 +22,7 @@
 //! visited); and a host-declared private used only in the part stays
 //! silent while a genuinely unused one reports.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::model::FileElements;
@@ -360,7 +361,7 @@ void f(C c) {
     assert!(unused_element_rows(source).is_empty(), "{source:?}");
 }
 
-/// The unnamed-extension self-use shape (the ffi_verifier.dart census
+/// The unnamed-extension self-use shape (the `ffi_verifier.dart` census
 /// cluster): a getter referenced bare inside a sibling getter of the same
 /// unnamed extension is used — the nameless container's face key carries
 /// the credit the consume loop checks.
@@ -381,7 +382,7 @@ void f(Annotation a) {
     assert!(unused_element_rows(source).is_empty(), "{source:?}");
 }
 
-/// The class-member self-use guard (the bundle_writer.dart census row's
+/// The class-member self-use guard (the `bundle_writer.dart` census row's
 /// shape): a private method referenced only through a bare in-class call
 /// stays spared through the name-level element pool — the derivation must
 /// not disturb the non-extension path.

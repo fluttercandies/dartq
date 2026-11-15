@@ -42,6 +42,7 @@
 //! order, `--fail-fast`, `--experimental-faster-testing`, and malformed
 //! arguments.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::borrow::Cow;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -209,10 +210,10 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     // The tool resolves packages before running unless they are up to date
     // (and prints what it did); only an up-to-date resolution is
     // reproduced here, so no shard ever resolves.
-    if !inv.no_pub {
-        if let Some(reason) = stale_resolution(&root, &flutter) {
-            return delegate_with(&line, true, reason);
-        }
+    if !inv.no_pub
+        && let Some(reason) = stale_resolution(&root, &flutter)
+    {
+        return delegate_with(&line, true, reason);
     }
     let workers = inv.concurrency.or(config.concurrency).unwrap_or_else(|| {
         // This runner's default: three quarters of the cores, at least
@@ -646,11 +647,12 @@ fn execute(
              -> io::Result<()> {
                 while let Ok((index, block)) = stock_rx.try_recv() {
                     stats.ran += 1;
-                    if complete(&block) && tally(&block.events).green {
-                        if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
-                            cache.stage(key, &block.events)?;
-                            staged.insert(index, key.to_owned());
-                        }
+                    if complete(&block)
+                        && tally(&block.events).green
+                        && let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref())
+                    {
+                        cache.stage(key, &block.events)?;
+                        staged.insert(index, key.to_owned());
                     }
                     slots[index] = Some(block.events);
                 }
@@ -712,13 +714,12 @@ fn execute(
                         // Stage only green verdicts — a sharded suite's red
                         // verdict is delivered too (it must not rerun stock),
                         // and a cached red would replay a failure as fact.
-                        if tally(&block.events).green {
-                            if let (Some(cache), Some(key)) =
+                        if tally(&block.events).green
+                            && let (Some(cache), Some(key)) =
                                 (cache.as_mut(), keys[index].as_deref())
-                            {
-                                cache.stage(key, &block.events)?;
-                                staged.insert(index, key.to_owned());
-                            }
+                        {
+                            cache.stage(key, &block.events)?;
+                            staged.insert(index, key.to_owned());
                         }
                         slots[index] = Some(block.events);
                         emit(&mut slots, &mut outputs, &mut totals)
@@ -773,11 +774,12 @@ fn execute(
             &mut |index, block| {
                 stats.ran += 1;
                 verdicts[index] = Some(SuiteVerdict::Stock);
-                if complete(&block) && tally(&block.events).green {
-                    if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
-                        cache.stage(key, &block.events)?;
-                        staged.insert(index, key.to_owned());
-                    }
+                if complete(&block)
+                    && tally(&block.events).green
+                    && let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref())
+                {
+                    cache.stage(key, &block.events)?;
+                    staged.insert(index, key.to_owned());
                 }
                 slots[index] = Some(block.events);
                 emit(&mut slots, &mut outputs, &mut totals)
@@ -942,7 +944,7 @@ fn stale_resolution(root: &Path, flutter: &Path) -> Option<&'static str> {
     let Some(recorded) = recorded else {
         return Some("no Flutter resolution stamp — run flutter pub get");
     };
-    if !framework_version(flutter).is_some_and(|version| version == recorded) {
+    if framework_version(flutter).is_none_or(|version| version != recorded) {
         return Some("the resolution is from another Flutter — run flutter pub get");
     }
     if pubspec < lock && pubspec < config_time {
@@ -1341,7 +1343,7 @@ fn grouped_pass(
             next
         });
     }
-    let digests = dartq_test::flutter::closure_digests(root, &sdk, &seeds).unwrap_or_default();
+    let digests = dartq_test::flutter::closure_digests(root, sdk, &seeds).unwrap_or_default();
     // Intra-suite sharding (opt-in): a suite whose own file attests
     // `// dartq: shardable` and whose recorded span clears the floor runs
     // as two rows with complementary selections of its top-level entries.

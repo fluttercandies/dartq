@@ -92,7 +92,7 @@ fn check(c: &mut Check<'_>) {
             operand_end = Some(c.utf16_span(pieces[pos]).end);
         }
         let inner = c.collect_direct(pieces[pos]);
-        pieces.splice(pos..pos + 1, inner);
+        pieces.splice(pos..=pos, inner);
     }
     // `node.operand.unParenthesized` is a property access (:50-55): the
     // operand's tail is its access marker (`!(a || b)` carries none).

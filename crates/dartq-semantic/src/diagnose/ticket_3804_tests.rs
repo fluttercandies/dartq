@@ -34,6 +34,7 @@
 //! non-function path, where no signature binder exists and the covariant
 //! seed must survive untouched.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows, types_for};
 use dartq_types::UninternedType;
 

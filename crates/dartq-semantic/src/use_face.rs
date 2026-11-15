@@ -25,6 +25,7 @@
 //! already kept. Faces accumulate per library and are released at close —
 //! per-library maps, no unbounded growth.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_resolution::LibraryId;
 use dartq_source::{FileId, SourceRange, StringId};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -48,7 +49,7 @@ pub struct UnitUseFace {
     pub annotations: FxHashSet<StringId>,
     /// Extension members an implicit application resolved to (the official
     /// `usedElements.members` — an ELEMENT set): `(declaring file, index of
-    /// the face in that file's `extension_faces()`, member spelling)`. The
+    /// the face in that file's ``extension_faces()``, member spelling)`. The
     /// element key keeps the oracle's `identical(element.library)` gate at
     /// the library close: a resolved application credits the exact face it
     /// bound to — same-spelled members of sibling extensions, or of an
@@ -97,7 +98,7 @@ pub struct ExportUseFace {
     /// The whole directive's span (`export` keyword start → `;` end) —
     /// the `deprecated_member_use` face's anchor (upstream
     /// `element_usage_detector.dart:256`, `usageRange: node.sourceRange` =
-    /// the ExportDirective, not the URI literal). Zero-length when the
+    /// the `ExportDirective`, not the URI literal). Zero-length when the
     /// capture never ran (a `default()` face built outside the listener).
     pub directive_range: SourceRange,
 }

@@ -1,6 +1,6 @@
 //! Ticket #3212 — F4 recovery-position family pins. One positive + one
 //! negative per repaired recovery arm, each frozen to the oracle 3.13.7 row
-//! (`dart analyze --format=json` on the upstream partial_code source with
+//! (`dart analyze --format=json` on the upstream `partial_code` source with
 //! the `//`-marker expectation lines stripped — they are the test DSL, not
 //! source):
 //!
@@ -29,6 +29,7 @@
 //! * `catch (e, <junk>` — `CatchParameterIdentifierContext.ensureIdentifier`
 //!   (:33-44) reports `catchSyntax` and consumes non-keyword junk in doubt.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;

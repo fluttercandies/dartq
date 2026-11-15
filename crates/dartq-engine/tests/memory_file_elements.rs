@@ -12,7 +12,11 @@
 //!
 //! Run: `cargo test -p dartq-engine --test memory_file_elements -- --nocapture`
 
-#![allow(clippy::cast_possible_truncation)] // measurement math only
+#![allow(
+    clippy::useless_conversion,
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)] // measurement math only
 #![allow(clippy::cast_precision_loss)] // byte counts are far below 2^52
 
 mod common;
@@ -74,10 +78,10 @@ fn file_elements_bytes(elements: &FileElements) -> usize {
     }
     for (_, container) in elements.containers() {
         bytes += size_of::<StringId>();
-        for (_, entry) in container.members.iter() {
+        for (_, entry) in &container.members {
             bytes += size_of::<StringId>() + member_bytes(entry);
         }
-        for (_, formals) in container.ctor_formals.iter() {
+        for (_, formals) in &container.ctor_formals {
             bytes += size_of::<StringId>() + formals_bytes(formals);
         }
         bytes += (container.with_clause.len()
@@ -92,7 +96,7 @@ fn file_elements_bytes(elements: &FileElements) -> usize {
     }
     for face in elements.extension_faces() {
         bytes += size_of::<ExtensionFace>();
-        for (_, entry) in face.members.iter() {
+        for (_, entry) in &face.members {
             bytes += size_of::<StringId>() + member_bytes(entry);
         }
     }

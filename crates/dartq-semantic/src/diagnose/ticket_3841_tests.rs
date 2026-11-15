@@ -22,6 +22,7 @@
 //!   `applicableTo` subtypes `T` via `bound(T)`, so `t + t` inside
 //!   `A<T extends C?>` resolves `extension on C?`'s `operator +` and the
 //!   oracle reports nothing.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use crate::diagnose::test_rig::report_ops;
 use crate::diagnose::types::FileReport;
@@ -71,7 +72,7 @@ fn ticket_3841_undefined_bare_operand_reports_no_unchecked_row() {
 /// The staged-promotion variant of the same face: `x is String?` writes a
 /// `String?` promotion the oracle never builds — upstream `x` is
 /// `InvalidType`, and the `is`-tested branch's `x + 1` operand inherits
-/// that face (InvalidType is not promoted).
+/// that face (`InvalidType` is not promoted).
 ///
 /// Probed 3.13.7 (the `parser/generated` `test_is_nullable*` family):
 /// `UNDEFINED_IDENTIFIER` on each `x`, `dead_code` on `z`, zero
@@ -89,7 +90,7 @@ fn ticket_3841_is_tested_undefined_operand_stays_invalid() {
     );
 }
 
-/// A parameter declared `X?` over an unresolvable `X` is InvalidType —
+/// A parameter declared `X?` over an unresolvable `X` is `InvalidType` —
 /// the `TypeUse` verdict's `Missing` head — so `x + bar(7)` reports the
 /// `undefined_*` rows alone (the `NNBDParserTest::test_assignment_complex`
 /// shape).
@@ -135,9 +136,9 @@ fn ticket_3841_defined_nullable_operand_still_reports() {
     );
 }
 
-/// The member-tail InvalidType face: `x.y + 1` where `x` resolves to
+/// The member-tail `InvalidType` face: `x.y + 1` where `x` resolves to
 /// nothing types the read `InvalidType` upstream (the resolver never
-/// runs the member lookup on the InvalidType receiver).
+/// runs the member lookup on the `InvalidType` receiver).
 ///
 /// Probed 3.13.7: `undefined_identifier` on `x`, zero
 /// `UNCHECKED_USE_OF_NULLABLE_VALUE` rows.
@@ -259,7 +260,7 @@ fn ticket_3841_parameter_bound_satisfies_nullable_on_clause() {
     );
 }
 
-/// The bound chain's InvalidType face: `T extends X?` over an
+/// The bound chain's `InvalidType` face: `T extends X?` over an
 /// unresolvable `X` is invalid-bounded upstream
 /// (`isInvalidBounded`'s `TypeParameterTypeImpl` arm), so `t + t` keeps
 /// the under-report posture.

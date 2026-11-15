@@ -43,6 +43,7 @@
 //!   checked against the expected identifier — a file that drifted since
 //!   the analysis refuses instead of corrupting.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 
 use dartq_diagnostics::FileLayoutProvider as _;
@@ -173,7 +174,7 @@ pub fn rename<'a>(
     if !is_legal_new_name(new_name) {
         return Err(RenameError::IllegalName(new_name.to_owned()));
     }
-    let _ = prelude(engine)?;
+    let () = prelude(engine)?;
     plan(engine, target, anchor)
 }
 

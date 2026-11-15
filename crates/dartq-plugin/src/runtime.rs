@@ -84,6 +84,7 @@
 //! - `feed` skips unknown [`FileId`]s (a caller-contract violation, same
 //!   posture as `FileLayoutProvider`) rather than failing a whole batch.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;

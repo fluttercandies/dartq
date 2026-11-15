@@ -28,6 +28,7 @@
 //! keeps the module inside the `diagnose` subtree so
 //! `crate::diagnose::test_rig` resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{report_ops_bare, rows};
 
@@ -143,7 +144,7 @@ class B extends A { int m(int a) => 0; }
 /// contravariant), so the intermediate class's interface map carries `J.m`
 /// and the subclass's row anchors there.
 #[test]
-fn twoInterfaces_cohort_anchors_at_the_widest_parameter_face() {
+fn two_interfaces_cohort_anchors_at_the_widest_parameter_face() {
     let report = report_ops_bare(
         "\
 abstract class I { m(int n); }

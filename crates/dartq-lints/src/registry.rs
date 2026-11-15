@@ -12,6 +12,7 @@
 //! follow the SDK's `RemovedAnalysisRule` registrations (the rules.json
 //! `removed` state).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use dartq_ast::NodeKind;
@@ -559,8 +560,8 @@ fn assert_startup_consistency(rules: &[&'static RuleSpec]) {
         .filter_map(|pair| (pair[0] == pair[1]).then_some(pair[0]))
         .collect();
 
-    fn unresolved<'a>(
-        rules: &'a [&'static RuleSpec],
+    fn unresolved(
+        rules: &[&'static RuleSpec],
         names: impl Iterator<Item = &'static str>,
     ) -> Vec<&'static str> {
         names
@@ -865,7 +866,6 @@ const RUN_EPILOGUE_SEAM: &[&str] = &["unnecessary_ignore"];
 /// frozen lint-gate universe's governance pin (`tests/registry_pin.rs`,
 /// the `lint_codes.txt` freeze) and the harness fixture-coverage pin's
 /// live lint tier — so the seams are restated nowhere else.
-#[must_use]
 pub fn emittable_rule_names() -> impl Iterator<Item = &'static str> {
     rules()
         .iter()

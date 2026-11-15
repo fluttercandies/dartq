@@ -5,6 +5,7 @@
 //! JSON writer still prints the bare `{"version":1,"diagnostics":[]}` line —
 //! both matching the oracle (only the human-readable default differs).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::borrow::Cow;
 use std::io::{self, Write};
 

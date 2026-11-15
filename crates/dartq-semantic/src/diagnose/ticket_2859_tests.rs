@@ -8,6 +8,7 @@
 //! (the element-leaf least type, the closure's dynamic columns) carry
 //! over unchanged.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops;
 use crate::diagnose::types::FileReport;
 
@@ -23,7 +24,7 @@ fn type_check_rows(report: &FileReport) -> Vec<(u32, u32)> {
     found
 }
 
-/// —— the set literal initializer ——
+// —— the set literal initializer ——
 
 /// `var x = {1, 2, 3}; x is Set<int>` (the co19 `set_literals_A02_t01`
 /// shape): the declaration infers `Set<int>`, and the later is-check
@@ -97,7 +98,7 @@ fn const_set_initializer_reports() {
     );
 }
 
-/// —— the list and map initializers ——
+// —— the list and map initializers ——
 
 /// `var x = [1, 2]; x is List<int>`: the drained list leaves' faces
 /// infer the element argument.
@@ -169,7 +170,7 @@ fn empty_braces_initializer_not_set() {
     );
 }
 
-/// —— the leaf conventions ——
+// —— the leaf conventions ——
 
 /// `int` mixed with `double` lifts to `num`: `x is Set<num>` folds.
 #[test]
@@ -204,7 +205,7 @@ fn lifted_num_refuses_int() {
     );
 }
 
-/// —— the closure initializer ——
+// —— the closure initializer ——
 
 /// `var f = (int x) {}; f is void Function(int)`: the written formal
 /// rides the parameter column, the contravariant leg folds.
@@ -279,7 +280,7 @@ fn arrow_initializer_reports_the_decided_check() {
     );
 }
 
-/// —— the annotated initializer stays exact ——
+// —— the annotated initializer stays exact ——
 
 /// `Set<int> x = {1}; x is Set<int>` folds through the written
 /// declaration type, and `x is Set<String>` refuses — the annotated
@@ -311,7 +312,7 @@ fn annotated_initializer_stays_exact() {
     );
 }
 
-/// —— the inference window ——
+// —— the inference window ——
 
 /// A declarator without an initializer stays unknown: `var x; x is
 /// Set<int>` is a real runtime question.

@@ -14,6 +14,7 @@
 //! unchecked-nullable census cluster 5 (431 fail rows; the operator and
 //! function texts verbatim from the oracle side of the conformance diff).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// The single unchecked row of `source` as `(offset, length, message,
@@ -68,7 +69,7 @@ fn property_access_reports_the_property_variant() {
 
 /// A nullable function-typed expression invoked bare reports the function
 /// text with the null-check correction (messages.yaml
-/// `uncheckedInvocationOfNullableValue` — the FunctionExpressionInvocation
+/// `uncheckedInvocationOfNullableValue` — the `FunctionExpressionInvocation`
 /// arm; the census's `Never?` tear-off rows).
 #[test]
 fn function_invocation_reports_the_function_variant() {
@@ -111,7 +112,7 @@ fn method_invocation_reports_the_method_variant() {
 
 /// A binary operator applied to a nullable operand reports the operator
 /// text with the null-check correction (messages.yaml
-/// `uncheckedOperatorInvocationOfNullableValue` — the BinaryExpression
+/// `uncheckedOperatorInvocationOfNullableValue` — the `BinaryExpression`
 /// arm; the census's `nullable_operator_call_error_test` rows).
 #[test]
 fn binary_operator_reports_the_operator_variant() {

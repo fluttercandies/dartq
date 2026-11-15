@@ -9,6 +9,7 @@
 //! mtime: a touched but unchanged file keeps its key, and an edited
 //! file with a forged mtime still changes it.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -62,7 +63,7 @@ pub fn flutter_root(flutter_bin: &Path) -> Result<PathBuf> {
 }
 
 /// Fingerprints the flutter toolchain at `flutter_root`, reading the
-/// flutter_tools 3.47.1 layout:
+/// `flutter_tools` 3.47.1 layout:
 ///
 /// * `engine_revision`: `bin/cache/engine-dart-sdk.stamp` (trimmed);
 /// * `flutter_version`: `frameworkVersion` of
@@ -109,7 +110,7 @@ pub fn fingerprint_toolchain(flutter_root: &Path) -> Result<ToolchainFingerprint
 /// every other define stays, read or not, so the key stays conservative
 /// (deduplication belongs to the blob layer, never to the key).
 ///
-/// flutter_tools 3.47.1 injects `FLUTTER_GIT_URL` from the SDK checkout's
+/// `flutter_tools` 3.47.1 injects `FLUTTER_GIT_URL` from the SDK checkout's
 /// remote (`repositoryUrl` of `bin/cache/flutter.version.json`), so it is
 /// constant for one SDK install. It is still compiled into the kernel as
 /// the `FlutterVersion.gitUrl` constant: a hit can carry another install's
@@ -138,7 +139,7 @@ pub fn filter_defines(raw: &BTreeMap<String, String>) -> BTreeMap<String, String
 /// Safety of the coarseness: whatever the config key cannot see is
 /// caught where flutter itself catches it — every build re-validates
 /// the recorded input hashes of a build dir (stamps, `.filecache`) and
-/// rebuilds on mismatch, and frontend_server invalidates a stale
+/// rebuilds on mismatch, and `frontend_server` invalidates a stale
 /// initialize-from-dill kernel. That delegation is sound for a
 /// replayed dir because the replay rules guarantee the recorded paths
 /// resolve identically in the target tree: worktree-root paths are

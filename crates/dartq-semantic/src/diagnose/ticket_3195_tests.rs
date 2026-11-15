@@ -26,6 +26,7 @@
 //! never fires even at `@dart=3.10` where the flag is provably off
 //! (`class A(int x)` reports `experiment_not_enabled` there).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, report_ops_bare};
 use crate::FileReport;
 

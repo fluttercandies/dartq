@@ -29,6 +29,7 @@
 //! (declaration order, bounds with their written arguments) in
 //! `fn_capture_end`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 use crate::model::{ArgPool, Ty};

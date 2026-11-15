@@ -22,6 +22,7 @@
 //! incompatible axes are the answer's data, not a failure — 64 usage, 4
 //! internal.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 

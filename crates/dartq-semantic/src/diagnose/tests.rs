@@ -1,3 +1,5 @@
+#![allow(clippy::assert_is_empty)]
+
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -644,7 +646,7 @@ fn null_check_promotion_cleans_the_branch_assignment() {
 }
 
 /// The why-not-promoted context (#1877): a write-demotion shape rides
-/// the invalid_assignment row — "Variable 'x' could not be promoted due
+/// the `invalid_assignment` row — "Variable 'x' could not be promoted due
 /// to an assignment" anchored at the demoting write expression (the
 /// official `DemoteViaExplicitWrite.node`, upstream Dart SDK source,
 /// pkg/analyzer/lib/src/dart/resolver/type_analyzer.dart:6180-6193).
@@ -774,7 +776,7 @@ fn promotion_over_written_args_local_cleans_the_promoted_branch() {
 
 /// The conversion's drop rule at the seam: `void` never stages (a `void`
 /// promotion cannot arise, `tryPromoteToType` only subtype-narrows,
-/// type_system.dart:1729); `Never` stages its spelled type — non-null
+/// `type_system.dart:1729`); `Never` stages its spelled type — non-null
 /// `Never`, nullable `Null` — because the staged-check join reads it
 /// (`receiver_of_type_never` first, and `Never <: T` vacuously cleans
 /// every assignability face, subtype.dart Right Bottom); the other special
@@ -1015,7 +1017,7 @@ fn shown_name_on_broken_import_still_reports_annotation() {
 }
 
 /// A dead supertype edge (undefined, ambiguous, or non-class spelling —
-/// the oracle's InvalidType) contributes nothing to the member
+/// the oracle's `InvalidType`) contributes nothing to the member
 /// interface: the class's own declarations are the whole face, so
 /// instance misses report (`undefined_method`, `undefined_getter`,
 /// `undefined_identifier`). An own member stays silent.
@@ -1060,7 +1062,7 @@ fn dead_super_formals_report_unassociated() {
         "class C extends Missing {\n  C({required super.code, super.a});\n}\nclass D extends Missing {\n  D(super.b);\n}",
     );
     let mut names = code_names(&report);
-    names.sort();
+    names.sort_unstable();
     assert_eq!(
         names,
         [
@@ -1075,7 +1077,7 @@ fn dead_super_formals_report_unassociated() {
 
 /// An undefined `is` operand reports `type_test_with_undefined_name` at
 /// the operand name; an undefined `as` operand reports
-/// `cast_to_non_type` (error_verifier.dart `visitIsExpression` /
+/// `cast_to_non_type` (`error_verifier.dart` `visitIsExpression` /
 /// `visitAsExpression`). The dedicated codes replace the resolver's
 /// `undefined_class` at the operand position — the CLI pipeline (with
 /// the SDK import face) keeps the operand silent there, probed
@@ -1256,7 +1258,7 @@ fn recovered_initializer_lhs_stays_silent() {
 }
 
 /// `super()` followed by a selector (`super().foo`, the
-/// invalid_super_in_initializer fixture) is recovery residue: the
+/// `invalid_super_in_initializer` fixture) is recovery residue: the
 /// oracle reports only the parser's `invalid_super_in_initializer` —
 /// no `undefined_constructor_in_initializer` mis-fire on the trailing
 /// selector.
@@ -1294,7 +1296,7 @@ fn super_field_initializer_is_not_a_constructor_reference() {
 }
 
 /// `this()` followed by a selector (`this().foo`, the
-/// invalid_this_in_initializer fixture) is recovery residue: the
+/// `invalid_this_in_initializer` fixture) is recovery residue: the
 /// parser's `invalid_this_in_initializer` at `this`, plus the
 /// verifier's `recursive_constructor_redirect` at `this()` (the
 /// self-redirect participates in a cycle of one) — the trailing
@@ -1320,7 +1322,7 @@ fn this_invocation_selector_residue_drops_the_member_face() {
 /// enclosing class's *constructor* table
 /// (`RedirectingConstructorInvocation`) — a declared `C.other` is no
 /// `undefined_method`; a missing target reports nothing upstream either
-/// (element_resolver.dart defers the report).
+/// (`element_resolver.dart` defers the report).
 #[test]
 fn redirecting_initializer_resolves_against_the_constructor_table() {
     let report = report("class C { C() : this.other() {} C.other(); }");
@@ -1331,7 +1333,7 @@ fn redirecting_initializer_resolves_against_the_constructor_table() {
 /// non-assignable field initializer codes
 /// `field_initializer_not_assignable` at the initializer expression —
 /// even under a misnamed constructor, whose own face stays
-/// `invalid_constructor_name` (the parser's, capture: issue_41121
+/// `invalid_constructor_name` (the parser's, capture: `issue_41121`
 /// L23/L27) — never the plain `invalid_assignment`. `int` is modeled
 /// concretely (the harness has no core names).
 ///
@@ -1356,34 +1358,34 @@ fn initializer_assignment_suppresses_the_plain_assignment_check() {
 // —— F-B: `new` as an identifier — the invocation/tear-off faces ————
 
 /// A qualified creation head (`prefix.C` of `const prefix.C.new()`)
-/// resolves as a prefixed NamedType: the dead prefix reports
+/// resolves as a prefixed `NamedType`: the dead prefix reports
 /// `undefined_identifier` over the written `prefix.C` span — never the
-/// creation-head type-miss a bare head carries (named_type_resolver's
+/// creation-head type-miss a bare head carries (`named_type_resolver`'s
 /// importPrefix face; the prefix bail returns before any argument
 /// resolution, so the `<int>` group adds no row). The
 /// parameterized-oracle probe q3 parses `prefix.C<int>.new()` as the
 /// plain selector chain (the group splits the head from the
-/// continuation — the ast_rewrite's UnqualifiedFunctionInvocation
+/// continuation — the `ast_rewrite`'s `UnqualifiedFunctionInvocation`
 /// shape): the head row plus the `.new` method face on the Invalid
 /// receiver.
 ///
 /// q3 dependency (verified against the current parser, 2026-10-16): the
 /// parser's implicit-creation lookahead (`identifier ('.' identifier)?
 /// '<' typeArguments '.' (identifier|new) '('` — upstream Dart SDK
-/// source, pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart
+/// source, pkg/_`fe_analyzer_shared/lib/src/parser/parser_impl.dart`
 /// :7264-7283) takes the one-dot parameterized form
 /// `prefix.C<int>.new()` into `ConstructorReferenceContext::Implicit`,
 /// so the engine sees one requalified head row where the oracle's
-/// ast_rewrite (the missing `const`/`new` keyword) keeps the selector
+/// `ast_rewrite` (the missing `const`/`new` keyword) keeps the selector
 /// chain. That keyword-less PARAMETERIZED shape stays red until the
-/// parser lands the ast_rewrite form — no semantic-side approximation.
+/// parser lands the `ast_rewrite` form — no semantic-side approximation.
 /// The unparameterized `prefix.C.new()` never enters the probe (no `<`
 /// after the second segment) and already parses as the plain chain —
 /// see `prefixed_invocation_chain_reports_head_then_method`. The
 /// two-segment reference
 /// `const Missing.new()` — the
 /// `.new` riding the qualified rest — makes the type itself the
-/// two-segment NamedType `Missing.new`, so the same importPrefix bail
+/// two-segment `NamedType` `Missing.new`, so the same importPrefix bail
 /// reports `undefined_identifier 'Missing'` over the whole written
 /// head (oracle q4: 1:18 length 11), never the plain-path
 /// `undefined_class`.
@@ -1441,14 +1443,14 @@ fn generic_creation_selector_survives_a_following_plain_chain() {
 /// plain selector chain: the dead head survives the member folds (its
 /// `undefined_identifier` defers) and the `.new()` invocation still
 /// reports — `undefined_method`, the oracle's name=='new' property
-/// lookup on the InvalidType receiver
+/// lookup on the `InvalidType` receiver
 /// (type_property_resolver.dart:78-83 answers `needsGetterError`
 /// before the invalid-receiver silence).
 ///
 /// Parser shape (verified 2026-10-16): `prefix.C.new()` never enters
 /// the implicit-creation lookahead — the probe requires the
 /// `<typeArguments>` group after the second segment (upstream Dart SDK
-/// source, pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart
+/// source, pkg/_`fe_analyzer_shared/lib/src/parser/parser_impl.dart`
 /// :7264-7283) — so the events are the plain dot chain (the `.new`
 /// rides the dot-continuation identifier rewrite) and this pin is the
 /// green half of the q3 probe. The parameterized sibling
@@ -1470,7 +1472,7 @@ fn prefixed_invocation_chain_reports_head_then_method() {
 
 /// The prefixed tear-off (`prefix.C.new`) reports the head and the
 /// `new` getter — the read face of the same name=='new' lookup — and
-/// the chain stops there: the failed `.new` read is InvalidType, whose
+/// the chain stops there: the failed `.new` read is `InvalidType`, whose
 /// property lookups stay silent, so `.toString()` adds no row.
 #[test]
 fn prefixed_tearoff_reports_head_then_new_getter() {
@@ -1517,11 +1519,10 @@ fn redirect_target_head_never_reports_undefined_class() {
     );
     let initializer = report("class C { C.constructor_field_initializer() : this.new = null; }");
     let names = code_names(&initializer);
-    assert!(!names.contains(&"undefined_class"), "{:?}", names);
+    assert!(!names.contains(&"undefined_class"), "{names:?}");
     assert!(
         names.contains(&"expected_identifier_but_got_keyword"),
-        "{:?}",
-        names
+        "{names:?}"
     );
 }
 
@@ -1614,7 +1615,7 @@ fn redirect_to_non_const_constructor_pairs_with_return_type_face() {
 }
 
 /// `redirect_generative_to_non_generative_constructor` —
-/// redirect_generative_to_non_generative_constructor.dart's generative
+/// `redirect_generative_to_non_generative_constructor.dart`'s generative
 /// `W() : this.n();` whose target resolves to the factory `W.n`
 /// (error_verifier.dart:4300-4306, `.at(invocation)` = the whole
 /// `this.n()` node extent); a generative target stays silent.
@@ -1829,7 +1830,7 @@ fn const_pattern_new_reference_is_not_a_getter() {
 /// A constant pattern whose expression fails const-evaluation reports
 /// `constant_pattern_with_non_constant_expression` at the failing
 /// expression (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
-/// constant/constant_verifier.dart `visitConstantPattern` →
+/// `constant/constant_verifier.dart` `visitConstantPattern` →
 /// `_evaluateAndReportError` :128-142; registry row diagnostic.g.dart
 /// :2528-2538). The fixture's offenders — postfix/prefix inc-dec,
 /// `this`, `new Class()`, `await`, an `assert` or a nested `switch`
@@ -1992,7 +1993,7 @@ fn why_not_promoted_assignability_pair_anchors_at_the_expression() {
 /// constructor: when the enum declares none — a recovered `new.named();`
 /// member names a constructor upstream, killing the implicit unnamed
 /// face — the constant reports `undefined_enum_constructor`
-/// (type_analyzer.dart's `visitEnumConstantDeclaration` unnamed arm).
+/// (`type_analyzer.dart`'s `visitEnumConstantDeclaration` unnamed arm).
 /// A declared selector cancels the constant's own question (the
 /// selector's face answers instead), and a named-constructor enum
 /// reports its selector-less constants.
@@ -2028,7 +2029,7 @@ fn enum_constant_reports_the_missing_unnamed_constructor() {
 
 /// A non-augmentation enum whose element list is empty reports
 /// `enum_without_constants` at the name (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/error/error_verifier.dart `checkEnumDeclaration`
+/// `pkg/analyzer/lib/src/error/error_verifier.dart` `checkEnumDeclaration`
 /// — `!isAugmentation && constants.isEmpty` at `node.namePart.typeName`,
 /// registry row diagnostic.g.dart:4966-4974). An enum with constants and
 /// the missing-body recovery shape keep silent on this code's own row.
@@ -2531,7 +2532,7 @@ fn bounds_violation_carries_the_inverted_type_context() {
 /// named_type_resolver.dart:313-330 — `resolveConstructorTypeReference`'s
 /// tail reports `newWithNonType`/`constWithNonType` for a missing or
 /// non-class element; the captured oracle row for the unresolved
-/// `new C(;)` recovery head — the bracket_mismatch_06 corpus case —
+/// `new C(;)` recovery head — the `bracket_mismatch_06` corpus case —
 /// carries the same code).
 ///
 /// Hand-trace: `begin_new_expression` raises `ctor_pos`, so the argument
@@ -3008,9 +3009,9 @@ fn prefixed_invoke_miss_reports_undefined_function() {
 /// while the subtype-requirement row keeps the declaring name (the E1
 /// span parity): the oracle reports the outside-library faces at the
 /// supertype's whole type annotation — `.at(superclass)` and the
-/// written `implements` NamedType, sealed faces `.at(namedType)` — and
+/// written `implements` `NamedType`, sealed faces `.at(namedType)` — and
 /// the subtype requirement at `.at(nameToken)` (upstream Dart SDK
-/// source, pkg/analyzer, error_verifier.dart:5625/:5657/:5927/:7431
+/// source, pkg/analyzer, `error_verifier.dart:5625/:5657/:5927/:7431`
 /// against the `base_or_final_type_verifier` drive's name anchor). One
 /// library declares the modifier faces; the use sites sit in another.
 ///
@@ -3132,14 +3133,13 @@ fn modifier_use_site_rows_anchor_written_entries() {
             // stays silent (no `non_type_as_type_argument`).
             ("invalid_use_of_type_outside_library", 140, 6),
         ],
-        "{:?}",
-        rows
+        "{rows:?}"
     );
 }
 
 /// The `@sealed` contract rows anchor on the whole declaring node: the
 /// oracle reports `.at(node)` (upstream Dart SDK source, pkg/analyzer,
-/// best_practices_verifier.dart:1195/:1202), so the subtype face of a
+/// `best_practices_verifier.dart:1195/:1202`), so the subtype face of a
 /// package:meta `@sealed` supertype spans the use-site declaration from
 /// its first non-metadata token to its close brace — not the declaring
 /// name.
@@ -3241,8 +3241,7 @@ fn sealed_contract_row_anchors_declaring_node() {
         // `class X extends S {}` starts at 18 (the two `import` line
         // bytes plus the blank line) and closes at 37: the whole
         // declaring node from its first token, not the name.
-        "{:?}",
-        rows
+        "{rows:?}"
     );
 }
 
@@ -4725,7 +4724,7 @@ fn astral_surrogate_identifier_reports_undefined() {
 /// the written `int`, and the failing row names the LOCAL function —
 /// never the enclosing executable the frame walk used to fall through
 /// to (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/dart/resolver/return_type_verifier.dart).
+/// `pkg/analyzer/lib/src/dart/resolver/return_type_verifier.dart`).
 #[test]
 fn local_function_return_host_latches_at_its_name() {
     let dynamic_host = report("void main() { f() { return 42; } f(); }");
@@ -4749,7 +4748,7 @@ fn local_function_return_host_latches_at_its_name() {
 /// past the closed variable group), so the arrow body never feeds the
 /// enclosing `void` host's return matrix. The oracle under-reports
 /// local-function bodies for this shape (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/dart/resolver/return_type_verifier.dart — the
+/// `pkg/analyzer/lib/src/dart/resolver/return_type_verifier.dart` — the
 /// enclosing executable's check walks only its own body, and the
 /// recovered getter's `FunctionDeclarationImpl` is not part of it).
 #[test]
@@ -4775,7 +4774,7 @@ fn recovered_getter_in_function_keeps_the_enclosing_matrix_silent() {
 }
 
 /// The no-type `late` declaration family (upstream Dart SDK source,
-/// error_recovery/best_practices_no_late.dart corpus face — SDK issues
+/// `error_recovery/best_practices_no_late.dart` corpus face — SDK issues
 /// 43811-43813): the declared name binds UNKNOWN and joins its frame
 /// (or the library/container element table), so later references
 /// resolve — no undefined row. Each lane carries exactly its parser's
@@ -4851,7 +4850,7 @@ fn declaration_start_keywords_stay_silent() {
 /// face reports for it. The parse tier carries the oracle's own single
 /// row (`ExpressionIdentifierContext.ensureIdentifier` reports at the
 /// `;`, upstream Dart SDK source,
-/// pkg/_fe_analyzer_shared/lib/src/parser/identifier_context_impl.dart
+/// pkg/_`fe_analyzer_shared/lib/src/parser/identifier_context_impl.dart`
 /// :455-466; the dot arm adds no second anchor) — the pin is that the
 /// merged report holds exactly that row and nothing else.
 #[test]
@@ -4892,11 +4891,11 @@ fn empty_name_selector_rows_stay_silent() {
 
 /// The invalidated configuration literal: an interpolated `==` value
 /// in an `if (...)` configuration is the parser's
-/// invalid_literal_in_configuration face, and the configuration is
+/// `invalid_literal_in_configuration` face, and the configuration is
 /// never resolved as an expression (the oracle resolves only the
 /// dottedName) — the interpolation's name references stay silent
 /// (upstream Dart SDK source, pkg/analyzer/lib/src/dart/analysis/
-/// library_analyzer.dart, the Configuration walk). The parser's own
+/// `library_analyzer.dart`, the Configuration walk). The parser's own
 /// face remains in the report; the pin is the name-silence.
 #[test]
 fn invalidated_configuration_literal_keeps_its_names_silent() {
@@ -4976,19 +4975,18 @@ fn local_prefix_head_reports_the_shadowed_prefix() {
 /// the `ExtendsClause` arm of the oracle's clause switch — never the
 /// bare `undefined_class`, while the implements head keeps its own
 /// clause face (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/dart/resolver/scope_analyzer.dart
-/// `_resolveType`; the oracle pin: implements_non_class at `B`,
-/// extends_non_class at `C`).
+/// `pkg/analyzer/lib/src/dart/resolver/scope_analyzer.dart`
+/// `_resolveType`; the oracle pin: `implements_non_class` at `B`,
+/// `extends_non_class` at `C`).
 #[test]
 fn recovered_extends_tail_codes_extends_non_class() {
     let r = report("class A implements B extends C {}\n");
     let codes = code_names(&r);
     assert!(
         codes.contains(&"implements_non_class") && codes.contains(&"extends_non_class"),
-        "{:?}",
-        codes
+        "{codes:?}"
     );
-    assert!(!codes.contains(&"undefined_class"), "{:?}", codes);
+    assert!(!codes.contains(&"undefined_class"), "{codes:?}");
     let ext = r
         .diagnostics
         .iter()
@@ -5003,7 +5001,7 @@ fn recovered_extends_tail_codes_extends_non_class() {
 }
 
 /// The zero-case switch-expression recovery: the arm fold over zero
-/// arms is the oracle's InvalidType, so the enclosing `=>` return
+/// arms is the oracle's `InvalidType`, so the enclosing `=>` return
 /// check asks no question of the expression — and the poisoned value
 /// row stops the scrutinee's own row from being the body's single row
 /// (upstream Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart
@@ -5024,7 +5022,7 @@ fn zero_case_switch_expression_keeps_the_return_matrix_silent() {
 /// `<synthetic> is (x-1)` — the operand-splice recovery — and the
 /// expression still types `bool`, so the return matrix reports the
 /// oracle's row naming the `is` host
-/// (keyword_named_top_level_methods_2.dart:183, upstream Dart SDK
+/// (`keyword_named_top_level_methods_2.dart:183`, upstream Dart SDK
 /// source, pkg/analyzer/lib/src/dart/ast/ast.dart
 /// `IsExpressionImpl.staticType`).
 ///
@@ -5051,7 +5049,7 @@ fn recovered_is_expression_types_bool() {
 /// folds its field window into a record-typed result row, so an applied
 /// operator resolves against a type that declares none — the oracle's
 /// `undefined_operator` with the record display (`(int,)`),
-/// keyword_named_class_methods_2.dart:49 (`const(x-1) + 1`, the
+/// `keyword_named_class_methods_2.dart:49` (`const(x-1) + 1`, the
 /// const-keyword recovery shape) — and the enclosing return stays
 /// silent (the failed invocation types `dynamic`).
 ///
@@ -5529,7 +5527,7 @@ fn stale_type_param_invocation_follows_live_frame() {
 /// face: the extension type is an `InterfaceElement` upstream
 /// (`ExtensionTypeElementImpl extends InterfaceElementImpl` — the
 /// implicit `this` of the body carries the extension type itself), so
-/// the UnqualifiedLookupDomain names the head exactly like a class
+/// the `UnqualifiedLookupDomain` names the head exactly like a class
 /// body names its class, never the context-free `undefined_function`.
 /// The `int i` field formal's `int` resolves through dart:core's
 /// final-primitive lane in every rig, so no `undefined_class` row joins
@@ -5944,7 +5942,7 @@ fn raw_generic_receiver_suppresses_the_unbound_formal_face() {
 
 /// The accessor-twin face: an inherited FIELD induces the setter face
 /// (`_CastQueueList`'s `set _head` overrides `QueueList`'s
-/// `int _head` field — the corpus's queue_list.dart setter rows): no
+/// `int _head` field — the corpus's `queue_list.dart` setter rows): no
 /// override row fires. The private setter itself is never written, so
 /// the oracle (3.13.7) reports it `unused_element`; the field is read.
 #[test]
@@ -6010,7 +6008,7 @@ fn null_cast_to_a_type_parameter_target_stays_silent() {
 /// An extension's `this` types as its `on` type, and the unindexed
 /// `Comparator<T>` alias head is the callable face (`compareBy`'s
 /// `(R a, R b) => this(keyOf(a), keyOf(b))` — the corpus's
-/// iterable_extensions.dart `this(...)` rows).
+/// `iterable_extensions.dart` `this(...)` rows).
 #[test]
 fn extension_this_invokes_through_the_on_type_alias() {
     let source = "class int {} class Comparator<T> {} \
@@ -7607,7 +7605,7 @@ fn const_creation_arguments_check_per_argument() {
 
 /// A multi-positional const creation evaluates each argument on its
 /// own: the parser emits `handle_positional_argument` once per
-/// positional operand (parser_impl.dart:9608), so `const v = C(0, 0)`
+/// positional operand (`parser_impl.dart:9608`), so `const v = C(0, 0)`
 /// captures two `Value` nodes — not one merged `Other`. Before the
 /// event landed every positional list collapsed to a single
 /// non-constant leaf and over-fired both `const_with_non_constant_argument`
@@ -7645,7 +7643,7 @@ fn const_creation_type_folds_to_its_container() {
 }
 
 /// A container without a const constructor reports both initializer
-/// rows at the creation (the oracle's const_with_non_const fixture:
+/// rows at the creation (the oracle's `const_with_non_const` fixture:
 /// `const x = C()` over `class C { C(); }` emits
 /// `const_with_non_const` AND `const_initialized_with_non_constant_
 /// value` at the same span); an unresolvable name keeps only the
@@ -7847,7 +7845,7 @@ fn const_eval_faults_match_the_official_codes() {
 }
 
 /// The dynamic operand face (the retired m1-semantic targeted fixture
-/// const_eval_type_num_string.dart:9): a `dynamic` right
+/// `const_eval_type_num_string.dart:9)`: a `dynamic` right
 /// operand is assignable to the operator's formal — the argument face
 /// stays silent and only the const-eval fault reports, const context
 /// or not. The literal operand keeps the co-fire the oracle probes
@@ -8460,7 +8458,7 @@ fn static_members_are_skipped() {
 /// extends miss `EXTENDS_NON_CLASS` when no with clause stands
 /// (upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
 /// scope_analyzer.dart:1216-1220 — oracle probe: `class B extends
-/// Missing` emits EXTENDS_NON_CLASS at the name, `undefined_class`
+/// Missing` emits `EXTENDS_NON_CLASS` at the name, `undefined_class`
 /// does not survive the clause context).
 #[test]
 fn unresolved_superclass_suppresses() {
@@ -9001,7 +8999,7 @@ fn overridden_member_context_degrades_on_a_missing_span() {
 /// Parse-tier contract (verified against the 2026-10-16 rider log): the
 /// body-less `;` members here carry NO `missing_function_body` row —
 /// the parse gate mirrors upstream `parseFunctionBody`'s `allowAbstract`
-/// (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/parser/
+/// (upstream Dart SDK source, pkg/_`fe_analyzer_shared/lib/src/parser`/
 /// parser_impl.dart:6075-6078: `(static == null || external ||
 /// augmentations) && inPlainSync`), so a plain instance sync member
 /// accepts the `;` body silently, and the semantic crate has no
@@ -10167,7 +10165,7 @@ fn extension_type_implements_members_resolve() {
 /// the tear-off and the invocation stay silent; a member absent from
 /// the container reports the container family (`undefined_getter` /
 /// `undefined_method` "for the type 'Directory'"), not the prefix-miss
-/// `undefined_prefixed_name`. The oracle's ast_rewrite keeps the
+/// `undefined_prefixed_name`. The oracle's `ast_rewrite` keeps the
 /// qualified type as the selector's receiver static type (probe:
 /// `dart analyze` on `io.Directory.gone` → `UNDEFINED_GETTER` over the
 /// selector).
@@ -11595,9 +11593,7 @@ fn ifnull_init_non_null_rhs_binds_non_null_local() {
          }\n";
     let report = report(source);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "unchecked_use_of_nullable_value"),
+        !code_names(&report).contains(&"unchecked_use_of_nullable_value"),
         "{:?}",
         code_names(&report)
     );
@@ -11649,9 +11645,7 @@ fn ifnull_init_same_head_unrelated_args_folds() {
          }\n";
     let report = report(source);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "unchecked_use_of_nullable_value"),
+        !code_names(&report).contains(&"unchecked_use_of_nullable_value"),
         "{:?}",
         code_names(&report)
     );
@@ -12033,7 +12027,7 @@ fn if_case_root_never_match_fires_with_pattern_type_span() {
 
 /// The collection-element if-case runs the same family (the element
 /// face of the statement pin above): the official routes a case-clause
-/// element through `analyzeIfCaseElement` (type_analyzer.dart:3334),
+/// element through `analyzeIfCaseElement` (`type_analyzer.dart:3334`),
 /// whose pattern gets the condition value as its matched type — the
 /// same one-case window — so the shared root checks fire at the
 /// written type's span, and the case clause spares the plain
@@ -12632,7 +12626,7 @@ fn cast_from_null_always_fails_routes_by_operand_and_target() {
 /// exhaustiveness face out of the pin. The cast target `int` is
 /// undeclared in the bare-unit harness — a cast pattern's type reports
 /// `undefined_class` (the `castToNonType` arm requires an
-/// `AsExpression` parent; a CastPattern falls through to the plain
+/// `AsExpression` parent; a `CastPattern` falls through to the plain
 /// arms, #2184).
 #[test]
 fn cast_from_null_pattern_reports() {
@@ -12869,7 +12863,7 @@ fn body_might_complete_normally_nullable_spares_generator_and_illegal_async() {
 
 /// An `async` body's completion verdict reads the declared return's
 /// completion context — the official `_contextTypeForImposed` final arm
-/// (body_inference_context.dart), the `FutureOr<V>` union over the
+/// (`body_inference_context.dart`), the `FutureOr<V>` union over the
 /// future value type, not the flatten: a `Future<void>` async body's
 /// union base is `void` and stays silent, a `FutureOr<int>` async body
 /// asks through the potentially non-nullable `FutureOr<int>` and
@@ -13102,8 +13096,8 @@ fn body_might_complete_normally_reports_factories_and_closures() {
     );
 }
 
-/// The COMPILE_TIME_ERROR twin of the same walk
-/// (`isPotentiallyNonNullable`'s pick, type_analyzer.dart:688): a
+/// The `COMPILE_TIME_ERROR` twin of the same walk
+/// (`isPotentiallyNonNullable`'s pick, `type_analyzer.dart:688)`: a
 /// potentially non-nullable return type — `Never` included — reports
 /// `body_might_complete_normally` at the declaring name (the corpus
 /// `vendor/test_api` `Never`-returning `expect` face).
@@ -13140,7 +13134,7 @@ fn body_might_complete_normally_reports_at_the_declaring_name() {
     );
 }
 
-/// The switch-end `isExhaustive` arm (flow_analysis.dart `switch_end`,
+/// The switch-end `isExhaustive` arm (`flow_analysis.dart` `switch_end`,
 /// type_analyzer.dart:638-712 reads `isReachable` at the body end): a
 /// `default`-less statement switch over a sealed scrutinee whose cases
 /// all return leaves the body end unreachable — silent; the same shape
@@ -13194,7 +13188,7 @@ fn definitely_unassigned_late_local_variable_reports_at_the_read() {
 }
 
 /// The operand's resolved static type decides `x is T`
-/// (`leftNode.typeOrThrow`, best_practices_verifier.dart:1011): a
+/// (`leftNode.typeOrThrow`, `best_practices_verifier.dart:1011)`: a
 /// `var`-inferred local reads its initializer's type, so the
 /// `var self = this` face over the own container is constant-true and
 /// mutation plays no part in the verdict; a non-matching pair stays
@@ -13375,7 +13369,7 @@ fn missing_default_value_reports() {
 /// formal, a `?`-suffixed type parameter's head (a BARE `T` reports —
 /// `isNullable` never consults `bound`, type_system.dart:1216-1233), an
 /// abstract method's `;` body, and a function-typed context all stay
-/// silent (error_verifier.dart:8327-8372 + type_system.dart:1257).
+/// silent (error_verifier.dart:8327-8372 + `type_system.dart:1257`).
 #[test]
 fn missing_default_value_silence_faces() {
     let r = report(
@@ -13566,7 +13560,7 @@ fn bounded_context_solution_keeps_context_type() {
     );
 }
 
-/// The inference-failure face (`couldNotInfer`, generic_inferrer.dart
+/// The inference-failure face (`couldNotInfer`, `generic_inferrer.dart`
 /// `tryChooseFinalTypes`): the creation's return constraint against
 /// the outer formal's `C<List<_>>` schema solves `X := List<Object?>`,
 /// which the function literal's `void Function(List<int>)` violates.
@@ -13627,7 +13621,7 @@ fn could_not_infer_stays_silent_when_satisfied_or_fixed() {
     }
 }
 
-/// #1314 FAM14 (scope_analyzer.dart `_resolveType`'s clause switch):
+/// #1314 FAM14 (`scope_analyzer.dart` `_resolveType`'s clause switch):
 /// an unresolved clause name reports the clause face — `implements`
 /// and `with` replace `undefined_class`, the alias superclass reports
 /// `mixin_with_non_class_superclass`, and the mixin `on` constraint is
@@ -13696,9 +13690,9 @@ fn clause_names_report_clause_faces() {
     assert!(r.diagnostics.iter().all(|d| d.range.offset as usize == 11));
 }
 
-/// #1444 (named_type_resolver.dart `reportNullOrNonTypeElement`'s
+/// #1444 (`named_type_resolver.dart` `reportNullOrNonTypeElement`'s
 /// clause-parent guard — "Ignored. The error will be reported
-/// elsewhere"; ast_builder.dart `endExtensionTypeDeclaration` pops
+/// elsewhere"; `ast_builder.dart` `endExtensionTypeDeclaration` pops
 /// only the implements clause): an extension-type header's clause
 /// names never report `undefined_class` — whichever clause they stand
 /// in, however many entries the clause carries, and also in the
@@ -13756,7 +13750,7 @@ fn extension_type_clause_names_stay_off_undefined_class() {
     assert_eq!(undefined[0].range.offset as usize, 17);
 }
 
-/// #1314 FAM18 (error_verifier.dart `_checkForNotInitializedField`
+/// #1314 FAM18 (`error_verifier.dart` `_checkForNotInitializedField`
 /// family): a non-nullable, non-final, non-late, non-const declaration
 /// without an initializer reports at its name — the variable code for
 /// top-level variables and static fields, the instance-field code when
@@ -14278,7 +14272,7 @@ fn variance_superinterface_legacy_face_fires_by_default() {
 /// one face the fixture answers is the parse verdict itself: the
 /// analyzer's `endTypeVariable` reports `experimentNotEnabled` at the
 /// keyword when the flag is off (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/fasta/ast_builder.dart —
+/// `pkg/analyzer/lib/src/fasta/ast_builder.dart` —
 /// `reportVarianceModifierNotEnabled`).
 #[test]
 fn variance_explicit_faces_stay_gated_without_the_experiment() {
@@ -14891,7 +14885,7 @@ fn ifnull_bool_literal_lhs_reports_dead_rhs() {
 /// The `??` right operand's staged row spans the WHOLE operand
 /// expression, token-derived (oracle `x ?? []` over an unassigned
 /// non-nullable local: `dead_null_aware_expression` = the `[]` literal,
-/// and the flow's own `?? []` dead_code row keeps its full extent).
+/// and the flow's own `?? []` `dead_code` row keeps its full extent).
 /// Half-landed: the token-derived range (first token through
 /// `handle_binary_rhs_end`'s last) is in, but this shape needs two
 /// missing halves — the unassigned-non-null root never arms the
@@ -14940,7 +14934,7 @@ fn null_aware_chain_climbs_to_one_row() {
 /// The parenthesized receiver shape of the same oracle face
 /// (`(i)?.sign.sign;`) stays silent here: the definitely-unassigned walk
 /// keys on the receiver identifier and does not unwrap a
-/// ParenthesizedExpression yet. Tracked with the unassigned-root gap.
+/// `ParenthesizedExpression` yet. Tracked with the unassigned-root gap.
 #[ignore = "the unassigned walk does not see through parens yet"]
 #[test]
 fn null_aware_chain_paren_receiver_stays_silent() {
@@ -15614,10 +15608,10 @@ fn unnecessary_cast_stays_argument_exact() {
 /// (getter on the read, setter under the assignment).
 ///
 /// The parse tier rides the capture face (regression case 35ed6821,
-/// the null_shorting_index rows): each `?.[` link takes ONE
+/// the `null_shorting_index` rows): each `?.[` link takes ONE
 /// `missing_identifier` anchored on its `[` — "Expected an identifier.",
 /// length 1 (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/dart/ast/ast_builder.dart doDotExpression
+/// `pkg/analyzer/lib/src/dart/ast/ast_builder.dart` doDotExpression
 /// recovery). The rows are the capture's own parse face and stay; the
 /// pin holds the merged six-row set.
 #[test]
@@ -15643,8 +15637,7 @@ fn null_assert_upgrade_drives_the_null_aware_faces() {
             // can't be null.").
             "unnecessary_non_null_assertion",
         ],
-        "{:?}",
-        names
+        "{names:?}"
     );
     let missing: Vec<_> = report
         .diagnostics
@@ -15677,8 +15670,8 @@ fn null_assert_upgrade_drives_the_null_aware_faces() {
 /// the selector's `missing_identifier` at the `;` ("Expected an
 /// identifier.", length 1) plus the argument tail's `expected_token`
 /// ("Expected to find '('.", length 1, anchored on the follower —
-/// upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/parser/
-/// parser_impl.dart parseConstructorInvocationArguments). The pin
+/// upstream Dart SDK source, pkg/_`fe_analyzer_shared/lib/src/parser`/
+/// `parser_impl.dart` parseConstructorInvocationArguments). The pin
 /// holds the merged four-row set.
 #[test]
 fn synthetic_enum_selector_reports_the_recovery_faces() {
@@ -15695,8 +15688,7 @@ fn synthetic_enum_selector_reports_the_recovery_faces() {
             "undefined_enum_constructor",
             "unused_element",
         ],
-        "{:?}",
-        names
+        "{names:?}"
     );
     let semi = report
         .diagnostics
@@ -15777,13 +15769,13 @@ fn nameless_recovery_declaration_reports_unnamed() {
 /// `super?.x` keeps the super-member resolution after the (matched)
 /// operator error: the `?.`-on-super report never suppresses the
 /// selector, and a class with no explicit supertype still resolves
-/// `super.member` against `Object` (walk_super's Object face —
+/// `super.member` against `Object` (`walk_super`'s Object face —
 /// upstream Dart SDK source, pkg/analyzer/lib/src/generated/
-/// element_resolver.dart super resolution).
+/// `element_resolver.dart` super resolution).
 ///
-/// Oracle: invalid_operator_questionmark_period_for_super 4:19 +
-/// undefined_super_member 4:21 ("The getter 'x' isn't defined in a
-/// superclass of 'C'.", invalid_operator_questionmark_period_for_super
+/// Oracle: `invalid_operator_questionmark_period_for_super` 4:19 +
+/// `undefined_super_member` 4:21 ("The getter 'x' isn't defined in a
+/// superclass of 'C'.", `invalid_operator_questionmark_period_for_super`
 /// .dart).
 #[test]
 fn super_null_aware_keeps_the_super_member_resolution() {
@@ -15809,14 +15801,14 @@ fn super_null_aware_keeps_the_super_member_resolution() {
 /// Invoking an extension NAME is not a call: the plain invocation
 /// reports `undefined_function` while the type-argumented override
 /// (`Ext<int>(l)`) stays callable with its own arity face
-/// (extension_named_type.dart 7:14; upstream Dart SDK source,
+/// (`extension_named_type.dart` 7:14; upstream Dart SDK source,
 /// pkg/analyzer/lib/src/dart/element/element.dart — extension elements
 /// are not executable).
 /// The explicit extension application without a type-argument group is
 /// an override exactly like its parameterized twin: the resolver's
 /// send rewrite answers `ExtensionElement` before any function shape
 /// (upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-/// ast_rewrite.dart — the `ExtensionElementImpl` arm), so the
+/// `ast_rewrite.dart` — the `ExtensionElementImpl` arm), so the
 /// applicable application stays silent.
 #[test]
 fn extension_name_invocation_is_a_silent_override() {
@@ -15857,8 +15849,8 @@ fn symbol_literal_member_chain_resolves_on_symbol() {
 /// The cascade section's index operand still resolves: the fold that
 /// rewrites the receiver's `[]` intent defers the operand's unresolved
 /// row, so both the cascade target and the index operand report
-/// (issue_42267 2:3/2:16 — upstream Dart SDK source,
-/// pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart resolves
+/// (`issue_42267` 2:3/2:16 — upstream Dart SDK source,
+/// pkg/_`fe_analyzer_shared/lib/src/parser/parser_impl.dart` resolves
 /// every subexpression).
 #[test]
 fn cascade_index_operand_resolves() {
@@ -15875,7 +15867,7 @@ fn cascade_index_operand_resolves() {
 
 /// Indexing a type literal applies the operator to the literal's
 /// static type `Type`, which declares no `[]`: the report anchors on
-/// the bracket pair (issue_45251_list 21:36 — "The operator '[]' isn't
+/// the bracket pair (`issue_45251_list` 21:36 — "The operator '[]' isn't
 /// defined for the type 'Type'.").
 #[test]
 fn type_literal_index_reports_type_operator() {
@@ -15909,15 +15901,14 @@ fn recovered_enum_element_argument_stays_undefined_identifier() {
              enum const E4() { this(int x) : assert(1 > 2); }",
     );
     let names = code_names(&report);
-    assert!(!names.contains(&"undefined_function"), "{:?}", names);
+    assert!(!names.contains(&"undefined_function"), "{names:?}");
     assert_eq!(
         names
             .iter()
             .filter(|name| **name == "undefined_identifier")
             .count(),
         2,
-        "{:?}",
-        names
+        "{names:?}"
     );
     let row = report
         .diagnostics
@@ -15929,7 +15920,7 @@ fn recovered_enum_element_argument_stays_undefined_identifier() {
 
 /// The constant-pattern creation head codes as an invoked callee: a
 /// missing `const A()` head reports `undefined_function 'A'` (the
-/// oracle's coding at issue50591_example2 3:11), never
+/// oracle's coding at `issue50591_example2` 3:11), never
 /// `undefined_identifier` — the pattern path's argument group closes
 /// without a send event, so the close resolves the head's link.
 #[test]
@@ -16181,7 +16172,7 @@ fn on_catch_var_keyword_binds_only_as_a_parameter_twin() {
 /// Regression: a plain single-parameter catch keeps both postures — a
 /// read spares, and an unread exception stays silent as today (no
 /// `on`-type spares it exactly like the official rule's
-/// `node.onKeyword == null` auto-use, unused_local_elements_verifier
+/// `node.onKeyword == null` auto-use, `unused_local_elements_verifier`
 /// .dart:72-74).
 #[test]
 fn plain_catch_exception_postures_unchanged() {
@@ -16307,7 +16298,7 @@ fn doc_comment_ignore_for_file_is_inert() {
     assert_eq!(anchors(source, &report), vec![("unused_element", "_y")]);
 }
 
-/// ERROR-severity rows never suppress (ignore_info.dart's gate).
+/// ERROR-severity rows never suppress (`ignore_info.dart`'s gate).
 #[test]
 fn ignore_comment_never_suppresses_error_severity() {
     let source = "// ignore: undefined_class\nC x = C();";
@@ -16569,7 +16560,7 @@ fn unnamed_extension_member_reports_when_unused() {
         "void f(C c) { c.g; c.m(); }\n",
     );
     assert!(code_names(&report(applied)).is_empty(),);
-    let named = concat!("class C {} extension E on C { C get g => C(); }\n",);
+    let named = "class C {} extension E on C { C get g => C(); }\n";
     assert!(code_names(&report(named)).is_empty(),);
 }
 
@@ -16610,7 +16601,7 @@ fn super_formal_resolves_against_the_invoked_target() {
     let src = "class int {} \
              class C { C(int x); } \
              class D extends C { D(this.w, super.y, super.x); final int w; }";
-    assert_eq!(&src[second..second + 1], "x");
+    assert_eq!(&src[second..=second], "x");
     assert_eq!(second, src.rfind("x);").unwrap());
 }
 
@@ -16692,7 +16683,7 @@ fn super_formal_named_associates_with_this_selector_formal() {
 
 /// The reserved `new` head IS the unnamed constructor: `new();` /
 /// `const new();` keep `C()` / `const C()` creations callable (the
-/// FACTORY_CONSTRUCTOR_NEW_NAME head semantics; oracle-silent at
+/// `FACTORY_CONSTRUCTOR_NEW_NAME` head semantics; oracle-silent at
 /// lints-new `CNewSyntax`/`ANewSyntax`).
 #[test]
 fn new_head_declares_the_unnamed_constructor() {
@@ -16855,9 +16846,7 @@ fn this_in_extension_on_nullable_stays_nullable() {
              void m() { var self = this; self!; } }",
     );
     assert!(
-        !code_names(&r)
-            .iter()
-            .any(|name| *name == "unnecessary_non_null_assertion"),
+        !code_names(&r).contains(&"unnecessary_non_null_assertion"),
         "{:?}",
         code_names(&r)
     );
@@ -16900,7 +16889,7 @@ fn named_argument_use_spares_the_parameter() {
 }
 
 /// #2097 F1: a primary constructor counts as a generative constructor
-/// (constructor_fields_verifier.dart `_addPrimaryConstructor`; the
+/// (`constructor_fields_verifier.dart` `_addPrimaryConstructor`; the
 /// `hasGenerativeConstructor` fold reads `PrimaryConstructorBodyImpl`,
 /// error_verifier.dart:7111-7122) — a `this.x` formal or a
 /// `this : _x = v` body initializer initializes the field, so the
@@ -16944,7 +16933,7 @@ fn primary_ctor_field_formals_satisfy_final_field_init() {
 /// #2097 F10: a factory's `= C.name` redirect participates in the
 /// `recursive_constructor_redirect` cycle walk — `foo = bar; bar = foo`
 /// reports once on each edge (upstream anchors the redirect type's full
-/// span, error_verifier.dart's `visitRedirectingFactoryConstructor`
+/// span, `error_verifier.dart`'s `visitRedirectingFactoryConstructor`
 /// cycle leg).
 #[test]
 fn factory_redirect_cycle_reports_on_each_edge() {
@@ -16966,7 +16955,7 @@ fn factory_redirect_cycle_reports_on_each_edge() {
 
 /// #2097 F8: a bare `C()` miss inside *any* class member (static
 /// included) names the enclosing type as `undefined_method`, not the
-/// top-level `undefined_function` (error_verifier.dart's unqualified-
+/// top-level `undefined_function` (`error_verifier.dart`'s unqualified-
 /// reference domain); the return-type `C` still reports
 /// `undefined_class`.
 #[test]
@@ -16980,7 +16969,7 @@ fn static_member_bare_invoke_miss_names_the_enclosing_type() {
 
 /// #2097 F10: a `String this.p` formal binds its declared type into the
 /// ctor body's expression walk — `assert(p != null)` is an invariant
-/// comparison (best_practices_verifier.dart `_checkForInvariantNull-
+/// comparison (`best_practices_verifier.dart` `_checkForInvariantNull-
 /// Comparison`), reporting `unnecessary_null_comparison` at `!= null`.
 #[test]
 fn this_formal_declared_type_reaches_the_body_assert() {
@@ -17079,7 +17068,7 @@ fn object_pattern_head_reports_undefined_class() {
 /// pattern — report independently; the defined arm stays silent. The
 /// bound variable `x` keeps its ordinary `unused_local_variable` row,
 /// and an unresolved case head skips the whole exhaustiveness pass
-/// (the oracle's `hasInvalidType`, constant_verifier.dart:1070), so no
+/// (the oracle's `hasInvalidType`, `constant_verifier.dart:1070`), so no
 /// `non_exhaustive_switch_expression` row (a wildcard arm would close
 /// it only over resolvable heads).
 #[test]
@@ -17088,7 +17077,7 @@ fn switch_expression_arm_heads_report() {
     let r = report(source);
     // Row order is report order, not offset order, so compare sorted.
     let mut got = code_offsets(&r);
-    got.sort();
+    got.sort_unstable();
     let mut want = vec![
         ("undefined_class", offset_of(source, "Missing2")),
         ("unused_local_variable", offset_of(source, "x)")),
@@ -17104,7 +17093,7 @@ fn switch_expression_arm_heads_report() {
         // anchor is the return expression (`r`), not the `return` keyword.
         ("return_of_invalid_type", offset_of(source, "r;\n}")),
     ];
-    want.sort();
+    want.sort_unstable();
     assert_eq!(got, want, "{:?}", code_offsets(&r));
 }
 
@@ -17148,7 +17137,7 @@ fn object_pattern_head_with_type_args_reports_both_faces() {
 }
 
 /// F5: the cast pattern's `as` type never reaches the `cast_to_non_type`
-/// arm (its parent is a CastPattern, not an AsExpression) — a miss
+/// arm (its parent is a `CastPattern`, not an `AsExpression`) — a miss
 /// reports `undefined_class`, a resolved non-type `not_a_type`. The
 /// expression cast keeps its dedicated face. The bound `x`/`y` keep
 /// their `unused_local_variable` rows.
@@ -17268,7 +17257,7 @@ fn defined_object_pattern_heads_stay_silent() {
 /// The unresolved `on` anchor: `extension E on Gone` carries an
 /// `InvalidType` extended type — the member scope is the extension's own
 /// map alone, so a bare miss inside the body reports
-/// `undefined_identifier` (lexical_lookup.dart's fall-through) instead
+/// `undefined_identifier` (`lexical_lookup.dart`'s fall-through) instead
 /// of riding the old blanket `on_opaque` suppression. The oracle's
 /// `undefined_class` on `Gone` stands beside it (the clause's own
 /// type-miss face).
@@ -17533,7 +17522,7 @@ fn mixin_on_indexed_write_hit_stays_silent() {
 /// `: _fullPattern = pattern, super(_patchQuotes(pattern), parent);`)
 /// all fold to a `SuperConstructorInvocation` — the early return the
 /// official `_checkForUndefinedConstructorInInitializerImplicit` takes
-/// (upstream Dart SDK source, error_verifier.dart).
+/// (upstream Dart SDK source, `error_verifier.dart`).
 #[test]
 fn explicit_super_invocation_satisfies_implicit_super_face() {
     // Bare positional `super(...)`.
@@ -17583,7 +17572,7 @@ fn explicit_super_invocation_satisfies_implicit_super_face() {
 /// An extension type's representation field never reports
 /// `final_not_initialized`: upstream's representation constructor is
 /// generative (`element.constructors.any(isGenerative)`,
-/// error_verifier.dart:7114), so the `ConstructorFieldsVerifier` owns
+/// `error_verifier.dart:7114`), so the `ConstructorFieldsVerifier` owns
 /// the container and the primary's formal binds the rep — even when
 /// the only other constructor is a factory (the corpus drift row,
 /// `extension type _SerializedRequest._(JSObject inner)` beside
@@ -17617,7 +17606,7 @@ fn extension_type_rep_field_never_reports_uninitialized() {
 /// analyzer row, `List<TypeImpl>.filled(_, DynamicTypeImpl.instance)`
 /// at 510:53). Only a `new`/`const` creation HEAD is a type position —
 /// `creation_with_non_type` at its name (upstream Dart SDK source,
-/// error_verifier.dart's `visitInstanceCreationExpression`).
+/// `error_verifier.dart`'s `visitInstanceCreationExpression`).
 #[test]
 fn new_const_creation_argument_miss_is_undefined_identifier() {
     // Resolved head, missing argument: the T6 corpus shape. The const
@@ -17704,7 +17693,7 @@ fn typedef_after_use_still_types_tear_off_argument() {
 // dartq's own emission, message alignment is a separate lane. ————————
 
 /// `await x` in a sync body (`return await x;` — the official
-/// await_in_wrong_context_test.dart `test_sync` shape) converts the
+/// `await_in_wrong_context_test.dart` `test_sync` shape) converts the
 /// parser's `endInvalidAwaitExpression` recovery at the `await` keyword.
 /// Oracle probed: error `await_in_wrong_context` at the `await` token,
 /// "The await expression can only be used in an async function."
@@ -17742,7 +17731,7 @@ fn const_collection_equality_reports_const_eval_primitive_equality() {
 
 /// Bare creation over a type alias whose RHS names nothing this unit can
 /// build on: the head is a type, not a value (`invocation.rs`'s
-/// `report_alias_invocation_of_non_function`, element_resolver.dart's
+/// `report_alias_invocation_of_non_function`, `element_resolver.dart`'s
 /// function-invocation face). Oracle probed: error
 /// `invocation_of_non_function` at the head, "'T' isn't a function."
 #[test]
@@ -17781,7 +17770,7 @@ fn non_constant_map_pattern_key_reports_at_the_key() {
 /// forever (stack overflow — SDK issue 29943; the same fold underlies the
 /// anonymous-method cascades and `p.(unresolved)`). The strictly-earlier
 /// hop guard answers through the classified receiver instead, and the
-/// oracle's face survives (missing_identifier + undefined_identifier).
+/// oracle's face survives (`missing_identifier` + `undefined_identifier`).
 #[test]
 fn recv_walk_degenerate_record_terminates() {
     let r = report("bad() { x.(null); } main() {}");
@@ -17798,7 +17787,7 @@ fn recv_walk_degenerate_record_terminates() {
 /// A bare-read credit must never outlive its frame: the for-body recovery
 /// re-walks tokens after the frame closed, and the write-intent conversion
 /// consumed the stale `local_hits` entry past the truncated `locals`
-/// (`self.locals[hit]` — index out of bounds, front_end parser_recovery_04).
+/// (`self.locals[hit]` — index out of bounds, `front_end` `parser_recovery_04`).
 /// The frame close now drops the truncated range's entries; the reads keep
 /// their credits where the locals still live.
 #[test]
@@ -17808,7 +17797,7 @@ fn local_hit_credit_dies_with_frame() {
              void bar() { for (int i = 0; i < 10; i++) var y = a<int, void>?.c = 42; }",
     );
     assert!(
-        code_names(&r).iter().any(|c| *c == "unused_local_variable"),
+        code_names(&r).contains(&"unused_local_variable"),
         "{:?}",
         code_names(&r)
     );
@@ -17817,7 +17806,7 @@ fn local_hit_credit_dies_with_frame() {
 /// Const evaluation must share substructure: each level references the
 /// previous const twice, and a deep-cloning value domain doubled per level
 /// (9+ GB before the kill on the SDK's own 44-level test,
-/// canonicalize/hashing_memoize_array_test). The shared (`Rc`) payloads
+/// `canonicalize/hashing_memoize_array_test`). The shared (`Rc`) payloads
 /// clone in O(1); the values stay oracle-clean.
 #[test]
 fn const_shared_substructure_stays_bounded() {
@@ -23334,6 +23323,9 @@ mod ticket_3703_tests;
 #[cfg(test)]
 #[path = "ticket_3617_tests.rs"]
 mod ticket_3617_tests;
+#[cfg(test)]
+#[path = "ticket_3619_tests.rs"]
+mod ticket_3619_tests;
 
 #[cfg(test)]
 #[path = "ticket_3710_tests.rs"]

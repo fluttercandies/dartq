@@ -29,6 +29,7 @@
 //! `class C {}` + `C c = .bar();` / `C c = .bar;` — the two texts above
 //! at the same selector span, `DOT_SHORTHAND_UNDEFINED_MEMBER` both.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use crate::diagnose::FileReport;
 

@@ -12,14 +12,15 @@
 //!    verifier's first dead node is the loop body
 //!    (`dead_code_verifier.dart` `_visitNode`, :183-205). The updaters then
 //!    get their own row (`for_updaterBegin`, :357-378) and the body's
-//!    covering close its own (type_analyzer.dart:3192). Pins mirror
+//!    covering close its own (`type_analyzer.dart:3192`). Pins mirror
 //!    `dead_code_test.dart`'s `test_flowEnd_forParts_condition_exists` and
 //!    `test_flowEnd_forParts_condition_throw`.
 //! 2. A conditional's dead else arm reports the ARM NODE's extent
-//!    (`flowEnd(elseExpression)`, type_analyzer.dart:2616): the parser's
+//!    (`flowEnd(elseExpression)`, `type_analyzer.dart:2616)`: the parser's
 //!    returned end tiles a bare leaf (a read, a member chain) through its
 //!    follower, so the row never swallows the statement's `;`. Compound
 //!    arms keep their own last token unchanged.
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

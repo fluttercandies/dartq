@@ -11,12 +11,12 @@ use super::test_rig::{code_names, report_ops, rows};
 #[test]
 fn private_extension_type_ctor_exposed_via_public_typedef_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 extension type _E(int i) {
   _E.named(this.i);
 }
 typedef A = _E;
-"#,
+",
     );
     assert!(
         !code_names(&report).contains(&"unused_element"),
@@ -32,13 +32,13 @@ typedef A = _E;
 #[test]
 fn private_extension_type_ctor_exposed_via_indirect_typedef_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 extension type _E(int i) {
   _E.named(this.i);
 }
 typedef _A = _E;
 typedef B = _A;
-"#,
+",
     );
     assert!(
         !code_names(&report).contains(&"unused_element"),
@@ -55,14 +55,14 @@ typedef B = _A;
 #[test]
 fn private_ctor_of_aliased_class_still_reports() {
     let report = report_ops(
-        r#"
+        r"
 class _C {
   _C();
   _C.named();
   _C._hidden();
 }
 typedef Pub = _C;
-"#,
+",
     );
     let codes = code_names(&report);
     assert!(
@@ -91,11 +91,11 @@ typedef Pub = _C;
 #[test]
 fn private_extension_type_ctor_without_typedef_still_reports() {
     let report = report_ops(
-        r#"
+        r"
 extension type _F(int i) {
   _F.named(this.i);
 }
-"#,
+",
     );
     assert!(
         code_names(&report).contains(&"unused_element"),
@@ -111,12 +111,12 @@ extension type _F(int i) {
 #[test]
 fn private_typedef_does_not_expose() {
     let report = report_ops(
-        r#"
+        r"
 extension type _E(int i) {
   _E.named(this.i);
 }
 typedef _Priv = _E;
-"#,
+",
     );
     assert!(
         code_names(&report).contains(&"unused_element"),

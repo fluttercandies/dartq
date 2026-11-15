@@ -11,6 +11,7 @@
 //! a flutter face is fail-open (one stderr note, then the passthrough
 //! spawn): the cache must never block a build.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -327,7 +328,7 @@ fn framework_version_of(flutter_bin: &Path) -> Option<String> {
 /// flutter with the original argv, nothing else — and no second process
 /// around it. `exec` replaces this process with flutter outright, so
 /// signals reach flutter directly and this process's memory goes away;
-/// the DARTQ_SHIM strip keeps a nested dartq from mistaking the child
+/// the `DARTQ_SHIM` strip keeps a nested dartq from mistaking the child
 /// for a shim. A runner that cannot replace itself falls back to
 /// spawn-and-wait inside `exec`; a failed exec reports and exits 127.
 fn spawn_passthrough(flutter: &Path, argv: &[OsString], cwd: &Path) -> i32 {
@@ -697,7 +698,7 @@ mod tests {
         // The opt-out survives a project section that pins only its
         // store: the global tier's gate holds through the merge.
         let home = root.join("home");
-        fs::create_dir_all(&home.join(".dartq")).expect("mkdir global");
+        fs::create_dir_all(home.join(".dartq")).expect("mkdir global");
         fs::write(
             home.join(".dartq").join("dartq.yaml"),
             "build_cache:\n  enabled: false\n",
@@ -776,7 +777,7 @@ mod tests {
     }
 
     /// The shim install lifecycle: fresh → Installed; the same
-    /// executable again → AlreadyPresent; a stale link is refreshed; a
+    /// executable again → `AlreadyPresent`; a stale link is refreshed; a
     /// real file is never clobbered; remove takes down the link only.
     #[test]
     fn shim_install_and_remove_never_touch_a_real_file() {

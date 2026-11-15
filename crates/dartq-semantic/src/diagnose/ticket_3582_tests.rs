@@ -4,6 +4,7 @@
 //! extra. Each pin below reproduces one clustered shape with the oracle's
 //! own answer written beside it (dart 3.13.7, `--format=machine`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{
     RigImport, assert_silent, code_names, report_ops, report_ops_imports, rows,
 };
@@ -24,9 +25,8 @@ fn t3582_probe_foreign_old_style_alias_nullable() {
             source: "typedef bool CheckFn(exception); void take2(dynamic body, [CheckFn? check, String reason = '']) {}",
         }],
     );
-    assert_eq!(
+    assert!(
         code_names(&report).is_empty(),
-        true,
         "probe A rows: {:?}",
         rows(&report)
     );
@@ -39,9 +39,8 @@ fn t3582_probe_local_old_style_alias_nullable() {
     let report = report_ops(
         "typedef bool CheckFn(exception); void take2(dynamic body, [CheckFn? check]) {} void main() { take2(() {}, (e) => e is int); }",
     );
-    assert_eq!(
+    assert!(
         code_names(&report).is_empty(),
-        true,
         "probe A' rows: {:?}",
         rows(&report)
     );
@@ -59,9 +58,8 @@ fn t3582_probe_foreign_modern_alias_nullable() {
             source: "typedef CheckFn = bool Function(dynamic); void take2(dynamic body, [CheckFn? check]) {}",
         }],
     );
-    assert_eq!(
+    assert!(
         code_names(&report).is_empty(),
-        true,
         "probe B rows: {:?}",
         rows(&report)
     );

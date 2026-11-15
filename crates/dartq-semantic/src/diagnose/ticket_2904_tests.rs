@@ -26,6 +26,7 @@
 //! `invalid_override_in_mixin_test`, and co19 `Enhanced-Enum`
 //! `implementing_enum_A04_t21` (`dart analyze`, Dart 3.13).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, fold_unit, merge_source_ordered};
 use crate::library::ElementIndex;

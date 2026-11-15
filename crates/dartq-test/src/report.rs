@@ -8,6 +8,7 @@
 //! driven by the events that counterpart listens to: test start, test
 //! output (`print`), errors, test end, and the end of the run.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::SuiteBlock;
 use crate::event::Json;
 use std::io::{self, Write};
@@ -178,10 +179,11 @@ impl Renderer {
 
     fn description(&self, test: &Test) -> String {
         let mut name = test.name.clone();
-        if self.opts.print_path && !test.load {
-            if let Some(path) = self.suites.get(&test.suite) {
-                name = format!("{path}: {name}");
-            }
+        if self.opts.print_path
+            && !test.load
+            && let Some(path) = self.suites.get(&test.suite)
+        {
+            name = format!("{path}: {name}");
         }
         if test.load {
             name = format!(
@@ -210,15 +212,14 @@ impl Renderer {
             message.to_owned(),
             suffix.map(str::to_owned),
         );
-        if let Some(last) = &self.last {
-            if last.0 == state.0
-                && last.1 == state.1
-                && last.2 == state.2
-                && last.3 == state.3
-                && (suffix.is_none() || last.4 == state.4)
-            {
-                return Ok(());
-            }
+        if let Some(last) = &self.last
+            && last.0 == state.0
+            && last.1 == state.1
+            && last.2 == state.2
+            && last.3 == state.3
+            && (suffix.is_none() || last.4 == state.4)
+        {
+            return Ok(());
         }
         self.last = Some(state);
         let mut line = String::new();
@@ -444,16 +445,15 @@ impl Renderer {
                 if let Some(entry) = self.tests.get_mut(&id) {
                     entry.result = next;
                 }
-                if self.kind == Kind::Expanded {
-                    if let Some(first) = self
+                if self.kind == Kind::Expanded
+                    && let Some(first) = self
                         .active
                         .first()
                         .and_then(|first| self.tests.get(first))
                         .cloned()
-                    {
-                        let description = self.description(&first);
-                        self.progress(out, &description, None, None)?;
-                    }
+                {
+                    let description = self.description(&first);
+                    self.progress(out, &description, None, None)?;
                 }
             }
         }
@@ -779,10 +779,11 @@ impl Compact {
 
     fn description(&self, test: &Live) -> String {
         let mut name = test.name.clone();
-        if self.opts.print_path && !test.load {
-            if let Some(path) = self.suites.get(&test.suite) {
-                name = format!("{path}: {name}");
-            }
+        if self.opts.print_path
+            && !test.load
+            && let Some(path) = self.suites.get(&test.suite)
+        {
+            name = format!("{path}: {name}");
         }
         if test.load {
             name = format!(
@@ -814,17 +815,16 @@ impl Compact {
         suffix: Option<&str>,
     ) -> io::Result<()> {
         let elapsed = self.started.elapsed().as_secs();
-        if let Some(last) = &self.last {
-            if last.0 == self.passed
-                && last.1 == self.skipped
-                && last.2 == self.failed
-                && last.3 == message
-                && (suffix.is_none() || last.4.as_deref() == suffix)
-                && (truncate_line || !last.5)
-                && (self.printed_newline || elapsed == self.last_elapsed)
-            {
-                return Ok(());
-            }
+        if let Some(last) = &self.last
+            && last.0 == self.passed
+            && last.1 == self.skipped
+            && last.2 == self.failed
+            && last.3 == message
+            && (suffix.is_none() || last.4.as_deref() == suffix)
+            && (truncate_line || !last.5)
+            && (self.printed_newline || elapsed == self.last_elapsed)
+        {
+            return Ok(());
         }
         self.last = Some((
             self.passed,
@@ -937,9 +937,9 @@ impl Compact {
             hidden: false,
         };
         if test.load {
-            self.loads.push(id)
+            self.loads.push(id);
         } else {
-            self.active.push(id)
+            self.active.push(id);
         }
         let load = test.load;
         self.tests.insert(id, test);
@@ -1061,9 +1061,9 @@ impl Compact {
             test.result = if skipped { "skipped" } else { "success" };
             if !hidden {
                 if skipped {
-                    self.skipped += 1
+                    self.skipped += 1;
                 } else {
-                    self.passed += 1
+                    self.passed += 1;
                 }
             }
             self.active.retain(|&active| active != id);
@@ -1644,7 +1644,7 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
         (&a, &b)
     };
     let mut events = kept.events.clone();
-    if !std::ptr::eq(kept, &a) {
+    if !std::ptr::eq(kept, &raw const a) {
         // `b` survived while `a`'s load failed: `b`'s header spells the
         // shard path — rewrite it to the real suite path (suite event,
         // load-test name and url) so the merged block reads as the
@@ -1705,7 +1705,16 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
         });
     };
 
-    if !failed_load(&other.events) {
+    if failed_load(&other.events) {
+        // A crashed shard contributes only its `error`+`testDone` tail —
+        // the events past its `suite` + `load testStart` header, remapped
+        // onto the kept load test's id.
+        for event in &other.events[2.min(other_load_end)..other_load_end] {
+            let mut event = event.clone();
+            remap(&mut event);
+            events.push(event);
+        }
+    } else {
         // `other`'s root `group` event drops; its `testCount` joins the
         // kept block's root (the sum is the whole-suite count).
         if let Some((_, count, _)) = other_root
@@ -1740,15 +1749,6 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
             if drops.contains(&index) {
                 continue;
             }
-            let mut event = event.clone();
-            remap(&mut event);
-            events.push(event);
-        }
-    } else {
-        // A crashed shard contributes only its `error`+`testDone` tail —
-        // the events past its `suite` + `load testStart` header, remapped
-        // onto the kept load test's id.
-        for event in &other.events[2.min(other_load_end)..other_load_end] {
             let mut event = event.clone();
             remap(&mut event);
             events.push(event);
@@ -1996,7 +1996,7 @@ mod tests {
         // No error event ever arrived (the run ended on the test), so the
         // runner prints no chaining notice.
         assert_eq!(
-            render(Kind::Expanded, &[suite.clone()]),
+            render(Kind::Expanded, std::slice::from_ref(&suite)),
             "00:00 +0: loading test/exit_test.dart\n\
              00:00 +0: test/exit_test.dart: exits\n\
              Shell: goodbye raw\n\
@@ -2008,7 +2008,7 @@ mod tests {
         );
         // The failures-only and compact reporters print the same marker.
         assert!(
-            render(Kind::FailuresOnly, &[suite.clone()])
+            render(Kind::FailuresOnly, std::slice::from_ref(&suite))
                 .contains("test/exit_test.dart: exits - did not complete [E]")
         );
         let mut out = Vec::new();
@@ -2330,7 +2330,7 @@ mod tests {
             r#"{"testID":2,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":2}"#,
             r#"{"testID":2,"error":"late","stackTrace":"frame","isFailure":true,"type":"error","time":3}"#,
         ]);
-        let text = render(Kind::Expanded, &[suite.clone()]);
+        let text = render(Kind::Expanded, std::slice::from_ref(&suite));
         assert!(text.contains("00:00 +0: test/a_test.dart: t\n"));
         assert!(text.contains("00:00 +0 -1: test/a_test.dart: t [E]\n"));
         assert!(text.contains("Failing tests:\n  test/a_test.dart: t\n"));

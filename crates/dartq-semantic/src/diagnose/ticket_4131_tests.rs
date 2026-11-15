@@ -13,6 +13,7 @@
 //!   closure formal's schema (the pass-2 receiver walk is memoized), so the
 //!   closure body's miss reports against the solved formal type.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

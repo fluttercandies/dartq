@@ -15,6 +15,7 @@
 //! slot still never joins the list's name scope, so the duplicate checks are
 //! untouched.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::diagnose::FileReport;
 

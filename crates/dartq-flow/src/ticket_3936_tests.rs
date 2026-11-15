@@ -14,6 +14,7 @@
 //! `ShapePattern` event also kills the state the failure join reads, which
 //! folds the `else` dead alongside the body. The kill commits AFTER the join.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 #[cfg(test)]
 mod tests {
     use crate::facts::FlowFact;

@@ -2972,7 +2972,7 @@ fn annotate_overrides_object_root_reports() {
 
 /// The annotated operator face: `@override` on an `operator ==`
 /// declaration (with or without a written return type) stays silent —
-/// the members_family.dart rc2 divergence (the metadata lookup must
+/// the `members_family.dart` rc2 divergence (the metadata lookup must
 /// reach the operator's `MetadataStar` like any other member).
 #[test]
 fn annotate_overrides_annotated_operator_stays_silent() {
@@ -6576,7 +6576,7 @@ fn prefer_const_declarations_tearoffs_report() {
 /// constructor-tear-off blocks (`X.new` over a constructor-less class)
 /// ride the implicit-constructor tear-off face owned by the
 /// const-ability module; the `m<T>` type-variable instantiation negative
-/// (upstream test_staticFunctionTearoff_instantiatedWithTypeVariable)
+/// (upstream `test_staticFunctionTearoff_instantiatedWithTypeVariable`)
 /// is gated by that module's type-argument read too.
 #[test]
 fn prefer_const_declarations_corpus_tearoff_blocks_report() {

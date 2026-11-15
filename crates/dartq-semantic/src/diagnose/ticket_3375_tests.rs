@@ -17,8 +17,8 @@
 //!
 //! # Residuals (each root owned by another file; not fixed here)
 //!
-//! - EXTRA `show hide, show hide ugly` (combinators2_test 11:9|4 `hide`,
-//!   12:9|4 `show`; combinators_test 19:25|4, 20:25|4, part 10:10|4): the
+//! - EXTRA `show hide, show hide ugly` (`combinators2_test` 11:9|4 `hide`,
+//!   12:9|4 `show`; `combinators_test` 19:25|4, 20:25|4, part 10:10|4): the
 //!   engine diet walk's name-slot gate accepts only `Identifier` and
 //!   built-in identifiers, so the PSEUDO keywords `show`/`hide` are dropped
 //!   from the clause name lists and the `show` clause imports nothing —
@@ -33,8 +33,8 @@
 //!   in the diagnose emission sites (held files); the same-position display
 //!   twins (`unresolved` |16 vs |10, `prefix` |8 vs |6, `p` |3 vs |1) are
 //!   the head span covering `.Class`/`<T>` instead of the identifier alone.
-//! - MISSING unquoted-imports rows (keywords_A01_t02 22:44|3 `l08`,
-//!   48:30|3; static_semantics_A02_t02 17:27|1 `c`, 18:33|1 `d`, 25:9,
+//! - MISSING unquoted-imports rows (`keywords_A01_t02` 22:44|3 `l08`,
+//!   48:30|3; `static_semantics_A02_t02` 17:27|1 `c`, 18:33|1 `d`, 25:9,
 //!   26:9, 29:9, 30:9, 31:9): the oracle at the 3.13.7 pin recovers the
 //!   unquoted `import` directives as broken declarations and reports
 //!   `undefined_class` on the `as` tail plus `undefined_identifier` on the
@@ -42,8 +42,8 @@
 //!   rows are `not_a_type`/`undefined_prefixed_name`). Matching requires
 //!   the unquoted-imports feature posture decision (parser/feature level).
 //! - MISSING prefixed-NamedType-in-pattern rows (extractor_
-//!   prefixedNamedUnderscore_withTypeArgs_insideCase 3:10|8,
-//!   object_prefixed_withTypeArgs_insideAssignment 2:3|12 `Future`): the
+//!   `prefixedNamedUnderscore_withTypeArgs_insideCase` 3:10|8,
+//!   `object_prefixed_withTypeArgs_insideAssignment` 2:3|12 `Future`): the
 //!   oracle reports `undefined_class` naming the class segment over the
 //!   full `_.Future` spelling when the prefix is undefined
 //!   (`reportNullOrNonTypeElement`, `_getErrorRange` spanning
@@ -51,6 +51,7 @@
 //!   that shape for `PrefixedTypeReference` heads, but the object-pattern /
 //!   extractor faces never route one (listener pattern-face routing).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -199,7 +200,7 @@ fn diagnose_with_combinators(
     )
 }
 
-/// The recon's EXTRA core (combinators2_test, oracle row 15:9|4 only):
+/// The recon's EXTRA core (`combinators2_test`, oracle row 15:9|4 only):
 /// `show hide, show hide ugly` shows the keyword-spelled members `hide` and
 /// `show` and hides `ugly` — the uses of `hide`/`show` resolve and only
 /// `ugly` reports. With the correct capture the clause lists carry, the
@@ -243,7 +244,7 @@ fn t3375_bare_import_hide_drops_only_hidden() {
     );
 }
 
-/// The prefixed `show` face (combinators_test `as M show e`, oracle row
+/// The prefixed `show` face (`combinators_test` `as M show e`, oracle row
 /// `M.e` silent): only the shown name enters the prefix table; a live
 /// prefix's unshown member reports `undefined_prefixed_name` over the
 /// written `M.z` spelling, and a prefixed import contributes its prefix

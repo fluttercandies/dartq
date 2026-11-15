@@ -1,5 +1,6 @@
 //! The crate-wide error type.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// Every fallible operation in this crate fails with one of these.
 ///
 /// Variants carry string payloads naming the specific path, key, or value

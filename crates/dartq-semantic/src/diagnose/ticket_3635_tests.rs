@@ -30,21 +30,22 @@
 //! those targets expand equal to the value and stay silent) staying
 //! silent exactly as the oracle does.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{RigImport, report_ops_with, rows};
 
 /// The foreign `co19/Utils/lang_feature_check.dart` face the corpus
 /// mounts (`part of 'expect.dart'`, imported across the library edge):
 /// `typedef F<X> = void Function<Y extends X>()` plus `toF`.
-const LANG_FEATURE_CHECK: &str = r#"
+const LANG_FEATURE_CHECK: &str = r"
 typedef F<X> = void Function<Y extends X>();
 F<X> toF<X>(X x) => <Y extends X>() {};
-"#;
+";
 
 /// The real `typedef_l2_03_t15` body: `class A<X>` plus the two-parameter
 /// bound-cycle typedef `G`, then the 25 target declarations of the
 /// `test(G source)` body.
-const CASE_BODY: &str = r#"
+const CASE_BODY: &str = r"
 class A<X> {}
 typedef G<X extends Y, Y extends A<Y>> = void Function(Y);
 
@@ -82,7 +83,7 @@ main() {
   G? source;
   G == int;
 }
-"#;
+";
 
 fn case_report() -> FileReport {
     report_ops_with(

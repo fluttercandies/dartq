@@ -14,7 +14,7 @@
 //! carries the join, but the `??` fold leaves the enclosing group row's
 //! range as its closing paren alone, so the receiver resolved `Unknown`
 //! and every member/operator check on a `(a ?? b)` receiver was skipped —
-//! `Engine::group_expression_face` (row_resolution.rs) closes that: the
+//! `Engine::group_expression_face` (`row_resolution.rs`) closes that: the
 //! group's static type is its inner expression's own, re-derived through
 //! the same compound join.
 //!
@@ -23,6 +23,7 @@
 //! the module inside the `diagnose` subtree so
 //! `crate::diagnose::test_rig` resolves).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// The `class C` fixture head both receiver shapes read.

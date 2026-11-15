@@ -15,6 +15,7 @@
 //! Oracle provenance: `dart analyze` 3.13.1 — every expectation below
 //! was probed against the real binary before the fix.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// `f.bar` on a `var`-inferred closure reports the getter face against

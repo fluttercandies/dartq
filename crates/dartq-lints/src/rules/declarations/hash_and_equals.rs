@@ -97,7 +97,7 @@ fn member_or_field_name(c: &Check<'_>, member: u32) -> Option<u32> {
 /// payload token (the `==` itself — `head_token` would hit the
 /// `operator` keyword), an `Identifier`/variable through its span head.
 /// The official `reportAtToken(name)` spans the token
-/// (hash_and_equals.dart:67/73 — the markup marks `==` / `hashCode`
+/// (`hash_and_equals.dart:67/73` — the markup marks `==` / `hashCode`
 /// whole).
 fn report_at(c: &mut Check<'_>, name: u32, args: &[&str]) {
     let token = if c.kind(name) == NodeKind::OperatorName {

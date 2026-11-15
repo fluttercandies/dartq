@@ -39,6 +39,7 @@
 //! complete, and it is hand-curated (a small, fidelity-reviewed surface),
 //! unlike the generated bulk tables.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// Per-library bundled extension-face source: `(dart: library name, the
 /// declaration excerpt)`. Each entry's library must be addressable — a name
 /// of the generated [`FLAT_LIBRARIES`] surface, so the consumer's synthetic
@@ -235,7 +236,7 @@ extension IterableExtensions<T> on Iterable<T> {
     ),
     (
         "collection",
-        r#"abstract final class HashMap<K, V> implements Map<K, V> {
+        r"abstract final class HashMap<K, V> implements Map<K, V> {
   external factory HashMap();
   external factory HashMap.from(Map other);
   external factory HashMap.of(Map<K, V> other);
@@ -306,7 +307,7 @@ base class UnmodifiableSetView<E> implements Set<E> {
 base class UnmodifiableListView<E> implements List<E> {
   external UnmodifiableListView(Iterable<E> source);
 }
-"#,
+",
     ),
     (
         // `dart:html` — the event-surface classes and their public member
@@ -342,7 +343,7 @@ base class UnmodifiableListView<E> implements List<E> {
         // names-only face name: modelling it would arm member walks over
         // every DOM receiver, far beyond the surface this entry owns.
         "html",
-        r#"typedef EventListener = void Function(Event event);
+        r"typedef EventListener = void Function(Event event);
 
 class Events {
   Events(EventTarget target);
@@ -437,7 +438,7 @@ class MessagePort extends EventTarget {
   external void postMessage(dynamic message, [List<Object>? transfer]);
   external Stream<MessageEvent> get onMessage;
 }
-"#,
+",
     ),
 ];
 
@@ -518,7 +519,7 @@ mod tests {
 
     /// The `html` excerpt is the container surface an `on MessagePort`
     /// extension resolves its on-type through (upstream Dart SDK source,
-    /// sdk/lib/html/dart2js/html_dart2js.dart:22219): `MessagePort` must
+    /// `sdk/lib/html/dart2js/html_dart2js.dart:22219)`: `MessagePort` must
     /// stay a member-bearing class extending `EventTarget`, with the
     /// `onMessage`/`postMessage`/`close` surface the web channel code reads,
     /// and the event heads it leans on must stay declared. Dropping the

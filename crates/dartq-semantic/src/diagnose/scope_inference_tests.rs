@@ -5,6 +5,7 @@
 //!
 //! Oracle provenance (`dart analyze` 3.13.1): every shape is silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, assert_silent, code_names, report_ops, report_ops_imports, rows};
 
 /// `priority.index` on an enum-typed receiver resolves through the

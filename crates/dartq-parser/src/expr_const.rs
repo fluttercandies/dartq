@@ -12,6 +12,7 @@
 //! collections/strings (`literals.rs`), arguments and constructor
 //! references (the full engine), and the binary-level table below.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind};
 
 pub(crate) use crate::listener::ConstantPatternContext;
@@ -1373,7 +1374,10 @@ mod tests {
         // (official :7386-7393) — `x is int == y` is clean outside constant
         // patterns (a pattern context legitimately reports the `is`
         // over-collection like the oracle).
-        assert!(expression_errors("x is int == y").is_empty());
+        assert_eq!(
+            expression_errors("x is int == y"),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -1381,7 +1385,10 @@ mod tests {
         // F2: `as` never touches the chain flag; driven with no
         // constant-pattern context so `as` takes the relational arm
         // (a pattern context would exit at `as` for the cast pattern).
-        assert!(expression_errors("x as int as double").is_empty());
+        assert_eq!(
+            expression_errors("x as int as double"),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -1398,7 +1405,7 @@ mod tests {
     fn negation_accepts_numeric_literals_only() {
         // F6 (official :7941-7958 + parsePrimary :8110-8167): implicit `-`
         // switches to numeric-literal-only.
-        assert!(pattern_errors("-1").is_empty());
+        assert_eq!(pattern_errors("-1"), [] as [std::string::String; 0]);
         assert_eq!(
             pattern_errors("-x"),
             vec!["invalid_constant_pattern_negation".to_string()]
@@ -1458,7 +1465,10 @@ mod tests {
             pattern_errors("Foo.bar<int>"),
             vec!["invalid_constant_pattern_generic".to_string()]
         );
-        assert!(expression_errors("Foo.bar<int>").is_empty());
+        assert_eq!(
+            expression_errors("Foo.bar<int>"),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -1617,10 +1627,10 @@ mod tests {
         // would drag the case colon into the operand's token window.
         let mut p = parser(".e", ShorthandLog::default());
         let _ = p.parse_pattern_entry(PatternContext::Matching);
-        assert!(p.listener.sends.is_empty());
+        assert_eq!(p.listener.sends, [] as [(u32, u32); 0]);
         assert_eq!(p.listener.head_dots, vec![0]);
         assert_eq!(p.listener.members, vec![1]);
-        assert!(p.listener.errors.is_empty());
+        assert_eq!(p.listener.errors, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1632,7 +1642,7 @@ mod tests {
         let _ = p.parse_pattern_entry(PatternContext::Matching);
         assert_eq!(p.listener.errors, ["missing_identifier"]);
         assert_eq!(p.listener.head_dots, vec![0]);
-        assert!(p.listener.members.is_empty());
+        assert_eq!(p.listener.members, [] as [u32; 0]);
     }
 
     #[test]

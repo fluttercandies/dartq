@@ -22,14 +22,15 @@
 //! result through `callee_return_ty` at the check, so the read spells
 //! `F<A<int>?>` and the verdict decides.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, code_names, report_ops_with};
 
 /// The shared `lang_feature_check.dart` face the co19 corpus mounts:
 /// `typedef F<X> = void Function<Y extends X>()` plus `toF`.
-const LANG_FEATURE_CHECK: &str = r#"
+const LANG_FEATURE_CHECK: &str = r"
 typedef F<X> = void Function<Y extends X>();
 F<X> toF<X>(X x) => <Y extends X>() {};
-"#;
+";
 
 /// Pin: `var fsource = toF(source)` infers `F<A<int>?>`; assigning it into
 /// `F<A<num>?>?` — the signatures' own `Y` bounds differ (`A<int>?` vs
@@ -39,7 +40,7 @@ F<X> toF<X>(X x) => <Y extends X>() {};
 // un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn bounds_differ_nested_nullability_reports() {
     let report = report_ops_with(
-        r#"import 'package:x/lang_feature_check.dart';
+        r"import 'package:x/lang_feature_check.dart';
 
 class num {} class int extends num {}
 
@@ -50,7 +51,7 @@ main() {
   var fsource = toF(source);
   F<A<num>?>? target = fsource;
 }
-"#,
+",
         &[RigImport {
             uri: "package:x/lang_feature_check.dart",
             prefix: None,
@@ -70,7 +71,7 @@ main() {
 #[test]
 fn bounds_equal_stays_silent() {
     let report = report_ops_with(
-        r#"import 'package:x/lang_feature_check.dart';
+        r"import 'package:x/lang_feature_check.dart';
 
 class num {} class int extends num {}
 
@@ -81,7 +82,7 @@ main() {
   var fsource = toF(source);
   F<A<num>?>? target = fsource;
 }
-"#,
+",
         &[RigImport {
             uri: "package:x/lang_feature_check.dart",
             prefix: None,

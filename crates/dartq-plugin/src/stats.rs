@@ -8,6 +8,7 @@
 //! is no snapshot-consistency problem: [`PluginStats::snapshot`] reads each
 //! atomic once and the result is a valid point-in-time lower bound.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 

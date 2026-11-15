@@ -22,6 +22,7 @@
 //! the undefined-callee `mystery()` face is InvalidType too, answers
 //! `double` and reports `return_of_invalid_type`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;
@@ -141,7 +142,7 @@ void f(Node node, Token operator) {
 }
 
 /// The refinement set is `{+,-,*,%}`: every one of them answers `double`
-/// over an invalid right operand (p_matrix lines 18-20).
+/// over an invalid right operand (`p_matrix` lines 18-20).
 #[test]
 fn int_plus_times_percent_invalid_all_double() {
     let source = "\
@@ -175,7 +176,7 @@ void f(Node node, Token operator) {
 
 /// `~/` sits outside the refinement set: the declared `int` return
 /// stands, so the `int`-formal call stays silent over the invalid
-/// operand — no over-report (p_matrix line 22 checks the declared face
+/// operand — no over-report (`p_matrix` line 22 checks the declared face
 /// through the oracle's `double`-formal probe; the call face for a
 /// non-refined fold row is the under-report direction here).
 #[test]
@@ -201,7 +202,7 @@ void f(Node node, Token operator) {
 }
 
 /// `/` declares `double` itself; the invalid operand changes nothing
-/// (p_matrix line 21).
+/// (`p_matrix` line 21).
 #[test]
 fn int_slash_invalid_keeps_declared_double() {
     let source = "\
@@ -225,7 +226,7 @@ void f(Node node, Token operator) {
 }
 
 /// A receiver outside `num` never refines: `String + <invalid>` answers
-/// the declared `String` (p_str line 12).
+/// the declared `String` (`p_str` line 12).
 #[test]
 fn string_plus_invalid_keeps_string() {
     let source = "\
@@ -277,7 +278,7 @@ void f(Node node, dynamic dy) {
 }
 
 /// A `num` receiver refines through the same `S <: double?` branch:
-/// `num - <invalid>` answers `double` (p_matrix line 30 — plain `num`
+/// `num - <invalid>` answers `double` (`p_matrix` line 30 — plain `num`
 /// arithmetic over a known-`int` right stays `num`, the invalid side is
 /// what decides `double` here).
 #[test]
@@ -305,7 +306,7 @@ void f(Node node, Token operator) {
 
 /// The under-report face is preserved: an invalid LEFT leaves the
 /// operator unresolved (upstream answers `InvalidType`) and every
-/// downstream check stays silent (p_matrix lines 37-40).
+/// downstream check stays silent (`p_matrix` lines 37-40).
 #[test]
 fn invalid_left_stays_silent() {
     let source = "\
@@ -330,9 +331,9 @@ void f(Node node, Token operator) {
 
 /// The compound face (`assignment_expression_resolver.dart:308-313`):
 /// `int total; total += <invalid>` types the read `total + <invalid>` as
-/// `double` and reports `invalid_assignment` (p_matrix line 43 — the
-/// manifest_ast.dart:158 census row); the `num` target accepts the
-/// refined `double` silently (p_matrix line 45).
+/// `double` and reports `invalid_assignment` (`p_matrix` line 43 — the
+/// `manifest_ast.dart:158` census row); the `num` target accepts the
+/// refined `double` silently (`p_matrix` line 45).
 #[test]
 fn compound_assignment_reports_invalid_assignment() {
     let source = "\
@@ -358,7 +359,7 @@ void f(Token operator) {
     );
 }
 
-/// Equality stays `bool` over an invalid operand (p_matrix line 27) —
+/// Equality stays `bool` over an invalid operand (`p_matrix` line 27) —
 /// the refinement never touches the `==` composite.
 #[test]
 fn equality_over_invalid_stays_bool() {

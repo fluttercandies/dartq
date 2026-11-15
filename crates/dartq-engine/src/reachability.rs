@@ -142,6 +142,7 @@
 //! worklist pops a marked node per iteration, and mark-before-push bounds
 //! each node to one enqueue.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fmt;
 use std::sync::Arc;
 
@@ -513,8 +514,6 @@ pub(crate) fn build(
 /// one member file, from its capture (the node rows and the attribution
 /// geometry), its owner surface's reference rows for the file, and its
 /// text. Every coordinate is file-local; [`build`] renumbers at assembly.
-#[expect(clippy::too_many_lines)]
-#[expect(clippy::too_many_arguments)] // one argument per derive input; a bundling struct would only relocate the list
 fn derive_unit(
     state: &EngineState,
     capture: &FileCapture,
@@ -953,11 +952,11 @@ mod tests {
             .by_name(id)
             .unwrap_or_else(|| panic!("declaration `{name}` present"));
         let decls = capture.index.decls();
-        let start = saturate_slot_u32(
+
+        saturate_slot_u32(
             (run.as_ptr() as usize - decls.as_ptr() as usize)
                 / std::mem::size_of::<dartq_index::DeclRow>(),
-        );
-        start
+        )
     }
 
     /// The reachability flag of `name`'s first declaration in `file`.

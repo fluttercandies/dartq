@@ -13,6 +13,7 @@
 //! face of a function-name read (its static type is the declaration's
 //! `FunctionType`, formals and written return included).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::super::types::FileReport;
 use super::async_return_tests::{code_names, report};
 

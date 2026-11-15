@@ -33,6 +33,7 @@
 //! - **M11 consumer** — the same-head `infer_gather` arm assumes
 //!   covariance; declared variance needs #3903's capture column.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 
 /// The generic receiver's index argument substitutes the written
@@ -42,7 +43,7 @@ use super::test_rig::{code_names, report_ops, rows};
 #[test]
 fn generic_container_index_key_substitutes_declared_parameter() {
     let report = report_ops(
-        r#"
+        r"
 class Box<K> {
   void operator []=(K key, int v) {}
   int operator [](K key) => 0;
@@ -52,7 +53,7 @@ void t(Box<int> b) {
   b['s'];
   b['s'] = 1;
 }
-"#,
+",
     );
     let names = code_names(&report);
     let key_rows = names
@@ -78,11 +79,11 @@ void t(Box<int> b) {
 #[test]
 fn index_write_value_checks_against_value_formal() {
     let report = report_ops(
-        r#"
+        r"
 void t(int? v, List<int> x) {
   x[0] = v;
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(
@@ -101,13 +102,13 @@ void t(int? v, List<int> x) {
 #[test]
 fn null_aware_composite_argument_keeps_nullable_join() {
     let report = report_ops(
-        r#"
+        r"
 void take(int v) {}
 
 void t(int? a, int? b) {
   take(a ?? b);
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(
@@ -124,7 +125,7 @@ void t(int? a, int? b) {
 #[test]
 fn void_type_argument_never_conforms_to_non_top_bound() {
     let report = report_ops(
-        r#"
+        r"
 void fc<T extends num>() {}
 void fd<T extends Object>() {}
 
@@ -132,7 +133,7 @@ void t() {
   fc<void>();
   fd<void>();
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert_eq!(
@@ -154,7 +155,7 @@ void t() {
 #[test]
 fn f_bounded_function_type_arg_reports_return_leg() {
     let report = report_ops(
-        r#"
+        r"
 typedef exp2 = void Function<T extends num>();
 typedef exp4 = void Function<T extends num>(T);
 
@@ -166,7 +167,7 @@ void t() {
   func1<exp4>();
   func3<exp2>();
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(
@@ -188,7 +189,7 @@ void t() {
 #[test]
 fn f_bounded_bound_message_renders_declared_binder() {
     let report = report_ops(
-        r#"
+        r"
 typedef exp2 = void Function<T extends num>();
 
 void func1<T extends T Function<T extends num>(T)>() {}
@@ -196,7 +197,7 @@ void func1<T extends T Function<T extends num>(T)>() {}
 void t() {
   func1<exp2>();
 }
-"#,
+",
     );
     let stated = rows(&report).join("\n");
     assert!(
@@ -220,14 +221,14 @@ void t() {
 #[test]
 fn gather_same_head_arm_covariant_control_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 class Cov<T> {
   final T? value;
   Cov(this.value);
 }
 
 Cov<Object?> widen(Cov<int> a) => a;
-"#,
+",
     );
     let names = code_names(&report);
     assert!(

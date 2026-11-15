@@ -14,7 +14,7 @@
 //! `undefined_identifier` when no namesake exists.
 //!
 //! Upstream Dart SDK source, pkg/analyzer/lib/src/summary2/
-//! element_builder.dart `_linkFormalParameters` — the fragments' parameter
+//! `element_builder.dart` `_linkFormalParameters` — the fragments' parameter
 //! lists link into one element per position and each body's formal scope
 //! is populated from the merged element.
 //!
@@ -25,6 +25,7 @@
 //! assigned/variable type pair pins the row's direction without pinning
 //! rig-shifted offsets).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops_experiments_with;
 
 /// The fixture's `invalid_assignment` messages, in source order.
@@ -105,7 +106,7 @@ main() {
 
 /// The constructor faces (the `augmenting_constructors_A01_t29` rows): the
 /// unnamed and `.named` chains in both directions. Oracle: zero
-/// invalid_assignment rows (the file's own faces — the defaulted augment
+/// `invalid_assignment` rows (the file's own faces — the defaulted augment
 /// curing the missing default — are outside this ticket's code).
 #[test]
 fn constructor_chains_merge_both_directions() {
@@ -133,7 +134,7 @@ main() {
 }
 
 /// An augment body reading a name the intro spells, over a constructor
-/// selector chain (the `augment ET.foo` shape of A01_t29).
+/// selector chain (the `augment ET.foo` shape of `A01_t29`).
 #[test]
 fn named_constructor_augment_body_reads_the_intro_name() {
     let source = "\
@@ -183,7 +184,7 @@ main() {
 }
 
 /// A position spelled `_` on every fragment binds nothing: the body's read
-/// falls through to the top-level variable (oracle: invalid_assignment at
+/// falls through to the top-level variable (oracle: `invalid_assignment` at
 /// the read). The merged scope never invents a name.
 #[test]
 fn all_wildcard_position_contributes_no_name() {
@@ -260,7 +261,7 @@ main() {
 
 /// A lone `_` formal (no augment anywhere) keeps the fall-through: the
 /// wildcard binds nothing and the read resolves to the top-level variable
-/// (oracle: invalid_assignment). The merged scope never fires without a
+/// (oracle: `invalid_assignment`). The merged scope never fires without a
 /// chain.
 #[test]
 fn lone_wildcard_formal_keeps_the_fall_through() {
@@ -277,7 +278,7 @@ main() {
     assert_eq!(invalid_assignment_messages(source), [STRING_TO_INT]);
 }
 
-/// Member methods (the instance-setter faces of A02_t13) merge the same
+/// Member methods (the instance-setter faces of `A02_t13`) merge the same
 /// way — the same-key instance space, both directions in one file.
 #[test]
 fn instance_member_chains_merge_both_directions() {
@@ -304,7 +305,7 @@ main() {
 }
 
 /// A static member chain keys apart from the instance one (the
-/// static-setter faces of A02_t13): same spellings, static space.
+/// static-setter faces of `A02_t13)`: same spellings, static space.
 #[test]
 fn static_member_chains_merge() {
     let source = "\

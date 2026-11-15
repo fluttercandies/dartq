@@ -42,6 +42,7 @@
 //! names-only SDK face units (`face_unit` + `declare_face`, the dart:ui
 //! projection the Flutter face-only pin mounts).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::{FileReport, StrictModes, fold_unit_with_ops, merge_source_ordered};
 use crate::collector::collect;
 use crate::library::ElementIndex;
@@ -55,7 +56,7 @@ use dartq_resolution::{
 };
 use dartq_scanner::ScanConfig;
 use dartq_source::{FileId, FileTable, StringTable};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::Path;
 
 // —— the fixture libraries ——————————————————————————————————————————————
@@ -171,8 +172,8 @@ fn report(source: &str, deps: &[Dep<'_>], mounts: &[(&str, &str)]) -> FileReport
     let elements = collect(source, &scanned.tokens, features, &strings);
     let mut builder = LibraryGraphBuilder::new(&strings);
     let lib = builder.intern("package:t/main.dart");
-    let mut libs: HashMap<&str, LibraryId> = HashMap::new();
-    let mut dep_files: HashMap<&str, FileId> = HashMap::new();
+    let mut libs: FxHashMap<&str, LibraryId> = FxHashMap::default();
+    let mut dep_files: FxHashMap<&str, FileId> = FxHashMap::default();
     for dep in deps {
         libs.insert(dep.uri, builder.intern(dep.uri));
         dep_files.insert(dep.uri, files.intern(Path::new(dep.uri)));
@@ -214,31 +215,28 @@ fn report(source: &str, deps: &[Dep<'_>], mounts: &[(&str, &str)]) -> FileReport
     for dep in deps {
         let dep_lib = libs[dep.uri];
         let dep_file = dep_files[dep.uri];
-        match dep.source {
-            Some(dep_source) => {
-                let dep_scanned = scan(dep_source, dep_file);
-                let dep_elements = collect(dep_source, &dep_scanned.tokens, features, &strings);
-                index.insert(dep_file, dep_elements.clone());
-                builder.unit(dep_lib, dep_file);
-                declare(&mut builder, dep_lib, dep_file, &dep_elements);
-                crate::capture_clause_trees(
-                    dep_file,
-                    dep_source,
-                    &dep_scanned.tokens,
-                    features,
-                    &strings,
-                    &mut clauses,
-                );
-            }
-            None => {
-                // The production SDK posture: the synthetic face file rides
-                // the element index with an empty model, so the namespace
-                // layer discriminates on `is_face_file`, never an index miss.
-                index.insert(dep_file, FileElements::default());
-                builder.face_unit(dep_lib, dep_file);
-                for &name in dep.face {
-                    builder.declare_face(dep_lib, strings.intern(name), dep_file, FaceKind::Class);
-                }
+        if let Some(dep_source) = dep.source {
+            let dep_scanned = scan(dep_source, dep_file);
+            let dep_elements = collect(dep_source, &dep_scanned.tokens, features, &strings);
+            index.insert(dep_file, dep_elements.clone());
+            builder.unit(dep_lib, dep_file);
+            declare(&mut builder, dep_lib, dep_file, &dep_elements);
+            crate::capture_clause_trees(
+                dep_file,
+                dep_source,
+                &dep_scanned.tokens,
+                features,
+                &strings,
+                &mut clauses,
+            );
+        } else {
+            // The production SDK posture: the synthetic face file rides
+            // the element index with an empty model, so the namespace
+            // layer discriminates on `is_face_file`, never an index miss.
+            index.insert(dep_file, FileElements::default());
+            builder.face_unit(dep_lib, dep_file);
+            for &name in dep.face {
+                builder.declare_face(dep_lib, strings.intern(name), dep_file, FaceKind::Class);
             }
         }
     }
@@ -362,7 +360,7 @@ fn scan(source: &str, file: FileId) -> dartq_scanner::ScanResult {
 // —— row helpers ——————————————————————————————————————————————————————————
 
 /// One code's rows in source order: `(message, line, column)`.
-fn rows<'a>(report: &'a FileReport, source: &str, code: &str) -> Vec<(String, u32, u32)> {
+fn rows(report: &FileReport, source: &str, code: &str) -> Vec<(String, u32, u32)> {
     let mut found: Vec<_> = report
         .diagnostics
         .iter()
@@ -406,7 +404,7 @@ fn getters(report: &FileReport, source: &str) -> Vec<(String, u32, u32)> {
 /// promotion and reports the member against `Widget` — `fit` exists only on
 /// the collision partner `widgets.Image`, which is exactly the member the
 /// optimistic step used to mask.
-const P14_P16_LEGACY: &str = r#"// @dart=2.12
+const P14_P16_LEGACY: &str = r"// @dart=2.12
 String p14(Widget w) {
   if (w is u.Image) {
     return w.fit;
@@ -420,7 +418,7 @@ String p16(Widget w) {
   }
   return '';
 }
-"#;
+";
 
 #[test]
 fn prefixed_tested_head_reports_on_the_declared_type() {
@@ -455,14 +453,14 @@ const LOCALIZED: &str = "class LocalizedText {\n  String resolve() => 'x';\n}\n"
 /// A promotion FROM a top type is valid for every tested spelling, so the
 /// lossy refusal must not refuse it: the corpus's `Object`-declared
 /// receivers keep their promotion, and `value.resolve` stays silent.
-const TOP_RECEIVER_LEGACY: &str = r#"// @dart=2.12
+const TOP_RECEIVER_LEGACY: &str = r"// @dart=2.12
 String topReceiver(Object value) {
   if (value is u.LocalizedText) {
     return value.resolve();
   }
   return '';
 }
-"#;
+";
 
 #[test]
 fn lossy_head_over_a_top_standing_type_still_promotes() {
@@ -482,13 +480,13 @@ fn lossy_head_over_a_top_standing_type_still_promotes() {
 /// `widgets.Image` is reachable only through a `show Widget` import). The
 /// collision claim must NOT relax the decidable pair — the strict resolved
 /// gate refuses at every language version.
-const P7: &str = r#"String p7(Widget w) {
+const P7: &str = r"String p7(Widget w) {
   if (w is Image) {
     return w.fit;
   }
   return '';
 }
-"#;
+";
 
 fn p7_report(version: &str) -> FileReport {
     let source = format!("// @dart={version}\n{P7}");
@@ -540,13 +538,13 @@ fn hidden_collision_whose_scope_names_the_slot_keeps_the_strict_gate_sound() {
 /// registered slot is the unrelated class, but a real declaration is in
 /// scope — both folds keep the optimistic step, and the member row stays on
 /// the promoted `Image`.
-const P6: &str = r#"String p6(Widget w) {
+const P6: &str = r"String p6(Widget w) {
   if (w is Image) {
     return w.uiOnly;
   }
   return '';
 }
-"#;
+";
 
 fn p6_report(version: &str) -> FileReport {
     let source = format!("// @dart={version}\n{P6}");
@@ -594,7 +592,7 @@ fn foreign_collision_keeps_the_optimistic_step_sound() {
 /// `ambiguous_import` error and, at 3.9, the member rows against `Widget`.
 /// At 2.12 the member rows stay suppressed (the ambiguous reference is not
 /// a promotion target), which the legacy fold reproduces.
-const P1: &str = r#"String p1WidgetMember(Widget w) {
+const P1: &str = r"String p1WidgetMember(Widget w) {
   if (w is Image) {
     return w.fit;
   }
@@ -607,25 +605,25 @@ int p1UiMember(Widget w) {
   }
   return 0;
 }
-"#;
+";
 
 /// `p2`: the member exists on neither collided declaration.
-const P2: &str = r#"String p2(Widget w) {
+const P2: &str = r"String p2(Widget w) {
   if (w is Image) {
     return w.gizmo;
   }
   return '';
 }
-"#;
+";
 
 /// `p3`: `is!` guard + early return, then the member read.
-const P3: &str = r#"String p3(Widget w) {
+const P3: &str = r"String p3(Widget w) {
   if (w is! Image) {
     return 'none';
   }
   return w.fit;
 }
-"#;
+";
 
 fn collided(version: &str, body: &str) -> (String, FileReport) {
     let source = format!("// @dart={version}\n{body}");
@@ -689,13 +687,13 @@ fn ambiguous_collision_reports_on_the_declared_type_sound() {
 // —— the exact controls ——————————————————————————————————————————————————
 
 /// `p5`: an unambiguous head keeps its row (the fix is collision-scoped).
-const P5: &str = r#"int p5(Solo s) {
+const P5: &str = r"int p5(Solo s) {
   if (s is Solo) {
     return s.missing;
   }
   return s.known;
 }
-"#;
+";
 
 #[test]
 fn unambiguous_wrong_member_still_reports() {
@@ -713,13 +711,13 @@ fn unambiguous_wrong_member_still_reports() {
 
 /// `p10`: a single-declaration `Image` keeps the resolved promotion — the
 /// member row rides the promoted class, `Image`.
-const P10: &str = r#"String p10(Widget w) {
+const P10: &str = r"String p10(Widget w) {
   if (w is Image) {
     return w.uiOnly;
   }
   return '';
 }
-"#;
+";
 
 #[test]
 fn single_declaration_name_keeps_the_resolved_promotion() {
@@ -747,7 +745,7 @@ fn single_declaration_name_keeps_the_resolved_promotion() {
 /// and the two oracle rows must report — `toByteData` (13:7 in the oracle
 /// probe; 11:7 here, the fixture drops the two import lines and adds the
 /// language marker) and `gizmo` (19:14 → 17:14).
-const FLUTTER_FACE: &str = r#"String fWidgetMember(Widget w) {
+const FLUTTER_FACE: &str = r"String fWidgetMember(Widget w) {
   if (w is! Image) {
     return '';
   }
@@ -766,7 +764,7 @@ String fNeitherMember(Widget w) {
   }
   return '';
 }
-"#;
+";
 
 #[test]
 fn flutter_face_collision_keeps_the_member_rows() {

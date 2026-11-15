@@ -4,7 +4,7 @@
 //! The flow layer aggregates the official `AssignedVariables` anywhere sets
 //! into one `(declaration name span, in_closure)` row per (declaration,
 //! in-closure) pair (upstream Dart SDK source,
-//! pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart —
+//! pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart` —
 //! `functionExpression_begin` joins `anywhere.written`/`anywhere.captured`
 //! into the closure's entry state, so a `final` local written only from
 //! inside a nested function is NOT definitely unassigned there and the
@@ -27,6 +27,7 @@
 //! * an initializer is not a write — an initialized, never-reassigned
 //!   `final` has no row at all.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::Path;
 
 use dartq_language::{Feature, FeatureSet, LanguageVersion};

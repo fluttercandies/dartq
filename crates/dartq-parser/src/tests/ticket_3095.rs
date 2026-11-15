@@ -8,11 +8,12 @@
 //! `this` token (oracle 3.13.1).
 //!
 //! The redirecting-initializer lane stays silent:
-//! `C() : this = 0;` carries expected_token +
-//! missing_assignment_in_initializer and never the selector row — that
+//! `C() : this = 0;` carries `expected_token` +
+//! `missing_assignment_in_initializer` and never the selector row — that
 //! entry head is consumed by the initializer parser's own recovery, so no
 //! this-target assignment reaches the arm from it.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -58,8 +59,8 @@ fn nested_assignment_this_selector_rows_match_oracle() {
 }
 
 /// The redirecting-initializer silence face: `this = 0` as the entry head
-/// degrades through the initializer recovery — expected_token on the `=`
-/// follower and missing_assignment_in_initializer on the `this` — never
+/// degrades through the initializer recovery — `expected_token` on the `=`
+/// follower and `missing_assignment_in_initializer` on the `this` — never
 /// the selector row.
 #[test]
 fn redirecting_initializer_head_stays_silent() {

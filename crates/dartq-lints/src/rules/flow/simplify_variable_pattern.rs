@@ -31,14 +31,14 @@ use crate::rules::{MemberQuery, NONE_TOKEN, utf16_token_span};
 /// `dynamic` and the unresolved `call` face (the official `_accessor`
 /// falls to `_ => 'field'` wherever the resolved element is neither
 /// method nor getter; conformance
-/// lints/simplify_variable_pattern/{test_patternField_dynamic,
-/// test_patternField_function,test_typeParameter_record,
-/// test_typeParameter_functionType,test_typeParameter_typedef_record,
-/// test_typedef_record}), answers getter for a named member of the
+/// `lints/simplify_variable_pattern/{test_patternField_dynamic`,
+/// `test_patternField_function,test_typeParameter_record`,
+/// `test_typeParameter_functionType,test_typeParameter_typedef_record`,
+/// `test_typedef_record`}), answers getter for a named member of the
 /// enumerated dart:core faces (`int`/`num`/`double`/`String`/`bool`/
 /// `Object` — the official int.isEven / Object.hashCode corpus
 /// getters) and stays silent on their miss
-/// (test_patternField_unnexistingProperty), getter for every other
+/// (`test_patternField_unnexistingProperty`), getter for every other
 /// unresolvable face (an import, an unknown name).
 ///
 /// Resolution guard (documented approximation): the official reports
@@ -50,7 +50,7 @@ use crate::rules::{MemberQuery, NONE_TOKEN, utf16_token_span};
 /// tables — so code the analyzer already rejects there (an undefined
 /// getter, a missing record field) stays silent where the official
 /// defers to the compile error
-/// (test_recordDestructuring_unnexistingField). Message:
+/// (`test_recordDestructuring_unnexistingField`). Message:
 /// `diagnostic.g.dart` `simplifyVariablePattern`.
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "simplify_variable_pattern",
@@ -185,12 +185,7 @@ fn accessor(c: &Check<'_>, container: u32, node: u32, name: &str) -> Option<&'st
 /// answers `field` on its declared named field, a function type spells
 /// `field` for `call`, the bare name answers `field` for `dynamic` and
 /// the unresolved `call` face and by dart:core membership otherwise.
-fn object_member_kind<'a>(
-    c: &Check<'a>,
-    object: u32,
-    node: u32,
-    name: &str,
-) -> Option<&'static str> {
+fn object_member_kind(c: &Check<'_>, object: u32, node: u32, name: &str) -> Option<&'static str> {
     let head = c.field(object, PayloadField::FirstName)?;
     // A prefixed container (`prefix.A(...)`, the `Period` word set)
     // resolves outside the file.
@@ -422,7 +417,7 @@ fn scrutinee_record_type(c: &Check<'_>, container: u32) -> Option<u32> {
             .into_iter()
             .find(|&kid| c.kind(kid) == NodeKind::Identifier)
             .map(|kid| c.lexeme(c.head_token(kid)));
-        if named.as_deref() != Some(value) {
+        if named != Some(value) {
             continue;
         }
         return match first_type_row(c, parameter) {
@@ -606,7 +601,7 @@ mod tests {
     /// `test_patternField_explicit` — the getter face, message
     /// verbatim. Pin re-derived to the oracle text: `int.isEven`
     /// resolves to a getter element, so the official `_accessor`
-    /// substitutes `getter` (census test_patternField_explicit passes
+    /// substitutes `getter` (census `test_patternField_explicit` passes
     /// with exactly this text).
     #[test]
     fn named_field_with_same_name_reports() {

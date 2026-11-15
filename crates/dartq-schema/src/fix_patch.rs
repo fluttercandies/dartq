@@ -1,6 +1,7 @@
 //! The fix patch document — `dartq fix --format=machine`, one
 //! single-line object per patched file.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

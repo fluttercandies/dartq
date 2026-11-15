@@ -61,6 +61,7 @@
 //! The CLI passes a throwaway memo —
 //! a one-shot run shares nothing across processes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::collections::VecDeque;
@@ -491,7 +492,7 @@ fn decode_rows(bytes: &[u8]) -> Option<Vec<Lint>> {
         .into_iter()
         .map(|row| {
             let index = usize::from(row.rule);
-            (index < RULES.len()).then(|| Lint {
+            (index < RULES.len()).then_some(Lint {
                 rule: RuleId(row.rule),
                 range: row.start..row.end,
                 message: row.message,
@@ -1099,7 +1100,7 @@ pub fn analyze_lints(
                 {
                     analysis
                         .iter()
-                        .flat_map(|analysis| analysis.facts())
+                        .flat_map(dartq_semantic::Analysis::facts)
                         .filter_map(|fact| match fact {
                             FlowFact::AsyncContextUse {
                                 span,
@@ -1271,25 +1272,25 @@ pub fn analyze_lints(
                     // and the full `Analysis` fold never runs for this face
                     // alone.
                     let join_context;
-                    let (context, strict) = match &context {
-                        Some(mounted) => (&mounted.0, mounted.1),
-                        None => {
-                            // The library's shared substrate when one was
-                            // built, the standalone build otherwise (a
-                            // library no semantic-mount miss needed) — the
-                            // same tables either way.
-                            join_context = match engine
-                                .library_of(file)
-                                .and_then(|library| artifacts.get(&library))
-                            {
-                                Some(shared) => semantic_context(text, file, shared),
-                                None => build_semantic_context(engine, text, file, members),
-                            };
-                            let join_strict = stricts.get(dir).copied().expect(
-                                "strict modes precomputed for every resident file's directory",
-                            );
-                            (&join_context, join_strict)
-                        }
+                    let (context, strict) = if let Some(mounted) = &context {
+                        (&mounted.0, mounted.1)
+                    } else {
+                        // The library's shared substrate when one was
+                        // built, the standalone build otherwise (a
+                        // library no semantic-mount miss needed) — the
+                        // same tables either way.
+                        join_context = match engine
+                            .library_of(file)
+                            .and_then(|library| artifacts.get(&library))
+                        {
+                            Some(shared) => semantic_context(text, file, shared),
+                            None => build_semantic_context(engine, text, file, members),
+                        };
+                        let join_strict = stricts
+                            .get(dir)
+                            .copied()
+                            .expect("strict modes precomputed for every resident file's directory");
+                        (&join_context, join_strict)
                     };
                     let neutral = neutralize_ignore_keywords(text, &comments);
                     let posture = LibraryClassModifiers::default();
@@ -1723,7 +1724,6 @@ fn unignorable_rows(
 /// silent and the validator face is the family's only emission path. Rows
 /// carry the official value-node span (UTF-16 over the pubspec text) and
 /// the `IgnoreInfo.forYaml` suppression face.
-#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
     let dirs: Vec<PathBuf> = engine
         .captured_pubspecs()
@@ -2286,7 +2286,7 @@ mod tests {
     /// the fold for it — while the name-only report filter
     /// (ignore_validator.dart:208-213) keeps the entry silent: no
     /// `unnecessary_ignore` row either way, exactly as upstream
-    /// (necessaryIgnore_uniqueName fixtures). Fold-less corpus.
+    /// (`necessaryIgnore_uniqueName` fixtures). Fold-less corpus.
     #[test]
     fn unique_name_citation_stays_silent_fold_less() {
         let rows = unnecessary_ignore_rows_for(

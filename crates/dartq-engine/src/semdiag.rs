@@ -75,6 +75,7 @@
 //! analyze, past the apply), so unlike the reachability memo it carries no
 //! applied/stale window: a stale entry just misses its key.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 #[cfg(test)]
 use std::cell::Cell;
 use std::sync::Arc;
@@ -315,7 +316,7 @@ const IMPORT_WARNING_GATE: &[&str] = &[
 ///   exported extension faces, scoped to `D`'s chain (an application in
 ///   `D` resolves through the scopes `D` sees).
 /// * Any member file's emitted diagnostics carrying a gate code
-///   (IMPORT_WARNING_GATE) suppresses every staged row library-wide.
+///   (`IMPORT_WARNING_GATE`) suppresses every staged row library-wide.
 fn release_unused_imports(
     library: &LibraryView<'_>,
     staged: Vec<Arc<Diagnostic>>,
@@ -634,7 +635,7 @@ fn on_type_is_type(library: &LibraryView<'_>, declaring: FileId, on: StringId) -
             .facts
             .get(&owner)
             .and_then(|facts| facts.elements.decl(on))
-            .map_or(true, |decl| is_type_kind(decl.kind)),
+            .is_none_or(|decl| is_type_kind(decl.kind)),
         _ => false,
     }
 }
@@ -820,7 +821,7 @@ pub(crate) fn build_index(facts: &FxHashMap<FileId, Arc<UnitFacts>>) -> ElementI
 }
 
 /// The per-library language-feature postures (#1294's `class-modifiers`,
-/// plus `wildcard-variables` for the dead_code wildcard gate): every live
+/// plus `wildcard-variables` for the `dead_code` wildcard gate): every live
 /// engine library's defining file's settled version (the `@dart` override
 /// applied) resolved through the feature registry (`class-modifiers`,
 /// `enabledIn 3.0.0`; `wildcard-variables`, `enabledIn 3.7.0`). Built once
@@ -1493,7 +1494,7 @@ impl SemanticDiagnoser for Diagnoser {
         // `unresolvedReadMembers` keeps the spelling.
         let mut member_edges: FxHashSet<(FileId, StringId, StringId)> = FxHashSet::default();
         let mut member_reads: FxHashSet<(FileId, StringId, StringId)> = FxHashSet::default();
-        for (_, refs) in self.member_refs(&library) {
+        for (_, refs) in self.member_refs(library) {
             for edge in refs.iter() {
                 member_edges.insert((edge.target_file, edge.target_container, edge.target_name));
                 if matches!(
@@ -1552,7 +1553,7 @@ impl SemanticDiagnoser for Diagnoser {
                 };
             (!released).then_some(row)
         }));
-        release_unused_imports(&library, staged_imports, &file_pools, out);
+        release_unused_imports(library, staged_imports, &file_pools, out);
     }
 
     /// The memo-backed member-ref face (#2618): every member's fold is
@@ -1826,7 +1827,7 @@ mod tests {
         );
     }
 
-    /// The dart:js_interop extension faces (#2186 S5): the bundled
+    /// The `dart:js_interop` extension faces (#2186 S5): the bundled
     /// extension-member source indexes under the `<dart:js_interop>` face
     /// file, so `toJS` on every core-typed receiver resolves silently
     /// through the extension pool — the exact positions the missing SDK
@@ -2484,7 +2485,7 @@ mod tests {
     /// (`member_refs` resolve the access to `B`), so the credit lands only
     /// on `B._m1` and `A._m1` reports at its own anchor — the verdict the
     /// oracle's element-level `usedElements.members` keeps
-    /// (unused_local_elements_verifier.dart: the member set joins on the
+    /// (`unused_local_elements_verifier.dart`: the member set joins on the
     /// resolved element, never the name). The single-unit `report_ops`
     /// path already resolves `B._m1` through its per-file `member_refs`
     /// edge; this pin lands on the library close's re-decision — the face

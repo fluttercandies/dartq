@@ -13,6 +13,7 @@
 //! operand mentions uncounted while a true type argument (a builtin, a
 //! typedef) never reports.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 
@@ -62,9 +63,9 @@ fn uv(name: &str, offset: usize, len: usize) -> String {
     format!("The value of the local variable '{name}' isn't used. @{offset}:{len}")
 }
 
-/// The co19 ambiguities_A01_t01 shape: `f(a<b, c>(d))` with `a`–`d`
+/// The co19 `ambiguities_A01_t01` shape: `f(a<b, c>(d))` with `a`–`d`
 /// locals parses as one method type-argument group (the parser contract
-/// gate_2804_sig_swallow pins), and the semantic tier answers both
+/// `gate_2804_sig_swallow` pins), and the semantic tier answers both
 /// faces — `non_type_as_type_argument` at `b` and at `c` (the oracle's
 /// 58:7/61:7 rows), and the read credit that spares every local the
 /// `unused_local_variable` row (`a` reads as the instantiation head,
@@ -87,7 +88,7 @@ fn method_type_arguments_over_locals_report_and_credit_reads() {
     assert_eq!(uv_rows(&report), [uv("e", e, 1)], "{:#?}", rows(&report));
 }
 
-/// The ambiguities_A01_t02 shape: the same call with a generic function
+/// The `ambiguities_A01_t02` shape: the same call with a generic function
 /// head and typedef arguments is a clean instantiation — no argument
 /// face, no undefined name, no unused rows (a true type argument is
 /// silent through the whole usage cluster).
@@ -103,7 +104,7 @@ fn true_type_arguments_stay_silent() {
 
 /// The annotation side of the same face: `List<b>` with a local `b`
 /// reports `non_type_as_type_argument` at the argument (the group is a
-/// TypeArgumentList whatever its use site) and counts the read, so only
+/// `TypeArgumentList` whatever its use site) and counts the read, so only
 /// the genuinely unread `x` reports.
 #[test]
 fn annotation_type_arguments_report_and_credit_the_local() {

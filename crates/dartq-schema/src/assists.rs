@@ -13,6 +13,7 @@
 //! tier here, and the built-in rows (`builtin-lint`) never appear (the
 //! built-in layers contribute no assists, fix.rs:646-647).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

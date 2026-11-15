@@ -40,6 +40,7 @@
 //! (`dart analyze` 3.13.7 — all silent except the four negative controls,
 //! which carry `argument_type_not_assignable` exactly once).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 fn argument_type_not_assignable(report: &crate::diagnose::FileReport) -> usize {

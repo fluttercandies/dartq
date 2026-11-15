@@ -110,10 +110,10 @@ pub(crate) mod unnecessary_brace_in_string_interps {
                         .flatten()
                         .is_some_and(|inner| match inner.kind {
                             TokenKind::Identifier => {
-                                !inner.is_synthetic() && !c.lexeme((i + 1) as u32).contains('$')
+                                !inner.is_synthetic() && !c.lexeme(i + 1).contains('$')
                             }
                             // `this` (keyword tokens lexeme-match).
-                            TokenKind::Keyword(_) => c.lexeme((i + 1) as u32) == "this",
+                            TokenKind::Keyword(_) => c.lexeme(i + 1) == "this",
                             _ => false,
                         });
                     if simple {
@@ -407,7 +407,7 @@ pub(crate) mod unnecessary_string_interpolations {
             Some(TokenKind::StringInterpolationIdentifier) => {
                 let is_word = matches!(
                     tokens.get(head as usize + 2).map(|t| t.kind),
-                    Some(TokenKind::Identifier) | Some(TokenKind::Keyword(_))
+                    Some(TokenKind::Identifier | TokenKind::Keyword(_))
                 );
                 let sole = is_word
                     && tokens
@@ -777,9 +777,9 @@ pub(crate) mod avoid_escaping_inner_quotes {
             .unwrap_or_else(|| c.unit.tokens.last().utf16_offset)
     }
 
-    /// Whether the segment ends the literal: its last byte is the quote and
-    /// an even number of backslashes precedes it (an escaped final quote
-    /// cannot be the closer) — the file-level [`closes_literal`].
+    // Whether the segment ends the literal: its last byte is the quote and
+    // an even number of backslashes precedes it (an escaped final quote
+    // cannot be the closer) — the file-level [`closes_literal`].
 
     /// The segment's escaped-quote faces over its contents (the opening
     /// quote of the head segment and the closing quote of the closing
@@ -832,11 +832,11 @@ pub(crate) mod avoid_escaping_inner_quotes {
                     (value, j)
                 }
                 b'u' => hex_run(content, k + 2, 4),
-                _ => (esc as u32, k + 2),
+                _ => (u32::from(esc), k + 2),
             };
-            if decoded == quote as u32 {
+            if decoded == u32::from(quote) {
                 *has_quote = true;
-            } else if decoded == other as u32 {
+            } else if decoded == u32::from(other) {
                 *has_other = true;
             }
             k = next.max(k + 2);
@@ -995,21 +995,19 @@ pub(crate) mod leading_newlines_in_multiline_strings {
             return;
         }
         // The first content character must be a newline (:65-67).
-        match lexeme.as_bytes().get(content_at) {
-            Some(b'\n' | b'\r') => {}
-            _ => {
-                // The official reports the whole literal (`reportAtNode`)
-                // — through the closing quotes and any interpolation tail;
-                // the node row covers only the first segment, so the
-                // extent walk bounds both ends.
-                let (Some(start), Some(end)) = (
-                    c.utf16_of_token(range.start),
-                    c.utf16_end_of_token(range.end - 1),
-                ) else {
-                    return;
-                };
-                c.report(start..end, &[]);
-            }
+        if let Some(b'\n' | b'\r') = lexeme.as_bytes().get(content_at) {
+        } else {
+            // The official reports the whole literal (`reportAtNode`)
+            // — through the closing quotes and any interpolation tail;
+            // the node row covers only the first segment, so the
+            // extent walk bounds both ends.
+            let (Some(start), Some(end)) = (
+                c.utf16_of_token(range.start),
+                c.utf16_end_of_token(range.end - 1),
+            ) else {
+                return;
+            };
+            c.report(start..end, &[]);
         }
     }
 }

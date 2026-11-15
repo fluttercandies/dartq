@@ -45,6 +45,30 @@
 //! Cost axis: measurement only — no walls are reported and nothing here is
 //! comparable to the timing benches' axes.
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::useless_conversion,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::fmt::Write as _;
@@ -97,7 +121,7 @@ fn peak_rss_kib() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     // Safety: same — the pointer is a live `rusage` of the right size.
     unsafe {
-        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        libc::getrusage(libc::RUSAGE_SELF, &raw mut usage);
     }
     #[cfg(target_os = "macos")]
     {
@@ -138,7 +162,7 @@ fn current_rss_kib() -> u64 {
                 task,
                 libc::MACH_TASK_BASIC_INFO,
                 std::ptr::from_mut(&mut info).cast::<libc::integer_t>(),
-                &mut count,
+                &raw mut count,
             )
         };
         if status == libc::KERN_SUCCESS {
@@ -372,7 +396,7 @@ fn main() {
         graph_maps_bytes,
     );
     let total = s1 + s2 + s3 + s4 + s5 + s6 + postings_bytes;
-    let face_tag = if files % 1000 == 0 {
+    let face_tag = if files.is_multiple_of(1000) {
         format!("{}k_files", files / 1000)
     } else {
         format!("{files}_files")

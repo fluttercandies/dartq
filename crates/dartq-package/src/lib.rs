@@ -25,7 +25,7 @@
 //!
 //! Format facts and pub behavior anchors live in the pub formats contract
 //! and `upstream pub source, lib/src/package.dart`; do not lint-prose them here.
-#![allow(clippy::doc_markdown)]
+#![allow(clippy::doc_markdown, clippy::semicolon_if_nothing_returned)]
 
 mod identity;
 mod name;

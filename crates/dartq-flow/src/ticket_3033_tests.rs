@@ -19,7 +19,7 @@
 //!   `TypeClassification.nullOrEquivalent`
 //!   (flow_analysis.dart:7224-7262 `_equalityCheck`;
 //!   flow_analysis.dart:7410-7508 `_handleEqualityCheckPattern`;
-//!   flow_analysis.dart / flow_analysis_operations.dart:141-146).
+//!   `flow_analysis.dart` / flow_analysis_operations.dart:141-146).
 //!   `Null <: Null` is the guaranteed cover (dead else over a
 //!   Null-typed matched value); non-nullable vs Null-only is the
 //!   disjoint kill (dead then over an `int` matched value).
@@ -29,6 +29,7 @@
 //! if-case covers/kills) plus the co19
 //! `object_pattern_switch_test`/`pattern_matching_null_test` shapes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

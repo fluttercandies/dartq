@@ -22,6 +22,7 @@
 //!   plugin; then the rule name compared case-insensitively against the
 //!   code's name, falling back to the unique name minus its class prefix.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::comments::Comments;
@@ -47,7 +48,7 @@ enum Entry {
 }
 
 impl Entry {
-    /// `IgnoredElement._matches` (ignore_info.dart:81). `plugin_name` is the
+    /// `IgnoredElement._matches` (`ignore_info.dart:81`). `plugin_name` is the
     /// reporting plugin's name — `None` for built-in codes
     /// (`IgnoreInfo.ignored`'s `pluginName` argument, :186-189, fed from the
     /// plugin's `configuration.name`, plugin_server.dart:444-450).

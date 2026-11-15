@@ -109,6 +109,7 @@
 //! or was skipped are stored — failures always rerun, so a flaky failure
 //! is never frozen into a cached verdict.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::deps::{FileFacts, Trigger, TriggerKind};
 use crate::stamp::{Stamps, package_files, write_atomic};
 use rayon::prelude::*;
@@ -127,7 +128,7 @@ const FORMAT: &str = "dartq-test-cache-v13";
 const MAX_ENTRIES: usize = 50_000;
 
 /// Minimum spacing between two prune passes over the shared store.
-const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_hours(24);
 
 /// Stand-ins for the package root in stored events (`url` fields, suite
 /// paths and messages of runners that spell suites absolutely), as a path
@@ -233,6 +234,7 @@ pub struct Runner<'a> {
 ///   pubspec's `flutter: assets:` and fonts) is readable from any suite
 ///   through `rootBundle`: every file a pubspec asset entry names is an
 ///   input of every suite.
+#[must_use]
 pub fn flutter_inputs(root: &Path, suite: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut absent = Vec::new();
     let mut configs = Vec::new();
@@ -991,7 +993,7 @@ impl Cache {
             while !frontier.is_empty() {
                 let mut next = Vec::new();
                 for id in frontier {
-                    if !named_by.contains_key(&id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = named_by.entry(id) {
                         let refs = self
                             .stamps
                             .get(&paths.paths[id as usize])
@@ -1005,7 +1007,7 @@ impl Cache {
                             }
                             named.extend_from_slice(&memo[literal]);
                         }
-                        named_by.insert(id, named);
+                        e.insert(named);
                     }
                     mark.resize(paths.paths.len(), 0);
                     for &named in &named_by[&id] {
@@ -1498,8 +1500,8 @@ impl Dense {
             || RefusalDetail::at(Refusal::SuiteUnknown, Some(suite.to_path_buf()), Vec::new());
         let start = *self
             .node_of
-            .get(*paths.ids.get(suite).ok_or_else(|| unknown())? as usize)
-            .ok_or_else(|| unknown())?;
+            .get(*paths.ids.get(suite).ok_or_else(unknown)? as usize)
+            .ok_or_else(unknown)?;
         if start == u32::MAX {
             return Err(unknown());
         }

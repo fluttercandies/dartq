@@ -2,7 +2,7 @@
 //! whose initializer is a compound assignment (`var x = Base.log += 'a'`)
 //! binds the write-back result the assignability half re-typed onto the
 //! window's tail row — upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart
+//! `pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart`
 //! `_resolveTypes` (`assignedType` = the refined operator return,
 //! :301-314, recorded on the assignment node; the variable's initializer
 //! inference reads the node's static type). Pre-fix the window had no
@@ -12,6 +12,7 @@
 //! Oracle rows: dart 3.13.7 (`dart analyze --format=machine`) over the
 //! fixtures below.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops_experiments_with;
 
 /// The fixture's rows of one code: messages in source order.
@@ -39,7 +40,7 @@ const STRING_TO_G2: &str = "A value of type 'String' can't be assigned to a vari
 const UNDEFINED_EMPTY_ANNOTATION: &str = "Undefined name '' used as an annotation.";
 
 /// A `@` whose identifier the parser recovered (the upstream
-/// annotation_test.dart `token: <empty> <synthetic>` shape) still joins the
+/// `annotation_test.dart` `token: <empty> <synthetic>` shape) still joins the
 /// annotation latch, so the oracle's `undefined_annotation` fires against
 /// the empty spelling exactly as it does for the census's
 /// `partial_code/annotation` ampersand family. Pre-fix the synthetic name

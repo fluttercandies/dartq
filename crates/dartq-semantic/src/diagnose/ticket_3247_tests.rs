@@ -6,7 +6,7 @@
 //!
 //! * The assignment write type is the WRITE ELEMENT's type, never the read's
 //!   (`AssignmentExpressionImpl.writeType`, upstream Dart SDK source,
-//!   pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart:361
+//!   `pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart:361`
 //!   — `_checkForInvalidAssignment(node.writeType!, ...)`, the same call `??=`
 //!   shares at :295-296). For a getter/setter pair, an implicit-this member,
 //!   or a top-level variable the write face is the `name=` setter's value
@@ -24,6 +24,8 @@
 //!
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs`
 //! is a live-lane file out of this ticket's write scope).
+
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
 
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
@@ -58,7 +60,7 @@ fn at(fixture: &str, needle: &str, nth: usize) -> u32 {
     u32::try_from(CORE_PRELUDE.len() + hit).expect("fixture offsets fit u32")
 }
 
-/// —— the write-target face (`??=` / `=`) ————————————————————————————
+// —— the write-target face (`??=` / `=`) ————————————————————————————
 
 /// A top-level getter/setter pair: `b ??= theA` checks the setter's value
 /// formal (`B?`), so the `A` right-hand side is the oracle's
@@ -155,7 +157,7 @@ class C {
     );
 }
 
-/// —— the type-variable source arms ————————————————————————————————
+// —— the type-variable source arms ————————————————————————————————
 
 /// `T extends num` is the Left Type Variable Bound face: `String s = t` asks
 /// `num <: String` (false — the report), while `num n = t` asks `num <: num`

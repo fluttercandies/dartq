@@ -8,6 +8,7 @@
 //! `Instantiate-to-bound/class/static/class_FutureOr_l1_t02` (75:3 and
 //! 59:7).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 
@@ -62,12 +63,12 @@ const TWIN_MESSAGE: &str = "'FutureOr<A<Object?>>' doesn't conform to the bound 
 /// extends bound and both rows report at the constructor name.
 #[test]
 fn raw_ctor_reports_inference_and_twin() {
-    let src = r#"
+    let src = r"
 class A<X extends FutureOr<A<X>>> {}
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "A();");
     assert_row(&report, "could_not_infer", offset, 1, INFER_MESSAGE);
@@ -84,12 +85,12 @@ main() {
 /// creation's own, with or without a formal table.
 #[test]
 fn raw_ctor_with_declared_constructor_reports_the_same() {
-    let src = r#"
+    let src = r"
 class A<X extends FutureOr<A<X>>> { A(); }
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(src);
     // The indented needle skips the constructor declaration's own `A();`
     // in the class body; +2 steps over the indentation to the name.
@@ -109,12 +110,12 @@ main() {
 #[test]
 fn satisfied_seed_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 class B<T extends num> {}
 main() {
   B();
 }
-"#,
+",
     );
     assert_none(&report, "could_not_infer");
     assert_none(&report, "type_argument_not_matching_bounds");
@@ -125,12 +126,12 @@ main() {
 #[test]
 fn unbounded_creation_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 class C<T> {}
 main() {
   C();
 }
-"#,
+",
     );
     assert_none(&report, "could_not_infer");
 }
@@ -140,13 +141,13 @@ main() {
 #[test]
 fn argument_position_suppresses_the_seed_face() {
     let report = report_ops(
-        r#"
+        r"
 class A<X extends FutureOr<A<X>>> {}
 void f(p) {}
 main() {
   f(A());
 }
-"#,
+",
     );
     assert_none(&report, "could_not_infer");
 }
@@ -156,12 +157,12 @@ main() {
 #[test]
 fn annotated_declaration_suppresses_the_seed_face() {
     let report = report_ops(
-        r#"
+        r"
 class A<X extends FutureOr<A<X>>> {}
 main() {
   A? x = A();
 }
-"#,
+",
     );
     assert_none(&report, "could_not_infer");
 }
@@ -172,13 +173,13 @@ main() {
 /// `wrong_number_of_type_arguments` face and maps nothing here).
 #[test]
 fn multi_parameter_container_reports_the_violating_slot_only() {
-    let src = r#"
+    let src = r"
 class D<T> {}
 class C<X extends D<X>, Y extends num> {}
 main() {
   C();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "C();");
     assert_row(
@@ -212,13 +213,13 @@ main() {
 /// inverted spellings at its argument.
 #[test]
 fn nested_bounded_head_reports_the_inverted_pass() {
-    let src = r#"
+    let src = r"
 class A<X extends FutureOr<A<X>>> {}
 class G<T> {}
 main() {
   G<A<FutureOr<A<dynamic>?>>>? g;
 }
-"#;
+";
     let report = report_ops(src);
     let needle = "FutureOr<A<dynamic>?>";
     let offset = at(src, needle);
@@ -238,7 +239,7 @@ main() {
 #[test]
 fn nested_head_correct_instantiation_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 class A<X extends FutureOr<A<X>>> {}
 class G<T> {}
 main() {
@@ -246,7 +247,7 @@ main() {
   G<A<dynamic>>? h;
   G<A?>? i;
 }
-"#,
+",
     );
     assert_none(&report, "type_argument_not_matching_bounds");
 }
@@ -256,12 +257,12 @@ main() {
 /// argument contains.
 #[test]
 fn outermost_site_reports_once_with_nested_queueing_live() {
-    let src = r#"
+    let src = r"
 class A<X extends FutureOr<A<X>>> {}
 main() {
   A<FutureOr<A<dynamic>?>>? x;
 }
-"#;
+";
     let report = report_ops(src);
     let needle = "FutureOr<A<dynamic>?>";
     let offset = at(src, needle);

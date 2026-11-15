@@ -6,6 +6,7 @@
 //! runs through the production bridge; the semantic-gated rules run
 //! with the face mounted (`Fixture::run_semantic`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::testsupport::{Fixture, one_rule};
 
 // —— prefer_null_aware_operators ——————————————————————————————————————

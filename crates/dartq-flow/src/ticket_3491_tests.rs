@@ -5,16 +5,17 @@
 //! c); }` rows `3:8 len3` (`c);`), `f(int a, Never b) { a.clamp(b, 3); }`
 //! rows `2:14 len3` (`3);`). The flow interval ends at the argument
 //! list's `)` — `flowEnd`'s `length = node.end - offset`
-//! (dead_code_verifier.dart:321) reports through the flow-ending node's
+//! (`dead_code_verifier.dart:321`) reports through the flow-ending node's
 //! end; the trailing `;` rides at the semantic layer's statement-tail
 //! face, so the flow pin anchors at `c)`/`3)`. Upstream: the
 //! bottom-typed read's own exit (`recordStaticType` -> `handleExit` on
 //! `type.isBottom`, ast.dart:11146-11153) ends the flow at `b`; the NEXT
 //! argument node is the first dead node and anchors
-//! (dead_code_verifier.dart's plain `node` arm at `checkUnreachableNode`
+//! (`dead_code_verifier.dart`'s plain `node` arm at `checkUnreachableNode`
 //! — the `AssignmentExpression`/`BinaryExpression` re-anchors do not
 //! apply, so the operand's own span IS the official extent).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -59,7 +60,7 @@ fn dead_ranges(source: &str) -> Vec<(u32, u32)> {
 /// A `Never` argument's NEXT sibling anchors — `a.clamp(b, c)` rows
 /// `c);` at `c`=40 through the statement's `;`=42 (the interval runs to
 /// the flow-ending node's end, `flowEnd`'s `length = node.end - offset`,
-/// dead_code_verifier.dart:321). Oracle: `dead_code 2:14 len3` = `c);`.
+/// `dead_code_verifier.dart:321`). Oracle: `dead_code 2:14 len3` = `c);`.
 #[test]
 fn never_argument_sibling_anchors_at_next_argument() {
     let source = "f(int a, Never b, int c) {\n  a.clamp(b, c);\n}";

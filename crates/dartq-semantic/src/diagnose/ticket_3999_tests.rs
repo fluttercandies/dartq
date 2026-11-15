@@ -15,6 +15,7 @@
 //! `FutureOr` composite target only, and the `Null` arm rides the same
 //! union leg (`Null <: FutureOr<T>` through `Null <: T`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

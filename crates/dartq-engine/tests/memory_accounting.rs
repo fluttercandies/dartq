@@ -46,7 +46,11 @@
 //!
 //! Run: `cargo test -p dartq-engine --test memory_accounting -- --nocapture`
 
-#![allow(clippy::cast_possible_truncation)] // u32 line counts widen; measurement math only
+#![allow(
+    clippy::useless_conversion,
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)] // u32 line counts widen; measurement math only
 #![allow(clippy::cast_precision_loss)] // measurement math only (byte counts are far below 2^52)
 
 mod common;

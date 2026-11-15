@@ -586,6 +586,7 @@ fn emit(rows: &[Row]) {
     out.push_str("/// instead of carrying local literals. Official codes only — dartq-own\n");
     out.push_str("/// codes carry their messages at the emit site.\n");
     out.push_str("#[must_use]\n");
+    out.push_str("#[allow(clippy::too_many_lines, clippy::match_same_arms)]\n");
     out.push_str("pub fn message_template(name: &str) -> Option<&'static str> {\n");
     out.push_str("    match name {\n");
     for row in rows {

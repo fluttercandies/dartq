@@ -33,6 +33,9 @@
 //! dropped altogether (the pre-#3518 body reported the `_ => throw` arm
 //! dead and never reported the `when false` body).
 
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

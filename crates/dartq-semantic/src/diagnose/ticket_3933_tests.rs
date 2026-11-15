@@ -55,6 +55,7 @@
 //! flow. That join lives in the flow crate's assignment fold (a live
 //! lane's file).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

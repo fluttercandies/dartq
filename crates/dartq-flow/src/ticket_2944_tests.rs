@@ -1,6 +1,6 @@
 //! The C3 pins: top-level named `const`/`final` conditions stay silent.
 //!
-//! Oracle contract (dead_code_test.dart's `debugConst` family, analyzer
+//! Oracle contract (`dead_code_test.dart`'s `debugConst` family, analyzer
 //! 3.13.7): the dead-code verifier's constant-condition fold fires on the
 //! literal node alone (`booleanLiteral`, resolver.dart's literal arm) — a
 //! named element's `evaluationResult` never reaches flow analysis, so
@@ -13,6 +13,7 @@
 //! exclusions pin the boundary the locals face keeps (`VarMeta::const_bool`
 //! is a local-only slot).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -61,7 +62,7 @@ fn dead_of(source: &str) -> Vec<String> {
 }
 
 /// `const t = true; if (t) {} else {}` — the oracle emits nothing
-/// (dead_code_test.dart `test_deadBlock_else_debugConst`).
+/// (`dead_code_test.dart` `test_deadBlock_else_debugConst`).
 #[test]
 fn const_top_level_else_stays_silent() {
     assert_eq!(
@@ -99,7 +100,7 @@ fn const_top_level_element_stays_silent() {
 }
 
 /// Conditional-expression arms: `t ? 1 : 2` over a named const reports
-/// nothing (dead_code_test.dart `test_deadBlock_conditionalThen_debugConst`).
+/// nothing (`dead_code_test.dart` `test_deadBlock_conditionalThen_debugConst`).
 #[test]
 fn const_top_level_conditional_stays_silent() {
     assert_eq!(

@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// The proof-port rule set (the ten rules `dartq-lints`' upstream_cases
+/// The proof-port rule set (the ten rules `dartq-lints`' `upstream_cases`
 /// driver pins). A rule without a `<rule>_test.dart` in the corpus dir
 /// fails the run — the data file set and the driver must stay in lockstep.
 const RULES: &[&str] = &[
@@ -56,32 +56,29 @@ fn ports_upstream_rule_tests_when_configured() {
         for (test, reason) in &outcome.skipped {
             eprintln!("  skipped {test}: {reason}");
         }
-        match &out {
-            Some(dir) => {
-                std::fs::create_dir_all(dir).expect("create out dir");
-                let path = Path::new(dir).join(format!("{rule}.fixture"));
-                // A previous generation's `//- diverge:` quarantines ride
-                // into the new file — regeneration never unpicks a pinned
-                // divergence.
-                let previous = std::fs::read_to_string(&path).unwrap_or_default();
-                let (rendered, stale) = dartq_fixture::merge_divergences(&rendered, &previous);
-                assert!(
-                    stale.is_empty(),
-                    "{rule}: stale quarantines (cases no longer porting): {stale:?}"
-                );
-                let doc = dartq_fixture::parse(&rendered)
-                    .unwrap_or_else(|e| panic!("{rule}: rendered fixture does not parse: {e:?}"));
-                assert_eq!(doc.cases.len(), ported, "{rule}: case count");
-                std::fs::write(&path, rendered)
-                    .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-                eprintln!("  wrote {}", path.display());
-            }
-            None => {
-                let doc = dartq_fixture::parse(&rendered)
-                    .unwrap_or_else(|e| panic!("{rule}: rendered fixture does not parse: {e:?}"));
-                assert_eq!(doc.cases.len(), ported, "{rule}: case count");
-                eprintln!("  (DARTQ_FIXTURE_OUT unset; not writing)");
-            }
+        if let Some(dir) = &out {
+            std::fs::create_dir_all(dir).expect("create out dir");
+            let path = Path::new(dir).join(format!("{rule}.fixture"));
+            // A previous generation's `//- diverge:` quarantines ride
+            // into the new file — regeneration never unpicks a pinned
+            // divergence.
+            let previous = std::fs::read_to_string(&path).unwrap_or_default();
+            let (rendered, stale) = dartq_fixture::merge_divergences(&rendered, &previous);
+            assert!(
+                stale.is_empty(),
+                "{rule}: stale quarantines (cases no longer porting): {stale:?}"
+            );
+            let doc = dartq_fixture::parse(&rendered)
+                .unwrap_or_else(|e| panic!("{rule}: rendered fixture does not parse: {e:?}"));
+            assert_eq!(doc.cases.len(), ported, "{rule}: case count");
+            std::fs::write(&path, rendered)
+                .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+            eprintln!("  wrote {}", path.display());
+        } else {
+            let doc = dartq_fixture::parse(&rendered)
+                .unwrap_or_else(|e| panic!("{rule}: rendered fixture does not parse: {e:?}"));
+            assert_eq!(doc.cases.len(), ported, "{rule}: case count");
+            eprintln!("  (DARTQ_FIXTURE_OUT unset; not writing)");
         }
     }
     pin_avoid_empty_else(&corpus);

@@ -20,6 +20,7 @@
 //! under-report of the assignability context face
 //! (`direct_function_typed_return_spelling_stays_silent`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

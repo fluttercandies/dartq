@@ -57,6 +57,7 @@
 //! owning lanes land (nothing here needs a `diagnose.rs` edit — the module is
 //! registered through `diagnose/tests.rs`'s `#[path]` tail).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

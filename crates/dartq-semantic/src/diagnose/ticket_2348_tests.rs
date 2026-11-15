@@ -37,6 +37,7 @@
 //! drops the guard before the recursion; the swap-back is non-vacuous —
 //! reverting the guard scoping restores the panic on the first pin.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

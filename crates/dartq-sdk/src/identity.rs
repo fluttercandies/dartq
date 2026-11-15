@@ -9,6 +9,7 @@
 //! language version, the expanded library tables, and the experiment
 //! whitelist — participates.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde::Serialize;
 
 use dartq_language::LanguageVersion;

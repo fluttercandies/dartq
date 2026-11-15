@@ -38,6 +38,7 @@
 //!   [`for_in_promoted_type_parameter_is_silent`] is the guard that fails if
 //!   the predicate is extended without the promoted-bound handling.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 

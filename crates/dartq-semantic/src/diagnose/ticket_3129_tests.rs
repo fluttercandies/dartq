@@ -30,6 +30,8 @@
 //! Oracle rows captured 2026-10-31 against `dart analyze --format
 //! machine` 3.13.7 (`/tmp/utc/cases`).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::report_ops;
 use super::*;
 
@@ -154,19 +156,19 @@ fn null_literal_operand_stays_silent() {
     assert!(utc_rows(&report).is_empty(), "{:?}", all_codes(&report));
 }
 
-/// `g() is void` — oracle reports the `unnecessary_type_check` TRUE row
-/// beside its own `expected_type_name`/`use_of_void_result` parse-face
-/// rows (the `void` target is a parse error but still resolves to the
-/// `void` TYPE for the `isSubtypeOf` ask). The resolution pass arms no
-/// `void` face here — the `is` target's `handle_void_keyword` never
-/// reaches the armed slot under recovery, so `checked` lands as the
-/// recovery `Named{;}` head and the verdict suppresses — a residual of
-/// `resolved_ops`'s `tested_arg_undefined`/`emit_is_type_miss` gap, not
-/// the subtype walk.
+// `g() is void` — oracle reports the `unnecessary_type_check` TRUE row
+// beside its own `expected_type_name`/`use_of_void_result` parse-face
+// rows (the `void` target is a parse error but still resolves to the
+// `void` TYPE for the `isSubtypeOf` ask). The resolution pass arms no
+// `void` face here — the `is` target's `handle_void_keyword` never
+// reaches the armed slot under recovery, so `checked` lands as the
+// recovery `Named{;}` head and the verdict suppresses — a residual of
+// `resolved_ops`'s `tested_arg_undefined`/`emit_is_type_miss` gap, not
+// the subtype walk.
 
 /// `new C() is C` — the `new` keyword joins the operand's extent
-/// (`.at(node)` = the whole IsExpression,
-/// best_practices_verifier.dart:997): the row starts at `new`, never at
+/// (`.at(node)` = the whole `IsExpression`,
+/// `best_practices_verifier.dart:997)`: the row starts at `new`, never at
 /// the created head.
 #[test]
 fn new_creation_operand_anchors_at_keyword() {

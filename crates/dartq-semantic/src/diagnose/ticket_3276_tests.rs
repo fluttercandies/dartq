@@ -35,6 +35,7 @@
 //! setter named 'foo' in class 'E'.") is likewise the assignment-to-*
 //! family's unimplemented face, not this path's.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 

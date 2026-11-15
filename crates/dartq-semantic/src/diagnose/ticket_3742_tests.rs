@@ -15,6 +15,7 @@
 //! against `E<num>`) still decides argument-wise so `E.b` never populates
 //! the `E<num>` set — the uncovered constant is the witness.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops};
 
 /// `FutureOr<int>` over `int _` alone: the `int` half is covered, the
@@ -49,9 +50,7 @@ fn future_or_scrutinee_full_cover_is_silent() {
         "String f(FutureOr<int> x) => switch (x) { int _ => 'i', Future<int> _ => 'g' };",
     );
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "non_exhaustive_switch_expression"),
+        !code_names(&report).contains(&"non_exhaustive_switch_expression"),
         "the covered union reports no non_exhaustive row, got {:?}",
         code_names(&report)
     );

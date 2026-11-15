@@ -20,6 +20,7 @@
 //! where it is not (`int`, a non-nullable `List`) — the rejection is the
 //! row the unmodelled face could not produce.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::FileReport;
 
@@ -53,7 +54,7 @@ fn arg_at(source: &str, call: &str, prefix: &str) -> u32 {
 /// `Function` row is the expanded shape's verdict, not a silent argument.
 #[test]
 fn ticket_3372_function_typedef_bound_feeds_the_type_variable_rule() {
-    let source = r#"
+    let source = r"
 typedef F<X> = void Function<Y extends X>();
 class A<T extends F<num>> {
   void f(T t) {
@@ -63,7 +64,7 @@ class A<T extends F<num>> {
 }
 void takesFunction(Function fn) {}
 void takesInt(int i) {}
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         argument_rows(&report),
@@ -79,7 +80,7 @@ void takesInt(int i) {}
 /// dynamic>()` — still a function type, never the unresolved face.
 #[test]
 fn ticket_3372_raw_typedef_bound_reads_its_to_bounds_default() {
-    let source = r#"
+    let source = r"
 typedef F<X> = void Function<Y extends X>();
 class A<T extends F> {
   void f(T t) {
@@ -89,7 +90,7 @@ class A<T extends F> {
 }
 void takesFunction(Function fn) {}
 void takesInt(int i) {}
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         argument_rows(&report),
@@ -105,7 +106,7 @@ void takesInt(int i) {}
 /// dropping either composition would read `List<num>` and silence the row.
 #[test]
 fn ticket_3372_nullable_typedef_bound_keeps_the_question_mark() {
-    let zero_bounded = r#"
+    let zero_bounded = r"
 typedef F<X> = List<X>?;
 class A<T extends F<num>> {
   void f(T t) {
@@ -113,7 +114,7 @@ class A<T extends F<num>> {
   }
 }
 void takesList(List<num> l) {}
-"#;
+";
     let report = report_ops(zero_bounded);
     assert_eq!(
         argument_rows(&report),
@@ -122,7 +123,7 @@ void takesList(List<num> l) {}
         report.diagnostics
     );
 
-    let use_site_bounded = r#"
+    let use_site_bounded = r"
 typedef G<X> = List<X>;
 class B<U extends G<num>?> {
   void g(U u) {
@@ -130,7 +131,7 @@ class B<U extends G<num>?> {
   }
 }
 void takesList(List<num> l) {}
-"#;
+";
     let report = report_ops(use_site_bounded);
     assert_eq!(
         argument_rows(&report),
@@ -145,14 +146,14 @@ void takesList(List<num> l) {}
 /// keeps the real `List<num>` bound and the argument passes.
 #[test]
 fn ticket_3372_registered_head_keeps_the_registry_arm() {
-    let source = r#"
+    let source = r"
 class A<T extends List<num>> {
   void f(T t) {
     takesList(t);
   }
 }
 void takesList(List<num> l) {}
-"#;
+";
     let report = report_ops(source);
     assert!(
         argument_rows(&report).is_empty(),
@@ -169,7 +170,7 @@ void takesList(List<num> l) {}
 /// and the #3341 self-reference row stands untouched.
 #[test]
 fn ticket_3372_self_referential_alias_keeps_the_unmodelled_face() {
-    let source = r#"
+    let source = r"
 typedef F = F;
 class A<T extends F> {
   void f(T t) {
@@ -179,7 +180,7 @@ class A<T extends F> {
 }
 void takesFunction(Function fn) {}
 void takesInt(int i) {}
-"#;
+";
     let report = report_ops(source);
     assert!(
         argument_rows(&report).is_empty(),

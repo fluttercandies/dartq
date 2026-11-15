@@ -1,3 +1,5 @@
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

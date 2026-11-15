@@ -21,6 +21,7 @@
 //! case (`conformance/expected.tsv`, pins `super_bounded_types_error2_test`
 //! / `super_bounded_types_test`), same message text.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

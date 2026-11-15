@@ -13,6 +13,7 @@
 //! (`src/summary2/extension_type.dart:97-135`), reported at the type name
 //! (:4893-4900).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 

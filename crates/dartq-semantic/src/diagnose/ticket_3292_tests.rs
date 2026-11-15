@@ -4,7 +4,7 @@
 //! # The defect
 //!
 //! A constructor-invocation receiver types as the `Type` metaclass (the
-//! TypeLiteral face of a container spelling in value position), and the
+//! `TypeLiteral` face of a container spelling in value position), and the
 //! `dart:core` containers resolve through the library namespace onto
 //! unindexed (external) units, so [`member_lookup`] chain-breaks there.
 //! Together those two faces made the getter-vs-tear-off split unreachable
@@ -31,6 +31,7 @@
 //! condition reports `non_bool_condition` at the condition expression
 //! alone (its updaters are never conditions).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::analysis::{Analysis, analyze_unit};
 use crate::diagnose::StrictModes;
 use crate::library::ElementIndex;
@@ -230,7 +231,7 @@ fn ticket_3292_core_member_type_underreports() {
     );
 }
 
-/// The TypeLiteral face stands: a `Type`-declared read types `Type`, and a
+/// The `TypeLiteral` face stands: a `Type`-declared read types `Type`, and a
 /// member asked of it under-reports (the metaclass carries no core
 /// container's members) — only the container SPELLING resolves its own
 /// member face.

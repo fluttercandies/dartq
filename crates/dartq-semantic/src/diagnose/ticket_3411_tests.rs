@@ -16,6 +16,7 @@
 //!   setter contravariance still reports
 //!   (`pkg/analyzer/test/src/dart/resolution/instance_member_inference_class_test.dart:1063`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

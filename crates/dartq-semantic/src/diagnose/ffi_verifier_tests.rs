@@ -7,6 +7,7 @@
 //! is `dart:ffi`, and every byte-level capture (`@Native`, `@Array`,
 //! `@Packed`, the invocation shapes) runs exactly as in the engine.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{
     CORE_PRELUDE, RigImport, report_ops, report_ops_imports, report_ops_with, rows,
@@ -349,7 +350,7 @@ fn invalid_field_type_in_struct() {
 }
 
 /// A nullable-suffix field type is still a *written* type: `Pointer?`
-/// reports `invalid_field_type_in_struct` (upstream ffi_verifier.dart
+/// reports `invalid_field_type_in_struct` (upstream `ffi_verifier.dart`
 /// `:1566-1570` — `declaredType.nullabilitySuffix ==
 /// NullabilitySuffix.question` → `fieldType.toSource()` keeps the `?`),
 /// never `missing_field_type_in_struct`. The span reaches past the `?`

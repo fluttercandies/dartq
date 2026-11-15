@@ -13,6 +13,7 @@
 //! same id. Pinned by
 //! `intern_across_existence_transition_holds_one_id`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;

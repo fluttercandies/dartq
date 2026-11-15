@@ -8,6 +8,7 @@
 //! Iterable<T>`), which is exactly what the analyzer's
 //! `allSupertypes`-plus-substitution walk consumes (`subtype.dart:211-221`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};

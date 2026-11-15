@@ -6,19 +6,43 @@
 //! target file is a part.
 //!
 //! Upstream mirrors: the splice is `ensureLiteralString`
-//! (upstream Dart SDK source, `_fe_analyzer_shared` parser_impl.dart
+//! (upstream Dart SDK source, `_fe_analyzer_shared` `parser_impl.dart`
 //! :5075-5103 — a synthetic empty string lands before the offending token,
 //! so `part class A {}` resolves `''` = the container, and the oracle reports
 //! `part_of_non_part` at the offending token, zero length, with the
 //! container's canonical URI); the interpolation row is
 //! `uriWithInterpolation.at(directive.uri)` — the whole literal region
-//! (library_analyzer.dart:732/:954/:993); the non-library rows are
+//! (`library_analyzer.dart:732/:954/:993`); the non-library rows are
 //! `_reportImportDirectiveErrors`/`_reportLibraryExportDirectiveErrors`
 //! (library_analyzer.dart:701-744/:910-955) — `importedLibrarySource ==
 //! null` exactly when the target file's kind is not `LibraryFileKind`
 //! (`_updateKind`, file_state.dart:928-949), carrying the WRITTEN selected
 //! URI string.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use common::Fixture;

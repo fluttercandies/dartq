@@ -261,7 +261,7 @@ pub(crate) fn ty_family(
         };
     }
     let bits = core_family_bits(spelled);
-    (bits != 0).then(|| bits & required != 0)
+    (bits != 0).then_some(bits & required != 0)
 }
 
 /// The member-receiver family face (`this.x.m(…)`, `a.b.m(…)`): the
@@ -341,7 +341,7 @@ pub(crate) fn receiver_family(
                 return Some(false);
             }
             let bits = core_family_bits(written);
-            return (bits != 0).then(|| bits & required != 0);
+            return (bits != 0).then_some(bits & required != 0);
         }
         if let Some(ty) = analysis?.type_of(query_site(c, *only)) {
             return ty_family(c, analysis?, ty, required);

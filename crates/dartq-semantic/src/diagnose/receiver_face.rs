@@ -9,6 +9,7 @@
 //! re-derivation every pass-2 receiver verdict reads
 //! ([`Engine::recv_expression_ty`] is its expression face).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 impl Engine<'_> {

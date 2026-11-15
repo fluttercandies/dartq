@@ -20,6 +20,7 @@
 //! outside-library family (`features/class-modifiers`), the private-member
 //! override shapes, and the `field/override4_test_01` /
 //! `mixin{,legacy}/accessor_test` fabricated rows.
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, RigImport, report_ops, report_ops_imports};
 
 /// The absolute fixture offset of `needle` (the prelude the rig prepends
@@ -112,7 +113,7 @@ fn bare_implements_face_still_reports_outside_library() {
 /// `class C with p.Final` over a plain class in another library reports
 /// `class_used_as_mixin` at the written entry: the teardown resolves a
 /// dotted spelling through the prefix table, and the entry's span now
-/// covers the whole `p.Final` NamedType (the completion fires at the
+/// covers the whole `p.Final` `NamedType` (the completion fires at the
 /// prefix token).
 #[test]
 fn prefixed_with_face_reports_class_used_as_mixin() {

@@ -1,15 +1,22 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::needless_range_loop,
+    clippy::unnecessary_debug_formatting,
+    clippy::many_single_char_names,
+    clippy::semicolon_if_nothing_returned
+)]
 use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
-/// The #3028 lint residual-wave pins: one green pin per fixed shape,
-/// each citing the conformance row it mirrors (the pinned
-/// `dart analyze` 3.13.7 oracle output in `conformance/expected.tsv`).
+// The #3028 lint residual-wave pins: one green pin per fixed shape,
+// each citing the conformance row it mirrors (the pinned
+// `dart analyze` 3.13.7 oracle output in `conformance/expected.tsv`).
 
 // —— prefer_is_empty ————————————————————————————————————————————————
 // Upstream Dart SDK source, pkg/linter .../prefer_is_empty.dart
 // (:97-101 `reportAtNode(expression)`; :188-208 `_drillDownTo`).
 
-/// `test_zero_notEq_listLength#0` — `INFO|…|2:9|14` — the whole binary
-/// expression, not the `;`-sealed container span.
+// `test_zero_notEq_listLength#0` — `INFO|…|2:9|14` — the whole binary
+// expression, not the `;`-sealed container span.
 #[test]
 fn pie_zero_not_eq_list_length_span() {
     let f = Fixture::parse("var x = 0 != [].length;\n");
@@ -24,8 +31,8 @@ fn pie_zero_not_eq_list_length_span() {
     assert_eq!(lints[0].range.end - lints[0].range.start, 14);
 }
 
-/// `test_listLength_asInt_greaterThan_zero#0` — the `as` cast drills
-/// through to the `.length` access (`ignoreAs`).
+// `test_listLength_asInt_greaterThan_zero#0` — the `as` cast drills
+// through to the `.length` access (`ignoreAs`).
 #[test]
 fn pie_as_cast_drills_to_length() {
     let f = Fixture::parse("var x = ([].length as int) > 0;\n");
@@ -54,10 +61,10 @@ fn pie_constructor_initializer_span_anchors_at_operand() {
 // Upstream Dart SDK source, pkg/linter .../unnecessary_statements.dart
 // (:114-116 the `visitNode` report face).
 
-/// `test_listLiteral#0` / `test_inForLoopUpdaters#0` (the `[];`
-/// statement and the `[]` for-updater) stay unpinned: the empty-list
-/// tiling keeps no `[` token row for the span probes — the shapes are
-/// tracked as conformance residuals.
+// `test_listLiteral#0` / `test_inForLoopUpdaters#0` (the `[];`
+// statement and the `[]` for-updater) stay unpinned: the empty-list
+// tiling keeps no `[` token row for the span probes — the shapes are
+// tracked as conformance residuals.
 
 /// `test_instanceField#0` — `INFO|…|3:3|5` — an invocation receiver's
 /// same-file class field tear-off (`C().g`).

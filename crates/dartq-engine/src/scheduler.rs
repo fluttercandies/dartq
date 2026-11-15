@@ -9,6 +9,7 @@
 //! an epoch a later write superseded) dropped at the single drain point so
 //! cancelled work never produces results.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cmp::Reverse;
 use std::collections::VecDeque;
 

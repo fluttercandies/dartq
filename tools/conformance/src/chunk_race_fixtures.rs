@@ -14,6 +14,7 @@
 //! | `adjacent_cases_keep_same_named_libraries_and_packages_apart` | One chunk holds every case in its own package root but a single analyzer process sees them all. Adjacent cases that both define `package:test/lib/test.dart` and an inline `package:aaa` must resolve against their own root; a shared root or a misattributed row attaches one case's diagnostics to its neighbour. |
 //! | `unclearable_chunk_root_aborts_the_run` | `remove_dir_all` errors were swallowed (`let _ =`), so a root that could not be created was still written into and analyzed; and a chunk-infrastructure failure was reported through the per-case channel. It must abort the run with no case verdicts instead of fabricating a report. |
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::case::Case;
 use crate::materialize::{self, LoadedCase};
 use crate::runner::{Runner, fresh_chunk_dir};
@@ -66,7 +67,7 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-fn runner<'a>(cases: &'a [LoadedCase], work_root: PathBuf, mocks_root: PathBuf) -> Runner<'a> {
+fn runner(cases: &[LoadedCase], work_root: PathBuf, mocks_root: PathBuf) -> Runner<'_> {
     Runner {
         cases,
         chunk_size: 2,

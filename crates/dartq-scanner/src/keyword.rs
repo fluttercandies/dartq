@@ -12,6 +12,7 @@
 //! feature enabled it is `Keyword.AUGMENT` (token.dart:139-145,
 //! `KeywordStyle.builtIn`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// Keyword classification (official `KeywordStyle`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeywordStyle {

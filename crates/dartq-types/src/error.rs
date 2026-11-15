@@ -1,5 +1,6 @@
 //! Explicit errors for type construction and hierarchy snapshot validation.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ids::{TypeDeclId, TypeParamId};
 use crate::ty::TypeKind;
 

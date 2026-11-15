@@ -32,6 +32,7 @@
 //! silent, and untyped-formal literals report against non-function
 //! formals exactly like the oracle.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

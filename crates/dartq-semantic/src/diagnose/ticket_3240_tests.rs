@@ -1,12 +1,13 @@
 //! The #3240 pins: `flag && v()` reports `use_of_void_result` ONCE. The
 //! lazy boolean operators check BOTH operands (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/generated/error_verifier.dart
+//! `pkg/analyzer/lib/src/generated/error_verifier.dart`
 //! `visitBinaryExpression` → `checkForUseOfVoidResult`) and the oracle
 //! answers a single row per consumed operand, while the engine folded the
 //! same right-operand row twice — `end_binary_expression`'s junction arm
 //! classifies both operands (`classify_condition`'s void face) and
 //! `fold_binary` then reports the pair again.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// The message the oracle spells for every face — parameterless
@@ -70,9 +71,7 @@ fn ticket_3240_logical_bool_operands_stay_silent() {
     let fixture = "void main() {\n  bool flag = true;\n  bool other = false;\n  flag && other;\n}";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "use_of_void_result"),
+        !code_names(&report).contains(&"use_of_void_result"),
         "{:?}",
         rows(&report)
     );

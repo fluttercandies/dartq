@@ -16,6 +16,7 @@
 //! precisely named skip or suppresses the case entirely (a case with wrong
 //! inputs would poison the differential run).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::case::Case;
 use crate::dart::{
     Arg, find_call, ident_end, is_ident_start, match_paren, next_char, parse_args,
@@ -366,18 +367,18 @@ fn base_env(content: &str, decl: &Declaration, decls: &[Declaration]) -> Env {
     }
     let mut experiments: Option<Vec<String>> = None;
     for member in &decl.members {
-        if member.name == "experiments" && experiments.is_none() {
-            if let Some((start, end)) = member.initializer {
-                if let Some(items) = setup::string_list(content[start..end].trim()) {
-                    experiments = Some(items);
-                }
-            }
+        if member.name == "experiments"
+            && experiments.is_none()
+            && let Some((start, end)) = member.initializer
+            && let Some(items) = setup::string_list(content[start..end].trim())
+        {
+            experiments = Some(items);
         }
     }
     let experiments = experiments.unwrap_or_else(|| {
         setup::DEFAULT_EXPERIMENTS
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect()
     });
     let (chain, supers) = class_chain(decl, decls);
@@ -449,10 +450,11 @@ fn build_path_env(
                     member.name.clone(),
                     content[start..end].to_string(),
                 );
-            } else if member.body.is_none() && member.params.is_empty() {
-                if !abstract_names.contains(&member.name) {
-                    abstract_names.push(member.name.clone());
-                }
+            } else if member.body.is_none()
+                && member.params.is_empty()
+                && !abstract_names.contains(&member.name)
+            {
+                abstract_names.push(member.name.clone());
             }
         }
     }
@@ -661,14 +663,14 @@ fn build_ctx<'a>(content: &'a str, decl: &Declaration, decls: &[Declaration]) ->
     let mut helpers = Vec::new();
     for source in &chain {
         for member in &source.members {
-            if let Some((start, end)) = member.body {
-                if member.name != "setUp" {
-                    helpers.push(Helper {
-                        name: member.name.clone(),
-                        body: (start, end),
-                        params: member.params.clone(),
-                    });
-                }
+            if let Some((start, end)) = member.body
+                && member.name != "setUp"
+            {
+                helpers.push(Helper {
+                    name: member.name.clone(),
+                    body: (start, end),
+                    params: member.params.clone(),
+                });
             }
         }
     }
@@ -687,13 +689,13 @@ fn scan_local_strings(body: &str, env: &Env) -> Vec<(String, String)> {
         let rest = &body[pos..];
         if rest.starts_with('\'')
             || rest.starts_with('"')
-            || (rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'') | Some(b'"')))
+            || (rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'' | b'"')))
         {
             skip_string(body, &mut pos);
             continue;
         }
         if rest.starts_with("//") {
-            pos += rest.find('\n').map_or(rest.len(), |e| e);
+            pos += rest.find('\n').unwrap_or(rest.len());
             continue;
         }
         if rest.starts_with("/*") {
@@ -709,15 +711,14 @@ fn scan_local_strings(body: &str, env: &Env) -> Vec<(String, String)> {
                 boundary = true;
                 pos += 1;
             }
-            _ if boundary => match try_decl(body, pos, &mut out, env) {
-                Some(end) => {
+            _ if boundary => {
+                if let Some(end) = try_decl(body, pos, &mut out, env) {
                     pos = end;
-                }
-                None => {
+                } else {
                     boundary = false;
                     pos = next_char(body, pos);
                 }
-            },
+            }
             _ => pos = next_char(body, pos),
         }
     }
@@ -758,14 +759,13 @@ fn try_decl(body: &str, start: usize, out: &mut Vec<(String, String)>, env: &Env
                 let rest = &body[r..];
                 if rest.starts_with('\'')
                     || rest.starts_with('"')
-                    || (rest.starts_with('r')
-                        && matches!(bytes.get(r + 1), Some(b'\'') | Some(b'"')))
+                    || (rest.starts_with('r') && matches!(bytes.get(r + 1), Some(b'\'' | b'"')))
                 {
                     skip_string(body, &mut r);
                     continue;
                 }
                 if rest.starts_with("//") {
-                    r += rest.find('\n').map_or(rest.len(), |e| e);
+                    r += rest.find('\n').unwrap_or(rest.len());
                     continue;
                 }
                 if rest.starts_with("/*") {
@@ -916,18 +916,15 @@ fn bind_helper_args(env: &mut Env, helper: &Helper, args: &[Arg]) {
         let Ok(value) = resolve_path_expr(&arg.expr, &env.names()) else {
             continue;
         };
-        match &arg.label {
-            Some(label) => {
-                if helper.params.iter().any(|p| p == label) {
-                    upsert(&mut env.locals, label.clone(), value);
-                }
+        if let Some(label) = &arg.label {
+            if helper.params.iter().any(|p| p == label) {
+                upsert(&mut env.locals, label.clone(), value);
             }
-            None => {
-                if let Some(param) = helper.params.get(positional) {
-                    upsert(&mut env.locals, param.clone(), value);
-                }
-                positional += 1;
+        } else {
+            if let Some(param) = helper.params.get(positional) {
+                upsert(&mut env.locals, param.clone(), value);
             }
+            positional += 1;
         }
     }
 }
@@ -971,19 +968,19 @@ fn interpret_config_call(env: &mut Env, args: &[Arg]) {
                             .find(|a| a.label.as_deref() == Some("rootFolder")),
                     ) {
                         let mut pos = 0usize;
-                        if let Some(d) = parse_string_expression(&name.expr, &mut pos) {
-                            if !d.interpolated {
-                                let root_expr = root.expr.trim();
-                                let root_expr = root_expr
-                                    .strip_prefix("getFolder(")
-                                    .and_then(|e| e.strip_suffix(')'))
-                                    .unwrap_or(root_expr);
-                                if let Ok(resolved) = resolve_path_expr(root_expr, &env.names()) {
-                                    if !env.aux_packages.contains(&d.value) {
-                                        env.aux_packages.push(d.value.clone());
-                                    }
-                                    upsert(&mut env.package_roots, d.value, resolved);
+                        if let Some(d) = parse_string_expression(&name.expr, &mut pos)
+                            && !d.interpolated
+                        {
+                            let root_expr = root.expr.trim();
+                            let root_expr = root_expr
+                                .strip_prefix("getFolder(")
+                                .and_then(|e| e.strip_suffix(')'))
+                                .unwrap_or(root_expr);
+                            if let Ok(resolved) = resolve_path_expr(root_expr, &env.names()) {
+                                if !env.aux_packages.contains(&d.value) {
+                                    env.aux_packages.push(d.value.clone());
                                 }
+                                upsert(&mut env.package_roots, d.value, resolved);
                             }
                         }
                     }
@@ -1023,12 +1020,11 @@ fn interpret_options_file_call(env: &mut Env, args: &[Arg], skip: &mut dyn FnMut
     let (Some(root_arg), Some(content_arg)) = (args.first(), args.get(1)) else {
         return;
     };
-    let root = match resolve_path_expr(&root_arg.expr, &env.names()) {
-        Ok(root) => root,
-        Err(_) => {
-            skip("setup_newAnalysisOptionsYamlFile".into());
-            return;
-        }
+    let root = if let Ok(root) = resolve_path_expr(&root_arg.expr, &env.names()) {
+        root
+    } else {
+        skip("setup_newAnalysisOptionsYamlFile".into());
+        return;
     };
     let test_root = env.test_root();
     if root == test_root {
@@ -1063,12 +1059,11 @@ fn interpret_pubspec_call(env: &mut Env, args: &[Arg], skip: &mut dyn FnMut(Stri
     let (Some(root_arg), Some(content_arg)) = (args.first(), args.get(1)) else {
         return;
     };
-    let root = match resolve_path_expr(&root_arg.expr, &env.names()) {
-        Ok(root) => root,
-        Err(_) => {
-            skip("setup_newPubspecYamlFile".into());
-            return;
-        }
+    let root = if let Ok(root) = resolve_path_expr(&root_arg.expr, &env.names()) {
+        root
+    } else {
+        skip("setup_newPubspecYamlFile".into());
+        return;
     };
     if root != env.test_root() {
         skip("setup_newPubspecYamlFile".into());
@@ -1114,23 +1109,21 @@ fn interpret_new_file(prefix: &str, env: &mut Env, args: &[Arg], skip: &mut dyn 
             return;
         }
     };
-    let content = match resolve_path_expr(&content_arg.expr, &env.names()) {
-        Ok(content) => content,
-        Err(_) => {
-            skip("companion_interpolated".into());
-            return;
-        }
+    let content = if let Ok(content) = resolve_path_expr(&content_arg.expr, &env.names()) {
+        content
+    } else {
+        skip("companion_interpolated".into());
+        return;
     };
     // Package-build generated directories are only reachable through the
     // workspace's generated-file mapping, which the single-package-root
     // model of a case cannot express.
-    if env.workspace == Workspace::PackageBuild {
-        if let Some(generated) = env.lookup("testPackageGeneratedPath") {
-            if path.starts_with(&generated) {
-                skip("companion_package_build_workspace".into());
-                return;
-            }
-        }
+    if env.workspace == Workspace::PackageBuild
+        && let Some(generated) = env.lookup("testPackageGeneratedPath")
+        && path.starts_with(&generated)
+    {
+        skip("companion_package_build_workspace".into());
+        return;
     }
     match section_for_path(&path, env) {
         Some(rel_path) => {
@@ -1213,7 +1206,7 @@ fn literal_single(args: &[Arg]) -> Option<String> {
     }
     let mut pos = 0usize;
     let d = parse_string_expression(&args[0].expr, &mut pos)?;
-    (pos == args[0].expr.len() && !d.interpolated).then(|| d.value)
+    (pos == args[0].expr.len() && !d.interpolated).then_some(d.value)
 }
 
 fn skip_string(src: &str, pos: &mut usize) {
@@ -1287,7 +1280,7 @@ fn extract_declaration(
             out.skips.push(Skip {
                 id: format!("{code_prefix}/{}", decl.name),
                 reason,
-            })
+            });
         });
         env.locals.truncate(saved);
     }
@@ -1359,7 +1352,7 @@ fn extract_method(
         if name == "resolveFilesWithDiagnostics" {
             let mut site_skips: Vec<String> = Vec::new();
             interpret_calls(&body[..open], &mut env, ctx, 0, &mut |reason| {
-                site_skips.push(reason)
+                site_skips.push(reason);
             });
             for reason in &site_skips {
                 out.skips.push(Skip {
@@ -1420,7 +1413,7 @@ fn extract_method(
 
         let mut site_skips: Vec<String> = Vec::new();
         interpret_calls(&body[..open], &mut env, ctx, 0, &mut |reason| {
-            site_skips.push(reason)
+            site_skips.push(reason);
         });
         if name == "assertTestCodeWithStrictCastsDiagnostics" {
             env.options = strict_casts_options(&env.experiments);
@@ -1502,7 +1495,7 @@ fn add_placeholder_sections(files: &mut Vec<(String, String)>, env: &Env) {
     }
 }
 
-/// Extracts the front_end `parser_testcases/` corpus: one source-only case
+/// Extracts the `front_end` `parser_testcases/` corpus: one source-only case
 /// per `.dart` file, `*.crash_dart` included (the runner's crash
 /// bookkeeping covers them). The official parser suite runs every file with
 /// the `--enable-experiment` flags of its `folder.options` chain, merged
@@ -1516,15 +1509,14 @@ pub fn extract_front_end_parser(root: &Path) -> DirExtraction {
     for rel in &files {
         out.scanned += 1;
         let id = rel.strip_suffix(".dart").unwrap_or(rel);
-        let content = match std::fs::read_to_string(root.join(rel)) {
-            Ok(text) => text,
-            Err(_) => {
-                out.skips.push(Skip {
-                    id: format!("parser-fe/{id}"),
-                    reason: "unreadable".into(),
-                });
-                continue;
-            }
+        let content = if let Ok(text) = std::fs::read_to_string(root.join(rel)) {
+            text
+        } else {
+            out.skips.push(Skip {
+                id: format!("parser-fe/{id}"),
+                reason: "unreadable".into(),
+            });
+            continue;
         };
         let experiments = folder_experiments(root, rel);
         let options =
@@ -1549,7 +1541,7 @@ pub fn extract_front_end_parser(root: &Path) -> DirExtraction {
 fn folder_experiments(root: &Path, rel: &str) -> Vec<String> {
     let mut experiments: Vec<String> = setup::DEFAULT_EXPERIMENTS
         .iter()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
     let mut dir = PathBuf::from("");
     let chain = rel.split('/').collect::<Vec<_>>();
@@ -1600,7 +1592,7 @@ fn collect_dir_files(root: &Path, rel: &str, out: &mut Vec<String>) {
 mod tests {
     use super::*;
 
-    const FILE: &str = r#"
+    const FILE: &str = r"
 import 'context.dart';
 
 @reflectiveTest
@@ -1652,7 +1644,7 @@ var x = $noSuchName;
     await resolveTestCode('var y = 2;');
   }
 }
-"#;
+";
 
     #[test]
     fn extracts_cases_with_setup() {
@@ -1734,7 +1726,7 @@ var x = $noSuchName;
     }
 
     /// Inherited getters and inherited `setUp` effects (`_TestBase` shape).
-    const INHERIT_FILE: &str = r#"
+    const INHERIT_FILE: &str = r"
 @reflectiveTest
 class SubTest extends _TestBase {
   test_aaa() async {
@@ -1758,7 +1750,7 @@ class _TestBase extends PubPackageResolutionTest {
     );
   }
 }
-"#;
+";
 
     #[test]
     fn inherited_setups_and_getters_apply() {
@@ -1842,7 +1834,7 @@ class GenTest extends PubPackageResolutionTest {
     }
 
     /// A helper method's modeled calls apply with bound arguments.
-    const HELPER_FILE: &str = r#"
+    const HELPER_FILE: &str = r"
 @reflectiveTest
 class HelperTest extends PubPackageResolutionTest {
   test_version() async {
@@ -1857,7 +1849,7 @@ class HelperTest extends PubPackageResolutionTest {
     );
   }
 }
-"#;
+";
 
     #[test]
     fn helper_methods_bind_parameters() {
@@ -2066,7 +2058,7 @@ class MyRootTest extends PubPackageResolutionTest {
     /// `flutter: true` implies the meta package (official builder).
     #[test]
     fn flutter_implies_meta() {
-        let src = r#"
+        let src = r"
 @reflectiveTest
 class FlutterTest extends PubPackageResolutionTest {
   test_x() async {
@@ -2074,7 +2066,7 @@ class FlutterTest extends PubPackageResolutionTest {
     await resolveTestCodeWithDiagnostics('var f = 1;');
   }
 }
-"#;
+";
         let out = extract_file("src/diagnostics/flutter_test.dart", src);
         assert!(out.skips.is_empty(), "{:?}", out.skips);
         assert_eq!(out.cases[0].packages, vec!["flutter", "meta"]);
@@ -2083,7 +2075,7 @@ class FlutterTest extends PubPackageResolutionTest {
     /// The pinned micro-resolver base class layout (`FileResolutionTest`).
     #[test]
     fn file_resolution_base_table() {
-        let src = r#"
+        let src = r"
 @reflectiveTest
 class FileResolverXTest extends FileResolutionTest {
   test_x() async {
@@ -2091,7 +2083,7 @@ class FileResolverXTest extends FileResolutionTest {
     await resolveTestCodeWithDiagnostics('var a = 1;');
   }
 }
-"#;
+";
         let out = extract_file("src/dart/micro/x_test.dart", src);
         assert!(out.skips.is_empty(), "{:?}", out.skips);
         assert_eq!(out.cases[0].files[1].0, "lib/a.dart");
@@ -2101,7 +2093,7 @@ class FileResolverXTest extends FileResolutionTest {
     /// files keep their bare stem, other files keep their path stem.
     #[test]
     fn parse_calls_route_to_the_parser_face() {
-        let src = r#"
+        let src = r"
 @reflectiveTest
 class ErrorParserTest extends ParserDiagnosticsTest {
   test_x() {
@@ -2112,7 +2104,7 @@ f(;
 }
 
 class ParserDiagnosticsTest {}
-"#;
+";
         let out = extract_file("generated/error_parser_test.dart", src);
         assert_eq!(out.cases.len(), 1, "{:?}", out.skips);
         assert_eq!(
@@ -2132,7 +2124,7 @@ class ParserDiagnosticsTest {}
     /// case is suppressed with a named skip.
     #[test]
     fn parse_feature_set_override_skips() {
-        let src = r#"
+        let src = r"
 class T extends ParserDiagnosticsTest {
   test_x() {
     parseTestCodeWithDiagnostics(
@@ -2143,7 +2135,7 @@ class T extends ParserDiagnosticsTest {
 }
 
 class ParserDiagnosticsTest {}
-"#;
+";
         let out = extract_file("generated/p_test.dart", src);
         assert!(out.cases.is_empty(), "{:?}", out.cases);
         assert_eq!(out.skips.len(), 1);
@@ -2153,7 +2145,7 @@ class ParserDiagnosticsTest {}
     /// Unmodeled target-shaped calls are recorded as named skips.
     #[test]
     fn unmodeled_target_calls_are_recorded() {
-        let src = r#"
+        let src = r"
 class T extends PubPackageResolutionTest {
   test_resolveFile() async {
     var a = getFile('$testPackageLibPath/a.dart');
@@ -2164,7 +2156,7 @@ class T extends PubPackageResolutionTest {
     parseTestCodeIgnoringDiagnostics('var x = 1;');
   }
 }
-"#;
+";
         let out = extract_file("src/dart/micro/u_test.dart", src);
         assert!(out.cases.is_empty(), "{:?}", out.cases);
         let reasons: Vec<&str> = out.skips.iter().map(|s| s.reason.as_str()).collect();
@@ -2208,7 +2200,7 @@ class GnTest extends PubPackageResolutionTest {
     /// ride along.
     #[test]
     fn resolve_files_map_becomes_sections() {
-        let src = r#"
+        let src = r"
 @reflectiveTest
 class LibTest extends PubPackageResolutionTest {
   test_inPart() async {
@@ -2226,7 +2218,7 @@ part of 'a.dart';
     });
   }
 }
-"#;
+";
         let out = extract_file("src/dart/resolution/library_import_test.dart", src);
         assert_eq!(out.cases.len(), 1, "{:?}", out.skips);
         let case = &out.cases[0];
@@ -2241,7 +2233,7 @@ part of 'a.dart';
         assert_eq!(case.files[2].0, "lib/c.dart");
     }
 
-    /// The front_end parser_testcases corpus: whole-file source-only cases
+    /// The `front_end` `parser_testcases` corpus: whole-file source-only cases
     /// with the folder.options experiments merged over the defaults.
     #[test]
     fn front_end_parser_corpus_extracted_whole_file() {
@@ -2263,7 +2255,7 @@ part of 'a.dart';
         assert_eq!(out.scanned, 2, "{:?}", out.skips);
         assert_eq!(out.cases.len(), 2, "{:?}", out.skips);
         let mut ids: Vec<&str> = out.cases.iter().map(|c| c.id.as_str()).collect();
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(
             ids,
             vec![
@@ -2302,7 +2294,7 @@ part of 'a.dart';
     /// An unresolvable map key or a non-literal value suppresses the case.
     #[test]
     fn resolve_files_map_failures_suppress() {
-        let src = r#"
+        let src = r"
 @reflectiveTest
 class BadTest extends PubPackageResolutionTest {
   test_unknownKey() async {
@@ -2321,7 +2313,7 @@ var x = 1;
     });
   }
 }
-"#;
+";
         let out = extract_file("src/dart/resolution/bad_test.dart", src);
         assert!(out.cases.is_empty(), "{:?}", out.cases);
         let reasons: Vec<&str> = out.skips.iter().map(|s| s.reason.as_str()).collect();

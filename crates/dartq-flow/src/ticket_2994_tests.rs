@@ -6,7 +6,8 @@
 //! separator's own offset — trivia between them belonged to the arm), and
 //! the named-const condition face (`if (DEBUG)` over a named `const`/
 //! `final` bool never dead-folds — the official's `booleanLiteral` fold
-//! fires on literal nodes only, dead_code_test.dart's debugConst family).
+//! fires on literal nodes only, `dead_code_test.dart`'s debugConst family).
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

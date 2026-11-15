@@ -3,9 +3,10 @@
 //! carries the extension's own non-nullable result, so a staged
 //! nullable-condition face (a `&&` right operand reading the member)
 //! stands down. Oracle provenance: `dart analyze` 3.13.1 census —
-//! ffi_verifier.dart:2644's `element.supertype.isAbiSpecificInteger`
+//! `ffi_verifier.dart:2644`'s `element.supertype.isAbiSpecificInteger`
 //! over `extension on DartType?`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// A member resolved through a nullable-applicable extension face on a

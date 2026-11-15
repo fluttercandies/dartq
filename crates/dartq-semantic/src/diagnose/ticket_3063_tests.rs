@@ -29,6 +29,7 @@
 //! the SINK row (`invalid_assignment`), whose message renders the folded
 //! node type, which is exactly what these two mechanisms decide.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

@@ -1,6 +1,7 @@
 //! Content identities: the 128-bit blake3 digest that names source bytes
 //! everywhere in dartq.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fmt;
 use std::str::FromStr;
 

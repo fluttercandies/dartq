@@ -23,6 +23,7 @@
 //! update path (`watch::Freshness`) reuses the exact surface a full take
 //! covers — never a second derivation to drift apart.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -58,7 +59,7 @@ pub(crate) struct Stat {
 #[must_use]
 pub(crate) fn stat(path: &Path) -> Option<Stat> {
     STAT_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
-    let metadata = fs::metadata(path).ok().filter(|m| m.is_file())?;
+    let metadata = fs::metadata(path).ok().filter(std::fs::Metadata::is_file)?;
     Some(Stat::of(&metadata))
 }
 
@@ -1084,7 +1085,7 @@ mod tests {
         let take = || Snapshot::take(std::slice::from_ref(&app), None, &sdk);
         let first = take();
         assert!(
-            first.0.iter().any(|e| &*e.path == dep.join("lib/d.dart")),
+            first.0.iter().any(|e| *e.path == dep.join("lib/d.dart")),
             "path dependency walked"
         );
         assert!(

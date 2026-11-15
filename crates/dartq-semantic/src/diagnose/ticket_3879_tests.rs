@@ -38,7 +38,7 @@
 //!   argument rows go unreported. Upstream: the downward
 //!   `InferenceContext` binds through the instantiated supertype
 //!   (upstream Dart SDK source,
-//!   pkg/analyzer/lib/src/dart/resolver/invocation_inferrer.dart:180
+//!   `pkg/analyzer/lib/src/dart/resolver/invocation_inferrer.dart:180`
 //!   `FullInvocationInferrer` — the context type feeds the solve ahead
 //!   of the argument constraints, `chooseFinalTypes` at :345 and the
 //!   `resolveArgumentsToParameters` pairing at :354, defined at
@@ -52,16 +52,16 @@
 //!   row's static type on the BIND path is lost when the written group
 //!   carries a `dynamic` segment, although the same group reads
 //!   correctly through the argument-check path (pinned below). Owner:
-//!   the listener.rs/engine_core.rs init-read seam, not this reader.
+//!   the `listener.rs/engine_core.rs` init-read seam, not this reader.
 //! * The tear-off family: `var v = List<int>.filled; v(3, "s")` — the
 //!   direct spelling also under-reports, so the root is the tear-off
 //!   value's signature at the send (`engine_core.rs` `tearoff_ty` and
 //!   the send-close formal pairing), not the typedef fold.
 //! * `mapLiterals`/`futureUnion`: collection-literal context inference
-//!   and `FutureOr` union faces — collection_literal.rs / the send
+//!   and `FutureOr` union faces — `collection_literal.rs` / the send
 //!   close, outside this packet's files.
 //!
-//! **M4, instantiate-to-bounds fallback — the constructor2_test_05
+//! **M4, instantiate-to-bounds fallback — the `constructor2_test_05`
 //! row** (`const C.subtyped(a)` over `const C.subtyped(B<U> this.a)`:
 //! the argument's `A<int>` constrains nothing, the oracle falls back to
 //! `U := dynamic` and still checks, reporting `'A<int>'` against
@@ -76,7 +76,7 @@
 //! #3871 i2b engine's `Bounds::itb_default_args`). Owner: the
 //! invocation.rs lane; the engine to reuse is landed and read-only.
 //!
-//! **E8, enum-formal Never — 8 extra rows** (grammar_A12_t01: an enum
+//! **E8, enum-formal Never — 8 extra rows** (`grammar_A12_t01`: an enum
 //! constructor's SUPER formals (`const E1(super.x)`) park `Ty::Never`,
 //! and `check_enum_const_arguments` plus its const twin then report
 //! `argument_type_not_assignable` and
@@ -102,6 +102,7 @@
 //! carries the fixture behind it on one line. All fixtures are ASCII,
 //! so byte and UTF-16 offsets coincide.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -156,20 +157,17 @@ void f() {
     assert_eq!(
         rows[0].0,
         at(source, "dynamic>(\"hello\"") + "dynamic>(".len() as u32,
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
     assert_eq!(
         rows[1].0,
         at(source, ".named(\"hello\", 3);\n  var k") + ".named(".len() as u32,
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
     assert_eq!(
         rows[2].0,
         at(source, ".named(\"hello\", 3);\n}") + ".named(".len() as u32,
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
 }
 
@@ -182,7 +180,7 @@ void f() {
 /// Routed residual recorded above: the same fixture with a `dynamic`
 /// segment in the group (`new A<int, dynamic>`) currently binds nothing
 /// usable on this path while the argument-check path (the pin above)
-/// reads the same group — the listener.rs/engine_core.rs init-read
+/// reads the same group — the `listener.rs/engine_core.rs` init-read
 /// seam owns that half.
 #[test]
 fn written_group_binds_the_created_row_type() {

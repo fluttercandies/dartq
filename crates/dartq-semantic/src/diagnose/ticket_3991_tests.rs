@@ -20,11 +20,13 @@
 //! Known residuals outside this lane's scope:
 //! - dartq reports no `ASSIGNMENT_TO_FINAL` row for a bare top-level getter
 //!   write at all (the `resolve_bare_row` `RefTarget::Decl` arm carries no
-//!   write-intent face) — owner: row_resolution.rs's bare Decl arm.
+//!   write-intent face) — owner: `row_resolution.rs`'s bare Decl arm.
 //! - `unreachable += 3` still dead-codes: upstream reads the getter under
 //!   `hasRead` but a STATIC getter's `getType` face stays null so no exit
 //!   fires — owner: the flow `Resolved::Top` arm's unconditional
 //!   `is_bottom` exit on compound-operator targets.
+
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{code_names, report_ops, report_ops_bare, rows};
 use crate::diagnose::FileReport;
@@ -42,18 +44,18 @@ fn dead_code_rows(report: &FileReport) -> Vec<&Diagnostic> {
 /// window — the write resolves through the `name=` setter spelling (which
 /// does not exist here — upstream's `ASSIGNMENT_TO_FINAL` row on the
 /// target is the setter-missing face; dartq's missing row is the noted
-/// row_resolution.rs residual), and `print('after')` stays live. The
+/// `row_resolution.rs` residual), and `print('after')` stays live. The
 /// oracle's exact face is `ASSIGNMENT_TO_FINAL` only; dartq asserts the
 /// `dead_code` absence (the setter-missing error's own row gap is the
 /// residual above, pinned loosely so a later fix does not collide).
 #[test]
 fn plain_write_to_never_getter_opens_no_dead_window() {
-    let source = r#"Never get unreachable => throw 0;
+    let source = r"Never get unreachable => throw 0;
 void main() {
   unreachable = 3;
   print('after');
 }
-"#;
+";
     let report = report_ops_bare(source);
     assert!(dead_code_rows(&report).is_empty(), "{:#?}", rows(&report));
 }
@@ -64,13 +66,13 @@ void main() {
 /// recorder-context override makes the flow event agree.
 #[test]
 fn forward_never_getter_write_target_opens_no_dead_window() {
-    let source = r#"void main() {
+    let source = r"void main() {
   unreachable = 3;
   print('after');
 }
 
 Never get unreachable => throw 0;
-"#;
+";
     let report = report_ops_bare(source);
     assert!(dead_code_rows(&report).is_empty(), "{:#?}", rows(&report));
 }
@@ -82,14 +84,14 @@ Never get unreachable => throw 0;
 /// `dead_code` absence is the fix's face.
 #[test]
 fn plain_write_to_never_member_getter_opens_no_dead_window() {
-    let source = r#"class C {
+    let source = r"class C {
   Never get x => throw 0;
   void m() {
     x = 3;
     print('after');
   }
 }
-"#;
+";
     let report = report_ops_bare(source);
     assert!(
         code_names(&report).contains(&"assignment_to_final_no_setter"),
@@ -104,12 +106,12 @@ fn plain_write_to_never_member_getter_opens_no_dead_window() {
 /// a real read — the #3966 fixture family's own face).
 #[test]
 fn genuine_never_getter_read_still_dead_codes() {
-    let source = r#"Never get unreachable => throw 0;
+    let source = r"Never get unreachable => throw 0;
 void main() {
   unreachable;
   print('after');
 }
-"#;
+";
     let report = report_ops_bare(source);
     let hits = dead_code_rows(&report);
     assert_eq!(hits.len(), 1, "{:#?}", rows(&report));
@@ -122,12 +124,12 @@ void main() {
 /// target keeps its `Expression` event and the dead rows stand.
 #[test]
 fn if_null_write_to_never_getter_still_dead_codes() {
-    let source = r#"Never get unreachable => throw 0;
+    let source = r"Never get unreachable => throw 0;
 void main() {
   unreachable ??= 3;
   print('after');
 }
-"#;
+";
     let report = report_ops_bare(source);
     assert!(
         code_names(&report).contains(&"dead_code"),

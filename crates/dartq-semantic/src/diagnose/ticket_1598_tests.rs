@@ -17,6 +17,7 @@
 //! constant_verifier.dart` `visitConstantPattern` → `_evaluateAndReportError`
 //! for the pattern expression's own verdict.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

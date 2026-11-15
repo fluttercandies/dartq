@@ -24,6 +24,7 @@
 //!   declared face — `literal_ctx_ty` reads `frame.var_types` for a
 //!   `LocalKind::Parameter` binding left of the separator.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

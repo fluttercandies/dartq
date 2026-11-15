@@ -5,7 +5,7 @@
 //! The if/else element took the last branch's row
 //! (`[if (c) 1 else "s"]` answered `List<String>`); the oracle joins both
 //! branches (`typed_literal_resolver.dart` `_computeElementType`'s
-//! IfElementImpl arm — `leastUpperBound(thenType, elseType)`, a missing
+//! `IfElementImpl` arm — `leastUpperBound(thenType, elseType)`, a missing
 //! `else` keeping the then leaf), so `1 | "s"` joins at `Object` and the
 //! literal infers `List<Object>`. The generic-bound spread answered `None`
 //! wherever the operand's head is an in-scope type parameter (`{...t}`
@@ -18,6 +18,7 @@
 //! (the oracle's spread over a boundless parameter leaves the literal
 //! ambiguous — no constant-true check to fire).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

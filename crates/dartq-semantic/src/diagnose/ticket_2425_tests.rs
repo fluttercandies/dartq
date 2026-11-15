@@ -29,6 +29,7 @@
 //! function-argument-vs-`int`-formal twin, and the callable-class twins
 //! behave as pinned here on the same oracle.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -38,7 +39,7 @@ use dartq_source::FileTable;
 use std::path::Path;
 
 /// Diagnoses `main_source` as `main.dart` importing `lib.dart` — the
-/// ticket_2417 two-file harness, reused so the foreign-pool formals ride
+/// `ticket_2417` two-file harness, reused so the foreign-pool formals ride
 /// the same path the projection fix landed on. Same-file cases put the
 /// whole fixture in `main_source` (`lib.dart` stays a filler the harness
 /// still links).

@@ -16,25 +16,24 @@
 //! the exception — the official emits it INSIDE the window, so it never
 //! consults the table).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// Asserts no `unchecked_use_of_nullable_value` sits anywhere in the
 /// report — the whole point of the gate.
 fn assert_no_unchecked(report: &super::FileReport) {
     assert!(
-        !code_names(report)
-            .iter()
-            .any(|&c| c == "unchecked_use_of_nullable_value"),
+        !code_names(report).contains(&"unchecked_use_of_nullable_value"),
         "unchecked_use_of_nullable_value inside a dead window: {:?}",
         rows(report)
     );
 }
 
-/// Asserts the dead_code row fired (the fixture IS dead — the gate is
+/// Asserts the `dead_code` row fired (the fixture IS dead — the gate is
 /// wrong if nothing reports).
 fn assert_dead_code(report: &super::FileReport) {
     assert!(
-        code_names(report).iter().any(|&c| c == "dead_code"),
+        code_names(report).contains(&"dead_code"),
         "expected a dead_code row: {:?}",
         rows(report)
     );
@@ -74,8 +73,8 @@ fn member_read_inside_nested_dead_blocks_stays_silent() {
     assert_no_unchecked(&report);
 }
 
-/// `x?.abs()` is null-AWARE — no unchecked_use fires anywhere — but the
-/// fixture still asserts the dead window reports only its dead_code row
+/// `x?.abs()` is null-AWARE — no `unchecked_use` fires anywhere — but the
+/// fixture still asserts the dead window reports only its `dead_code` row
 /// (the null-aware arm never rode the gate anyway).
 #[test]
 fn null_aware_read_inside_dead_block_stays_silent() {
@@ -93,9 +92,7 @@ fn member_read_outside_dead_block_reports() {
     let fixture = "void f(int? x) {\n  if (false) {\n    x.abs();\n  }\n  x.abs();\n}";
     let report = report_ops(fixture);
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|&c| c == "unchecked_use_of_nullable_value"),
+        code_names(&report).contains(&"unchecked_use_of_nullable_value"),
         "expected the live read's unchecked_use_of_nullable_value: {:?}",
         rows(&report)
     );
@@ -114,7 +111,7 @@ fn two_dead_windows_each_suppress() {
 }
 
 /// A dead block containing BOTH a member call and a property read —
-/// every suppressed face inside the window stays silent (one dead_code
+/// every suppressed face inside the window stays silent (one `dead_code`
 /// row covers the whole interior).
 #[test]
 fn mixed_accesses_inside_dead_block_stay_silent() {

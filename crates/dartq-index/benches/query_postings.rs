@@ -12,6 +12,12 @@
 //! Scale: `DARTQ_BENCH_FILES` (default 2000), `DARTQ_BENCH_QUERIES`
 //! (default 200).
 
+#![allow(clippy::similar_names, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::too_many_lines)]
+
 use std::env;
 use std::hint::black_box;
 use std::path::Path;
@@ -68,7 +74,11 @@ fn bench_symbols(index: &SymbolIndex, names: &[StringId], scan: bool) -> (Vec<Du
         matches = if scan {
             index
                 .files()
-                .map(|(_, surface)| surface.by_name(name).map_or(0, |rows| rows.len()))
+                .map(|(_, surface)| {
+                    surface
+                        .by_name(name)
+                        .map_or(0, <[dartq_index::DeclRow]>::len)
+                })
                 .sum::<usize>()
         } else {
             index.symbols(name).count()
@@ -94,7 +104,7 @@ fn bench_references(
             index
                 .libraries()
                 .filter_map(|(_, surface)| surface.references_of(file, name))
-                .map(|rows| rows.len())
+                .map(<[dartq_index::RefRow]>::len)
                 .sum::<usize>()
         } else {
             index.references(file, name).count()

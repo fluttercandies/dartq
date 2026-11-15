@@ -9,6 +9,7 @@
 //! declaration model has no constructor rows — the class-name face owns
 //! the site) — pinned as the deliberate zero.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

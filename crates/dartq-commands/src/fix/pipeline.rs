@@ -1,4 +1,14 @@
-use super::*;
+use super::{
+    AnalysisOptions, Arc, AssistAnswer, BTreeMap, BUILTIN_ASSIST_SOURCE, BUILTIN_IGNORE_SOURCE,
+    BUILTIN_PARSER_SOURCE, BUILTIN_SEMANTIC_SOURCE, BUILTIN_SOURCE, Diagnostic, DiscoverError,
+    EnableSet, Features, FileEvidence, FileFixSet, FixInput, FixRole, FixSource, FixesReply,
+    FxHashMap, FxHashSet, LineIndex, Lint, MAX_SOURCE_BYTES, PackageConfig, Path, PathBuf,
+    PlannerFuse, PluginFix, PluginHostError, PluginHosts, PrioritizedChange, RULES, RuleFix,
+    SourceRange, anchored_edit, builtin_assists, builtin_assists_with, capacity_error, discover,
+    from_imports, from_switch_cases, ignore_file_fix, ignore_line_fix, ignore_options_edit,
+    parse_unit, rejection_notice, run, semantic_fix_diagnostics, stat_capacity_error,
+    unit_features, utf16_len_of,
+};
 
 /// The fix source stage: validates the targets through discovery, then
 /// parses each file once through the lints layer's production entry and

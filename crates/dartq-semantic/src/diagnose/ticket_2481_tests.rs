@@ -25,6 +25,7 @@
 //! (the `this.element` chain keeps the oracle's verdict), and probe d (the
 //! promoted `e.supertype` chain spares).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::model::FileElements;
@@ -113,7 +114,7 @@ fn unused_element_rows(source: &str) -> Vec<String> {
 /// spares the member — the oracle reports nothing.
 #[test]
 fn var_of_instance_getter_chain_spares_extension_member() {
-    let source = r#"
+    let source = r"
 class Element {}
 
 class ElementAnnotation {
@@ -134,7 +135,7 @@ void use(Annotation a) {
   var e = a.elementAnnotation?.element;
   e.ffiClass;
 }
-"#;
+";
     assert!(
         unused_element_rows(source).is_empty(),
         "expected no unused rows: {:?}",
@@ -149,7 +150,7 @@ void use(Annotation a) {
 /// oracle reports nothing.
 #[test]
 fn var_of_extension_getter_spares_extension_member() {
-    let source = r#"
+    let source = r"
 class Element {}
 
 class InterfaceElement extends Element {}
@@ -166,7 +167,7 @@ bool usesGetter(InterfaceElement element) {
   var enclosingElement = element.enclosingElement2;
   return enclosingElement.isStruct;
 }
-"#;
+";
     assert!(
         unused_element_rows(source).is_empty(),
         "expected no unused rows: {:?}",
@@ -179,7 +180,7 @@ bool usesGetter(InterfaceElement element) {
 /// an access actually resolves through.
 #[test]
 fn unused_extension_member_still_reports_beside_typed_var() {
-    let source = r#"
+    let source = r"
 class Element {}
 
 class ConstructorElement extends Element {}
@@ -202,7 +203,7 @@ extension on Annotation {
     return element is ConstructorElement && element.ffiClass != null;
   }
 }
-"#;
+";
     assert_eq!(
         unused_element_rows(source),
         vec!["The declaration 'isMapping' isn't referenced.".to_string()],
@@ -214,7 +215,7 @@ extension on Annotation {
 /// resolves on the nullable `on` face — the oracle reports nothing.
 #[test]
 fn null_aware_extension_getter_var_stays_nullable_and_spares() {
-    let source = r#"
+    let source = r"
 class C2 {
   C2? get maybe => null;
 }
@@ -227,7 +228,7 @@ void f(C2 c) {
   var v = c.maybe;
   v?._ext();
 }
-"#;
+";
     assert!(
         unused_element_rows(source).is_empty(),
         "expected no unused rows: {:?}",
@@ -241,7 +242,7 @@ void f(C2 c) {
 /// `ambiguous_extension_member_access` posture.
 #[test]
 fn ambiguous_extension_getter_keeps_member_uncredited() {
-    let source = r#"
+    let source = r"
 class C3 {}
 
 extension A1 on C3 {
@@ -260,7 +261,7 @@ void f(C3 c) {
   var v = c.shared;
   v?._gone();
 }
-"#;
+";
     let rows = unused_element_rows(source);
     assert!(
         rows.iter().any(|row| row.contains("'_gone'")),
@@ -273,7 +274,7 @@ void f(C3 c) {
 /// while the never-referenced `isNativeLeaf` still reports.
 #[test]
 fn this_getter_chain_var_keeps_oracle_verdict() {
-    let source = r#"
+    let source = r"
 class Element {}
 
 class ConstructorElement extends Element {}
@@ -292,7 +293,7 @@ extension on ElementAnnotation {
     return element is ConstructorElement && element.ffiClass;
   }
 }
-"#;
+";
     assert_eq!(
         unused_element_rows(source),
         vec!["The declaration 'isNativeLeaf' isn't referenced.".to_string()],
@@ -304,7 +305,7 @@ extension on ElementAnnotation {
 /// result resolves — the oracle reports nothing.
 #[test]
 fn promoted_chain_keeps_sparing() {
-    let source = r#"
+    let source = r"
 class Element {}
 
 class ClassElement extends Element {
@@ -321,7 +322,7 @@ bool f(Element? e) {
   }
   return false;
 }
-"#;
+";
     assert!(
         unused_element_rows(source).is_empty(),
         "expected no unused rows: {:?}",

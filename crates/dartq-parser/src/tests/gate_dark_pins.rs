@@ -25,6 +25,7 @@
 //! full streams stay owned by the wave gates; these gates own per-code
 //! visibility.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::setup;
 
 /// Whole-unit parse, diagnostic-code sequence only.

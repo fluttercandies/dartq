@@ -24,6 +24,7 @@
 //! (`EX(s)?.p ??= e` types `E?`). A cascade target (`c?..v ??= e`) types
 //! the CASCADE's value, its receiver (`C?`), never the section's face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops;
 use crate::diagnose::types::FileReport;
 

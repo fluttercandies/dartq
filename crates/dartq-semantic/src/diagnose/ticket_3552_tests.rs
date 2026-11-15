@@ -26,6 +26,7 @@
 //! filter keeps auxiliary rows like `non_type_as_type_argument` out of
 //! the answer).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 
 /// Every `body_might_complete_normally*` row as `(code, offset)`,
@@ -120,8 +121,8 @@ fn async_nullable_inner_future_or_void_stays_silent() {
 /// reported the ERROR twin against the same oracle row.
 ///
 /// Probed: one row, `body_might_complete_normally_nullable` at `f`'s
-/// name — "This function has a nullable return type of 'FutureOr<
-/// FutureOr<int>?>', but ends without returning a value."
+/// name — "This function has a nullable return type of '`FutureOr`<
+/// `FutureOr`<int>?>', but ends without returning a value."
 #[test]
 fn async_nullable_inner_future_or_int_reports_the_warning_twin() {
     let source = "FutureOr<FutureOr<int>?> f() async {}\n";
@@ -162,7 +163,7 @@ fn async_future_of_nullable_future_or_int_reports_the_warning_twin() {
 ///
 /// Probed: one row, `body_might_complete_normally` at `f`'s name —
 /// "The body might complete normally, causing 'null' to be returned,
-/// but the return type, 'FutureOr<FutureOr<int>>', is a potentially
+/// but the return type, '`FutureOr`<`FutureOr`<int>>', is a potentially
 /// non-nullable type."
 #[test]
 fn async_nested_future_or_int_keeps_the_error_twin() {
@@ -181,7 +182,7 @@ fn async_nested_future_or_int_keeps_the_error_twin() {
 /// ERROR twin stays.
 ///
 /// Probed: one row, `body_might_complete_normally` at `g`'s name —
-/// "the return type, 'FutureOr<R>', is a potentially non-nullable
+/// "the return type, '`FutureOr`<R>', is a potentially non-nullable
 /// type."
 #[test]
 fn async_future_or_type_parameter_keeps_the_error_twin() {
@@ -198,7 +199,7 @@ fn async_future_or_type_parameter_keeps_the_error_twin() {
 /// fires — `Future<int>`'s value type `int` is no silent face.
 ///
 /// Probed: one row, `body_might_complete_normally` at `f`'s name —
-/// "the return type, 'FutureOr<int>', is a potentially non-nullable
+/// "the return type, '`FutureOr`<int>', is a potentially non-nullable
 /// type."
 #[test]
 fn async_future_int_still_reports_the_error_twin() {
@@ -216,7 +217,7 @@ fn async_future_int_still_reports_the_error_twin() {
 /// silent base.
 ///
 /// Probed: one row, `body_might_complete_normally_nullable` at `f`'s
-/// name — "This function has a nullable return type of 'FutureOr<
+/// name — "This function has a nullable return type of '`FutureOr`<
 /// Object?>', but ends without returning a value."
 #[test]
 fn async_future_or_object_question_keeps_the_warning_twin() {
@@ -280,7 +281,7 @@ fn async_nested_future_or_alias_to_future_or_stays_silent() {
 /// the folded `int` — the staging fold resolves for the verdict only.
 ///
 /// Probed: one row, `body_might_complete_normally` at `f`'s name —
-/// "the return type, 'FutureOr<NInt>', is a potentially non-nullable
+/// "the return type, '`FutureOr`<NInt>', is a potentially non-nullable
 /// type."
 #[test]
 fn async_future_or_alias_to_int_keeps_the_error_twin() {

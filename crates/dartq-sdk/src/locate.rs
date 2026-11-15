@@ -8,6 +8,7 @@
 //! spelling of a root; [`dart_sdk_root_of_dart`] accepts either spelling of
 //! a `dart` executable.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::path::{Path, PathBuf};
 

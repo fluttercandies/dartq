@@ -34,7 +34,7 @@
 //!
 //! The `js_interop` excerpt also carries the library's extension-type
 //! declarations (`JSAny`, `JSObject`, `JSFunction` — upstream
-//! js_interop.dart:181/:200/:248). Without a container for the receiver's
+//! `js_interop.dart:181/:200/:248`). Without a container for the receiver's
 //! type spelling, the semantic member walk reads it as unresolvable
 //! (`ChainBroken`): member and operator misses rode dynamic and stayed
 //! silent where the oracle reports them. The declarations' internal
@@ -50,6 +50,7 @@
 //! silently overwrite the earlier face's element model (pinned by an
 //! in-module test).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::Path;
 
 use dartq_language::FeatureSet;
@@ -75,7 +76,7 @@ static SDK_EXTENSION_FACE_SOURCES: &[(&str, &str)] = &[
         // annotations are dropped: metadata plays no part in the
         // resolution surfaces the faces carry.
         "js_interop",
-        r#"extension ListToJSArray<T extends JSAny?> on List<T> {
+        r"extension ListToJSArray<T extends JSAny?> on List<T> {
   external JSArray<T> get toJS;
   external JSArray<T> get toJSProxyOrRef;
 }
@@ -167,7 +168,7 @@ extension JSBooleanToBool on JSBoolean {
 extension JSStringToString on JSString {
   external String get toDart;
 }
-"#,
+",
     ),
     (
         // Upstream Dart SDK source, sdk/lib/js_interop_unsafe/
@@ -179,7 +180,7 @@ extension JSStringToString on JSString {
         // library-private upstream and invisible to every user-visible
         // resolution.
         "js_interop_unsafe",
-        r#"extension JSObjectUnsafeUtilExtension on JSObject {
+        r"extension JSObjectUnsafeUtilExtension on JSObject {
   external bool has(String property);
   external JSBoolean hasProperty(JSAny property);
   external JSAny? operator [](String property);
@@ -194,7 +195,7 @@ extension JSFunctionUnsafeUtilExtension on JSFunction {
   external R callAsConstructor<R>([JSAny? arg1, JSAny? arg2, JSAny? arg3, JSAny? arg4]);
   external R callAsConstructorVarArgs<R extends JSObject>([List<JSAny?>? arguments]);
 }
-"#,
+",
     ),
     (
         // Upstream Dart SDK source, sdk/lib/ffi/ffi.dart:343-368 — the
@@ -208,11 +209,11 @@ extension JSFunctionUnsafeUtilExtension on JSFunction {
         // `leaf_call_must_not_*` / `non_native_function_type_argument_to_
         // pointer` corpus rows hang off exactly that send.
         "ffi",
-        r#"extension NativeFunctionPointer<NF extends Function>
+        r"extension NativeFunctionPointer<NF extends Function>
     on Pointer<NativeFunction<NF>> {
   external DF asFunction<DF extends Function>({bool isLeaf = false});
 }
-"#,
+",
     ),
 ];
 

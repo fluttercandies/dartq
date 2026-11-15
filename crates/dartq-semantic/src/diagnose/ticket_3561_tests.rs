@@ -31,6 +31,7 @@
 //! `diagnose/listener.rs` and need their own `SemanticCode` entries in
 //! `codes.rs`; they are not part of this pin file.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{assert_silent, code_names, report_ops_bare};
 
 /// A private named field formal that is fully legal from 3.12 on. Untyped on

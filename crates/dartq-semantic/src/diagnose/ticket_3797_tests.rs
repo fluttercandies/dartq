@@ -27,6 +27,7 @@
 //! Oracle provenance: `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze`
 //! over a package fixture — each pin names the verdict it encodes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// The co19 `StaticType`/`Exactly<T>` extension the census cases use.

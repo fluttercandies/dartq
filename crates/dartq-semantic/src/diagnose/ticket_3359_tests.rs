@@ -12,7 +12,7 @@
 //!   `dynamic`, and the completion/return checks stay silent on it.
 //! * Augment field group: upstream checks every `FieldDeclaration` node,
 //!   augmentations included (upstream Dart SDK source,
-//!   pkg/analyzer/lib/src/generated/error_verifier.dart
+//!   `pkg/analyzer/lib/src/generated/error_verifier.dart`
 //!   `_checkForNotInitializedFieldDeclaration`), exempt only by the node's
 //!   own `abstract`/`external` keyword.
 //! * `void` receiver: a member send reports `use_of_void_result` at the
@@ -25,6 +25,7 @@
 //! Anchors locate themselves with `find` over the prelude-prefixed source.
 //! Registered through `diagnose/tests.rs`'s `#[path]` tail.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

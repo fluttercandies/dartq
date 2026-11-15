@@ -1,5 +1,6 @@
 //! The lexical-stance fold pins (`ScanConfig::from_feature_set`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ScanConfig;
 use dartq_language::{Feature, FeatureSet, LanguageVersion, NEWEST_KNOWN_VERSION};
 

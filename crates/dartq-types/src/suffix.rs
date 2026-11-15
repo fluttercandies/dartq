@@ -1,5 +1,6 @@
 //! The nullability suffix dimension.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::error::TypeError;
 
 /// Suffix indicating the nullability of a type, mirroring the analyzer's

@@ -16,6 +16,7 @@
 //! `begin_local_function_declaration` (unconditional), each BEFORE the
 //! declared name binds.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

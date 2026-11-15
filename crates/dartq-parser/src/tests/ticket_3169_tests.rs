@@ -3,6 +3,7 @@
 //! synthetic-`)` follower adoption, and the `assert`-statement `;` anchor
 //! (oracle 3.13.7). Upstream citations live per-test.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.

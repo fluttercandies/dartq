@@ -5,7 +5,7 @@
 //! (`file://<project-root>/lib/main.dart`) in exactly two tables per
 //! component — the source table's `uri`/`importUri` strings and the
 //! string table's entries — so a cached dill only replays into the tree
-//! it was compiled in: frontend_server's initialize-from-dill pass
+//! it was compiled in: `frontend_server`'s initialize-from-dill pass
 //! invalidates every library whose URI it cannot resolve, and a foreign
 //! URI is always unresolvable. This module rewrites `file://<old>/`
 //! prefixes to `file://<new>/` inside those tables, rebuilding every
@@ -59,9 +59,10 @@
 //! the file), no capacity is ever allocated from an unchecked count,
 //! and the whole rewrite runs inside `catch_unwind` so even an
 //! unforeseen panic surfaces as the same refusal the gates produce.
-//! Each window is PROT_READ for its whole lifetime and the input is a
+//! Each window is `PROT_READ` for its whole lifetime and the input is a
 //! cache-owned blob that nothing truncates mid-rewrite.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
@@ -152,9 +153,10 @@ static POISON_REWRITE: AtomicBool = AtomicBool::new(false);
 
 fn rewrite_mapped(src: &Path, dst: &Path, from: &[u8], to: &[u8]) -> Result<DillRewrite> {
     #[cfg(test)]
-    if POISON_REWRITE.swap(false, Ordering::SeqCst) {
-        panic!("rewrite poisoned by test");
-    }
+    assert!(
+        !POISON_REWRITE.swap(false, Ordering::SeqCst),
+        "rewrite poisoned by test"
+    );
     let mut input = Reader::open(src)?;
     let mut out = Out::new(BufWriter::new(fs::File::create(dst)?));
     let mut stats = DillRewrite::default();
@@ -983,7 +985,7 @@ pub(crate) fn synthetic_component(
     out.extend_from_slice(b"CONST-TABLE");
     out.extend_from_slice(b"CONST-IDX");
     out.extend_from_slice(b"LINK");
-    while out.len() % 8 != 0 {
+    while !out.len().is_multiple_of(8) {
         out.push(0);
     }
     let meta_payloads = out.len();
@@ -1365,7 +1367,7 @@ mod tests {
         }
     }
 
-    /// A matched non-ASCII string refuses the whole file; an UNmatched
+    /// A matched non-ASCII string refuses the whole file; an `UNmatched`
     /// non-ASCII string (foreign UTF-8 elsewhere in the tree) does not.
     #[test]
     fn non_ascii_matched_string_refuses_and_unmatched_is_fine() {
@@ -1785,25 +1787,20 @@ mod tests {
         // of the run. A `ps` failure is a skipped sample, never fatal:
         // the loop still terminates on child exit.
         let status = loop {
-            match child.try_wait().expect("try_wait") {
-                Some(status) => break status,
-                None => {
-                    if let Ok(output) = std::process::Command::new("ps")
-                        .args(["-o", "rss=", "-p", &pid])
-                        .output()
-                    {
-                        if output.status.success() {
-                            if let Ok(text) = std::str::from_utf8(&output.stdout) {
-                                if let Ok(kib) = text.trim().parse::<u64>() {
-                                    peak_kib = peak_kib.max(kib);
-                                    samples += 1;
-                                }
-                            }
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
             }
+            if let Ok(output) = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &pid])
+                .output()
+                && output.status.success()
+                && let Ok(text) = std::str::from_utf8(&output.stdout)
+                && let Ok(kib) = text.trim().parse::<u64>()
+            {
+                peak_kib = peak_kib.max(kib);
+                samples += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
         };
         assert!(
             status.success(),
@@ -1828,7 +1825,7 @@ mod tests {
     const RSS_DELTA_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 
     /// A valid dill with `count` string-table entries (~257 bytes
-    /// each; 260_000 makes a ~68 MB file) whose string table dominates
+    /// each; `260_000` makes a ~68 MB file) whose string table dominates
     /// the file, so the rewrite's memory posture — not the fixture
     /// builder's — is what a resident-set measurement sees.
     fn build_large_dill(path: &Path, count: usize) {

@@ -19,6 +19,7 @@
 //! normal AST dispatch (`kinds: [Import, Export]`) off the
 //! [`WorkspaceFacts`][crate::WorkspaceFacts] the mount attaches per unit.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::NodeKind;
 
 use crate::registry::{Group, RuleSpec};
@@ -162,7 +163,7 @@ pub(crate) mod path_dependencies {
     /// The official resolution (:58-63) over the posix host: `path` is
     /// split on `/` (`path.posix.split` — empty parts dropped), joined
     /// under `pubspec_dir` (`context.join` — a rooted `path` replaces the
-    /// base), then normalized (`context.normalize`, parsed_path.dart
+    /// base), then normalized (`context.normalize`, `parsed_path.dart`
     /// :100-129 — `.` and empty parts drop, `..` pops, a relative path
     /// keeps the `..` it backs out past, an absolute one clamps at the
     /// root, and a relative result collapsed to nothing reads `.`). The
@@ -601,13 +602,13 @@ pub(crate) mod path_dependencies {
     /// digits of the radix.
     fn dart_int_radix(b: &[u8], radix: u8) -> bool {
         let digits = match b.first() {
-            Some(b'+') | Some(b'-') => &b[1..],
+            Some(b'+' | b'-') => &b[1..],
             _ => b,
         };
         !digits.is_empty()
             && digits
                 .iter()
-                .all(|&d| (d as char).to_digit(u32::from(radix)).is_some())
+                .all(|&d| (d as char).is_digit(u32::from(radix)))
     }
 
     /// Dart `double.tryParse`'s decimal shape: an optional sign, digits
@@ -789,7 +790,7 @@ pub(crate) mod path_dependencies {
         }
 
         /// A dep entry's own line is never the spec (`path: ../x` as the
-        /// dep NAME is a scalar value — not a YamlMap, the official
+        /// dep NAME is a scalar value — not a `YamlMap`, the official
         /// returns :43-45) and a block-form `path:` is a null (`asString`
         /// null, silent :46-47).
         #[test]
@@ -843,7 +844,7 @@ pub(crate) mod path_dependencies {
         }
 
         /// The resolution (:58-63): relative joins under the pubspec's
-        /// directory, `..` pops (`pkg/../x` collapses to `x` — parsed_path
+        /// directory, `..` pops (`pkg/../x` collapses to `x` — `parsed_path`
         /// :108-113 pops whatever the stack holds), `.` and empty parts
         /// drop, a rooted entry replaces the base, an absolute base roots
         /// the result, `..` past a relative start leads, `..` clamps at an
@@ -945,7 +946,7 @@ pub(crate) mod path_dependencies {
         }
 
         /// Inline `path:` on the `- ` dash line is the item's own field
-        /// (`- path: a.png` is a one-key YamlMap) — same span/cook faces
+        /// (`- path: a.png` is a one-key `YamlMap`) — same span/cook faces
         /// as the indented form.
         #[test]
         fn screenshots_scan_inline_path_is_the_field() {
@@ -1109,10 +1110,10 @@ pub(crate) mod secure_pubspec_urls {
         }
     }
 
-    /// Bracketed host content: IPvFuture (`v` 1*HEXDIG "." 1*address-char,
+    /// Bracketed host content: `IPvFuture` (`v` 1*HEXDIG "." 1*address-char,
     /// `_validateIPvFutureAddress`) or IPv6 with an optional RFC 6874 zone
     /// after the first `%` (any further `%` in the zone must open a valid
-    /// escape — `_normalizeZoneID`'s "ZoneID should not contain % anymore").
+    /// escape — `_normalizeZoneID`'s "`ZoneID` should not contain % anymore").
     fn parses_as_ip_literal(content: &[u8]) -> bool {
         if content.first() == Some(&b'v') {
             let mut i = 1;
@@ -1197,14 +1198,14 @@ pub(crate) mod secure_pubspec_urls {
         loop {
             let ch = if cursor >= b.len() { 0 } else { b[cursor] };
             let hex_digit = match ch {
-                c @ b'0'..=b'9' => Some((c - b'0') as u32),
+                c @ b'0'..=b'9' => Some(u32::from(c - b'0')),
                 c @ b'a'..=b'f' => {
                     dec_value = false;
-                    Some((c - b'a' + 10) as u32)
+                    Some(u32::from(c - b'a' + 10))
                 }
                 c @ b'A'..=b'F' => {
                     dec_value = false;
-                    Some((c - b'A' + 10) as u32)
+                    Some(u32::from(c - b'A' + 10))
                 }
                 _ => None,
             };
@@ -1270,7 +1271,7 @@ pub(crate) mod secure_pubspec_urls {
             let ch = if cursor >= b.len() { 0 } else { b[cursor] };
             if ch.is_ascii_digit() {
                 if octet_value != 0 || cursor == octet_start {
-                    octet_value = octet_value * 10 + (ch - b'0') as u32;
+                    octet_value = octet_value * 10 + u32::from(ch - b'0');
                     if octet_value <= 255 {
                         cursor += 1;
                         continue;
@@ -1321,9 +1322,9 @@ pub(crate) mod secure_pubspec_urls {
             _ => port,
         };
         if body.len() >= 2 && body[0] == b'0' && (body[1] | 0x20) == b'x' {
-            return !body[2..].is_empty() && body[2..].iter().all(|c| c.is_ascii_hexdigit());
+            return !body[2..].is_empty() && body[2..].iter().all(u8::is_ascii_hexdigit);
         }
-        body.iter().all(|c| c.is_ascii_digit())
+        body.iter().all(u8::is_ascii_digit)
     }
 
     /// Reg-name host general delimiters (`_normalizeRegName` :2597-2600):
@@ -1415,7 +1416,7 @@ pub(crate) mod secure_pubspec_urls {
 
         /// Bracketed IPv6 hosts, an empty port and an IPv6 zone are
         /// legal parses — they report like any other `http` URL. So are
-        /// a valid IPvFuture host (`v1.a` = version `1`, address `a`)
+        /// a valid `IPvFuture` host (`v1.a` = version `1`, address `a`)
         /// and `[`/`]` in the path or query: those components normalize
         /// with `escapeDelimiters: true` and escape the delimiters
         /// instead of failing.

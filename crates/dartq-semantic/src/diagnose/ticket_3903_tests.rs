@@ -7,7 +7,7 @@
 //!
 //! Upstream keeps the keyword beside the bound (`endTypeVariable`'s
 //! `varianceKeyword`, upstream Dart SDK source,
-//! pkg/analyzer/lib/src/fasta/ast_builder.dart) and reads it back per
+//! `pkg/analyzer/lib/src/fasta/ast_builder.dart`) and reads it back per
 //! interface argument (`_interfaceArguments`, pkg/analyzer/lib/src/dart/
 //! element/subtype.dart): covariant checks `sub <: super`, contravariant the
 //! reverse, invariant both, and a modifier-less parameter answers the
@@ -17,6 +17,7 @@
 //! the subtype face belong to the consumer lanes; these pins hold the
 //! capture to the written facts.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::model::{Container, FileElements};
 use crate::persisted::PersistedElements;

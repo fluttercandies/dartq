@@ -33,6 +33,7 @@
 //! domination resolves, the dominated face's member reports),
 //! lib/r2.dart + lib/r3.dart (nested-index read credit).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

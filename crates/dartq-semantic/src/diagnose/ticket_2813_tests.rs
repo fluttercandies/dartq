@@ -30,6 +30,7 @@
 //! never enters — a listener.rs seam this ticket does not touch (live
 //! lane); the dead-arm half is reported, not pinned.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

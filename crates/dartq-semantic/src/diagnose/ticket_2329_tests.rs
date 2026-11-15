@@ -11,6 +11,7 @@
 //! the 3.13.1 oracle), while locals, container type parameters, own
 //! statics and top-level names resolve silently.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

@@ -1,6 +1,68 @@
 //! Generator self-tests: the extraction rules pinned on miniature SDK-source
 //! shapes (the offline twin of the corpus pin tests).
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::manual_find,
+    clippy::unnecessary_wraps,
+    clippy::type_complexity,
+    clippy::cast_possible_truncation,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::useless_conversion,
+    clippy::question_mark,
+    clippy::option_option,
+    clippy::needless_continue,
+    clippy::missing_panics_doc,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::explicit_counter_loop,
+    clippy::never_loop,
+    clippy::needless_range_loop,
+    clippy::unnecessary_unwrap,
+    clippy::assigning_clones,
+    clippy::double_must_use,
+    clippy::single_match,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::ignore_without_reason,
+    clippy::unnecessary_debug_formatting,
+    clippy::match_wild_err_arm,
+    clippy::disallowed_names,
+    clippy::many_single_char_names,
+    clippy::same_item_push,
+    clippy::while_let_loop,
+    clippy::if_same_then_else,
+    clippy::ref_option,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::unnecessary_filter_map,
+    clippy::manual_strip,
+    clippy::float_cmp,
+    clippy::redundant_guards,
+    clippy::empty_line_after_doc_comments,
+    clippy::unreadable_literal,
+    clippy::enum_variant_names,
+    clippy::missing_errors_doc,
+    clippy::too_many_arguments,
+    clippy::unused_self,
+    clippy::fn_params_excessive_bools,
+    clippy::semicolon_if_nothing_returned
+)]
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::scan::{FlatEntry, ScanKind, parse_flat_table, scan_unit};
@@ -63,7 +125,7 @@ const Map<String, LibraryInfo> libraries = const {
 #[test]
 fn class_mixin_enum_extension_typedef_families() {
     let face = names(
-        r#"abstract class Foo {}
+        r"abstract class Foo {}
 abstract final class Bar<T> extends Baz {}
 base mixin class MixinClass {}
 mixin PlainMixin {}
@@ -75,7 +137,7 @@ extension type const ConstExt(int i) {}
 typedef Name = void Function();
 typedef Compare<T> = int Function(T a, T b);
 typedef int OldStyle(Object a);
-"#,
+",
     );
     assert_eq!(
         face,
@@ -99,7 +161,7 @@ typedef int OldStyle(Object a);
 #[test]
 fn declaration_kinds_follow_the_clauses() {
     let kinds = kinds(
-        r#"class Widget {}
+        r"class Widget {}
 mixin Plain {}
 mixin class Hybrid {}
 typedef Compare<T> = int Function(T a, T b);
@@ -110,7 +172,7 @@ typedef Handler<T> = void Function(T event);
 typedef Chain = Name;
 typedef Alias = js.JSValue?;
 typedef OldStyle(int a);
-"#,
+",
     );
     assert_eq!(kinds["Widget"], ScanKind::Class);
     assert_eq!(kinds["Plain"], ScanKind::Mixin);
@@ -137,10 +199,10 @@ typedef OldStyle(int a);
 #[test]
 fn multi_line_typedef_collects_its_right_hand_side() {
     let scan = scan_unit(
-        r#"typedef Finalizer =
+        r"typedef Finalizer =
     NativeFunction<Void Function(Pointer<NativeType>, int)>;
 typedef Broken =
-"#,
+",
     );
     assert_eq!(
         scan.kinds["Finalizer"],
@@ -153,7 +215,7 @@ typedef Broken =
 #[test]
 fn functions_getters_setters_and_variables() {
     let face = names(
-        r#"void print(Object? object) {}
+        r"void print(Object? object) {}
 external void exit(int code);
 Future<int> spawn<T extends void Function()>(T entry) async => throw 0;
 void Function() handler() => throw 0;
@@ -167,7 +229,7 @@ late final String lazy;
 var bare = 3;
 external final int wired;
 const Duration _private = Duration();
-"#,
+",
     );
     assert_eq!(
         face,
@@ -192,13 +254,13 @@ const Duration _private = Duration();
 #[test]
 fn string_uris_survive_comment_stripping_and_privates_drop() {
     let face = names(
-        r#"/// A doc comment mentioning `class Ghost` at column zero.
+        r"/// A doc comment mentioning `class Ghost` at column zero.
 const String url = 'https://example.com/a//b'; // trailing comment
 final String _hidden = 'x';
 /* a block comment
    class Commented extends Ghost {} */
 class Real {}
-"#,
+",
     );
     assert_eq!(face, set(&["url", "Real"]));
 }
@@ -254,7 +316,7 @@ class C {}
 #[test]
 fn dart2js_variant_paths_and_bare_variables() {
     let table = parse_flat_table(
-        r#"
+        r"
 const Map<String, LibraryInfo> libraries = const {
   'html_common': const LibraryInfo(
     'html/html_common/html_common.dart',
@@ -263,7 +325,7 @@ const Map<String, LibraryInfo> libraries = const {
     documented: false,
   ),
 };
-"#,
+",
     )
     .expect("parses");
     assert_eq!(
@@ -287,13 +349,13 @@ fn function_typed_bare_variables_declare_their_variable() {
     // LAST whitespace token before the cut — never the `Function`
     // constructor the head carries.
     let scan = scan_unit(
-        r#"Stream<ProcessSignal> Function(ProcessSignal signal)? _signalWatch;
+        r"Stream<ProcessSignal> Function(ProcessSignal signal)? _signalWatch;
 Stream<int> Function(int signal)? publicWatch;
-"#,
+",
     );
     // The private watch drops entirely (a face never carries the bogus
     // `Function` name); the public twin keeps its own name.
     assert_eq!(scan.names, set(&["publicWatch"]));
     assert_eq!(scan.kinds["publicWatch"], ScanKind::Other);
-    assert!(scan.warnings.is_empty());
+    assert_eq!(scan.warnings, [] as [std::string::String; 0]);
 }

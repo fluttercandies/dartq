@@ -14,11 +14,12 @@
 //! now shared through the exact join. The if-led element
 //! took its last in-span row (`[if (cond) 1 else "s"]` read `String`);
 //! the oracle joins the branches (`typed_literal_resolver.dart`
-//! `_computeElementType`'s IfElementImpl arm —
+//! `_computeElementType`'s `IfElementImpl` arm —
 //! `leastUpperBound(thenType, elseType)`, a missing `else` keeping the
 //! then leaf), at the is-operand face here and at the bind-time leg the
 //! closing pin of #4014 tracks.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

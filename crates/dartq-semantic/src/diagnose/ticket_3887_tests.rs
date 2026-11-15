@@ -20,6 +20,7 @@
 //! Oracle provenance: `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze
 //! --format=machine` — every fixture probed there.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops, report_ops_bare, rows};
 use crate::diagnose::FileReport;
 
@@ -78,14 +79,14 @@ fn unchecked_function(report: &FileReport) -> Vec<String> {
 #[test]
 fn explicit_type_args_substitute_member_formal() {
     let report = report_ops_bare(
-        &r#"
+        &r"
         __NUMERIC_PRELUDE__
         class Box { T id<T>(T x) => x; }
         void h(int x) {}
         void g(Box b) {
           h(b.id<int>(1));
         }
-        "#
+        "
         .replace("__NUMERIC_PRELUDE__", NUMERIC_PRELUDE),
     );
     assert_silent(&report);
@@ -98,14 +99,14 @@ fn explicit_type_args_substitute_member_formal() {
 #[test]
 fn explicit_type_args_absent_keeps_declared_formal() {
     let report = report_ops_bare(
-        &r#"
+        &r"
         __NUMERIC_PRELUDE__
         class Box { T id<T>(T x) => x; }
         void h(int x) {}
         void g(Box b) {
           h(b.id(1));
         }
-        "#
+        "
         .replace("__NUMERIC_PRELUDE__", NUMERIC_PRELUDE),
     );
     assert_silent(&report);
@@ -118,14 +119,14 @@ fn explicit_type_args_absent_keeps_declared_formal() {
 #[test]
 fn clamp_positive_double_gate() {
     let report = report_ops_bare(
-        &r#"
+        &r"
         __NUMERIC_PRELUDE__
         T f<T>() => throw 0;
         void h(double x) {}
         void g(double d) {
           h(d.clamp(f(), f()));
         }
-        "#
+        "
         .replace("__NUMERIC_PRELUDE__", NUMERIC_PRELUDE),
     );
     assert_silent(&report);
@@ -137,14 +138,14 @@ fn clamp_positive_double_gate() {
 #[test]
 fn arithmetic_negative_double_gate_control() {
     let report = report_ops_bare(
-        &r#"
+        &r"
         __NUMERIC_PRELUDE__
         T f<T>() => throw 0;
         void h(int x) {}
         void g(double d) {
           h(d + f());
         }
-        "#
+        "
         .replace("__NUMERIC_PRELUDE__", NUMERIC_PRELUDE),
     );
     // `d + f()` types by its declared `double operator +` return — the
@@ -171,10 +172,10 @@ fn arithmetic_negative_double_gate_control() {
 #[test]
 fn member_callee_function_nullable_found_arm() {
     let report = report_ops(
-        r#"
+        r"
         class C { void Function()? get cb => null; }
         void g(C c) { c.cb(); }
-        "#,
+        ",
     );
     let found = unchecked_function(&report);
     assert!(
@@ -189,10 +190,10 @@ fn member_callee_function_nullable_found_arm() {
 #[test]
 fn member_callee_method_send_control() {
     let report = report_ops(
-        r#"
+        r"
         class C { void m() {} }
         void g(C c) { c.m(); }
-        "#,
+        ",
     );
     assert_silent(&report);
 }
@@ -203,10 +204,10 @@ fn member_callee_method_send_control() {
 #[test]
 fn member_callee_non_nullable_function_control() {
     let report = report_ops(
-        r#"
+        r"
         class C { void Function() get cb => () {}; }
         void g(C c) { c.cb(); }
-        "#,
+        ",
     );
     assert!(
         unchecked_function(&report).is_empty(),

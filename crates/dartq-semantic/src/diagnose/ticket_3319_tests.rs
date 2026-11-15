@@ -23,6 +23,7 @@
 //! Oracle provenance: `dart analyze` 3.13.7 over the conformance corpus
 //! (`diagnostics/base_mixin_implemented_outside_of_library`,
 //! `diagnostics/sealed_class_subtype_outside_of_library`).
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, RigImport, report_ops_imports};
 
 /// The absolute fixture offset of `needle` (the prelude the rig prepends

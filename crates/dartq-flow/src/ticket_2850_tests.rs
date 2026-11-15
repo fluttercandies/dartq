@@ -11,6 +11,7 @@
 //! null-checks, non-covered object heads, non-empty maps, guards) keep
 //! the chain alive.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

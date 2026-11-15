@@ -28,6 +28,7 @@
 //! session is outside the contract, as it already is for every mmap-based
 //! tool serving source from the page cache.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fmt;
 use std::fs::File;
 use std::io::Read as _;
@@ -183,6 +184,7 @@ impl fmt::Debug for SourceText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SourceText")
             .field("id", &self.id)
+            .field("inner", &self.inner)
             .field("len", &self.len())
             .field("mapped", &self.is_mapped())
             .finish()
@@ -266,7 +268,6 @@ pub(crate) fn strip_one_bom(bytes: &[u8]) -> &[u8] {
 /// [`OpenError::TooLarge`] rejection when the file exceeds
 /// [`MAX_SOURCE_BYTES`] (the caller reports the rejection at the file's
 /// own position and moves on — the rest of the load batch is unaffected).
-#[must_use]
 pub fn open_mapped(path: &Path) -> Result<SourceText, OpenError> {
     MappedRange::open(path)
 }
@@ -318,7 +319,7 @@ mod tests {
 
         // A BOM-only file strips to empty.
         let only = SourceText::canonical("\u{FEFF}".as_bytes());
-        assert!(only.as_str().is_empty());
+        assert_eq!(only.as_str(), "");
     }
 
     #[test]

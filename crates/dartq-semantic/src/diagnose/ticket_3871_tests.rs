@@ -21,6 +21,7 @@
 //! `F<A<G<A<Never>>>>` — every `Never`/`Null`/`dynamic` target row the
 //! oracle emits reads that source type.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 fn render<'a>(bounds: &Bounds<'a>, strings: &'a StringTable, tree: &TypeTree) -> String {

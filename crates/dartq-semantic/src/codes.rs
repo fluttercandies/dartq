@@ -79,6 +79,7 @@
 //! `wrong_number_of_parameters_for_operator` are implemented above, and
 //! `uri_does_not_exist` lives in the M0 official registry
 //! (`dartq-diagnostics`), emitted by the resolution layer.
+#![allow(unused_variables)]
 
 use dartq_diagnostics::{CodeInfo, DiagnosticType, Severity, message_template};
 
@@ -165,7 +166,7 @@ pub enum SemanticCode {
     /// `await e` inside a sync (non-generator, non-async) body
     /// (`awaitInWrongContext`, diagnostic.g.dart:1475-1484; the fasta
     /// `AwaitInSync` recoverable error converted at
-    /// error_converter.dart — the event arrives as
+    /// `error_converter.dart` — the event arrives as
     /// `end_invalid_await_expression`).
     AwaitInWrongContext,
     /// `The method '{0}' isn't defined for the type '{1}'.`
@@ -186,7 +187,7 @@ pub enum SemanticCode {
     /// local declaration.` — a prefixed type whose head names a local
     /// scope element (`prefixShadowedByLocalDeclaration`, the
     /// importPrefix gate's fall-through,
-    /// named_type_resolver.dart:117/:188).
+    /// `named_type_resolver.dart:117/:188`).
     PrefixShadowedByLocalDeclaration,
     /// `The setter '{0}' isn't defined for the type '{1}'.`
     UndefinedSetter,
@@ -362,7 +363,7 @@ pub enum SemanticCode {
     /// instantiations cannot merge (upstream Dart SDK source,
     /// `pkg/analyzer/lib/src/generated/error_verifier.dart`
     /// `_checkForConflictingGenerics` :3848-3878 over
-    /// `class_hierarchy.dart`'s `InterfacesMerger` — the NNBD_TOP_MERGE of
+    /// `class_hierarchy.dart`'s `InterfacesMerger` — the `NNBD_TOP_MERGE` of
     /// NORM of every collected instantiation, one row per conflicting
     /// element in collection order). Anchored at the declaration's name
     /// token; the kind word is the official `ClassKind.displayName`
@@ -385,7 +386,7 @@ pub enum SemanticCode {
     /// `final` local variable or formal that is not definitely unassigned
     /// at the write (`AssignmentExpressionShared.checkFinalAlreadyAssigned`,
     /// upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver
+    /// `pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver`
     /// .dart:395-425). The `late` locals and the for-each identities report
     /// their own codes.
     AssignmentToFinalLocal,
@@ -403,14 +404,14 @@ pub enum SemanticCode {
     /// (`integerLiteralImpreciseAsDouble`, messages.yaml:9350-9356; the
     /// informal-spec predicate is `IntegerLiteralImpl.isValidAsDouble`,
     /// upstream Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart,
-    /// fired from `_checkForOutOfRange`, error_verifier.dart). `{0}` is
+    /// fired from `_checkForOutOfRange`, `error_verifier.dart`). `{0}` is
     /// the literal's lexeme, `-`-prefixed when it is the operand of a
     /// unary minus (`immediatelyNegated`); the anchor is the literal
     /// token, never the negation.
     IntegerLiteralImpreciseAsDouble,
     /// `The member '{0}' can only be used within '{1}' or a template
     /// library.` — a member annotated `@visibleForTemplate`
-    /// (package:angular_meta) referenced from another library
+    /// (`package:angular_meta`) referenced from another library
     /// (`invalidUseOfVisibleForTemplateMember`, diagnostic.g.dart
     /// :9811-9819; `{1}` is the declaring library's URI, the report at
     /// the member-name token — `best_practices_verifier.dart:1940-1946`).
@@ -541,7 +542,7 @@ pub enum SemanticCode {
     /// disabled) switch-statement `case e:` whose expression fails
     /// const-evaluation (`nonConstantCaseExpression`, diagnostic.g.dart
     /// :12650-12658; `CaseExpression`'s constant requirement,
-    /// constant_verifier.dart's switch-case visit).
+    /// `constant_verifier.dart`'s switch-case visit).
     NonConstantCaseExpression,
     /// `Constant values from a deferred library can't be used as a case
     /// expression.` — a legacy (`< 3.0`, patterns disabled) switch-statement
@@ -1036,7 +1037,7 @@ pub enum SemanticCode {
     /// best_practices_verifier.dart:795-799).
     NullCheckAlwaysFails,
     /// `Missing selector such as '.identifier' or '[0]'.` — the resolver's
-    /// `_resolveNullCheck` SuperExpression arm (upstream Dart SDK source,
+    /// `_resolveNullCheck` `SuperExpression` arm (upstream Dart SDK source,
     /// `pkg/analyzer/lib/src/resolver/postfix_expression_resolver.dart`:
     /// 196-205): a bare `super!` has no selector to assert on, so the whole
     /// `super!` node reports the selector row, the operand and node both
@@ -1088,17 +1089,17 @@ pub enum SemanticCode {
     /// `The relational pattern expression must be a constant.` — a
     /// relational pattern's operand expression is not a compile-time
     /// constant (`nonConstantRelationalPatternExpression`,
-    /// constant_verifier.dart `visitRelationalPattern`).
+    /// `constant_verifier.dart` `visitRelationalPattern`).
     NonConstantRelationalPatternExpression,
     /// `Pattern variables can't be assigned inside the guard of the
     /// enclosing guarded pattern.` — an unqualified write to a pattern
     /// variable inside its own `when` clause (`isVisitingWhenClause`,
-    /// scope_analyzer.dart `_recordUnqualifiedWrite`).
+    /// `scope_analyzer.dart` `_recordUnqualifiedWrite`).
     PatternVariableAssignmentInsideGuard,
     /// `Local variable '{0}' can't be referenced before it is declared.` —
     /// a pattern variable referenced inside the relational operand of the
     /// pattern that declares it (`referencedBeforeDeclaration`,
-    /// `_hiddenElements` face, error_verifier.dart).
+    /// `_hiddenElements` face, `error_verifier.dart`).
     ReferencedBeforeDeclaration,
     /// `The constant expression type '{0}' is not assignable to the
     /// parameter type '{1}' of the '{2}' operator.` — the resolved
@@ -1279,8 +1280,8 @@ pub enum SemanticCode {
     BodyMightCompleteNormallyNullable,
     /// `The body might complete normally, causing 'null' to be returned, but
     /// the return type, '{0}', is a potentially non-nullable type.` — the
-    /// COMPILE_TIME_ERROR twin of the same walk (`isPotentiallyNonNullable`
-    /// picks it over the nullable warning, type_analyzer.dart:688), reported
+    /// `COMPILE_TIME_ERROR` twin of the same walk (`isPotentiallyNonNullable`
+    /// picks it over the nullable warning, `type_analyzer.dart:688`), reported
     /// at the block's `{`. `diagnostic.g.dart` :1571-1586.
     BodyMightCompleteNormally,
     // —— #747: the W4 const-duplicate pair (all `STATIC_WARNING`) ———————————
@@ -1427,14 +1428,14 @@ pub enum SemanticCode {
     NonTypeAsTypeArgument,
     /// `The name '{0}' isn't defined, so it can't be used in an 'is'
     /// expression.` — an unresolved simple name in an `is` operand
-    /// (`type_test_with_undefined_name`, error_verifier.dart
+    /// (`type_test_with_undefined_name`, `error_verifier.dart`
     /// `visitIsExpression`; the metadata-path twin of the FAM13 context
     /// faces — the operand's type row reports this instead of staying
     /// silent).
     TypeTestWithUndefinedName,
     /// `The name '{0}' isn't a type, so it can't be used in an 'as'
     /// expression.` — an unresolved simple name in an `as` operand
-    /// (`cast_to_non_type`, error_verifier.dart `visitAsExpression`).
+    /// (`cast_to_non_type`, `error_verifier.dart` `visitAsExpression`).
     CastToNonType,
     /// `The class '{0}' can't be used as a mixin because it's neither a
     /// mixin class nor a mixin.` — a `with` entry resolving to a plain
@@ -1449,7 +1450,7 @@ pub enum SemanticCode {
     /// `Couldn't infer type parameter '{0}'.{1}` — generic inference left a
     /// type parameter unsolved or solved it to a type violating the
     /// invocation's context (`couldNotInfer`, diagnostic.g.dart :3478-3485;
-    /// the generic inferrer's failure report, generic_inferrer.dart). `{1}`
+    /// the generic inferrer's failure report, `generic_inferrer.dart`). `{1}`
     /// carries the structured reason text.
     CouldNotInfer,
     /// `The name '{0}' isn't a type and can't be used in an on-catch
@@ -1463,7 +1464,7 @@ pub enum SemanticCode {
     //    ————————————————————————————————————————————————————————————————————
     /// `Classes can only mix in mixins and classes.` — an unresolved or
     /// non-class name in a `with` clause reports this context face
-    /// (scope_analyzer.dart `_resolveType`, the `WithClause` arm).
+    /// (`scope_analyzer.dart` `_resolveType`, the `WithClause` arm).
     MixinOfNonClass,
     /// `Classes and mixins can only implement other classes and mixins.`
     /// — the `implements` clause counterpart (the `ImplementsClause` arm).
@@ -1577,21 +1578,21 @@ pub enum SemanticCode {
     /// name defined by '{2}'.` — two `with` entries define the same private
     /// member name across different libraries
     /// (`private_collision_in_mixin_application`,
-    /// error_verifier.dart `_checkForMixinWithConflictingPrivateMember`).
+    /// `error_verifier.dart` `_checkForMixinWithConflictingPrivateMember`).
     PrivateCollisionInMixinApplication,
     /// `This constructor can't be declared 'const' because a mixin adds the
     /// instance field: {0}.` — a const constructor on a class whose `with`
     /// clause brings in a mixin with instance fields
     /// (`const_constructor_with_mixin_with_field`,
-    /// error_verifier.dart `_checkForConstConstructorWithNonFinalField`).
+    /// `error_verifier.dart` `_checkForConstConstructorWithNonFinalField`).
     ConstConstructorWithMixinWithField,
     /// `Mixins applied to enums can't have instance variables.` — an enum's
     /// `with` clause entry whose mixin has instance fields
-    /// (`enum_mixin_with_instance_variable`, enum_verifier.dart).
+    /// (`enum_mixin_with_instance_variable`, `enum_verifier.dart`).
     EnumMixinWithInstanceVariable,
     /// `Mixins can't be instantiated.` — a `new`/`const` creation whose
     /// resolved element is a mixin (`mixin_instantiate`,
-    /// error_verifier.dart `_checkForMixinInstantiate`).
+    /// `error_verifier.dart` `_checkForMixinInstantiate`).
     MixinInstantiate,
     /// `The super-invoked member '{0}' has the type '{1}', and the concrete
     /// member in the class has the type '{2}'.` — the concrete-super-invoked
@@ -1601,7 +1602,7 @@ pub enum SemanticCode {
     /// `Deferred classes can't be used as superclass constraints.` — a
     /// mixin's `on` clause entry resolving to a deferred-imported class
     /// (`mixin_super_class_constraint_deferred_class`,
-    /// error_verifier.dart `_checkForOnClauseErrorCodes`).
+    /// `error_verifier.dart` `_checkForOnClauseErrorCodes`).
     MixinSuperClassConstraintDeferredClass,
     /// `The annotation '@Deprecated.mixin' can only be applied to classes.`
     /// — a `@Deprecated.mixin` annotation on a non-class target
@@ -1645,34 +1646,34 @@ pub enum SemanticCode {
     /// `ConstructorFieldInitializer` whose name misses the field set, or
     /// resolves to a getter/setter
     /// (`initializer_for_non_existent_field`, diagnostic.g.dart:8208;
-    /// error_verifier.dart `_checkForInvalidField`).
+    /// `error_verifier.dart` `_checkForInvalidField`).
     InitializerForNonExistentField,
     /// `'{0}' isn't a field in the enclosing class.` — an initializing
     /// formal (`this.name`) whose name is not a field of the immediately
     /// enclosing class — an inherited field does not count, a getter/
     /// setter-only name counts as missing
     /// (`initializing_formal_for_non_existent_field`,
-    /// diagnostic.g.dart:8259; error_verifier.dart `_checkForValidField`).
+    /// diagnostic.g.dart:8259; `error_verifier.dart` `_checkForValidField`).
     InitializingFormalForNonExistentField,
     /// `No associated named super constructor parameter.` — a `super.name`
     /// formal in the named section whose superclass's unnamed constructor
     /// declares no matching named parameter
     /// (`super_formal_parameter_without_associated_named`,
-    /// diagnostic.g.dart:15971; error_verifier.dart
+    /// diagnostic.g.dart:15971; `error_verifier.dart`
     /// `_checkForValidSuperFormalParameter`).
     SuperFormalParameterWithoutAssociatedNamed,
     /// `No associated positional super constructor parameter.` — a
     /// `super.name` formal whose superclass's unnamed constructor has no
     /// positional parameter at this formal's own positional index
     /// (`super_formal_parameter_without_associated_positional`,
-    /// diagnostic.g.dart:15985; error_verifier.dart
+    /// diagnostic.g.dart:15985; `error_verifier.dart`
     /// `_checkForValidSuperFormalParameter`).
     SuperFormalParameterWithoutAssociatedPositional,
     /// `Constructors can't redirect to themselves either directly or
     /// indirectly.` — a generative constructor's
     /// `RedirectingConstructorInvocation` participates in a redirect cycle
     /// (`recursive_constructor_redirect`, diagnostic.g.dart:14638;
-    /// error_verifier.dart `_checkForRecursiveConstructorRedirect`).
+    /// `error_verifier.dart` `_checkForRecursiveConstructorRedirect`).
     RecursiveConstructorRedirect,
     /// `The constant constructor depends on itself.` — a const constructor
     /// whose own formal default values const-instantiate the same
@@ -1719,14 +1720,14 @@ pub enum SemanticCode {
     /// written annotation).
     NonVoidReturnForSetter,
     /// `{0} isn't a type.` — a name in type position resolving to a
-    /// non-type element (`not_a_type`, named_type_resolver.dart:199/:596,
+    /// non-type element (`not_a_type`, `named_type_resolver.dart:199/:596`,
     /// the plain resolver path; local variables and local functions route
     /// to `referenced_before_declaration` instead and stay out of scope
     /// here).
     NotAType,
     /// `Conditions must have a static type of 'bool'.` — an `if`, `while`,
     /// or `for` condition whose static type is known and not `bool`
-    /// (`non_bool_condition`, error_verifier.dart:5655/:5687/:5733 via
+    /// (`non_bool_condition`, `error_verifier.dart:5655/:5687/:5733` via
     /// `checkCollection`/`_checkForUseOfVoidResult` neighbors).
     NonBoolCondition,
     /// `A negation operand must have a static type of 'bool'.` — the `!`
@@ -1742,8 +1743,8 @@ pub enum SemanticCode {
     NonBoolOperand,
     /// `The expression in an assert must be of type 'bool'.` — an `assert`
     /// condition whose static type is known and not `bool`
-    /// (`non_bool_expression`, resolver.dart:2136/:2163 — AssertInitializer
-    /// and AssertStatement share the face).
+    /// (`non_bool_expression`, resolver.dart:2136/:2163 — `AssertInitializer`
+    /// and `AssertStatement` share the face).
     NonBoolExpression,
     /// `An expression whose value is always 'null' can't be dereferenced.`
     /// — an invocation whose callee expression statically evaluates to
@@ -1761,18 +1762,18 @@ pub enum SemanticCode {
     /// `'{0}' isn't a function.` — a bare function invocation whose name
     /// resolves to a type alias whose right-hand chain never grounds in a
     /// constructor-callable or primitive type (`invocation_of_non_function`,
-    /// element_resolver.dart's function-invocation face; the alias name is
+    /// `element_resolver.dart`'s function-invocation face; the alias name is
     /// a type, not a value).
     InvocationOfNonFunction,
     /// `Invalid reference to 'this' expression.` — `this` outside an
     /// instance member of a class-family container (`invalid_reference_to_this`,
-    /// type_analyzer.dart:4608 `isThisAccessible` via
+    /// `type_analyzer.dart:4608` `isThisAccessible` via
     /// element_resolver.dart:357-374).
     InvalidReferenceToThis,
     /// `Invalid context for 'super' invocation.` — `super` outside an
     /// instance context of a class-family container
-    /// (`super_in_invalid_context`, element_resolver.dart:365 with the
-    /// `SuperContext` classification, super_context.dart).
+    /// (`super_in_invalid_context`, `element_resolver.dart:365` with the
+    /// `SuperContext` classification, `super_context.dart`).
     SuperInInvalidContext,
     /// `The return type '{0}' of the redirected constructor isn't a subtype of
     /// '{1}'.` — a redirecting factory's target constructor whose return type
@@ -1814,31 +1815,31 @@ pub enum SemanticCode {
     /// a constructor initializer referencing an instance member of the
     /// enclosing class
     /// (`implicit_this_reference_in_initializer`, diagnostic.g.dart;
-    /// error_verifier.dart `_checkForImplicitThisReferenceInInitializer`).
+    /// `error_verifier.dart` `_checkForImplicitThisReferenceInInitializer`).
     ImplicitThisReferenceInInitializer,
     /// `The element type '{0}' can't be assigned to the list type '{1}'.`
     /// — a list literal element whose type is not assignable to the list's
     /// element type (`list_element_type_not_assignable`,
-    /// diagnostic.g.dart; error_verifier.dart list-element walk).
+    /// diagnostic.g.dart; `error_verifier.dart` list-element walk).
     ListElementTypeNotAssignable,
     /// `The late local variable '{0}' is definitely unassigned at this
     /// point.` — a `late` local variable read while flow analysis proves
     /// it definitely unassigned
     /// (`definitely_unassigned_late_local_variable`, diagnostic.g.dart;
-    /// type_analyzer.dart `_checkReadOfNotAssignedLocalVariable`).
+    /// `type_analyzer.dart` `_checkReadOfNotAssignedLocalVariable`).
     DefinitelyUnassignedLateLocalVariable,
     /// `The non-nullable local variable '{0}' must be assigned before it
     /// can be used.` — a non-late, non-final local variable with a
     /// potentially non-nullable type, read while not definitely assigned
     /// (`not_assigned_potentially_non_nullable_local_variable`,
-    /// diagnostic.g.dart; type_analyzer.dart
+    /// diagnostic.g.dart; `type_analyzer.dart`
     /// `_checkReadOfNotAssignedLocalVariable`, :5016-5023).
     NotAssignedPotentiallyNonNullableLocalVariable,
     /// `The final variable '{0}' can't be read because it's potentially
     /// unassigned at this point.` — a non-late `final` local variable read
     /// while not definitely assigned
     /// (`read_potentially_unassigned_final`, diagnostic.g.dart;
-    /// type_analyzer.dart `_checkReadOfNotAssignedLocalVariable`,
+    /// `type_analyzer.dart` `_checkReadOfNotAssignedLocalVariable`,
     /// :5008-5013).
     ReadPotentiallyUnassignedFinal,
     /// `A value of type '{0}' can't be assigned to a parameter of type
@@ -1863,7 +1864,7 @@ pub enum SemanticCode {
     /// '{1}'.` — a map literal entry's key whose static type is not
     /// assignable to the literal's resolved key type
     /// (`map_key_type_not_assignable`, diagnostic.g.dart:10480;
-    /// literal_element_verifier.dart `_verifyMapLiteralEntryKey`). The
+    /// `literal_element_verifier.dart` `_verifyMapLiteralEntryKey`). The
     /// nullability twin shares the name and the message (the
     /// `uniqueName` split) — one variant covers both faces.
     MapKeyTypeNotAssignable,
@@ -1871,14 +1872,14 @@ pub enum SemanticCode {
     /// '{1}'.` — a map literal entry's value whose static type is not
     /// assignable to the literal's resolved value type
     /// (`map_value_type_not_assignable`, diagnostic.g.dart:10520;
-    /// literal_element_verifier.dart `_verifyMapLiteralEntryValue`). The
+    /// `literal_element_verifier.dart` `_verifyMapLiteralEntryValue`). The
     /// nullability twin shares the name and the message (the
     /// `uniqueName` split) — one variant covers both faces.
     MapValueTypeNotAssignable,
     /// `A yielded value of type '{0}' must be assignable to '{1}'.` — a
     /// generator's `yield` expression whose static type is not assignable
     /// to the declared sequence's element type (`yield_of_invalid_type`,
-    /// diagnostic.g.dart:18890; yield_statement_resolver.dart
+    /// diagnostic.g.dart:18890; `yield_statement_resolver.dart`
     /// `_checkForYieldOfInvalidType`).
     YieldOfInvalidType,
     /// `The type '{0}' implied by the 'yield*' expression must be
@@ -1895,7 +1896,7 @@ pub enum SemanticCode {
     /// brace literal whose elements cannot decide the shape (the
     /// spread-of-dynamic form)
     /// (`ambiguous_set_or_map_literal_either`, diagnostic.g.dart:431;
-    /// typed_literal_resolver.dart `_inferSetOrMapLiteralType`).
+    /// `typed_literal_resolver.dart` `_inferSetOrMapLiteralType`).
     AmbiguousSetOrMapLiteralEither,
     /// `The literal can't be either a map or a set because it contains at
     /// least one literal map entry or a spread operator spreading a
@@ -1907,7 +1908,7 @@ pub enum SemanticCode {
     /// `The element type '{0}' can't be assigned to the set type '{1}'.`
     /// — a set literal element whose static type is not assignable to the
     /// set's element type (`set_element_type_not_assignable`,
-    /// diagnostic.g.dart; literal_element_verifier.dart `_verifyElement`'s
+    /// diagnostic.g.dart; `literal_element_verifier.dart` `_verifyElement`'s
     /// set arm). The nullability twin shares the name and the message (the
     /// `uniqueName` split) — one variant covers both faces.
     SetElementTypeNotAssignable,
@@ -1915,35 +1916,35 @@ pub enum SemanticCode {
     /// 'Iterable'.` — a `...expr` element in a list or set literal whose
     /// operand's static type has no `Iterable` face
     /// (`not_iterable_spread`, diagnostic.g.dart;
-    /// literal_element_verifier.dart `_verifySpreadForListOrSet`).
+    /// `literal_element_verifier.dart` `_verifySpreadForListOrSet`).
     NotIterableSpread,
     /// `Spread elements in map literals must implement 'Map'.` — a
     /// `...expr` element in a map literal whose operand's static type has
     /// no `Map` face (`not_map_spread`, diagnostic.g.dart;
-    /// literal_element_verifier.dart `_verifySpreadForMap`).
+    /// `literal_element_verifier.dart` `_verifySpreadForMap`).
     NotMapSpread,
     /// `The Null-typed expression can't be used with a non-null-aware
     /// spread.` — a `...expr` element whose operand's static type is
     /// `Null` (a null-aware `...?` spread is legal and stays silent)
     /// (`not_null_aware_null_spread`, diagnostic.g.dart;
-    /// literal_element_verifier.dart `_verifySpreadForListOrSet` /
+    /// `literal_element_verifier.dart` `_verifySpreadForListOrSet` /
     /// `_verifySpreadForMap`).
     NotNullAwareNullSpread,
     /// `A list or a set is expected in this spread.` — a `const` list or
     /// set literal's `...expr` element whose operand is not a constant
     /// list or set (`const_spread_expected_list_or_set`,
-    /// diagnostic.g.dart; constant_verifier.dart `_validateListOrSetSpread`).
+    /// diagnostic.g.dart; `constant_verifier.dart` `_validateListOrSetSpread`).
     ConstSpreadExpectedListOrSet,
     /// `A map is expected in this spread.` — a `const` map literal's
     /// `...expr` element whose operand is not a constant map
     /// (`const_spread_expected_map`, diagnostic.g.dart;
-    /// constant_verifier.dart `_validateMapSpread`).
+    /// `constant_verifier.dart` `_validateMapSpread`).
     ConstSpreadExpectedMap,
     /// `Expressions can't be used in a map literal.` — a non-entry
     /// expression element in a map literal (a bare expression, not a
     /// `key: value` entry, not a spread, not a control-flow element)
     /// (`expression_in_map`, diagnostic.g.dart;
-    /// literal_element_verifier.dart `_verifyElement`'s map arm).
+    /// `literal_element_verifier.dart` `_verifyElement`'s map arm).
     ExpressionInMap,
     // —— The `dart:ffi` verifier family (`ffi_verifier.dart`) ————————————
     /// `Classes extending 'AbiSpecificInteger' must have exactly one const
@@ -2282,19 +2283,19 @@ pub enum SemanticCode {
     /// whose resolved element's `@Target({TargetKind.…})` allow-list
     /// forbids the declaration kind it annotates
     /// (`AnnotationVerifier._checkKinds`, annotation_verifier.dart:373-401;
-    /// STATIC_WARNING, diagnostic.g.dart:8306-8314). `{1}` is the sorted
+    /// `STATIC_WARNING`, diagnostic.g.dart:8306-8314). `{1}` is the sorted
     /// kind display list joined with the Oxford-comma `or` chain.
     InvalidAnnotationTarget,
     /// `Braces unnecessarily wrap this expression in a set literal.` — an
     /// arrow body whose set literal feeds a void-return context
     /// (`BestPracticesVerifier._checkForUnnecessarySetLiteral`,
-    /// best_practices_verifier.dart:1353-1391; STATIC_WARNING,
+    /// best_practices_verifier.dart:1353-1391; `STATIC_WARNING`,
     /// diagnostic.g.dart:17389-17400).
     UnnecessarySetLiteral,
     /// `The keyword 'final' isn't necessary because the parameter is
     /// implicitly 'final'.` — `final` on a formal parameter
     /// (`BestPracticesVerifier._checkFinalParameter`,
-    /// best_practices_verifier.dart:932-940; STATIC_WARNING,
+    /// best_practices_verifier.dart:932-940; `STATIC_WARNING`,
     /// diagnostic.g.dart:17202-17214).
     UnnecessaryFinal,
     /// `The import of '{0}' is unnecessary because all of the used
@@ -2307,8 +2308,8 @@ pub enum SemanticCode {
     /// `The parameter '{0}' is required.` — an optional named formal
     /// carrying package:meta's `@required`/`@Required` whose call site
     /// supplies no matching named argument
-    /// (`RequiredParametersVerifier._check`, required_parameters_verifier.
-    /// dart:153-196; STATIC_WARNING, diagnostic.g.dart:10933-10960 — the
+    /// (`RequiredParametersVerifier._check`, `required_parameters_verifier`.
+    /// dart:153-196; `STATIC_WARNING`, diagnostic.g.dart:10933-10960 — the
     /// shape enum picks the plain vs with-reason text; both print the
     /// shared `missing_required_param` name).
     MissingRequiredParam(MissingRequiredParamShape),
@@ -2321,7 +2322,7 @@ pub enum SemanticCode {
     /// `Named parameters can't start with an underscore.` — a named
     /// parameter whose name starts with `_` while the
     /// private-named-parameters feature is off and the parameter is not a
-    /// field formal, at the parameter's name token (SYNTACTIC_ERROR,
+    /// field formal, at the parameter's name token (`SYNTACTIC_ERROR`,
     /// analyzer-codes.tsv).
     PrivateOptionalParameter,
     /// `This requires the 'private-named-parameters' language feature to be
@@ -2332,17 +2333,17 @@ pub enum SemanticCode {
     ExperimentNotEnabled,
     /// `Named parameters that don't refer to instance variables can't start
     /// with underscore.` — a non-field named parameter starting with `_`
-    /// under the enabled feature, at the name token (SYNTACTIC_ERROR,
+    /// under the enabled feature, at the name token (`SYNTACTIC_ERROR`,
     /// analyzer-codes.tsv).
     PrivateNamedNonFieldParameter,
     /// `A private named parameter must be a public identifier after removing
     /// the leading underscore.` — the private name has no public spelling
-    /// after the strip, at the name token (COMPILE_TIME_ERROR,
+    /// after the strip, at the name token (`COMPILE_TIME_ERROR`,
     /// analyzer-codes.tsv).
     PrivateNamedParameterWithoutPublicName,
     /// `The corresponding public name '{0}' is already the name of another
     /// parameter.` — two private parameters strip to the same public name,
-    /// at the later name token (COMPILE_TIME_ERROR, analyzer-codes.tsv).
+    /// at the later name token (`COMPILE_TIME_ERROR`, analyzer-codes.tsv).
     PrivateNamedParameterDuplicatePublicName,
     /// `Using a colon as the separator before a default value is deprecated
     /// and will not be supported in language version 3.0 and later.` — a
@@ -3999,9 +4000,6 @@ impl SemanticCode {
     }
 
     /// The verbatim oracle `problemMessage` with placeholders filled.
-    #[must_use]
-    #[expect(clippy::match_same_arms)] // rows follow the official code listing; bodies coincide by arity
-    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     /// The private-enum variant of the switch covering rows
     /// (`nonExhaustiveSwitchExpressionPrivate`/`...StatementPrivate`,
     /// upstream `pkg/analyzer/messages.yaml`): the same *shared* code name as
@@ -4039,7 +4037,6 @@ impl SemanticCode {
     /// exhaustiveness rows, diagnostic.g.dart:13018/:13079). Rows without a
     /// correction answer `None`.
     #[must_use]
-
     pub fn message(self, a0: &str, a1: &str) -> String {
         match self {
             Self::DuplicateDefinition => format!("The name '{a0}' is already defined."),
@@ -6021,12 +6018,12 @@ impl SemanticCode {
                  for named arguments."
                     .to_string(),
             ),
-            Self::NotEnoughPositionalArguments(ArgCountShape::Singular)
-            | Self::NotEnoughPositionalArguments(ArgCountShape::NameSingular) => {
+            Self::NotEnoughPositionalArguments(ArgCountShape::Singular |
+ArgCountShape::NameSingular) => {
                 Some("Try adding the missing argument.".to_string())
             }
-            Self::NotEnoughPositionalArguments(ArgCountShape::Plural)
-            | Self::NotEnoughPositionalArguments(ArgCountShape::NamePlural) => {
+            Self::NotEnoughPositionalArguments(ArgCountShape::Plural |
+ArgCountShape::NamePlural) => {
                 Some("Try adding the missing arguments.".to_string())
             }
             // `missingRequiredArgument`'s verbatim correctionMessage
@@ -7521,27 +7518,14 @@ mod tests {
         match code {
             SemanticCode::AmbiguousExtensionMemberTwo
             | SemanticCode::AmbiguousExtensionMemberThreeOrMore
-            // The #2879 anonymous-method rows: analyzer-tier table rows
-            // (names/metadata only — messages render as local literals at
-            // the message arm, not via the syntax-tier generated accessor).
             | SemanticCode::AnonymousMethodWrongParameterList
             | SemanticCode::AnonymousMethodWrongParameterType
             | SemanticCode::ArgumentTypeNotAssignable
-            // The #3282 assignment-to-* family: the inline `message` arms
-            // above are the template source (no `registry_message` call
-            // site), and the descriptor round-trips through `code_info()`.
             | SemanticCode::AssignmentToFinal
             | SemanticCode::AssignmentToFinalLocal
             | SemanticCode::AssignmentToFinalNoSetter
-            // The #3293 const-constructor declaration face: an inline
-            // `message` arm (no `registry_message` call site).
             | SemanticCode::ConstConstructorWithNonFinalField
-            // The #3626 conflicting-generic-interfaces face: an inline
-            // `message4` arm (no `registry_message` call site).
             | SemanticCode::ConflictingGenericInterfaces
-            // The #2784/#2867 augmentation faces — none registry-backed (the
-            // dartq-diagnostics table predates them; the inline `message`
-            // arms above are the sole template source).
             | SemanticCode::AugmentationAlreadyComplete(_)
             | SemanticCode::AugmentationExtendsClauseAlreadyPresent
             | SemanticCode::AugmentationFormalParameterModifierExtra
@@ -7562,8 +7546,6 @@ mod tests {
             | SemanticCode::AugmentationTypeParameterName
             | SemanticCode::AugmentationWithoutDeclaration(_)
             | SemanticCode::TypedefAugmentation
-            // The #3569 faces ride the same inline-template posture (no
-            // `registry_message` call site).
             | SemanticCode::FunctionNotCompleteAfterAugmentations
             | SemanticCode::InducedGetterNotCompleteAfterAugmentations
             | SemanticCode::InducedSetterNotCompleteAfterAugmentations
@@ -7598,8 +7580,6 @@ mod tests {
             | SemanticCode::EqualKeysInMapPattern
             | SemanticCode::PatternConstantFromDeferredLibrary
             | SemanticCode::NonConstantCaseExpression
-            // The #3559 legacy-switch cluster: none registry-backed (the
-            // inline `message` arms are the sole template source).
             | SemanticCode::NonConstantCaseExpressionFromDeferredLibrary
             | SemanticCode::CaseExpressionTypeImplementsEquals
             | SemanticCode::CaseExpressionTypeIsNotSwitchExpressionSubtype
@@ -7614,22 +7594,10 @@ mod tests {
             | SemanticCode::DeadCodeOnCatchSubtype
             | SemanticCode::DeadNullAwareExpression
             | SemanticCode::DuplicateDefinition
-            // The formal-scope swap row: an inline `message` arm (no
-            // `registry_message` call site), the descriptor round-trips
-            // through `code_info()`.
             | SemanticCode::DuplicateFieldFormalParameter
-            // The record-field duplicate row: an inline `message` arm
-            // (no `registry_message` call site), the descriptor
-            // round-trips through `code_info()`.
             | SemanticCode::DuplicateFieldName
             | SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded
-            // The #3891 uninstantiated-bound row: an inline `message` arm
-            // (no `registry_message` call site), the descriptor
-            // round-trips through `code_info()`.
             | SemanticCode::NotInstantiatedBound
-            // The #3341 alias self-reference row: an inline `message` arm
-            // (no `registry_message` call site — the name reaches
-            // `analyzer-codes.tsv` as metadata only).
             | SemanticCode::TypeAliasCannotReferenceItself
             | SemanticCode::EnumWithoutConstants
             | SemanticCode::EqualElementsInConstSet
@@ -7677,8 +7645,6 @@ mod tests {
             | SemanticCode::MixinOnSealedClass
             | SemanticCode::MixinSuperClassConstraintNonInterface
             | SemanticCode::MixinWithNonClassSuperclass
-            // The #3885 mixin-application family faces: all
-            // inline-template rows (no `registry_message` call sites).
             | SemanticCode::ClassUsedAsMixinDeclaresGenerativeConstructor
             | SemanticCode::MixinInheritsFromNotObject
             | SemanticCode::MixinClassDeclaresNonTrivialGenerativeConstructor
@@ -7686,8 +7652,6 @@ mod tests {
             | SemanticCode::MixinClassDeclarationWithClause
             | SemanticCode::MixinModifierMixinApplicationClassWithMultipleMixins
             | SemanticCode::MixinOfTypeAliasExpandsToTypeParameter
-            // The #3899 clause faces of the shared
-            // `supertype_expands_to_type_parameter` machine name.
             | SemanticCode::ExtendsTypeAliasExpandsToTypeParameter
             | SemanticCode::ImplementsTypeAliasExpandsToTypeParameter
             | SemanticCode::MixinOnTypeAliasExpandsToTypeParameter
@@ -7699,8 +7663,6 @@ mod tests {
             | SemanticCode::MixinSuperClassConstraintDeferredClass
             | SemanticCode::InvalidDeprecatedMixinAnnotation
             | SemanticCode::MustCallSuper
-            // The #3331 combined-signature inference row: not registry-backed
-            // (the inline `message` arm is the template source).
             | SemanticCode::NoCombinedSuperSignature
             | SemanticCode::NonConstCallToLiteralConstructor
             | SemanticCode::NonConstantListElement
@@ -7708,9 +7670,6 @@ mod tests {
             | SemanticCode::NonConstantMapKey
             | SemanticCode::NonConstantMapValue
             | SemanticCode::NonConstantRecordField
-            // The #3647 `invalid_field_name` faces: the inline `message`
-            // arms carry each uniqueName row's verbatim problemMessage
-            // (the registry table holds only the fromObject text).
             | SemanticCode::InvalidFieldNamePrivate
             | SemanticCode::InvalidFieldNamePositional
             | SemanticCode::InvalidFieldNameFromObject
@@ -7744,16 +7703,10 @@ mod tests {
             | SemanticCode::OverrideOnNonOverridingMethod
             | SemanticCode::OverrideOnNonOverridingSetter
             | SemanticCode::PatternNeverMatchesValueType
-            // The #3519 pattern-scope rows: none registry-backed (the
-            // dartq-diagnostics table predates them; the inline `message`
-            // arms are the sole template source).
             | SemanticCode::PatternTypeMismatchInIrrefutableContext
             | SemanticCode::NonConstantRelationalPatternExpression
             | SemanticCode::PatternVariableAssignmentInsideGuard
             | SemanticCode::ReferencedBeforeDeclaration
-            // The relational-signature pair: none registry-backed (the
-            // inline `message`/`message3` arms are the sole template
-            // source).
             | SemanticCode::RelationalPatternOperandTypeNotAssignable
             | SemanticCode::RelationalPatternOperatorReturnTypeNotAssignableToBool
             | SemanticCode::PatternVariableSharedCaseScopeDifferentFinalityOrType
@@ -7762,9 +7715,6 @@ mod tests {
             | SemanticCode::ReceiverOfTypeNever
             | SemanticCode::RecursiveCompileTimeConstant
             | SemanticCode::StrictRawType
-            // The #2972 non-subtypable supertype faces (not registry-backed:
-            // the analyzer-tier table carries one representative template and
-            // the four clause texts stay local, like the struct-class trio).
             | SemanticCode::SubtypeOfDisallowedTypeInExtends
             | SemanticCode::SubtypeOfDisallowedTypeInWith
             | SemanticCode::SubtypeOfDisallowedTypeInImplements
@@ -7794,15 +7744,9 @@ mod tests {
             | SemanticCode::UndefinedPrefixedName
             | SemanticCode::UndefinedReferencedParameter
             | SemanticCode::UndefinedSetter
-            // The function-type member-miss rows: inline `message` arms (the
-            // generated table carries the base row's type-shaped template,
-            // never the function-type one).
             | SemanticCode::UndefinedGetterOnFunctionType
             | SemanticCode::UndefinedMethodOnFunctionType
             | SemanticCode::UndefinedSetterOnFunctionType
-            // The super-member miss pair: the dispatch-vs-interface two-stage
-            // lookup's rows — the abstract interface hit reports beside the
-            // dispatch miss's own `undefined_super_member`.
             | SemanticCode::AbstractSuperMemberReference(_)
             | SemanticCode::PrefixShadowedByLocalDeclaration
             | SemanticCode::UnnecessaryCast
@@ -7882,9 +7826,6 @@ mod tests {
             | SemanticCode::YieldEachOfInvalidType
             | SemanticCode::AmbiguousSetOrMapLiteralEither
             | SemanticCode::AmbiguousSetOrMapLiteralBoth
-            // The #3534 spread/collection-element rows: none
-            // registry-backed (the dartq-diagnostics table predates them;
-            // the inline `message` arms are the sole template source).
             | SemanticCode::SetElementTypeNotAssignable
             | SemanticCode::NotIterableSpread
             | SemanticCode::NotMapSpread
@@ -7942,26 +7883,19 @@ mod tests {
             | SemanticCode::NativeFunctionMissingType
             | SemanticCode::NonConstantTypeArgument
             | SemanticCode::NonNativeFunctionTypeArgumentToPointer
-            // The #2993 whole-face-missing rows: none registry-backed (the
-            // inline `message` arms are the sole template source, like the
-            // #2784 augmentation faces).
             | SemanticCode::InvalidAnnotationTarget
             | SemanticCode::UnnecessarySetLiteral
             | SemanticCode::UnnecessaryFinal
             | SemanticCode::UnnecessaryImport
-            | SemanticCode::MissingRequiredParam(MissingRequiredParamShape::Plain)
-            | SemanticCode::MissingRequiredParam(MissingRequiredParamShape::WithDetails)
-            // The #3373 enum member-set and mixin-application rows: the
-            // inline `message`/`message3` arms above are the sole template
-            // source.
+            | SemanticCode::MissingRequiredParam(
+                MissingRequiredParamShape::Plain | MissingRequiredParamShape::WithDetails,
+            )
             | SemanticCode::EnumWithAbstractMember
             | SemanticCode::IllegalConcreteEnumMember
             | SemanticCode::IllegalEnumValues
             | SemanticCode::ValuesDeclarationInEnum
             | SemanticCode::MixinApplicationNoConcreteSuperInvokedMember
             | SemanticCode::MixinApplicationNotImplementedInterface
-            // The #3629 S2 structural pattern faces: none registry-backed
-            // (the inline `message` arms are the sole template source).
             | SemanticCode::MissingNamedPatternFieldName
             | SemanticCode::PositionalFieldInObjectPattern
             | SemanticCode::MissingVariablePattern
@@ -7975,22 +7909,13 @@ mod tests {
             | SemanticCode::DuplicatePatternAssignmentVariable
             | SemanticCode::DuplicateRestElementInPattern
             | SemanticCode::ExpectedOneListPatternTypeArguments
-            // The #3768 private-named-parameter and colon-default faces: five
-            // rows carry their inline `message` arms (no `registry_message`
-            // call site); the experiment row is the syntax-tier
-            // `REGISTRY_BACKED` row whose text renders filled.
             | SemanticCode::PrivateOptionalParameter
             | SemanticCode::ExperimentNotEnabled
             | SemanticCode::PrivateNamedNonFieldParameter
             | SemanticCode::PrivateNamedParameterWithoutPublicName
             | SemanticCode::PrivateNamedParameterDuplicatePublicName
             | SemanticCode::DeprecatedColonForDefaultValue
-            | SemanticCode::AbstractSuperMemberReference(_)
-            // The #3802 `super!` selector row: a syntax-tier
-            // `REGISTRY_BACKED` row whose message renders through
-            // `registry_message`.
-            | SemanticCode::MissingAssignableSelector
-            => code.code_info(),
+            | SemanticCode::MissingAssignableSelector => code.code_info(),
         }
     }
 

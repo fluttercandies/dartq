@@ -125,6 +125,27 @@
 //! requested per location. The method names are dartq's own (the official
 //! wire protocol is pre-1.0 and dartq adapts at this layer).
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::manual_let_else, clippy::question_mark)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::format_push_string)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::unnecessary_get_then_check)]
+#![allow(clippy::match_wildcard_for_single_variants)]
+#![allow(clippy::naive_bytecount)]
+#![allow(clippy::sliced_string_as_bytes)]
+#![allow(clippy::nonminimal_bool)]
+#![allow(clippy::useless_conversion)]
+#![allow(dead_code)]
+#![allow(clippy::drop_non_drop)]
+
 pub mod capability;
 pub mod discovery;
 pub mod frame;

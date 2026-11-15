@@ -33,6 +33,7 @@
 //! remaining face's required argument reports `not_enough_positional_
 //! arguments` at :26).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -264,7 +265,7 @@ fn raw_receiver_fails_every_concrete_bound() {
     );
 }
 
-/// The informative_data.dart shape: a concrete unbounded face beside two
+/// The `informative_data.dart` shape: a concrete unbounded face beside two
 /// bounded siblings, all declaring the same member — each site resolves
 /// through its own face (the concrete one covariantly, the bounded ones
 /// through their bounds; the /tmp/probe2431/lib/c.dart verdicts, zero

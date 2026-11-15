@@ -1,5 +1,6 @@
 //! The on-disk store: XDG-rooted generations, atomic writes, LRU capacity.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -218,6 +219,7 @@ impl SnapshotStore {
     /// touches the generation's recency marker once, refreshing its access
     /// time for the LRU sweep.
     #[must_use]
+    #[allow(clippy::items_after_statements)]
     pub fn load<T: DeserializeOwned + Send>(
         &self,
         expected: &GenerationHeader,

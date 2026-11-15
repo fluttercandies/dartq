@@ -2,6 +2,7 @@
 //! family the 20261102-080528 census isolated (920 extra rows): the
 //! extension-member bounds face over an UNGROUNDED receiver face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// The shared `expectStaticType` scaffolding: the census cluster's
@@ -109,7 +110,7 @@ void main() {
   }
 }
 ";
-    let report = report_ops(&source);
+    let report = report_ops(source);
     assert!(
         !code_names(&report).contains(&"type_argument_not_matching_bounds"),
         "fabricated rows: {:#?}",
@@ -209,7 +210,7 @@ void testCovariantSuperbound<N extends Never>() {
   CFcov<Fcov<N>> x16;
 }
 ";
-    let report = report_ops(&source);
+    let report = report_ops(source);
     let bounds_rows: Vec<String> = rows(&report)
         .into_iter()
         .filter(|row| row.contains("type_argument_not_matching_bounds"))
@@ -312,7 +313,7 @@ void f() {
   FcovCyclicBound<A<int>> bad2;
 }
 ";
-    let report = report_ops(&source);
+    let report = report_ops(source);
     let bounds_rows: Vec<String> = rows(&report)
         .into_iter()
         .filter(|row| row.contains("type_argument_not_matching_bounds"))

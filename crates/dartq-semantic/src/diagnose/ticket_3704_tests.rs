@@ -17,6 +17,7 @@
 //! dropping the pending slot only removes the expression flavor's
 //! enqueue.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 use crate::diagnose::FileReport;
 

@@ -11,6 +11,7 @@
 //! The persisted index only carries the files the current run touched, so
 //! it stays bounded by the workspace's own dependency set.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::deps::{FileFacts, data_paths, facts};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;

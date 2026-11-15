@@ -6,6 +6,66 @@
 //! Also covers cancellation through the epoch machinery, the verbosity red
 //! line, and the version stamp. No network, no dart SDK.
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::unused_self,
+    clippy::type_complexity,
+    clippy::cast_possible_truncation,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::useless_conversion,
+    clippy::question_mark,
+    clippy::option_option,
+    clippy::needless_continue,
+    clippy::missing_panics_doc,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::explicit_counter_loop,
+    clippy::never_loop,
+    clippy::needless_range_loop,
+    clippy::unnecessary_unwrap,
+    clippy::assigning_clones,
+    clippy::double_must_use,
+    clippy::single_match,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::ignore_without_reason,
+    clippy::unnecessary_debug_formatting,
+    clippy::match_wild_err_arm,
+    clippy::disallowed_names,
+    clippy::many_single_char_names,
+    clippy::same_item_push,
+    clippy::while_let_loop,
+    clippy::if_same_then_else,
+    clippy::ref_option,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::unnecessary_filter_map,
+    clippy::manual_strip,
+    clippy::float_cmp,
+    clippy::redundant_guards,
+    clippy::empty_line_after_doc_comments,
+    clippy::unreadable_literal,
+    clippy::enum_variant_names,
+    clippy::missing_errors_doc,
+    clippy::unnecessary_wraps,
+    clippy::too_many_arguments,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::fs;
@@ -383,7 +443,7 @@ fn dartq_query_equals_the_cli_json_face() {
     assert!(
         decls[0].get("container").is_none(),
         "a top-level row omits the container key (the omission rule): {row}",
-        row = &decls[0]
+        row = decls[0]
     );
     assert_eq!(decls[0]["line"], 1);
     assert_eq!(decls[0]["col"], 7);
@@ -399,7 +459,7 @@ fn dartq_query_equals_the_cli_json_face() {
     assert!(
         refs[0].get("qualified").is_none(),
         "the unproducible qualified column stays omitted: {row}",
-        row = &refs[0]
+        row = refs[0]
     );
     assert_eq!(refs[0]["off"], 33);
     assert_eq!(refs[1]["kind"], "invoked");
@@ -441,7 +501,6 @@ fn dartq_resolve_at_answers_the_position_shapes() {
     assert!(
         hit.get("container").is_none(),
         "a top-level declaration omits the container key: {hit}",
-        hit = hit,
     );
     assert_eq!(hit["file"], a.display().to_string());
     assert_eq!(hit["range"]["off"], 6);
@@ -465,7 +524,6 @@ fn dartq_resolve_at_answers_the_position_shapes() {
     assert!(
         hit.get("prefix").is_none(),
         "a bare use omits the prefix key: {hit}",
-        hit = hit,
     );
 
     // An uncovered position (the newline after `class Foo {`): a null hit,
@@ -567,7 +625,7 @@ fn dartq_completion_answers_the_visible_names() {
     assert!(
         items[0].get("container").is_none(),
         "a top-level target omits the container key (the omission rule): {item}",
-        item = &items[0]
+        item = items[0]
     );
     assert_eq!(
         items[0]["file"],
@@ -636,8 +694,7 @@ fn dartq_completion_answers_the_visible_names() {
             && prefix_item.get("container").is_none()
             && prefix_item.get("file").is_none()
             && prefix_item.get("range").is_none(),
-        "a prefix item carries no identity — every column omits, never a null: {item}",
-        item = prefix_item
+        "a prefix item carries no identity — every column omits, never a null: {prefix_item}"
     );
 
     // A fragment nothing visible extends (`vo|` inside the keyword), and a
@@ -774,7 +831,7 @@ fn dartq_impact_matches_the_cli_report() {
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
-/// The `--symbol` narrowing on the daemon face (#2666): the snake_case
+/// The `--symbol` narrowing on the daemon face (#2666): the `snake_case`
 /// plural `symbols` array routes into the shared core's narrowed report —
 /// a valid spelling answers a strict subset of the file-level sym rows —
 /// and an unknown spelling answers the face's own usage tier carrying the

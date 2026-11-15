@@ -2,7 +2,7 @@
 //! `: super(...)` / `: super.named(...)` in a constructor-initializer list
 //! resolve the super constructor and pair its arguments like any other
 //! invocation (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/constructor_invocation_resolver.dart
+//! `pkg/analyzer/lib/src/dart/resolver/constructor_invocation_resolver.dart`
 //! plus `resolveArgumentsToParameters`). The real-corpus burn (17 packages)
 //! proved the whole face silent: 10 `extra_positional_arguments` and 10
 //! `undefined_named_parameter` oracle-only triples, every one a `super(...)`

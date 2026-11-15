@@ -27,6 +27,7 @@
 //! Upstream references are paths inside the pinned Dart SDK source tree;
 //! the fixtures restate the corpus shapes verbatim.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

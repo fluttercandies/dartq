@@ -21,6 +21,7 @@
 //! * not-sync anchors — setter/factory rows span the `async`/`sync` keyword
 //!   (`asyncToken`, `parser_impl.dart:4644/:6060/:6230`), never the star.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok, setup};
 use crate::Parser;
 

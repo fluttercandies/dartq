@@ -23,6 +23,7 @@
 //!    undeclared spelling pairs `undefined_identifier` with the const site
 //!    default.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

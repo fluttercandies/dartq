@@ -9,6 +9,7 @@
 //! renders) — version-pinned data like the engine's
 //! `KNOWN_EXPERIMENTS`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// `state.since.toString()` — the messages' `{1}` argument: the version
 /// text, or `null` for the unversioned state.
 pub(crate) fn since_arg(since: Option<&str>) -> &str {

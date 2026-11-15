@@ -22,6 +22,7 @@
 //!   The credit is judged at the resolution side and the declaration
 //!   walk trusts it as recorded.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::resolved_ops::{LibraryTypes, ResolvedTypeOps};
@@ -184,9 +185,7 @@ fn is_test_with_undefined_name_deads_the_else() {
         report.diagnostics
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|name| *name == "type_test_with_undefined_name"),
+        code_names(&report).contains(&"type_test_with_undefined_name"),
         "the undefined spelling reports its own code: {:?}",
         report.diagnostics
     );
@@ -393,9 +392,7 @@ fn is_not_test_with_undefined_name_deads_the_then() {
         report.diagnostics
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|name| *name == "type_test_with_undefined_name"),
+        code_names(&report).contains(&"type_test_with_undefined_name"),
         "the undefined spelling reports its own code: {:?}",
         report.diagnostics
     );
@@ -605,7 +602,7 @@ fn unnamed_extension_member_reports_when_never_applied() {
     );
 }
 
-/// The ffi_verifier shape end to end: the extension's `on` type and
+/// The `ffi_verifier` shape end to end: the extension's `on` type and
 /// the accessing receiver's declared type are BOTH undefined, so the
 /// access binds nothing and the member reports.
 #[test]
@@ -746,7 +743,7 @@ fn dead_rhs_chain_reports_per_level_with_reset() {
 /// `call_head_unresolved` answers the head (the flow's unresolved-call
 /// face), and the corpus's broken-import files carry this shape by the
 /// dozen (`var t = pop(); if (t is _CascadeBuilder) … else …` —
-/// ast_builder.dart:214; oracle-probed: DEAD_CODE spans the else block,
+/// `ast_builder.dart:214`; oracle-probed: `DEAD_CODE` spans the else block,
 /// no `unnecessary_type_check` rides along).
 #[test]
 fn unresolved_call_initializer_deads_the_else_arm() {
@@ -761,9 +758,9 @@ fn unresolved_call_initializer_deads_the_else_arm() {
 /// decides) rows its else operand whole — the official
 /// `flowEnd(elseExpression)` re-anchors past any poll an inner node
 /// opened (the as-cast's type poll): the first dead node is the arm
-/// expression itself (type_analyzer.dart:2616; oracle-probed:
+/// expression itself (`type_analyzer.dart:2616`; oracle-probed:
 /// `typeName is Q ? typeName.name : typeName as Q` inside the promotion
-/// reports DEAD_CODE at exactly the `typeName as Q` operand and
+/// reports `DEAD_CODE` at exactly the `typeName as Q` operand and
 /// `unnecessary_cast` beside it).
 #[test]
 fn always_true_conditional_rows_the_else_operand_whole() {
@@ -825,7 +822,7 @@ fn null_comparison_on_invalid_operand_is_open() {
 }
 
 /// The chained polarity: a `!= null` over an invalid operand promotes
-/// nothing, so a later `== null` stays open too (the ast_builder chain,
+/// nothing, so a later `== null` stays open too (the `ast_builder` chain,
 /// oracle-probed silent on both rows).
 #[test]
 fn null_comparison_chain_on_invalid_is_open() {
@@ -860,7 +857,7 @@ fn invalid_written_value_keeps_null_question_open() {
     );
 }
 
-/// The ast_builder shape: the invalid written value rides a member read
+/// The `ast_builder` shape: the invalid written value rides a member read
 /// over an invalid receiver inside a vacuous `is` arm — the write still
 /// promotes nothing, so the null question stays open (oracle-probed: the
 /// only dead row is the vacuous test's own else arm).

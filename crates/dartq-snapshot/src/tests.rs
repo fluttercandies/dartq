@@ -1,6 +1,7 @@
 //! Contract pins: round-trip, generation mismatch, corruption tolerance,
 //! LRU eviction, atomic writes, and cache-root resolution.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -236,7 +237,7 @@ fn empty_generation_loads_with_no_entries() {
         .store(DEFAULT_CAPACITY_BYTES)
         .load::<TestPayload>(&header)
         .expect("generation");
-    assert!(snapshot.entries.is_empty());
+    assert_eq!(snapshot.entries, Vec::<Entry<TestPayload>>::new());
     assert_eq!(snapshot.tables, tables());
 }
 
@@ -640,6 +641,10 @@ fn wide_generation_loads_whole_under_the_fanout() {
     let header = test_header();
     let saved: Vec<Entry<TestPayload>> = (0..2000u32)
         .map(|i| Entry {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "i % 256 is bounded to 0..=255"
+            )]
             key: key((i % 256) as u8, u64::from(i)),
             payload: payload(&format!("unit-{i}")),
         })
@@ -1255,7 +1260,10 @@ fn written_keys_track_landed_writes_stamps_and_sweeps() {
     let keys = [key(1, 10), key(2, 10)];
 
     // Before any write, nothing is vouched: the flush face does full work.
-    assert!(store.written_keys(&header, &first, &keys).is_empty());
+    assert_eq!(
+        store.written_keys(&header, &first, &keys),
+        Vec::<EntryKey>::new()
+    );
 
     // Both entries land; both are recorded.
     store
@@ -1279,7 +1287,10 @@ fn written_keys_track_landed_writes_stamps_and_sweeps() {
 
     // A stamp advance voids every record for the generation: all keys are
     // re-eligible, and the sibling-stamp records stay void afterwards.
-    assert!(store.written_keys(&header, &second, &keys).is_empty());
+    assert_eq!(
+        store.written_keys(&header, &second, &keys),
+        Vec::<EntryKey>::new()
+    );
 
     // A save carrying only one entry records only it — the partial-flush
     // shape must never vouch for a write that did not land.
@@ -1350,7 +1361,10 @@ fn load_seeds_the_written_keys_of_a_fresh_store() {
     }
     let store = cache.store(DEFAULT_CAPACITY_BYTES);
     let keys = [key(1, 10), key(2, 10)];
-    assert!(store.written_keys(&header, &tables(), &keys).is_empty());
+    assert_eq!(
+        store.written_keys(&header, &tables(), &keys),
+        Vec::<EntryKey>::new()
+    );
     store.load::<TestPayload>(&header).expect("generation");
     assert_eq!(store.written_keys(&header, &tables(), &keys).len(), 2);
 }

@@ -2,12 +2,13 @@
 //! time (the callers run chunks sequentially), a hard RSS ceiling and a
 //! wall-clock timeout, both killing the child and reporting a crash.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const RSS_LIMIT_KB: u64 = 8 * 1024 * 1024; // 8 GB
-pub const CHUNK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub const CHUNK_TIMEOUT: Duration = Duration::from_mins(30);
 
 pub struct RunResult {
     /// Killed by the watchdog or exited non-JSON-crash is decided by the

@@ -479,12 +479,9 @@ fn type_parameter_bound(c: &Check<'_>, name: &str) -> Option<u32> {
             if c.lexeme(declared) != name {
                 continue;
             }
-            return c
-                .children(variable)
-                .filter(|&inner| {
-                    is_type_row(c.kind(inner)) && c.unit.ast.parent(inner) == Some(variable)
-                })
-                .next();
+            return c.children(variable).find(|&inner| {
+                is_type_row(c.kind(inner)) && c.unit.ast.parent(inner) == Some(variable)
+            });
         }
     }
     None

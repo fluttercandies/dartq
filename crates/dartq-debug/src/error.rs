@@ -3,6 +3,7 @@
 //! wire data, RPC errors and process failures are all user-visible and
 //! recoverable.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// The crate's result alias.
 pub type Result<T> = std::result::Result<T, Error>;
 

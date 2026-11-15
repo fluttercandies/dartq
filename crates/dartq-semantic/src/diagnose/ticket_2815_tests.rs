@@ -9,15 +9,18 @@
 //! Oracle rows: dart 3.13.7 (the pinned conformance oracle) over the
 //! B2 census cases (the 2026-10-28 unchecked-nullable census sweep; the
 //! spans mirrored from the upstream expectations).
-//! Official sources: type_system.dart `isNonNullable` (:1161-1179),
-//! function_expression_invocation_resolver.dart (:53-70),
-//! assignment_expression_resolver.dart (:232-278), field_promotability
+//! Official sources: `type_system.dart` `isNonNullable` (:1161-1179),
+//! `function_expression_invocation_resolver.dart` (:53-70),
+//! `assignment_expression_resolver.dart` (:232-278), `field_promotability`
 //! .dart (:70-76).
 //!
 //! Message variants (#2877): the binary-operator face renders the
 //! operator variant and the bare-invocation face the function variant —
 //! messages.yaml's four shared-name rows dispatched by the access node's
 //! own shape (type_property_resolver.dart:128-148).
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(unused_imports)]
 
 use super::*;
 use crate::collector::collect;
@@ -152,7 +155,7 @@ fn at(source: &str, needle: &str) -> u32 {
 
 /// A `?`-less type-parameter reference reads its declared bound's
 /// nullability (the oracle's `typeParametersNullableBounds` face —
-/// static_errors test 42/57 pins): `T extends int?` dereferences
+/// `static_errors` test 42/57 pins): `T extends int?` dereferences
 /// unconditionally at the selector.
 #[test]
 fn param_bound_property_reports_unchecked() {
@@ -181,7 +184,7 @@ fn param_bound_property_reports_unchecked() {
 
 /// Binary operators on a nullable operand report at the operator token
 /// with the operator variant (#2877 — messages.yaml's
-/// `uncheckedOperatorInvocationOfNullableValue`, the BinaryExpression arm
+/// `uncheckedOperatorInvocationOfNullableValue`, the `BinaryExpression` arm
 /// of the node-shape dispatch).
 #[test]
 fn binary_operator_on_nullable_reports_at_operator() {
@@ -243,7 +246,7 @@ fn compound_and_increment_report_base_operator() {
 
 /// A promoted operand stands down (the compound reads the pre-write
 /// promotion — `c += i` after the null check is silent, the oracle's
-/// why_not_promoted compound_assignment shape).
+/// `why_not_promoted` `compound_assignment` shape).
 #[test]
 fn compound_after_promotion_stays_silent() {
     assert!(unchecked("void f(int? x) {\n  if (x == null) return;\n  x += 1;\n}").is_empty());
@@ -251,7 +254,7 @@ fn compound_after_promotion_stays_silent() {
 
 /// A compound on a MEMBER's own result reports at the operator token
 /// naming the base operator (`b.a.y += 0` over `A.y: int?` — the
-/// oracle's test_assignment_plusEq_propertyAccess3).
+/// oracle's `test_assignment_plusEq_propertyAccess3`).
 #[test]
 fn member_result_compound_reports_at_operator() {
     let src = "class A {\n  int? y;\n  A(this.y);\n}\n\
@@ -311,7 +314,7 @@ fn resolved_and_dynamic_invocations_stay_silent() {
 /// A getter, a public field, and a non-final field never promote: the
 /// by-name flow row staged at the selector span must not stand the
 /// receiver gate down (the oracle's Private-fields-promotion and
-/// why_not_promoted suites).
+/// `why_not_promoted` suites).
 #[test]
 fn non_promotable_member_accesses_report_unchecked() {
     let src = "class C {\n  int? i;\n  int? j = null;\n  int? get k => null;\n  \
@@ -330,7 +333,7 @@ fn non_promotable_member_accesses_report_unchecked() {
     }
 }
 
-/// An enum's public field never promotes (the oracle's not_promotable_A02
+/// An enum's public field never promotes (the oracle's `not_promotable_A02`
 /// implicit-this shape). The enum-PREFIXED chain (`E.e1.x.isEven`) shares
 /// the root but rides the static enum-constant container merge — a
 /// separate seam, under-reported until that merge re-decides its result

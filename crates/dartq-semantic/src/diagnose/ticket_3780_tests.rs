@@ -14,7 +14,7 @@
 //!    the ITERABLE (`.at(node.iterable)`). The wildcard declarator `Object? _`
 //!    and the existing-variable head `for (object in xs)` report exactly
 //!    like the declared `Object? o` head #3349 pinned.
-//! 2. The `?`-marked collection operand (literal_element_verifier.dart:117
+//! 2. The `?`-marked collection operand (`literal_element_verifier.dart:117`
 //!    /:152/:197): the null-aware marker TESTS the operand for `null`, so a
 //!    `void` operand is used even when the stored slot type is also `void` —
 //!    `<void>[?v]`, `<void, int>{?k: 0}`, `<int, void>{0: ?v}` all report at
@@ -39,6 +39,7 @@
 //! stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops, rows};
 use crate::diagnose::types::FileReport;
 

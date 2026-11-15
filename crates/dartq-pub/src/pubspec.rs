@@ -13,6 +13,7 @@
 //! is present (pubspec.dart:86-112, 169-193), and its key set is whitelisted
 //! (pubspec.dart:393-407).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::path::Path;
 

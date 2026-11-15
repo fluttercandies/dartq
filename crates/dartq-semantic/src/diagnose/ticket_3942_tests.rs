@@ -20,6 +20,7 @@
 //!
 //! Every expectation below is the 3.13.7 oracle's, verbatim.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{code_names, report_ops_experiments_with, rows};
 use dartq_language::Feature;
@@ -54,7 +55,7 @@ fn variance_report(source: &str) -> FileReport {
 #[test]
 fn covariant_and_legacy_heads_keep_the_covariant_leg() {
     let report = variance_report(
-        r#"class C {}
+        r"class C {}
 
 class Cov<out T> {}
 Cov<C?> covWiden(Cov<C> a) => a;
@@ -63,7 +64,7 @@ Cov<C> covNarrow(Cov<C?> a) => a;
 class Leg<T> {}
 Leg<C?> legWiden(Leg<C> a) => a;
 Leg<C> legNarrow(Leg<C?> a) => a;
-"#,
+",
     );
     let stated = assignability_rows(&report).join("\n");
     assert_eq!(
@@ -88,7 +89,7 @@ Leg<C> legNarrow(Leg<C?> a) => a;
 #[test]
 fn invariant_head_rejects_both_argument_directions() {
     let report = variance_report(
-        r#"class C {}
+        r"class C {}
 
 class Inv<inout T> {}
 void takesWide(Inv<C?> x) {}
@@ -97,7 +98,7 @@ void call(Inv<C> a, Inv<C?> b) {
   takesWide(a);
   takesNarrow(b);
 }
-"#,
+",
     );
     let names = code_names(&report);
     let rows = names
@@ -119,7 +120,7 @@ void call(Inv<C> a, Inv<C?> b) {
 #[test]
 fn contravariant_head_reverses_the_argument_pair() {
     let report = variance_report(
-        r#"class C {}
+        r"class C {}
 
 class Contra<in T> {}
 void takesWide(Contra<C?> x) {}
@@ -128,7 +129,7 @@ void call(Contra<C> a, Contra<C?> b) {
   takesWide(a);
   takesNarrow(b);
 }
-"#,
+",
     );
     let stated = assignability_rows(&report).join("\n");
     assert_eq!(
@@ -160,14 +161,14 @@ void call(Contra<C> a, Contra<C?> b) {
 #[test]
 fn invariant_multi_parameter_rejects_every_mixed_pair() {
     let report = variance_report(
-        r#"class C {}
+        r"class C {}
 
 class Pair<inout K, inout V> {}
 Pair<C?, C?> bothWide(Pair<C, C> a) => a;
 Pair<C, C> bothNarrow(Pair<C?, C?> a) => a;
 Pair<C?, C> mixLeft(Pair<C, C?> a) => a;
 Pair<C, C?> mixRight(Pair<C?, C> a) => a;
-"#,
+",
     );
     let names = code_names(&report);
     let rows = names
@@ -188,12 +189,12 @@ Pair<C, C?> mixRight(Pair<C?, C> a) => a;
 #[test]
 fn nested_invariant_head_rejects_both_directions() {
     let report = variance_report(
-        r#"class C {}
+        r"class C {}
 
 class Inv<inout T> {}
 Inv<Inv<C?>> widen(Inv<Inv<C>> a) => a;
 Inv<Inv<C>> narrow(Inv<Inv<C?>> a) => a;
-"#,
+",
     );
     let names = code_names(&report);
     let rows = names
@@ -219,11 +220,11 @@ Inv<Inv<C>> narrow(Inv<Inv<C?>> a) => a;
 #[test]
 fn unspellable_head_keeps_the_legacy_covariant_reading() {
     let report = variance_report(
-        r#"class C {}
+        r"class C {}
 
 Future<C?> widenFuture(Future<C> a) => a;
 Future<C> narrowFuture(Future<C?> a) => a;
-"#,
+",
     );
     let stated = assignability_rows(&report).join("\n");
     assert_eq!(
@@ -245,13 +246,13 @@ Future<C> narrowFuture(Future<C?> a) => a;
 #[test]
 fn forward_declared_invariant_head_rejects_both_directions() {
     let report = variance_report(
-        r#"Inv<C?> h(Inv<C> a) => a;
+        r"Inv<C?> h(Inv<C> a) => a;
 Inv<C> k(Inv<C?> a) => a;
 
 class C {}
 
 class Inv<inout T> {}
-"#,
+",
     );
     let names = code_names(&report);
     let rows = names

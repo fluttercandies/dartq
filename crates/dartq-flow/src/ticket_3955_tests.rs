@@ -11,6 +11,7 @@
 //! joins the reachable RHS post-state with the parked skip state — the
 //! join drops every fact the two paths do not share.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 #[cfg(test)]
 mod tests {
     use crate::facts::FlowFact;

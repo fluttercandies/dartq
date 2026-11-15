@@ -1,7 +1,7 @@
 //! The convert-family assist producers (#2400): the twelve landed kinds of
 //! the census's 23-kind convert wave, each mirroring its official
 //! producer's trigger shape and edit (upstream Dart SDK source,
-//! pkg/analysis_server/lib/src/services/correction/dart/convert_*.dart —
+//! `pkg/analysis_server/lib/src/services/correction/dart/convert`_*.dart —
 //! the file named on each producer).
 //!
 //! # The facts-blocked eleven
@@ -11,41 +11,50 @@
 //! facts-blocked, not a divergence — fewer assists, never an approximated
 //! one):
 //!
-//! - `classToEnum` (convert_class_to_enum.dart): reads field/constructor
+//! - `classToEnum` (`convert_class_to_enum.dart)`: reads field/constructor
 //!   element identity, redirect chains, and the type system (~97 element
 //!   reads) to synthesize the enum constants.
-//! - `classToMixin` (convert_class_to_mixin.dart): partitions the written
+//! - `classToMixin` (`convert_class_to_mixin.dart)`: partitions the written
 //!   supertype clauses by *which class element* each `super.` reference
 //!   resolves into — the declaring-class identity of a super member is the
 //!   missing face (the name-level model answers the receiver's own
 //!   container, not the declaring ancestor).
-//! - `partOfToPartUri` (convert_part_of_to_uri.dart): reads
+//! - `partOfToPartUri` (`convert_part_of_to_uri.dart)`: reads
 //!   `libraryElement.firstFragment.source.fullName` — the defining unit's
 //!   file path; the assist face carries no file-table access.
-//! - `relativeToPackageImport` (convert_to_package_import.dart): reads
+//! - `relativeToPackageImport` (`convert_to_package_import.dart)`: reads
 //!   the relative import's resolved `DirectiveUriWithSource` package URI —
 //!   the import-resolution face (relative spelling → package: URI) is the
 //!   missing edge.
-//! - `switchExpression` (convert_to_switch_expression.dart): reads
+//! - `switchExpression` (`convert_to_switch_expression.dart)`: reads
 //!   top-level-function/variable write identities across case bodies and
 //!   the exhaustiveness type system (`isAlwaysExhaustive`).
-//! - `toDeclaringParameter` (convert_to_declaring_parameter.dart): reads
+//! - `toDeclaringParameter` (`convert_to_declaring_parameter.dart)`: reads
 //!   field-formal declaring elements and field declarations by identity.
-//! - `toDotShorthand` (convert_to_dot_shorthand.dart): guards through
+//! - `toDotShorthand` (`convert_to_dot_shorthand.dart)`: guards through
 //!   `computeContextType` — the completion-grade context-type computer.
-//! - `toInBodyConstructor` (convert_to_in_body_constructor.dart): reads
+//! - `toInBodyConstructor` (`convert_to_in_body_constructor.dart)`: reads
 //!   parameter/field element identity through the body's reference graph.
-//! - `toInitializingFormal` (convert_to_initializing_formal.dart): reads
+//! - `toInitializingFormal` (`convert_to_initializing_formal.dart)`: reads
 //!   write-element resolution (`assignment.writeElement`) and field/
 //!   parameter type equality.
-//! - `toPrimaryConstructor` (convert_to_primary_constructor.dart): gated
+//! - `toPrimaryConstructor` (`convert_to_primary_constructor.dart)`: gated
 //!   on the `primary-constructors` experiment; the redirecting-generative
 //!   check reads the constructor's `redirectedConstructor` element.
-//! - `toSuperParameters` (convert_to_super_parameters.dart): reads the
+//! - `toSuperParameters` (`convert_to_super_parameters.dart)`: reads the
 //!   super constructor element's formal table and cross-declaration type
 //!   equality.
 
-use super::*;
+#![allow(clippy::semicolon_if_nothing_returned)]
+use super::{
+    AssistContext, FixInput, FxHashSet, NodeKind, Path, SyntaxTable, TokenKind,
+    ancestor_or_self_kind, binary_parts, child_of_kind, conditional_parts, covering_node,
+    covering_token, depth0_find, direct_children, eol_of, expression_end16, expression_extent,
+    if_parts, inner_expression, is_statement_kind, line_indent_of, line_start16,
+    map_from_iterable_for_element, matching_open, member_body, node_span16, prev_token_is,
+    reindent, slice16, sort_edits, statement_at, statement_children, token_at, token_end16,
+    trim_span16, unwrap_parens, utf16_count, utf16_end, utf16_span_between, word_at,
+};
 use dartq_ast::TOKEN_NONE;
 
 /// The payload word at `index` read as a token index.
@@ -65,7 +74,7 @@ fn is_set_literal(ast: &SyntaxTable, id: u32) -> bool {
 /// `_isUnambiguousElement`: whether an element lexically forces a set
 /// literal — an expression (anything but a map entry) is; `if`/`for`
 /// control-flow elements recurse into their branches/body (upstream Dart
-/// SDK source, convert_to_set_literal.dart `_isUnambiguousElement`).
+/// SDK source, `convert_to_set_literal.dart` `_isUnambiguousElement`).
 fn is_unambiguous_collection_element(ast: &SyntaxTable, element: u32) -> bool {
     match ast.kind(element) {
         NodeKind::MapEntry => false,
@@ -134,8 +143,8 @@ fn written_type_arguments(
 
 /// `dart.assist.convert.toIfElement` (`ConvertConditionalExpressionToIfElement`,
 /// upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_conditional_expression_to_if_element.dart): a conditional
+/// `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_conditional_expression_to_if_element.dart)`: a conditional
 /// expression inside a list or set literal rewrites to the collection
 /// `if` element — `if (condition) then else`. The outermost parenthesized
 /// wrapper joins the replacement (the producer's `nodeToReplace` walk);
@@ -186,8 +195,8 @@ pub(crate) fn convert_to_if_element(
 // ---------------------------------------------------------------------------
 
 /// `dart.assist.convert.toSpread` (`ConvertAddAllToSpread`, upstream Dart
-/// SDK source, pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_add_all_to_spread.dart): a cascaded `..addAll(x)` whose
+/// SDK source, `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_add_all_to_spread.dart)`: a cascaded `..addAll(x)` whose
 /// cascade target is a list literal moves the argument's elements into
 /// the literal — a list-literal argument splices its element run
 /// verbatim, every other argument rewraps (`x`, `x ?? []` → `...?x`,
@@ -325,8 +334,8 @@ fn compute_spread_element_text(context: &AssistContext<'_>, from16: u32) -> Opti
 // ---------------------------------------------------------------------------
 
 /// `dart.assist.convert.toMapLiteral` (`ConvertToMapLiteral`, upstream Dart
-/// SDK source, pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_to_map_literal.dart): the unparameterized-head creation
+/// SDK source, `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_to_map_literal.dart)`: the unparameterized-head creation
 /// `Map()` / `LinkedHashMap()` (no named constructor, no arguments,
 /// cursor at or before the argument list) rewrites to the map literal
 /// `<…>{}` — written type arguments carried verbatim. The
@@ -447,8 +456,8 @@ fn literal_creation_head(context: &AssistContext<'_>, names: &[&str]) -> Option<
 // ---------------------------------------------------------------------------
 
 /// `dart.assist.convert.toSetLiteral` (`ConvertToSetLiteral`, upstream Dart
-/// SDK source, pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_to_set_literal.dart), both faces:
+/// SDK source, `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_to_set_literal.dart`), both faces:
 ///
 /// - `list.toSet()` rewrites to the set literal — the target list's
 ///   element run moves inside braces; the `<dynamic>` disambiguation
@@ -645,8 +654,8 @@ fn head_name_at(context: &AssistContext<'_>, offset16: u32) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// `dart.assist.convert.toForElement` (`ConvertMapFromIterableToForLiteral`,
-/// upstream Dart SDK source, pkg/analysis_server/lib/src/services/
-/// correction/dart/convert_map_from_iterable_to_for_literal.dart): the
+/// upstream Dart SDK source, `pkg/analysis_server/lib/src/services`/
+/// `correction/dart/convert_map_from_iterable_to_for_literal.dart)`: the
 /// `Map.fromIterable(xs, key: (k) => …, value: (k) => …)` creation
 /// rewrites to the map-for element — the same-parameter leg the fix
 /// face's rewriter implements (the different-name legs re-spell the
@@ -686,8 +695,8 @@ pub(crate) fn convert_to_for_element(
 // ---------------------------------------------------------------------------
 
 /// `dart.assist.convert.getterToFinalField` (`ConvertIntoFinalField`,
-/// upstream Dart SDK source, pkg/analysis_server/lib/src/services/
-/// correction/dart/convert_into_final_field.dart): the getter with no
+/// upstream Dart SDK source, `pkg/analysis_server/lib/src/services`/
+/// `correction/dart/convert_into_final_field.dart)`: the getter with no
 /// corresponding setter rewrites to a `final` field — the returned
 /// expression (an arrow body's payload or a single-`return` block) or an
 /// `abstract final` declaration for the empty body. The cursor sits on
@@ -706,8 +715,7 @@ pub(crate) fn getter_to_final_field(
     // official walk reads only the name and type nodes).
     let name = direct_children(ast, getter)
         .into_iter()
-        .filter(|&child| ast.kind(child) == NodeKind::Identifier)
-        .last()?;
+        .rfind(|&child| ast.kind(child) == NodeKind::Identifier)?;
     let name_span = node_span16(context.tokens, text, ast, name)?;
     if name_span.start == name_span.end || context.selection.start >= name_span.end {
         return None;
@@ -742,8 +750,7 @@ pub(crate) fn getter_to_final_field(
             }
             if let Some(member_name) = direct_children(ast, member)
                 .into_iter()
-                .filter(|&child| ast.kind(child) == NodeKind::Identifier)
-                .last()
+                .rfind(|&child| ast.kind(child) == NodeKind::Identifier)
                 .and_then(|child| node_span16(context.tokens, text, ast, child))
                 && slice16(text, &member_name)? == name_text
                 && prev_token_is(context, member_name.start, "set")
@@ -901,8 +908,8 @@ fn container_of_member(context: &AssistContext<'_>, member: u32) -> Option<u32> 
 // ---------------------------------------------------------------------------
 
 /// `dart.assist.convert.fieldFormalToNormal` (`ConvertFieldFormalToNormal`,
-/// upstream Dart SDK source, pkg/analysis_server/lib/src/services/
-/// correction/dart/convert_field_formal_to_normal.dart): the constructor's
+/// upstream Dart SDK source, `pkg/analysis_server/lib/src/services`/
+/// `correction/dart/convert_field_formal_to_normal.dart)`: the constructor's
 /// `this.field` parameter rewrites to a normal parameter with an
 /// initializing initializer — `this.x` becomes `x` plus `: x = x` (or the
 /// joining comma). The typed leg only: the untyped face needs the field's
@@ -955,15 +962,14 @@ pub(crate) fn field_formal_to_normal(
     });
     let mut edits: Vec<(u32, u32, String)> = Vec::new();
     let mut parameter_name = name_text.clone();
-    if is_named {
-        if let Some(public) = name_text.strip_prefix('_') {
-            if !public.is_empty() {
-                let name_start = tokens.get(name)?.utf16_offset;
-                let name_len = utf16_count(&name_text);
-                edits.push((name_start, name_len, public.to_owned()));
-                parameter_name = public.to_owned();
-            }
-        }
+    if is_named
+        && let Some(public) = name_text.strip_prefix('_')
+        && !public.is_empty()
+    {
+        let name_start = tokens.get(name)?.utf16_offset;
+        let name_len = utf16_count(&name_text);
+        edits.push((name_start, name_len, public.to_owned()));
+        parameter_name = public.to_owned();
     }
     // The written type: present (the `this.` range deletes) or absent
     // (the field's type is the missing face — declines). The type (if
@@ -994,16 +1000,13 @@ pub(crate) fn field_formal_to_normal(
     // The initializer: after the last initializer (`,` prefix) or right
     // after the parameter list (` :` prefix).
     let initializers = child_of_kind(ast, constructor, NodeKind::Initializers);
-    match initializers {
-        Some(row) => {
-            let last = direct_children(ast, row).into_iter().last()?;
-            let last_end = node_span16(tokens, text, ast, last)?.end;
-            edits.push((last_end, 0, format!(", {name_text} = {parameter_name}")));
-        }
-        None => {
-            let list_close = parameters_close16(context, parameters)?;
-            edits.push((list_close, 0, format!(" : {name_text} = {parameter_name}")));
-        }
+    if let Some(row) = initializers {
+        let last = direct_children(ast, row).into_iter().last()?;
+        let last_end = node_span16(tokens, text, ast, last)?.end;
+        edits.push((last_end, 0, format!(", {name_text} = {parameter_name}")));
+    } else {
+        let list_close = parameters_close16(context, parameters)?;
+        edits.push((list_close, 0, format!(" : {name_text} = {parameter_name}")));
     }
     Some(sort_edits(edits))
 }
@@ -1167,20 +1170,19 @@ fn collect_identifier_spans(
         if context.ast.kind(row) != NodeKind::Identifier {
             continue;
         }
-        if let Some(row_span) = node_span16(context.tokens, context.text, context.ast, row) {
-            if row_span.start >= span.start
-                && row_span.end <= span.end
-                && row_span.start < row_span.end
-            {
-                out.push(row_span);
-            }
+        if let Some(row_span) = node_span16(context.tokens, context.text, context.ast, row)
+            && row_span.start >= span.start
+            && row_span.end <= span.end
+            && row_span.start < row_span.end
+        {
+            out.push(row_span);
         }
     }
 }
 
 /// `dart.assist.convert.ifCaseStatement` (`ConvertToIfCaseStatement`,
-/// upstream Dart SDK source, pkg/analysis_server/lib/src/services/
-/// correction/dart/convert_to_if_case_statement.dart): `var v = e; if (v
+/// upstream Dart SDK source, `pkg/analysis_server/lib/src/services`/
+/// `correction/dart/convert_to_if_case_statement.dart)`: `var v = e; if (v
 /// is T) {}` folds into `if (e case T v) {}` — the declaration deletes,
 /// the initializer moves into the condition. The `!= null` face folds
 /// into `var v?` (the `final` spelling rides the declaration's
@@ -1246,10 +1248,10 @@ pub(crate) fn if_case_statement(context: &AssistContext<'_>) -> Option<Vec<(u32,
     let parent = context.ast.parent(if_statement)?;
     let siblings = statement_children(context.ast, parent);
     let index = siblings.iter().position(|&s| s == if_statement)?;
-    if let Some(else_id) = parts.else_id {
-        if name_referenced_in(context, analysis, &declaration.name_text, else_id) {
-            return None;
-        }
+    if let Some(else_id) = parts.else_id
+        && name_referenced_in(context, analysis, &declaration.name_text, else_id)
+    {
+        return None;
     }
     for statement in &siblings[index + 1..] {
         if name_referenced_in(context, analysis, &declaration.name_text, *statement) {
@@ -1370,8 +1372,8 @@ fn switch_chain_groups(context: &AssistContext<'_>, block: u32) -> Option<Vec<Ch
 
 /// `dart.assist.convert.ifCaseStatementChain`
 /// (`ConvertToIfCaseStatementChain`, upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_to_if_case_statement_chain.dart): the switch statement whose
+/// `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_to_if_case_statement_chain.dart)`: the switch statement whose
 /// every group is a lone `default` or guarded pattern(s) rewrites to the
 /// `if (e case p) {} else if …` chain — joined patterns `||`, the
 /// default group the `else` block, trailing `break`s dropped, bodies
@@ -1467,8 +1469,8 @@ fn local_variable_conflicts(context: &AssistContext<'_>, block: u32) -> FxHashSe
 }
 
 /// `dart.assist.convert.forEachToForIndex` (`ConvertIntoForIndex`,
-/// upstream Dart SDK source, pkg/analysis_server/lib/src/services/
-/// correction/dart/convert_into_for_index.dart): `xs.forEach((e) …)` is
+/// upstream Dart SDK source, `pkg/analysis_server/lib/src/services`/
+/// `correction/dart/convert_into_for_index.dart)`: `xs.forEach((e) …)` is
 /// not this producer's face — it is the for-in loop whose iterable is a
 /// `List`-typed variable: `for (var e in xs) {…}` becomes `for (int i =
 /// 0; i < xs.length; i++) { var-marked bodies keep their element; the
@@ -1526,8 +1528,7 @@ pub(crate) fn for_each_to_for_index(
     let iterable = children[..head_end]
         .iter()
         .copied()
-        .filter(|&child| context.ast.kind(child) == NodeKind::Identifier)
-        .next_back()?;
+        .rfind(|&child| context.ast.kind(child) == NodeKind::Identifier)?;
     let iterable_span = node_span16(tokens, text, context.ast, iterable)?;
     let analysis = context.semantics()?;
     let source = dartq_source::SourceRange {
@@ -1634,7 +1635,7 @@ fn is_pattern_suffix_wildcard(
     while index < close {
         if word_at(context.tokens, text, index, "Function") {
             match context.tokens.get(index + 1).map(|t| t.kind) {
-                Some(TokenKind::Lt) | Some(TokenKind::OpenParen) => return Some(true),
+                Some(TokenKind::Lt | TokenKind::OpenParen) => return Some(true),
                 _ => return Some(false),
             }
         }
@@ -1774,9 +1775,10 @@ fn pattern_of_bool_condition(
         }
         NodeKind::IsExpression => {
             let (_, _, _, expression_span, type_span) = binary_parts(context, condition)?;
-            let suffix = match is_pattern_suffix_wildcard(context, &type_span)? {
-                true => " _",
-                false => "()",
+            let suffix = if is_pattern_suffix_wildcard(context, &type_span)? {
+                " _"
+            } else {
+                "()"
             };
             Some((
                 slice16(text, &expression_span)?.to_owned(),
@@ -1789,8 +1791,8 @@ fn pattern_of_bool_condition(
 
 /// The if-chain leg of `dart.assist.convert.switchStatement`
 /// (`ConvertIfStatementToSwitchStatement`, upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_to_switch_statement.dart): the case chain rewrites to the
+/// `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_to_switch_statement.dart)`: the case chain rewrites to the
 /// switch statement — bodies re-indented under their labels, empty
 /// non-last branches carrying `break;`, the if replaced whole.
 fn convert_if_chain_to_switch(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
@@ -1939,8 +1941,8 @@ fn trailing_semicolon_edit(
 
 /// The switch-expression leg of `dart.assist.convert.switchStatement`
 /// (`ConvertSwitchExpressionToSwitchStatement`, upstream Dart SDK
-/// source, pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_to_switch_statement.dart): the container faces are the return
+/// source, `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_to_switch_statement.dart)`: the container faces are the return
 /// statement, the single-variable declaration (the written type is kept —
 /// the `writeType` inference face is absent, so `var`/`final`-untyped
 /// forms decline), and the plain identifier assignment; each becomes the
@@ -1984,16 +1986,13 @@ fn convert_switch_expression_to_switch(
     } else {
         // The initializer wrappers climb to the declaration.
         let mut variable = None;
-        if context.ast.kind(parent) == NodeKind::VariableInitializer {
-            if let Some(initialized) = context.ast.parent(parent) {
-                if context.ast.kind(initialized) == NodeKind::InitializedIdentifier {
-                    if let Some(declaration) = context.ast.parent(initialized) {
-                        if context.ast.kind(declaration) == NodeKind::VariablesDeclaration {
-                            variable = Some((initialized, declaration));
-                        }
-                    }
-                }
-            }
+        if context.ast.kind(parent) == NodeKind::VariableInitializer
+            && let Some(initialized) = context.ast.parent(parent)
+            && context.ast.kind(initialized) == NodeKind::InitializedIdentifier
+            && let Some(declaration) = context.ast.parent(initialized)
+            && context.ast.kind(declaration) == NodeKind::VariablesDeclaration
+        {
+            variable = Some((initialized, declaration));
         }
         if let Some((_, declaration)) = variable {
             // Exactly one variable, with the type written (the inference
@@ -2106,8 +2105,8 @@ fn posix_relative(target: &str, from: &str) -> String {
 
 /// `dart.assist.convert.packageToRelativeImport`
 /// (`ConvertToRelativeImport`, upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_to_relative_import.dart): the `package:` import resolving
+/// `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_to_relative_import.dart)`: the `package:` import resolving
 /// within the same package rewrites to the relative path — the written
 /// URI's path taken against the unit's own directory, the quotes kept.
 /// The resolution face is the unit's own `package:` library URI plus the

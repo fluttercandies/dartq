@@ -34,6 +34,7 @@
 //! (`ast_builder.dart` 1564/1565/1910/6143-6146,
 //! `generic_inferrer.dart` 631-638).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::resolved_ops::{LibraryTypes, ResolvedTypeOps};
@@ -286,7 +287,7 @@ void f() {
 }
 
 /// The switch-expression face over a written invalid receiver (the
-/// generic_inferrer shape): the `<unresolvable>.member` receiver's
+/// `generic_inferrer` shape): the `<unresolvable>.member` receiver's
 /// annotation chains the invalid face into the scrutinee.
 #[test]
 fn invalid_receiver_switch_expression_deads_the_arms_after_the_absorber() {
@@ -405,9 +406,7 @@ fn invalid_operand_undefined_tested_deads_the_else() {
         report.diagnostics
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|name| *name == "type_test_with_undefined_name"),
+        code_names(&report).contains(&"type_test_with_undefined_name"),
         "the undefined spelling reports its own code: {:?}",
         report.diagnostics
     );
@@ -440,9 +439,7 @@ fn int_operand_undefined_tested_deads_the_else() {
         report.diagnostics
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|name| *name == "type_test_with_undefined_name"),
+        code_names(&report).contains(&"type_test_with_undefined_name"),
         "the undefined spelling reports its own code: {:?}",
         report.diagnostics
     );
@@ -475,9 +472,7 @@ fn is_not_undefined_tested_deads_the_then() {
         report.diagnostics
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|name| *name == "type_test_with_undefined_name"),
+        code_names(&report).contains(&"type_test_with_undefined_name"),
         "the undefined spelling reports its own code: {:?}",
         report.diagnostics
     );
@@ -501,9 +496,7 @@ fn undefined_tested_type_promotes_nothing() {
         report.diagnostics
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|name| *name == "undefined_getter"),
+        code_names(&report).contains(&"undefined_getter"),
         "the member read resolves against the declared `int` face: {:?}",
         report.diagnostics
     );

@@ -32,6 +32,7 @@
 //! payload to survive a warm start — while this pass always holds the
 //! tokens the payload was captured from.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::member_face::OBJECT_MEMBERS;
 use dartq_scanner::{Keyword, TokenKind};
@@ -101,7 +102,7 @@ impl Engine<'_> {
         // out: an instance field's row is `extension_type_declares_instance_field`
         // (the parser's), and the representation formal (a `Field` row)
         // keeps the name-check arm above.
-        for (name, member) in decl.members.iter() {
+        for (name, member) in &decl.members {
             if member.kind == MemberKind::Field
                 || member.name_range == MemberEntry::MISSING_NAME_RANGE
             {

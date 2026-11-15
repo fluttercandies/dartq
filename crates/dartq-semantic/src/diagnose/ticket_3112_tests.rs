@@ -14,6 +14,7 @@
 //! `extraneous_modifier` face, never this one — the pins mirror the
 //! oracle `3.13.7` rows on each shape.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops_bare;
 use super::*;
 
@@ -69,7 +70,7 @@ fn uf_super_formal_fires() {
 
 /// A plain `final` formal is the parser's `extraneous_modifier` face,
 /// never `unnecessary_final` — the oracle reports no WARNING row on
-/// `void f(final int x) {}` (only the SYNTACTIC_ERROR).
+/// `void f(final int x) {}` (only the `SYNTACTIC_ERROR`).
 #[test]
 fn uf_plain_formal_silent() {
     let report = report_ops_bare("void f(final int x) {}\n");

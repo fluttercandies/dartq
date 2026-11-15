@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    FixInput, Keyword, TokenKind, TokenTable, angle_group_end, angle_group_start, depth0_scan,
+    kind_of, line_indent, matching_begin, remove_lexeme, skip_group, slice16, span_over,
+    token_starting_at, utf16_count, utf16_end,
+};
 
 /// `expected_token`: the official trio told apart by the quoted token the
 /// message names — `InsertSemicolon` (`;` lands after the report, never

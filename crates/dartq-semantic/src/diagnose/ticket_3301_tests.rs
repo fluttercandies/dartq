@@ -46,6 +46,7 @@
 //!   emitted at all (a registry entry outside this file's scope) before the
 //!   remaining rows can move.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{code_names, report_ops};
 

@@ -43,6 +43,7 @@
 //! identity (element ids, constructor ids, declaration names) and edge
 //! order; behavior is a total function of that input.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Whether the successor walk from `start` returns to `start`, and the
@@ -68,9 +69,7 @@ where
     let mut exhausted: FxHashSet<N> = FxHashSet::default();
     let mut frames: Vec<(N, std::vec::IntoIter<N>)> = vec![(start, successors(start).into_iter())];
     loop {
-        let Some(frame) = frames.last_mut() else {
-            return None;
-        };
+        let frame = frames.last_mut()?;
         let node = frame.0;
         match frame.1.next() {
             // The frame is spent: its subtree cannot reach `start`, so the
@@ -118,6 +117,11 @@ where
 /// names **sorted** (`error.cycle.map(...).sorted()`); sorting is the
 /// caller's render step. Bounded: each node grays once, each edge is
 /// consumed once.
+///
+/// # Panics
+///
+/// Panics if a gray node is not on the current path (an internal invariant
+/// violation, not reachable from well-formed input).
 pub fn dependency_cycle<N>(start: N, successors: impl Fn(N) -> Vec<N>) -> Option<Vec<N>>
 where
     N: Copy + Eq + std::hash::Hash,
@@ -129,9 +133,7 @@ where
     color.insert(start, 1);
     path.push(start);
     loop {
-        let Some(frame) = frames.last_mut() else {
-            return None;
-        };
+        let frame = frames.last_mut()?;
         let node = frame.0;
         match frame.1.next() {
             None => {
@@ -191,6 +193,13 @@ pub struct StronglyConnected<N> {
 /// and the pop-until-root component extraction mirror
 /// `dependency_walker.dart:51-122` so a component's member order is the
 /// oracle's `evaluateScc` order exactly.
+///
+/// # Panics
+///
+/// Panics if the Tarjan stack is empty when a root component is closed, or
+/// if more than `u32::MAX` components are produced (internal invariant
+/// violations, not reachable from well-formed input).
+#[allow(clippy::while_let_loop)]
 pub fn strongly_connected<N>(nodes: &[N], successors: impl Fn(N) -> Vec<N>) -> StronglyConnected<N>
 where
     N: Copy + Eq + std::hash::Hash,
@@ -256,9 +265,9 @@ where
                     }
                 }
                 Some(dep) => {
-                    if !index.contains_key(&dep) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = index.entry(dep) {
                         // Fresh dependency: recurse (assign index, push).
-                        index.insert(dep, next_index);
+                        e.insert(next_index);
                         lowlink.insert(dep, next_index);
                         next_index += 1;
                         tarjan_stack.push(dep);

@@ -1,5 +1,6 @@
 //! Pattern grammar tests.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, setup};
 use crate::listener::PatternContext;
 
@@ -57,7 +58,10 @@ fn record_pattern_requires_trailing_comma_for_single_field() {
     // pattern, not a record.
     p.listener
         .assert_sequence(&[("handle", "parenthesized_pattern")]);
-    assert!(p.listener.errors.is_empty());
+    assert_eq!(
+        p.listener.errors,
+        [] as [(std::string::String, u32, u32); 0]
+    );
 }
 
 #[test]

@@ -32,6 +32,8 @@
 //! `_resolveBinary` argument check run on the operand's resolved
 //! `staticType`, which for an extension-type `ET(1)` is `ET`.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 

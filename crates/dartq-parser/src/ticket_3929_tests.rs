@@ -20,6 +20,7 @@
 //!    qualified event and the argument group in the official order, so a
 //!    dropped argument list is a collector-side (semantic) issue.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::parser::Parser;
 use crate::tests::collector::{Collector, latest_features, scan_ok};
 
@@ -121,9 +122,7 @@ fn qualified_with_clause_face_emits_its_type_arguments() {
         .position(|e| *e == ("end", "type_arguments"))
         .expect("group close");
     assert!(
-        out.log[group_close..]
-            .iter()
-            .any(|e| *e == ("handle", "type")),
+        out.log[group_close..].contains(&("handle", "type")),
         "the clause type event must follow its argument group: {:?}",
         out.log
     );

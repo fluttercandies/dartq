@@ -13,6 +13,7 @@
 //! resolver/extension_member_resolver.dart:119-124): a named extension
 //! contributes `extension 'E'` alone, an unnamed one the full extended type.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{code_names, report_ops, rows};
 

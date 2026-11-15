@@ -4,6 +4,7 @@
 //! are evicted and the consumer learns about the hole through the
 //! sequence space (a cursor whose entries are gone reads as dropped).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::VecDeque;
 
 /// Bounded FIFO keyed by a monotonic sequence number.

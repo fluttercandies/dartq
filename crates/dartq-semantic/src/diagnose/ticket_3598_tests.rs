@@ -22,7 +22,7 @@
 //!
 //! # The wiring
 //!
-//! [`Engine::solved_invoke_result`] (send_result.rs) types a solved
+//! [`Engine::solved_invoke_result`] (`send_result.rs`) types a solved
 //! invocation by its DECLARED RETURN instantiated with the solution —
 //! [`Engine::callee_return_ty`] through
 //! [`Engine::instantiate_call_return`], the same publication the
@@ -37,16 +37,17 @@
 //! recovered none — this is the engine-side root fix: the `var` binding
 //! is right in the first place. All oracle verdicts below were probed on
 //! 3.13.7 by the #3594/#3588 lanes' fixtures.
+#![allow(unused_variables, clippy::semicolon_if_nothing_returned)]
 
 use super::FileReport;
 use super::test_rig::{RigImport, code_names, report_ops_with, rows};
 
 /// The shared `lang_feature_check.dart` face the co19 corpus mounts:
 /// `typedef F<X> = void Function<Y extends X>()` plus `toF`.
-const LANG_FEATURE_CHECK: &str = r#"
+const LANG_FEATURE_CHECK: &str = r"
 typedef F<X> = void Function<Y extends X>();
 F<X> toF<X>(X x) => <Y extends X>() {};
-"#;
+";
 
 /// The corpus fixture's world: `num`/`int`/`String` plus the generic
 /// container the bounds families parameterize over.
@@ -147,9 +148,7 @@ fn t3598_param_free_return_unchanged() {
 #[test]
 fn t3598_plain_function_instantiation_not_unwrapped() {
     let report = report_ops_with(
-        &format!(
-            "class num {{}} class int extends num {{}} class String {{}}\ntypedef G<T> = T Function(T);\nG<T> id<T>(T x) => (T y) => y;\nmain() {{\n  var r = id(1);\n  String s = r;\n}}\n"
-        ),
+        "class num {} class int extends num {} class String {}\ntypedef G<T> = T Function(T);\nG<T> id<T>(T x) => (T y) => y;\nmain() {\n  var r = id(1);\n  String s = r;\n}\n",
         &[],
         None,
     );
@@ -173,9 +172,7 @@ fn t3598_plain_function_instantiation_not_unwrapped() {
 #[test]
 fn t3598_unsolved_function_result_keeps_single_flatten() {
     let report = report_ops_with(
-        &format!(
-            "class String {{}}\nint Function(int) top() => (int x) => x;\nvoid apply(int Function(int) f) {{ f(1); }}\nmain() {{\n  var r = top();\n  String s = r;\n  apply((int x) => x);\n}}\n"
-        ),
+        "class String {}\nint Function(int) top() => (int x) => x;\nvoid apply(int Function(int) f) { f(1); }\nmain() {\n  var r = top();\n  String s = r;\n  apply((int x) => x);\n}\n",
         &[],
         None,
     );

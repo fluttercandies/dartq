@@ -24,6 +24,7 @@
 //! `ExecutableBodyTest/test_class_getter_static_augmentation_hasBody`: no
 //! rows at all when the completing `augment` is visible).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, scan_ok};
 
 /// Parses `source` with the latest language version and the augmentations

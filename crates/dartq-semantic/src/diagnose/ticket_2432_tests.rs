@@ -33,6 +33,7 @@
 //! `argument_type_not_assignable` on `sink(1, "two")` and the
 //! `WRONG_NUMBER_OF_TYPE_ARGUMENTS*` family on the prefixed sites.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

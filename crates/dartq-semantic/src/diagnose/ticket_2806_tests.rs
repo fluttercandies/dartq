@@ -7,6 +7,7 @@
 //! true-positive guards around each skip (a real repeat in the same list,
 //! an introductory typedef re-declaring an occupied name).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{report_ops, rows};
 use crate::diagnose::types::FileReport;
 

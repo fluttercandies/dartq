@@ -1,4 +1,4 @@
-//! #3913 pins — the const_eval created-primitive operand matrix, the
+//! #3913 pins — the `const_eval` created-primitive operand matrix, the
 //! default-value face's residual, and the const-family accounting.
 //!
 //! Three faces were extracted from the census sweep and routed here:
@@ -40,10 +40,11 @@
 //! * **E-op B** (item 2, the `double_in_int_op` family). The census rows
 //!   are EXTRAS of `argument_type_not_assignable` on a const-`dynamic`
 //!   receiver's `|` operand. The root is `engine_core.rs`'s operator
-//!   argument face (Lane AP, live), not const_eval.rs: the const value's
+//!   argument face (Lane AP, live), not `const_eval.rs`: the const value's
 //!   type leaks into the argument check where the oracle reads the
 //!   receiver's STATIC type (`dynamic`, no check). Routed, not fixed.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

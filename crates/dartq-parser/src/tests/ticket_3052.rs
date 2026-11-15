@@ -29,6 +29,7 @@
 //!   (`<C()>`: `C` followed by `(`; `Function<T 5 6>`), misplacing every
 //!   downstream group boundary.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted —
@@ -117,12 +118,18 @@ fn index_real_closer_absorbs_junk() {
 }
 
 /// Clean forms stay silent: plain index, null-aware index, and the empty
-/// `a[]` operand face (oracle issue_42267: one `missing_identifier`, the
+/// `a[]` operand face (oracle `issue_42267`: one `missing_identifier`, the
 /// closer follows).
 #[test]
 fn index_clean_forms_stay_silent() {
-    assert!(rows_of("void f() {\n  a[1];\n}\n").is_empty());
-    assert!(rows_of("void f() {\n  a?[1];\n}\n").is_empty());
+    assert_eq!(
+        rows_of("void f() {\n  a[1];\n}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
+    assert_eq!(
+        rows_of("void f() {\n  a?[1];\n}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
     assert_eq!(
         sorted_rows("void f() {\n  a[];\n}\n"),
         vec![code("missing_identifier", 15, 16)],
@@ -298,9 +305,18 @@ fn broken_gft_chain_skip_discards_incomplete_function_suffix() {
 /// variables, prefixed tear-off receiver, and the chained-void-GFT control.
 #[test]
 fn nested_generic_clean_forms_stay_silent() {
-    assert!(rows_of("class A {\n  List<B<C>>? x;\n}\n").is_empty());
-    assert!(rows_of("class A {\n  Map<String, List<int>>? m;\n}\n").is_empty());
-    assert!(rows_of("class A {\n  void Function<T>()? f;\n}\n").is_empty());
+    assert_eq!(
+        rows_of("class A {\n  List<B<C>>? x;\n}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
+    assert_eq!(
+        rows_of("class A {\n  Map<String, List<int>>? m;\n}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
+    assert_eq!(
+        rows_of("class A {\n  void Function<T>()? f;\n}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
     assert!(
         rows_of("class A {\n  void h() {\n    var f = A<B<C>>.new;\n  }\n}\n").is_empty(),
         "clean constructor tear-off with nested type args"

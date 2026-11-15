@@ -7,6 +7,7 @@
 //! look dead (the census's EXTRA rows over the co19 Null-aware-elements
 //! corpus).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 /// The `invalid_null_aware_operator` rows of `source`, as `message @offset`.

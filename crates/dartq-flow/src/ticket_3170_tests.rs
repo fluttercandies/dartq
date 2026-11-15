@@ -3,6 +3,9 @@
 //! `interp.rs`, asserted as exact covered source text against the oracle
 //! 3.13.7 row law (`dead_code_verifier.dart`'s `_firstDeadNode`/`flowEnd`).
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

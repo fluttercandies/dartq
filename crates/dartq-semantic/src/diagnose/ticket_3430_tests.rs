@@ -23,6 +23,7 @@
 //!   already does) and the semantic decides — the pinned cases below
 //!   only assert the promotable face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 
 /// `(offset, length)` of `needle`'s first occurrence inside the FIXTURE

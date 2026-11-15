@@ -9,6 +9,7 @@
 //! `{container}\u{2}{name}` composite keys `const_decl_name` joins).
 //! Every expectation is a verbatim oracle 3.13.7 row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::super::test_rig::report_ops_bare;
 
 /// The `const_initialized_with_non_constant_value` rows of
@@ -40,7 +41,7 @@ fn as_cast_reports_at_operand() {
     assert_eq!(rows(source), vec![(22, 2)]);
 }
 
-/// `e1[e2]` is never constant — the oracle flags the whole IndexExpression
+/// `e1[e2]` is never constant — the oracle flags the whole `IndexExpression`
 /// regardless of the operands (`l[0]` over a const list fires the same
 /// way): receiver start through the closing bracket.
 #[test]
@@ -50,7 +51,7 @@ fn index_reports_whole_expression() {
 }
 
 /// `await` is never constant — the oracle anchors the whole
-/// AwaitExpression (the `await` keyword through the operand's end).
+/// `AwaitExpression` (the `await` keyword through the operand's end).
 #[test]
 fn await_reports_whole_expression() {
     let source = "Future<int> f() async => 1;\nf() async {\n  const x = await f();\n}\n";

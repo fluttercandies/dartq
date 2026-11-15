@@ -26,6 +26,7 @@
 //! function `-f()` keeps exactly one `unary-` row (the resolved adjacent
 //! arm's own verdict, never doubled by the teardown walk).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops};
 

@@ -1,4 +1,15 @@
-use super::*;
+use super::{
+    BUILTIN_ASSIST_SOURCE, Edit, Features, FixInput, Keyword, NodeKind, Path, PlannerFuse,
+    PluginFix, SourceRange, SyntaxTable, TokenKind, TokenTable, anchored_edit, angle_group_start,
+    byte_offset_to_utf16, convert_quotes, convert_to_for_element, convert_to_if_element,
+    convert_to_map_literal, convert_to_set_literal, convert_to_spread, convert_to_switch_statement,
+    depth0_find, doc_comment_to_line, field_formal_to_normal, for_each_to_for_index,
+    getter_to_final_field, hit_tokens, if_case_statement, if_case_statement_chain, kind_of,
+    line_of, matching_open, mirror_op, package_to_relative_import, paren_removable, parse_unit,
+    ride_line_comments, slice16, span_over, token_at, token_end_byte, token_starting_at,
+    unit_features, utf16_count, utf16_end, utf16_len_of, utf16_offset_to_byte, utf16_span_between,
+    word_at,
+};
 
 /// The evidence one built-in assist producer reads: the file text, the
 /// request selection (`[offset, offset + length)` in UTF-16), and the
@@ -42,7 +53,7 @@ impl AssistContext<'_> {
 /// drops the assist (the official self-guarding dispatch: every generator
 /// runs at every request and declines where its covering node does not
 /// apply; upstream Dart SDK source,
-/// pkg/analysis_server_plugin/lib/src/correction/assist_processor.dart).
+/// `pkg/analysis_server_plugin/lib/src/correction/assist_processor.dart`).
 pub(crate) struct AssistSpec {
     pub(crate) kind: &'static str,
     pub(crate) title: &'static str,
@@ -53,7 +64,7 @@ pub(crate) struct AssistSpec {
 /// The built-in producer table, in kind order (stable within a priority —
 /// the dispatch's deterministic order). Each row's producer mirrors its
 /// official producer's guard and edit shapes (upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/*, the file named
+/// `pkg/analysis_server/lib/src/services/correction/dart`/*, the file named
 /// on the producer). The table grows with the F5 waves: the if/condition
 /// and surround families land on this same substrate. The flutter-gated
 /// families resolve `package:flutter` elements upstream and stay out
@@ -519,45 +530,44 @@ pub(crate) fn covering_node(
         let deeper = direct_children(ast, current)
             .into_iter()
             .find(|&child| covers(child).is_some());
-        match deeper {
-            Some(child) => current = child,
-            None => {
-                // The flat layer's hidden leaf: the covering row the
-                // peel could not reach. When `current` covers only by
-                // the end-boundary rule the real leaf is its sibling —
-                // search the parent window too. Boundary ties rank the
-                // row starting at the offset (the token under the
-                // cursor) above an interior cover, above the row merely
-                // ending there; smallest span breaks the rest.
-                let rank_of = |row: u32| {
-                    covers(row).map(|span| {
-                        let rank = if span.start == offset16 {
-                            0
-                        } else if span.end == offset16 {
-                            2
-                        } else {
-                            1
-                        };
-                        (row, rank, span.end - span.start)
-                    })
-                };
-                let own_end = node_span16(tokens, text, ast, current)
-                    .is_some_and(|span| span.end == offset16);
-                let hidden = ast
-                    .children(current)
-                    .chain(
-                        own_end
-                            .then(|| ast.parent(current))
-                            .flatten()
-                            .into_iter()
-                            .flat_map(|parent| ast.children(parent)),
-                    )
-                    .filter(|&row| row != current)
-                    .filter_map(rank_of)
-                    .min_by_key(|(_, rank, width)| (*rank, *width))
-                    .map(|(row, _, _)| row);
-                return Some(hidden.unwrap_or(current));
-            }
+        if let Some(child) = deeper {
+            current = child
+        } else {
+            // The flat layer's hidden leaf: the covering row the
+            // peel could not reach. When `current` covers only by
+            // the end-boundary rule the real leaf is its sibling —
+            // search the parent window too. Boundary ties rank the
+            // row starting at the offset (the token under the
+            // cursor) above an interior cover, above the row merely
+            // ending there; smallest span breaks the rest.
+            let rank_of = |row: u32| {
+                covers(row).map(|span| {
+                    let rank = if span.start == offset16 {
+                        0
+                    } else if span.end == offset16 {
+                        2
+                    } else {
+                        1
+                    };
+                    (row, rank, span.end - span.start)
+                })
+            };
+            let own_end =
+                node_span16(tokens, text, ast, current).is_some_and(|span| span.end == offset16);
+            let hidden = ast
+                .children(current)
+                .chain(
+                    own_end
+                        .then(|| ast.parent(current))
+                        .flatten()
+                        .into_iter()
+                        .flat_map(|parent| ast.children(parent)),
+                )
+                .filter(|&row| row != current)
+                .filter_map(rank_of)
+                .min_by_key(|(_, rank, width)| (*rank, *width))
+                .map(|(row, _, _)| row);
+            return Some(hidden.unwrap_or(current));
         }
     }
 }
@@ -760,7 +770,7 @@ pub(crate) fn add_digit_separators(context: &AssistContext<'_>) -> Option<Vec<(u
             }
         }
         if let Some((e_index, negative, digits)) = exponential {
-            out.push_str(&lexeme[e_index..e_index + 1]);
+            out.push_str(&lexeme[e_index..=e_index]);
             if negative {
                 out.push('-');
             }
@@ -1874,7 +1884,7 @@ pub(crate) fn convert_to_is_not(context: &AssistContext<'_>) -> Option<Vec<(u32,
     let remove_parens = bang
         .checked_sub(1)
         .and_then(|index| context.tokens.get(index))
-        .map_or(false, |token| paren_removable(token.kind));
+        .is_some_and(|token| paren_removable(token.kind));
     if remove_parens {
         Some(sort_edits(vec![
             (bang16, paren_span.start + 1 - bang16, String::new()),
@@ -2561,7 +2571,7 @@ pub(crate) fn reindent_branch(context: &AssistContext<'_>, branch: u32) -> Optio
 }
 
 /// The shared `join` rewrite body (upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/join_if_with_*.dart):
+/// `pkg/analysis_server/lib/src/services/correction/dart/join_if_with`_*.dart):
 /// the merged condition (each side paren-wrapped when it binds looser
 /// than `&&`, an outer case clause spliced as `case … when …`), the
 /// branch statements re-indented one level, and the outer `if` replaced
@@ -2722,7 +2732,7 @@ pub(crate) fn else_if_chain(context: &AssistContext<'_>, inner: u32) -> Option<V
 }
 
 /// The join-else rewrite body (upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/join_else_with_if.dart):
+/// `pkg/analysis_server/lib/src/services/correction/dart/join_else_with_if.dart)`:
 /// the `else` keyword through the else block's end becomes the
 /// ` else if (…) { … }` chain; the moved blocks re-indent one level.
 /// Comment-bearing regions drop (the official producer's comment faces
@@ -2958,23 +2968,20 @@ pub(crate) fn remove_type_annotation(
         context.ast,
         node,
         NodeKind::FormalParameter,
-    ) {
-        if context.ast.kind(parameter) != NodeKind::FunctionTypedFormalParameter {
-            let mut children = logical_children(context, parameter).into_iter();
-            if let Some(first) = children.next()
-                && context.ast.kind(first) == NodeKind::Type
-                && let Some(next) = children.next()
-                && let Some(type_span) =
-                    node_span16(context.tokens, context.text, context.ast, first)
-                && let Some(next_span) =
-                    node_span16(context.tokens, context.text, context.ast, next)
-            {
-                return Some(vec![(
-                    type_span.start,
-                    next_span.start - type_span.start,
-                    String::new(),
-                )]);
-            }
+    ) && context.ast.kind(parameter) != NodeKind::FunctionTypedFormalParameter
+    {
+        let mut children = logical_children(context, parameter).into_iter();
+        if let Some(first) = children.next()
+            && context.ast.kind(first) == NodeKind::Type
+            && let Some(next) = children.next()
+            && let Some(type_span) = node_span16(context.tokens, context.text, context.ast, first)
+            && let Some(next_span) = node_span16(context.tokens, context.text, context.ast, next)
+        {
+            return Some(vec![(
+                type_span.start,
+                next_span.start - type_span.start,
+                String::new(),
+            )]);
         }
     }
     // The declaration-list face.
@@ -3140,7 +3147,7 @@ pub(crate) fn convert_to_generic_function_syntax(
         scope = ast.parent(owner);
     }
     let typed_list = |list: u32| -> Option<String> {
-        all_parameters_typed(context, list).then(|| ())?;
+        all_parameters_typed(context, list).then_some(())?;
         let span = node_span16(tokens, text, ast, list)?;
         Some(slice16(text, &span)?.to_owned())
     };
@@ -3977,11 +3984,11 @@ pub(crate) fn convert_body_to_expression(
     let expression_text = slice16(context.text, &expression_span)?;
     let mut replacement = String::new();
     if let Some((keyword, _)) = body_async_keyword(context, &body_span) {
-        replacement.push_str(&slice16(context.text, &keyword)?.to_owned());
+        replacement.push_str(slice16(context.text, &keyword)?);
         replacement.push(' ');
     }
     replacement.push_str("=> ");
-    replacement.push_str(&expression_text);
+    replacement.push_str(expression_text);
     // The semicolon: kept except on a closure's body (the official
     // `parent is FunctionExpression && parent.parent is not
     // FunctionDeclaration` shape).
@@ -4277,8 +4284,7 @@ pub(crate) fn final_field_to_getter(
     // ahead of it).
     let name = direct_children(context.ast, fields)
         .into_iter()
-        .filter(|&child| context.ast.kind(child) == NodeKind::Identifier)
-        .last()?;
+        .rfind(|&child| context.ast.kind(child) == NodeKind::Identifier)?;
     let name_span = node_span16(context.tokens, context.text, context.ast, name)?;
     if name_span.start == name_span.end {
         return None;
@@ -4345,7 +4351,7 @@ pub(crate) fn final_field_to_getter(
         replacement.push(' ');
     }
     replacement.push_str("get ");
-    replacement.push_str(&name_text);
+    replacement.push_str(name_text);
     replacement.push_str(" => ");
     replacement.push_str(&initializer_text);
     replacement.push(';');
@@ -4514,8 +4520,7 @@ pub(crate) fn split_variable_declaration(
     let declaration_start = context
         .tokens
         .get(keyword_index)
-        .map(|token| token.utf16_offset)
-        .unwrap_or(name_span.start);
+        .map_or(name_span.start, |token| token.utf16_offset);
     if context.selection.start < declaration_start || context.selection.start > name_span.end {
         return None;
     }
@@ -4591,7 +4596,7 @@ pub(crate) fn gap_has_tokens(context: &AssistContext<'_>, start16: u32, end16: u
     let mut lo = 0usize;
     let mut hi = table.len();
     while lo < hi {
-        let mid = (lo + hi) / 2;
+        let mid = usize::midpoint(lo, hi);
         let end =
             token_end16(context.tokens, context.text, mid).expect("token index stays in bounds");
         if end <= start16 {
@@ -4608,7 +4613,7 @@ pub(crate) fn gap_has_tokens(context: &AssistContext<'_>, start16: u32, end16: u
 }
 
 /// The nodes the selection fully covers, in source order (the official
-/// StatementAnalyzer outcome: the outermost covered nodes, each covering
+/// `StatementAnalyzer` outcome: the outermost covered nodes, each covering
 /// its whole subtree). The arena rows below the statement level lie flat
 /// in the root's window (no child windows), so the walk enumerates the
 /// rows and reduces them to the maximal covered spans — inner rows drop,
@@ -4985,8 +4990,8 @@ pub(crate) fn single_param_name(tokens: &TokenTable, open: usize, close: usize) 
 /// becomes `for (var e in xs) { … }`, and `xs.forEach((e) => e);` becomes a
 /// block loop carrying the statement's own indent — the official
 /// `ConvertForEachToForLoop` (upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_for_each_to_for_loop.dart) as one whole-statement replacement.
+/// `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_for_each_to_for_loop.dart`) as one whole-statement replacement.
 /// The official faces: a block body keeps its text in place with the `);`
 /// tail deleted; an expression body rewraps into a block; every `return`
 /// statement of the body but none of a nested function literal becomes
@@ -5219,8 +5224,8 @@ pub(crate) fn for_in_from_for_each(input: &FixInput<'_>) -> Option<(u32, u32, St
 /// (k) => k.id, value: (k) => k.name)` becomes
 /// `{ for (var k in xs) k.id : k.name }` — the official
 /// `ConvertMapFromIterableToForLiteral`'s same-parameter leg (upstream Dart
-/// SDK source, pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_map_from_iterable_to_for_literal.dart), the one face whose
+/// SDK source, `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_map_from_iterable_to_for_literal.dart`), the one face whose
 /// composition needs no reference inventory: the different-name legs
 /// re-spell the closure bodies through a parameter-reference finder and
 /// are absent, as is the block-body face beyond its single-`return` shape.
@@ -5347,8 +5352,8 @@ pub(crate) fn named_closure_body(
 
 /// `sort_child_properties_last`: the reported `child:`/`children:` argument
 /// moves behind the last argument — the official `SortChildPropertyLast`
-/// (upstream Dart SDK source, pkg/analysis_server/lib/src/services/
-/// correction/dart/sort_child_property_last.dart) as one contiguous-region
+/// (upstream Dart SDK source, `pkg/analysis_server/lib/src/services`/
+/// `correction/dart/sort_child_property_last.dart`) as one contiguous-region
 /// replacement: the args after the child keep their text, the child's text
 /// (its trailing comma included when the list carries one) appends at the
 /// producer's insertion point, and a comment sitting on the child's line
@@ -5489,8 +5494,8 @@ pub(crate) fn child_property_last(input: &FixInput<'_>) -> Option<(u32, u32, Str
 /// `unnecessary_underscores`: the reported multi-underscore name becomes
 /// `_` — the official `ConvertToWildcardVariable.automatically`'s
 /// parameter and local faces (upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/
-/// convert_to_wildcard_variable.dart). The parameter face carries the
+/// `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `convert_to_wildcard_variable.dart`). The parameter face carries the
 /// official owner gate: only a closure's or a `static` method's plain
 /// positional parameter converts — named parameters, receiver formals, and
 /// every other declaration owner refuse; the local-variable face needs no
@@ -5624,8 +5629,8 @@ pub(crate) fn signature_has_static(tokens: &TokenTable, name: usize) -> Option<b
 /// `use_key_in_widget_constructors`: the reported constructor gains the
 /// `{super.key}` parameter — the official `AddKeyToConstructors`'s
 /// constructor face, super-parameter leg (upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/dart/
-/// add_key_to_constructors.dart): inside an empty list, after the list's
+/// `pkg/analysis_server/lib/src/services/correction/dart`/
+/// `add_key_to_constructors.dart)`: inside an empty list, after the list's
 /// open, into an existing named group's head, or after the last parameter
 /// with the delimiters added. The class face (the constructor synthesis
 /// with its const-ability analysis) and the explicit-super-initializer

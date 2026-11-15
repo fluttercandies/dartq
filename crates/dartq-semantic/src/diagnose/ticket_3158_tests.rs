@@ -13,6 +13,7 @@
 //! reports the read face's own miss (`undefined_getter`), on the
 //! instance face and the static-container face alike.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

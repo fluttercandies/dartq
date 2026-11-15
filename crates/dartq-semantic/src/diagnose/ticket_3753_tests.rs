@@ -15,6 +15,7 @@
 //! (the `if (.one is C)` family) and on a reduced `(C c) => c == .one`
 //! probe for the retained equality face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::FileReport;
 

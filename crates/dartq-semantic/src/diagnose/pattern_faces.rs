@@ -65,6 +65,7 @@
 //!   arm resolves the `)` through the scanner's group table
 //!   (`TokenTable::matching_end`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_scanner::{Token as ScannedToken, TokenKind};
 
@@ -92,7 +93,7 @@ pub(super) fn object_pattern_field_faces(
 /// The record pattern's close: the field-name faces plus the per-field
 /// column judging (`analyzeRecordPattern` pushes each field's own slot
 /// type as its sub-pattern's `matchedValueType`, upstream Dart SDK source,
-/// pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart:
+/// pkg/_`fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart`:
 /// 1841-1855 — the record arm of `judge_object_field_rows`'s object face).
 /// `mustBeNamed: false` upstream, so a positional field is legal and only
 /// the name faces (`missing_named_pattern_field_name`,
@@ -145,8 +146,7 @@ fn judge_record_field_rows(listener: &mut DiagnoseListener<'_>) {
                     .named
                     .iter()
                     .find(|(slot, _)| slot == name)
-                    .map(|(_, ty)| *ty)
-                    .unwrap_or(Ty::Dynamic)
+                    .map_or(Ty::Dynamic, |(_, ty)| *ty)
             }
             (None, Ty::Record { shape, .. }) => {
                 let pool = listener.engine.boundary.pool();
@@ -251,7 +251,7 @@ fn shared_pattern_field_faces(
                 | TokenKind::OpenCurly
                 | TokenKind::StringInterpolationExpression => depth += 1,
                 TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                    depth -= 1
+                    depth -= 1;
                 }
                 TokenKind::Comma if depth == 0 => {
                     if start < i {
@@ -385,7 +385,7 @@ pub(super) fn rest_pattern_faces(
         for i in (0..dots_idx).rev() {
             match toks[i].kind {
                 TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                    depth += 1
+                    depth += 1;
                 }
                 TokenKind::OpenParen
                 | TokenKind::OpenSquare
@@ -422,7 +422,7 @@ pub(super) fn rest_pattern_faces(
                         | TokenKind::OpenCurly
                         | TokenKind::StringInterpolationExpression => inner += 1,
                         TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                            inner -= 1
+                            inner -= 1;
                         }
                         _ => {}
                     }
@@ -487,7 +487,7 @@ fn rest_element_span(
                 | TokenKind::OpenCurly
                 | TokenKind::StringInterpolationExpression => depth += 1,
                 TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                    depth -= 1
+                    depth -= 1;
                 }
                 _ => {}
             }
@@ -552,7 +552,7 @@ fn intern_slice(engine: &Engine<'_>, t: &ScannedToken) -> StringId {
 /// joined-variable consistency walk compares; `broken` marks a component
 /// that already joined under an inconsistency — upstream's `errorType`
 /// face, which structurally equals only itself.
-pub(super) struct OrBinder {
+pub(crate) struct OrBinder {
     pub(super) name: StringId,
     pub(super) span: SourceRange,
     /// The resolved declared type (alias-folded); `None` for an untyped
@@ -819,8 +819,7 @@ pub(super) fn pattern_type_argument_count(
                 (
                     SourceRange {
                         offset: toks[lt].utf16_offset,
-                        length: toks[gt].utf16_offset + toks[gt].byte_len as u32
-                            - toks[lt].utf16_offset,
+                        length: toks[gt].utf16_offset + toks[gt].byte_len - toks[lt].utf16_offset,
                     },
                     count,
                 )

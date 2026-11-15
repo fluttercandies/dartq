@@ -37,6 +37,7 @@
 //!   `bare_plain_assign_member_target` gate skips only Decl/Member/Opaque
 //!   targets).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops_bare, rows};
 use crate::diagnose::FileReport;
 use dartq_diagnostics::Diagnostic;
@@ -55,9 +56,9 @@ fn code_rows<'a>(report: &'a FileReport, code: &str) -> Vec<&'a Diagnostic> {
 /// `isBottom` face — the new write face only emits the diagnostic).
 #[test]
 fn plain_write_to_never_getter_reports_assignment_to_final() {
-    let source = r#"Never get unreachable => throw 0;
+    let source = r"Never get unreachable => throw 0;
 void main() { unreachable = 3; }
-"#;
+";
     let report = report_ops_bare(source);
     let hits = code_rows(&report, "assignment_to_final");
     assert_eq!(hits.len(), 1, "{:#?}", rows(&report));
@@ -83,9 +84,9 @@ void main() { unreachable = 3; }
 /// the under-report residual).
 #[test]
 fn write_to_top_level_final_var_reports_assignment_to_final() {
-    let source = r#"final int x = 1;
+    let source = r"final int x = 1;
 void main() { x = 3; }
-"#;
+";
     let report = report_ops_bare(source);
     let hits = code_rows(&report, "assignment_to_final");
     assert_eq!(hits.len(), 1, "{:#?}", rows(&report));
@@ -101,9 +102,9 @@ void main() { x = 3; }
 /// resolves the setter and reports nothing.
 #[test]
 fn write_to_top_level_var_stays_silent() {
-    let source = r#"var x = 1;
+    let source = r"var x = 1;
 void main() { x = 3; }
-"#;
+";
     let report = report_ops_bare(source);
     assert!(
         code_rows(&report, "assignment_to_final").is_empty(),
@@ -116,10 +117,10 @@ void main() { x = 3; }
 /// answers the write (the getter+setter pair), so no finality verdict.
 #[test]
 fn write_to_getter_setter_pair_stays_silent() {
-    let source = r#"Never get unreachable => throw 0;
+    let source = r"Never get unreachable => throw 0;
 set unreachable(Never v) {}
 void main() { unreachable = throw 0; }
-"#;
+";
     let report = report_ops_bare(source);
     assert!(
         code_rows(&report, "assignment_to_final").is_empty(),
@@ -134,9 +135,9 @@ void main() { unreachable = throw 0; }
 /// live (`unreachable += 3; print('after');` is fully live).
 #[test]
 fn compound_write_to_never_getter_reports_write_face_no_dead_row() {
-    let source = r#"Never get unreachable => throw 0;
+    let source = r"Never get unreachable => throw 0;
 void main() { unreachable += 3; print('after'); }
-"#;
+";
     let report = report_ops_bare(source);
     let hits = code_rows(&report, "assignment_to_final");
     assert_eq!(hits.len(), 1, "{:#?}", rows(&report));
@@ -153,8 +154,8 @@ void main() { unreachable += 3; print('after'); }
 /// top-level face.
 #[test]
 fn compound_write_to_never_local_opens_no_dead_row() {
-    let source = r#"void f(Never x) { x += 3; print('after'); }
-"#;
+    let source = r"void f(Never x) { x += 3; print('after'); }
+";
     let report = report_ops_bare(source);
     assert!(
         code_rows(&report, "dead_code").is_empty(),
@@ -168,9 +169,9 @@ fn compound_write_to_never_local_opens_no_dead_row() {
 /// oracle silent end to end.
 #[test]
 fn nested_compound_writes_to_never_getter_stay_live() {
-    let source = r#"Never get unreachable => throw 0;
+    let source = r"Never get unreachable => throw 0;
 void main() { unreachable += (unreachable += 1); print('after'); }
-"#;
+";
     let report = report_ops_bare(source);
     // Both LHS writes resolve the getter — two `assignment_to_final` rows.
     assert_eq!(
@@ -192,10 +193,10 @@ void main() { unreachable += (unreachable += 1); print('after'); }
 /// first dead node is the statement's own tail, `; print('after');`).
 #[test]
 fn compound_write_rhs_exit_keeps_the_kill() {
-    let source = r#"Never get unreachable => throw 0;
+    let source = r"Never get unreachable => throw 0;
 Never nf() => throw 0;
 void main() { unreachable += nf(); print('after'); }
-"#;
+";
     let report = report_ops_bare(source);
     assert_eq!(
         code_rows(&report, "assignment_to_final").len(),
@@ -212,9 +213,9 @@ void main() { unreachable += nf(); print('after'); }
 /// `; print('after');` dead-codes beside `receiver_of_type_never`.
 #[test]
 fn increment_of_never_getter_reports_write_face_and_dead_tail() {
-    let source = r#"Never get unreachable => throw 0;
+    let source = r"Never get unreachable => throw 0;
 void main() { unreachable++; print('after'); }
-"#;
+";
     let report = report_ops_bare(source);
     let hits = code_rows(&report, "assignment_to_final");
     assert_eq!(hits.len(), 1, "{:#?}", rows(&report));
@@ -229,9 +230,9 @@ void main() { unreachable++; print('after'); }
 /// pin's face verbatim.
 #[test]
 fn if_null_write_to_never_getter_reports_write_face_and_dead_rows() {
-    let source = r#"Never get unreachable => throw 0;
+    let source = r"Never get unreachable => throw 0;
 void main() { unreachable ??= 3; print('after'); }
-"#;
+";
     let report = report_ops_bare(source);
     assert_eq!(
         code_rows(&report, "assignment_to_final").len(),

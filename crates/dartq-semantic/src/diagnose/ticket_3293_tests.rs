@@ -21,6 +21,7 @@
 //! and an invoked non-const super constructor
 //! (`const_constructor_with_non_const_super`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops};
 use crate::diagnose::FileReport;
 

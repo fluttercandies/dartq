@@ -10,6 +10,7 @@
 //! stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 
@@ -51,7 +52,7 @@ fn ticket_3361_for_in_void_set_literal_group_element() {
 }
 
 /// The map's `void` VALUE slot discards the entry value (the oracle's
-/// `mapValueType` gate, literal_element_verifier.dart:166): the written
+/// `mapValueType` gate, `literal_element_verifier.dart:166)`: the written
 /// group is now a visible `Map<String, void>` row and the entry check
 /// still stays silent.
 #[test]

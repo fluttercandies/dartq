@@ -10,7 +10,7 @@
 //!   `return e;` reports `return_in_generative_constructor` at the
 //!   expression and skips the assignability matrix; a generator's
 //!   `return e;`/`=> e` early-returns (the parser's own
-//!   `generatorReturnsValue` row owns it, parser_impl.dart:6628/:6855);
+//!   `generatorReturnsValue` row owns it, `parser_impl.dart:6628/:6855`);
 //!   a bare `return;` routes to `_checkReturnWithoutValue`.
 //! * `_checkReturnWithoutValue`:292-308 — `return_without_value` at the
 //!   `return` keyword unless `T` (sync) or `futureValueType(T)` (async)
@@ -33,6 +33,7 @@
 //!   bridge (`U Function<U>(U, int)`) reports
 //!   (`relateTypeParameters`' count gate, type_system.dart:1585-1590).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::super::types::FileReport;
 use super::async_return_tests::{code_names, report};
 

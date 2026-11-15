@@ -25,6 +25,7 @@
 //! (the `T extends List<S>` chained-bound shape), and (e) explicit type
 //! arguments keep their spelling over any inference result.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

@@ -21,6 +21,7 @@
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs`
 //! is a live-lane file out of this ticket's write scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::FileReport;
 use crate::diagnose::test_rig::report_ops;
 

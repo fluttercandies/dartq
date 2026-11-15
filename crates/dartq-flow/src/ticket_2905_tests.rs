@@ -1,4 +1,4 @@
-//! The #2905 pins: the dead_code const-condition residual's four faces.
+//! The #2905 pins: the `dead_code` const-condition residual's four faces.
 //!
 //! P1 — literal non-nullability (`Expr::non_null_literal`): by-construction
 //! non-null values (literals, `this`, bool-producing operators) carry the
@@ -20,6 +20,7 @@
 //! gate the row — matching upstream's per-arm `flowEnd(rightOperand)`
 //! rows while inner polls fold into the enclosing dead window.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

@@ -18,6 +18,7 @@
 //! pins a suite whose closure observes the checkout's absolute location to
 //! that location.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, ScanConfig, TokenKind, TokenTable};
 use dartq_source::FileTable;
 use serde::{Deserialize, Serialize};
@@ -946,11 +947,11 @@ fn read_environment_access(
         // concatenate (`'N' 'AME'`); a literal followed by anything but
         // `]` is a computed key.
         Some(TokenKind::OpenSquare) => {
-            if let Some(name) = string_literal_run(source, tokens, at + 1) {
-                if kind(at + 1 + name.1) == Some(TokenKind::CloseSquare) {
-                    out.env_reads.push(name.0);
-                    return true;
-                }
+            if let Some(name) = string_literal_run(source, tokens, at + 1)
+                && kind(at + 1 + name.1) == Some(TokenKind::CloseSquare)
+            {
+                out.env_reads.push(name.0);
+                return true;
             }
             false
         }
@@ -1228,7 +1229,7 @@ void main() { const s = "import 'string.dart';"; }
 
     #[test]
     fn runtime_inputs() {
-        let facts = of(r#"
+        let facts = of(r"
 import 'dart:io';
 void main() {
   final cwd = Directory.current.path;
@@ -1238,7 +1239,7 @@ void main() {
   print('$cwd/bin');
   print('/etc/hosts');
 }
-"#);
+");
         assert!(facts.ambient);
         // `dart:io` is a URI, `hello world` prose; the interpolation tails
         // `/lib`, `/bin` still spell package paths.

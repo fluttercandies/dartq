@@ -30,6 +30,7 @@
 //! `UncheckedUseOfNullableValueTest/test_member_potentiallyNullable_
 //! called#0` (`dart analyze`, Dart 3.13).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::diagnose::FileReport;
 

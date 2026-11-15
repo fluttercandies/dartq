@@ -6,6 +6,7 @@
 //! shapes) — recovery cascades must surface once and only where the oracle
 //! reports.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, setup};
 
 fn parse(source: &'static str) -> Collector {

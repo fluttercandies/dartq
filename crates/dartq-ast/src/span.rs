@@ -13,6 +13,7 @@
 //! zero-width span pinned at the EOF token — under-report, never a panic
 //! (valid parses never read it; oracle face unchanged).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Token, TokenKind, TokenTable};
 use dartq_source::utf16_len_of;
 
@@ -44,13 +45,14 @@ fn assert_read_boundary(tokens: &TokenTable, ast: &SyntaxTable, id: u32) {
         (range.start as usize) < tokens.len(),
         "node {id} token range {range:?} starts past the token table"
     );
-    if ast.kind(id) != NodeKind::CompilationUnit && !range.is_empty() {
-        if let Some(last) = token_at(tokens, range.end - 1) {
-            debug_assert!(
-                last.kind != TokenKind::Eof,
-                "node {id} spans the Eof sentinel (only a CompilationUnit may)"
-            );
-        }
+    if ast.kind(id) != NodeKind::CompilationUnit
+        && !range.is_empty()
+        && let Some(last) = token_at(tokens, range.end - 1)
+    {
+        debug_assert!(
+            last.kind != TokenKind::Eof,
+            "node {id} spans the Eof sentinel (only a CompilationUnit may)"
+        );
     }
 }
 

@@ -24,6 +24,7 @@
 //! cycle shapes (bind mounts, FUSE loops) revisit a path already walked,
 //! which the set cuts.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -71,6 +72,11 @@ pub struct Universe {
 /// carry pub's relative spelling into the scan, where lexical
 /// normalization collapses `"."` to `""` and every child walk reads from
 /// nowhere.
+///
+/// # Panics
+///
+/// Panics if the resolved reference path has no parent directory (the
+/// walk assumes a file path with at least one ancestor).
 pub fn enclosing_universe(from: &Path) -> Result<Universe, PubError> {
     // #2593: the ladder walks the absolute spelling. A relative `from`
     // (the `dartq packages` default `.`) breaks twice — the workspace-ref
@@ -292,10 +298,10 @@ pub fn scan(root: &Path, options: &ScanOptions) -> ScanReport {
 
     // The root itself is classified like any directory (a pubspec at the
     // scan root is the common entry), but never pruned for carrying .git.
-    if root.join("pubspec.yaml").is_file() {
-        if let Ok(root_found) = classify(&root) {
-            register(&mut found, &mut registered, root_found);
-        }
+    if root.join("pubspec.yaml").is_file()
+        && let Ok(root_found) = classify(&root)
+    {
+        register(&mut found, &mut registered, root_found);
     }
 
     let mut level = child_dirs(&root, &root, options, &mut boundaries);
@@ -564,7 +570,7 @@ fn probe_pubspec(dir: &Path) -> Option<PathBuf> {
         let mut next = Vec::new();
         for current in &level {
             let mut entries: Vec<_> = fs::read_dir(current).ok()?.flatten().collect();
-            entries.sort_by_key(|entry| entry.file_name());
+            entries.sort_by_key(std::fs::DirEntry::file_name);
             for entry in entries {
                 let path = entry.path();
                 if path
@@ -616,7 +622,7 @@ fn stale_gitdir(git_file: &Path) -> Option<String> {
 fn relative_posix(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
     let mut out = String::new();
-    for component in rel.iter() {
+    for component in rel {
         let part = component.to_str()?;
         if !out.is_empty() {
             out.push('/');

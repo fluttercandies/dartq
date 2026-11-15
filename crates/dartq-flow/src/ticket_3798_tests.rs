@@ -1,5 +1,8 @@
-//! #3798 — dead_code / unnecessary_type_check face pins against the
+//! #3798 — `dead_code` / `unnecessary_type_check` face pins against the
 //! oracle (Dart SDK 3.13.7).
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
@@ -162,7 +165,7 @@ fn if_null_assign_null_literal_rhs_anchors_at_operand() {
 /// operand to the covering close — the entry-dead null path makes `2`
 /// the first dead node and `flowEnd(Block)` reports `2.offset ..
 /// block.lastStatement.end` (oracle `5:10|9` = `2;\n  g();`). The
-/// dead_null_aware row on `2` is a separate face.
+/// `dead_null_aware` row on `2` is a separate face.
 #[test]
 fn if_null_assign_int_rhs_dead_runs_to_close() {
     let source = "void g() {}\nvoid f() {\n  int nn = 0;\n  nn ??= 2;\n  g();\n}\n";

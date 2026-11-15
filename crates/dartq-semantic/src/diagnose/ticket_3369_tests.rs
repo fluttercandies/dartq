@@ -10,6 +10,7 @@
 //! (the oracle's `test_extensionOverride_argument_error#0` → `9:5|3`),
 //! never at the callee row's `f`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 

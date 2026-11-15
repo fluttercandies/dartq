@@ -51,6 +51,7 @@
 //! The part/part-of emitter wiring (`part_of_*`, `duplicate_part` rows into
 //! diagnostics) lives with the engine's pipeline.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 pub mod codes;
 pub mod conditional;
 pub mod cycles;

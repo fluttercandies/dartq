@@ -9,6 +9,7 @@
 //! read never takes the channel, and the top-level tear-off face stays
 //! green over the shared `tear_off_fn_ty` conversion.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

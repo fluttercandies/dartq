@@ -36,6 +36,7 @@
 //! * formal parameter duplicate (`void f(void g(), void g())` — l1
 //!   bake covers).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_pub::{LockFile, Pubspec, build_graph};
 use std::sync::atomic::{AtomicU32, Ordering};

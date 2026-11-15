@@ -18,6 +18,7 @@
 //! Projection happens once, at the report assembly boundary; the engine's
 //! and index's internal forms are unchanged.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 
 use dartq_package::PackageTable;
@@ -119,16 +120,16 @@ fn covering<P: AsRef<Path>>(mut dirs: impl Iterator<Item = P>) -> Option<PathBuf
 /// cannot carry them raw either way.
 #[must_use]
 pub(crate) fn pkg_label(table: &PackageTable, path: &Path) -> String {
-    if let Some(identity) = table.containing(path) {
-        if let Ok(rel) = path.strip_prefix(&identity.lib_dir) {
-            let rel = rel
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            if !rel.is_empty() {
-                return format!("package:{}/{rel}", identity.name.as_str());
-            }
+    if let Some(identity) = table.containing(path)
+        && let Ok(rel) = path.strip_prefix(&identity.lib_dir)
+    {
+        let rel = rel
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if !rel.is_empty() {
+            return format!("package:{}/{rel}", identity.name.as_str());
         }
     }
     path.to_string_lossy().into_owned()

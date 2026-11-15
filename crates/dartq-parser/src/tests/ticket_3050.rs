@@ -19,6 +19,7 @@
 //! and the valid `mixin M on A implements B {}` are silent; the junk
 //! cases below carry exactly the rows pinned here.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 
 fn rows_with(source: &'static str) -> Vec<(String, u32, u32)> {
@@ -52,11 +53,11 @@ fn clean_mixin_on_implements_is_silent() {
 
 /// `mixin M on implements B {}` (the recon core shape, oracle 1:23
 /// `unexpectedToken` on `B`): the built-in `implements` parses as the `on`
-/// constraint (ComplexType recovered face), leaving `B` as junk before the
+/// constraint (`ComplexType` recovered face), leaving `B` as junk before the
 /// body — the recovery's unexpected-token skip reports `B` and clears it so
 /// the body `{` is found. The collapse faces (`expected_body`,
 /// `missing_function_parameters`) must never appear. The type-reference
-/// face ON `implements` itself is the TypeReference context's business
+/// face ON `implements` itself is the `TypeReference` context's business
 /// (oracle `built_in_identifier_as_type`, recovery.rs lane) and is
 /// deliberately not pinned here.
 #[test]
@@ -82,7 +83,7 @@ fn on_clause_builtin_type_junk_clears_to_body() {
 /// `expectedBody` 1:12 + `missingIdentifier` on the `{` 1:18 — the reserved
 /// word is NOT a skipUnexpectedTokenOpt candidate, keywords are exempt): the
 /// reserved word survives the recovery loop for the body-side faces and the
-/// recovery adds no unexpected_token of its own.
+/// recovery adds no `unexpected_token` of its own.
 #[test]
 fn on_clause_reserved_word_survives_recovery() {
     let rows = rows_with("mixin N on class {}\n");

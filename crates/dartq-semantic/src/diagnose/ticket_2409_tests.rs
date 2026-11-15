@@ -11,6 +11,7 @@
 //! (Dart 3.13.1, fvm default) on the same sources — the `/tmp/probe2409`
 //! family (a/b/c/d/e/g/h/i/j/k/l/m/n/o).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

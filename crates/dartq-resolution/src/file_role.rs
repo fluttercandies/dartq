@@ -24,6 +24,7 @@
 //! earlier gates), which part-family row the include carries — or that the
 //! part joined the library silently.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_source::FileId;
 
 use crate::uri::{ResolvedTarget, SdkFileKind};
@@ -137,7 +138,7 @@ pub enum PartOfRow {
 #[must_use]
 pub fn part_of_row(
     included: FileRole<'_>,
-    includer: FileRole<'_>,
+    includer_role: FileRole<'_>,
     includer_file: FileId,
     library_name: Option<&str>,
     enhanced_parts: bool,
@@ -149,7 +150,7 @@ pub fn part_of_row(
         | FileRole::PartOfUriSdk
         | FileRole::PartOfUriUnknown => PartOfRow::UriMismatch,
         FileRole::PartOfName { name } => {
-            let attached = match includer {
+            let attached = match includer_role {
                 FileRole::Library {
                     name: Some(container_name),
                 } => container_name == name,

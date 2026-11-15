@@ -18,6 +18,7 @@
 //! clean miss (a name `Stream` genuinely lacks still reports), `Unknown`
 //! stays undecidable.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

@@ -32,6 +32,7 @@
 //! pins belong to that plumbing change; this module keeps the descriptor
 //! from drifting into a reused `duplicate_definition` name in the meantime.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::codes::SemanticCode;
 use dartq_diagnostics::{DiagnosticType, Severity};
 

@@ -2,7 +2,7 @@
 //!
 //! `unused_field`'s rule is a READ rule (`_isReadIdentifier` /
 //! `readMembers`, upstream Dart SDK source,
-//! pkg/analyzer/lib/src/error/unused_local_elements_verifier.dart): a write
+//! `pkg/analyzer/lib/src/error/unused_local_elements_verifier.dart)`: a write
 //! to a field never credits its implicit getter. The engine's read pool
 //! carries three write shapes the oracle never counts: a statement-position
 //! increment or compound whose target the expression statement discarded
@@ -23,6 +23,7 @@
 //! Registered here via `#[path]`; the module stays inside the `diagnose`
 //! subtree so `crate::diagnose::test_rig` resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{report_ops, rows};
 

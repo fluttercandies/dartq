@@ -26,6 +26,7 @@
 //! Those stay residual against the owning lanes; the pins here fix the
 //! predicate's contract so that change cannot silently regress it.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::FileReport;
 
@@ -48,13 +49,13 @@ fn reported(report: &FileReport, code: &str) -> bool {
 /// local and the following member call needs no assertion.
 #[test]
 fn ticket_3382_list_literal_head_promotes_the_target() {
-    let source = r#"
+    let source = r"
 void f() {
   List<int>? xs;
   xs = [1];
   xs.add(2);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         report.diagnostics.is_empty(),
@@ -68,7 +69,7 @@ void f() {
 /// hands the write — either way the argument row stays silent.
 #[test]
 fn ticket_3382_set_and_map_literal_heads_promote_the_target() {
-    let source = r#"
+    let source = r"
 void takeSet(Set<int> s) {}
 void takeMap(Map<int, int> m) {}
 void f() {
@@ -79,7 +80,7 @@ void f() {
   m = {1: 2};
   takeMap(m);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         report.diagnostics.is_empty(),
@@ -92,13 +93,13 @@ void f() {
 /// bracket, so the probe's third arm is what sees it.
 #[test]
 fn ticket_3382_type_argument_head_promotes_the_target() {
-    let source = r#"
+    let source = r"
 void f() {
   List<int>? xs;
   xs = <int>[1];
   xs.add(2);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         report.diagnostics.is_empty(),
@@ -111,13 +112,13 @@ void f() {
 /// probe steps over the keyword and still sees the bracket.
 #[test]
 fn ticket_3382_const_head_promotes_the_target() {
-    let source = r#"
+    let source = r"
 void f() {
   List<int>? xs;
   xs = const [1];
   xs.add(2);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         report.diagnostics.is_empty(),
@@ -131,13 +132,13 @@ void f() {
 /// the first *token*, never the next non-whitespace byte.
 #[test]
 fn ticket_3382_comment_before_the_head_still_promotes() {
-    let source = r#"
+    let source = r"
 void f() {
   List<int>? xs;
   xs = /* note */ [1];
   xs.add(2);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         report.diagnostics.is_empty(),
@@ -151,13 +152,13 @@ void f() {
 /// call is the row the predicate must never suppress.
 #[test]
 fn ticket_3382_nullable_operand_does_not_promote() {
-    let source = r#"
+    let source = r"
 void f(List<int>? other) {
   List<int>? xs;
   xs = other;
   xs.add(2);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         reported(&report, "unchecked_use_of_nullable_value"),

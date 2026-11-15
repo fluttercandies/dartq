@@ -21,23 +21,24 @@
 //! Pins, oracle 3.13.7:
 //!   - `C.gone()` over `class C<T>` reports `undefined_method` naming `C`
 //!     (`C<T>` before the fix; the same row as the census's
-//!     MethodInvocationResolutionTest test_error_undefinedMethod_hasTarget_class_typeParameter
-//!     and type_variable/conflict2_test pairs).
+//!     `MethodInvocationResolutionTest` `test_error_undefinedMethod_hasTarget_class_typeParameter`
+//!     and `type_variable/conflict2_test` pairs).
 //!   - `A.gone()` over `typedef A = List<int>` names `List` — the aliased
 //!     interface element, not the alias and not `List<int>`
-//!     (UndefinedMethodTest test_typeAlias_interfaceType).
+//!     (`UndefinedMethodTest` `test_typeAlias_interfaceType`).
 //!   - `C<int> c; c.gone()` (the instance face) names `C` — both faces
 //!     agree.
 //!   - `C.goneStatic` KEEPS `C<T>`: the read face's `thisType` text is the
 //!     positive direction pinned beside the invoke fix.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 
 /// `C.gone()` over `class C<T>` names the bare element `C`.
 #[test]
 fn static_invoke_miss_names_bare_generic_element() {
     let report = report_ops(
-        r#"
+        r"
 class C<T> {
   static int s = 1;
 }
@@ -45,7 +46,7 @@ class C<T> {
 void f() {
   C.gone();
 }
-"#,
+",
     );
     assert_eq!(
         code_names(&report),
@@ -65,13 +66,13 @@ void f() {
 #[test]
 fn static_invoke_miss_over_interface_alias_names_aliased_element() {
     let report = report_ops(
-        r#"
+        r"
 typedef A = List<int>;
 
 void f() {
   A.gone();
 }
-"#,
+",
     );
     assert_eq!(
         code_names(&report),
@@ -91,14 +92,14 @@ void f() {
 #[test]
 fn instance_invoke_miss_names_bare_generic_element() {
     let report = report_ops(
-        r#"
+        r"
 class C<T> {}
 
 void f() {
   C<int> c = C<int>();
   c.gone();
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(names.contains(&"undefined_method"), "{:#?}", rows(&report));
@@ -119,7 +120,7 @@ void f() {
 #[test]
 fn static_getter_miss_keeps_parameterised_this_type() {
     let report = report_ops(
-        r#"
+        r"
 class C<T> {
   static int s = 1;
 }
@@ -127,7 +128,7 @@ class C<T> {
 void f() {
   C.goneStatic;
 }
-"#,
+",
     );
     assert_eq!(
         code_names(&report),

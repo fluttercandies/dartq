@@ -17,6 +17,7 @@
 //! row renders its written spelling; the oracle spells the resolved
 //! instantiation).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{report_ops, rows};
 use crate::diagnose::types::FileReport;
 

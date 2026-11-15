@@ -22,6 +22,7 @@
 //! in `main.dart`) panicked `dartq` pre-fix at `model.rs:773` and reports
 //! zero rows on `dart analyze` 3.13.1.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

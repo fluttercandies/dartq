@@ -6,6 +6,7 @@
 //! codec bumps [`crate::SNAPSHOT_FORMAT_VERSION`], so an old generation
 //! is a whole-generation miss before any entry decodes).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 

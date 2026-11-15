@@ -20,6 +20,7 @@
 //!   still complete a const constructor invocation; any other follower
 //!   reports `invalidConstantPatternConstPrefix` once.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::setup;
 
 /// Sorted diagnostic-code multiset of one whole-unit parse of `pattern`

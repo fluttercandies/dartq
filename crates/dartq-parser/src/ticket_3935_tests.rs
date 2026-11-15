@@ -2,7 +2,7 @@
 //! with type parameters and a parameter list, but neither a return type nor a
 //! name (`Function(<S>())`, `f(<T>())`, `Function(<>($`).
 //!
-//! Upstream (`parseFormalParameter`, parser_impl.dart):
+//! Upstream (`parseFormalParameter`, `parser_impl.dart)`:
 //! * `:2208-2211` consumes a tentative name when the follower is an identifier;
 //! * `:2214-2239` is the UNNAMED arm — `next.isA(LT)` computes the group at
 //!   the token BEFORE the `<`, and a closer followed by `(` makes the whole
@@ -21,6 +21,7 @@
 //! ordinary name/type lane and cascaded. Every row below is measured against
 //! `dart analyze --format=machine` on the same fixture (oracle SDK 3.13.7).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::parser::Parser;
 use crate::tests::collector::{Collector, latest_features, scan_ok};
 
@@ -88,5 +89,8 @@ fn unnamed_type_param_formal_with_empty_group_cascades_like_the_oracle() {
 fn named_inline_function_typed_formal_is_unchanged() {
     // Control: the NAME-LED shape keeps its own path — `void f(g(int x)) {}`
     // reports nothing (oracle: zero rows).
-    assert!(rows("void f(g(int x)) {}\n").is_empty());
+    assert_eq!(
+        rows("void f(g(int x)) {}\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
 }

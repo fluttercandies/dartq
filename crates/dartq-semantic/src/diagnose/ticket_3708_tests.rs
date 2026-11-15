@@ -13,6 +13,7 @@
 //!
 //! Oracle-verbatim message: `The final variable 'af' can only be set once.`
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 use crate::diagnose::FileReport;
 

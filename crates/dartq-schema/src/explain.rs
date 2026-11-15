@@ -42,6 +42,7 @@
 //! economics over this face's own path-valued rows — not query/impact's
 //! `label|name` entity-reference table.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

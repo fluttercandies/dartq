@@ -26,6 +26,7 @@
 //! `record_type_annotation_resolver.dart` / `record_literal_resolver.dart`,
 //! `diagnostic.g.dart` `invalid_field_name*` uniqueName rows.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_wildcards, rows};
 
@@ -34,11 +35,10 @@ use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_wildcards, rows};
 /// [`CORE_PRELUDE`], so every fixture-local offset shifts by the
 /// prelude's length.
 fn at(fixture: &str, needle: &str, n: usize) -> u32 {
-    let hit = fixture
-        .match_indices(needle)
-        .nth(n)
-        .map(|(i, _)| i)
-        .unwrap_or_else(|| panic!("{needle:?} occurrence {n} not in fixture:\n{fixture}"));
+    let hit = fixture.match_indices(needle).nth(n).map_or_else(
+        || panic!("{needle:?} occurrence {n} not in fixture:\n{fixture}"),
+        |(i, _)| i,
+    );
     u32::try_from(CORE_PRELUDE.len() + hit).expect("fixture offsets fit u32")
 }
 

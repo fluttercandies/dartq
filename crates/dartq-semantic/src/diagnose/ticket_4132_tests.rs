@@ -15,6 +15,7 @@
 //!   parameter: the argument solver does not re-report what the creation
 //!   seam already reported.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 
@@ -61,13 +62,13 @@ fn f_bound_message(parameter: &str, head: &str) -> String {
 /// the class's `Y`. Oracle 4:3, both rows length 1.
 #[test]
 fn alias_twin_names_the_class_parameter() {
-    let src = r#"
+    let src = r"
 class C<Y extends C<Y>> {}
 typedef A<X extends C<X>> = C<X>;
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at_last(src, "A();");
     let infer = f_bound_message("X", "C");
@@ -92,7 +93,7 @@ main() {
 /// whole `A.foo` (length 5), and no twin. Oracle 7:3.
 #[test]
 fn alias_named_creation_reports_over_the_alias_parameter() {
-    let src = r#"
+    let src = r"
 class C<X> {
   C();
   factory C.foo() => C();
@@ -101,7 +102,7 @@ typedef A<X extends C<X>> = C<X>;
 void f() {
   A.foo();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at_last(src, "A.foo();");
     let infer = f_bound_message("X", "C");
@@ -119,12 +120,12 @@ void f() {
 /// Oracle 3:3.
 #[test]
 fn declared_named_constructor_reports_once() {
-    let src = r#"
+    let src = r"
 class B<X extends B<X>> { B(); B.named(); }
 main() {
   B.named();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at_last(src, "B.named();");
     let infer = f_bound_message("X", "B");

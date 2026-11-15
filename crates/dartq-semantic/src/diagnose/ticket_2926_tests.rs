@@ -41,6 +41,7 @@
 //! co19 `Instantiate-to-bound` `class_typedef_l1` family — `dart
 //! analyze`, Dart 3.13.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::FileReport;
 
@@ -77,7 +78,7 @@ fn at(source: &str, needle: &str) -> u32 {
 /// `this?.foo()` null-aware send stand down.
 #[test]
 fn bare_method_invocation_nullable_on_reports_method() {
-    let source = r#"
+    let source = r"
 class A {
   void foo() {}
 }
@@ -90,7 +91,7 @@ extension E on A? {
     bar();
   }
 }
-"#;
+";
     let report = report_ops(source);
     let rows = unchecked_rows(&report);
     assert_eq!(
@@ -111,11 +112,11 @@ extension E on A? {
 
 /// The bare read `foo` (a `set foo`/`get foo` pair on `A`) reports the
 /// property variant — the resolver's `propertyErrorEntity` is the
-/// SimpleIdentifier itself, not an invocation-shaped parent. Census
+/// `SimpleIdentifier` itself, not an invocation-shaped parent. Census
 /// `test_propertyAccess_getter_nullable#0` (oracle row Property).
 #[test]
 fn bare_getter_read_nullable_on_reports_property() {
-    let source = r#"
+    let source = r"
 class A {
   int get foo => 0;
 }
@@ -125,7 +126,7 @@ extension E on A? {
     foo;
   }
 }
-"#;
+";
     let report = report_ops(source);
     let rows = unchecked_rows(&report);
     assert_eq!(
@@ -153,7 +154,7 @@ extension E on A? {
 /// 11:10 Property). `bar = 0` — E's own setter — stays silent.
 #[test]
 fn bare_setter_write_nullable_on_reports_method() {
-    let source = r#"
+    let source = r"
 class A {
   set foo(int _) {}
 }
@@ -167,7 +168,7 @@ extension E on A? {
     bar = 0;
   }
 }
-"#;
+";
     let report = report_ops(source);
     let rows = unchecked_rows(&report);
     assert_eq!(
@@ -194,7 +195,7 @@ extension E on A? {
 #[test]
 fn bare_setter_write_reports_no_undefined_identifier() {
     let nullable = report_ops(
-        r#"
+        r"
 class A {
   set foo(int _) {}
 }
@@ -204,7 +205,7 @@ extension E on A? {
     foo = 0;
   }
 }
-"#,
+",
     );
     assert!(
         rows_named(&nullable, "undefined_identifier").is_empty(),
@@ -213,7 +214,7 @@ extension E on A? {
     );
 
     let non_nullable = report_ops(
-        r#"
+        r"
 class A {
   set foo(int _) {}
 }
@@ -223,7 +224,7 @@ extension E on A {
     foo = 0;
   }
 }
-"#,
+",
     );
     assert!(
         non_nullable.diagnostics.is_empty(),
@@ -233,13 +234,13 @@ extension E on A {
 }
 
 /// The own-setter twin: `bar = 0` where `set bar` lives on `E` itself
-/// resolves lexically (the ExtensionMemberScope wins over `this`), so
+/// resolves lexically (the `ExtensionMemberScope` wins over `this`), so
 /// the nullable `on` never fires unchecked for it — and the lexical
 /// resolution suppresses `undefined_identifier` outright.
 #[test]
 fn own_extension_setter_stays_silent_under_nullable_on() {
     let report = report_ops(
-        r#"
+        r"
 class A {}
 
 extension E on A? {
@@ -249,7 +250,7 @@ extension E on A? {
     bar = 0;
   }
 }
-"#,
+",
     );
     assert!(
         report.diagnostics.is_empty(),
@@ -268,13 +269,13 @@ extension E on A? {
 /// (oracle row at 4:9 Property).
 #[test]
 fn parenthesized_unbound_param_receiver_reports_unchecked() {
-    let source = r#"
+    let source = r"
 class C<T> {
   void f(T t) {
     (t).foo;
   }
 }
-"#;
+";
     let report = report_ops(source);
     let rows = unchecked_rows(&report);
     assert_eq!(
@@ -312,13 +313,13 @@ class C<T> {
 /// pre-#3685 expansion-spelled message.
 #[test]
 fn bare_alias_head_instantiates_through_fold() {
-    let source = r#"
+    let source = r"
 class A<X extends num> {}
 typedef H = A;
 void f(H h) {
   A<int> x = h;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_named(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "one invalid_assignment row: {rows:?}");

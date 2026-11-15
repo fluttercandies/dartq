@@ -6,6 +6,7 @@
 //! `sig_changed` (the digest pair stays internal), and the verdict keys on
 //! the digest comparison.
 
+#![allow(clippy::disallowed_names, clippy::semicolon_if_nothing_returned)]
 use dartq_ai::impact::{
     self as query, FileSnapshot, IMPACT_SCHEMA_VERSION, ImpactLevel, LibraryChange,
 };
@@ -165,8 +166,14 @@ fn no_change_answers_the_empty_report() {
         |_| Vec::new(),
     );
     assert_eq!(report.schema_version, IMPACT_SCHEMA_VERSION);
-    assert!(report.changed.is_empty());
-    assert!(report.affected.is_empty());
-    assert!(report.affected_tests.is_empty());
-    assert!(report.affected_environments.is_empty());
+    assert_eq!(report.changed, [] as [dartq_ai::impact::ChangedSymbol; 0]);
+    assert_eq!(report.affected, [] as [dartq_ai::impact::AffectedTarget; 0]);
+    assert_eq!(
+        report.affected_tests,
+        [] as [dartq_ai::impact::AffectedTest; 0]
+    );
+    assert_eq!(
+        report.affected_environments,
+        [] as [dartq_ai::impact::EnvironmentImpact; 0]
+    );
 }

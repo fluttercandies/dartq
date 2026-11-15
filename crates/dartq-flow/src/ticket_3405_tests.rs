@@ -9,13 +9,16 @@
 //! pkg/analyzer/lib/src/dart/element/type_system.dart:1754-1768); the
 //! official pattern face reaches the *same* gate
 //! (`promoteForPattern` → `tryPromoteForTypeCheck`,
-//! pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:7748),
+//! pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:7748`),
 //! so the same arm chains on the pattern face too.
 //!
 //! The harness is [`crate::ticket_3397_tests`]' — the same edge-closure
 //! back-end, because the strict gate (`to <: from && !(from <: to)`)
 //! refuses the intersection step for every proper `S` and the declared
 //! bound is element data only the Boundary table carries.
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
@@ -109,10 +112,10 @@ impl TypeOps for HierarchyOps {
 }
 
 /// [`crate::ticket_3397_tests::analyze`]: scan, parse, mount `ops`.
-fn analyze<'t>(
+fn analyze(
     source: &'static str,
     intern: &[&str],
-    ops: Option<&'t HierarchyOps>,
+    ops: Option<&HierarchyOps>,
 ) -> (Vec<u32>, Vec<FlowFact>) {
     let result = dartq_scanner::scan(
         source,
@@ -289,7 +292,7 @@ fn null_pattern_over_type_parameter_promotes_nothing() {
         "the else-arm read stays `T`: {reads:?}"
     );
     assert!(
-        reads.iter().all(|(s, ty)| *ty
+        reads.iter().all(|(_, ty)| *ty
             != Ty {
                 base: Base::Name(ids[3]),
                 nullable: false

@@ -11,7 +11,7 @@
 //! assigned to a variable of type 'C<int>'".
 //!
 //! # The contract (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver.dart)
+//! `pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver.dart`)
 //!
 //! The downward constraint `L<E> <: K` (the literal's own head against the
 //! context's `futureOrBase`) matches only when `K` is a top face or one of
@@ -24,6 +24,7 @@
 //! refuses the face (the message prints the type, so a guess would
 //! misprint it).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// Every `invalid_assignment` row of `source` as `(anchored text,

@@ -35,6 +35,7 @@
 //! Oracle provenance: `dart analyze --format=machine` 3.13.7, one probe
 //! per cluster over the fixtures below (verbatim), 2026-11-02.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// The `unused_local_variable` rows of `fixture`, as (offset, length).
@@ -65,8 +66,8 @@ fn name_in(fixture: &str, context: &str, name: &str) -> (u32, u32) {
 /// positional, optional named, `const`, unnamed, extension type. Before
 /// the fix each formal staged `unused_local_variable` (8 rows).
 ///
-/// Oracle 3.13.7 on this unit: no UNUSED_LOCAL_VARIABLE row (only
-/// REDIRECT_TO_INVALID_FUNCTION_TYPE on `A.h`'s target).
+/// Oracle 3.13.7 on this unit: no `UNUSED_LOCAL_VARIABLE` row (only
+/// `REDIRECT_TO_INVALID_FUNCTION_TYPE` on `A.h`'s target).
 #[test]
 fn redirecting_factory_formals_stay_silent() {
     let fixture = "class A {\n\
@@ -101,7 +102,7 @@ fn redirecting_factory_formals_stay_silent() {
 /// Cluster A control: a genuinely unused local beside a redirecting
 /// factory still reports, at its own name.
 ///
-/// Oracle 3.13.7: UNUSED_LOCAL_VARIABLE on `unused` only.
+/// Oracle 3.13.7: `UNUSED_LOCAL_VARIABLE` on `unused` only.
 #[test]
 fn local_beside_redirecting_factory_still_reports() {
     let fixture = "class A {\n\
@@ -124,7 +125,7 @@ fn local_beside_redirecting_factory_still_reports() {
 /// face — every binder below is read, so nothing reports. Before the fix
 /// `c1`, `d1`, `d2` and `c2` staged rows.
 ///
-/// Oracle 3.13.7: no UNUSED_LOCAL_VARIABLE row.
+/// Oracle 3.13.7: no `UNUSED_LOCAL_VARIABLE` row.
 #[test]
 fn declaration_pattern_heads_stay_silent() {
     let fixture = "class Square {\n\
@@ -152,7 +153,7 @@ fn declaration_pattern_heads_stay_silent() {
 /// Oracle 3.13.7 (corpus expected rows of the same shapes —
 /// co19 `Patterns/object_A03_t01` `var Rectangle(:int areaAsInt) = …`,
 /// `Patterns/type_inference_A07_t01` `var <B>[A v1, …] = …`):
-/// UNUSED_LOCAL_VARIABLE at each binder.
+/// `UNUSED_LOCAL_VARIABLE` at each binder.
 #[test]
 fn unread_declaration_pattern_heads_still_report() {
     let fixture = "class Square {\n\
@@ -177,7 +178,7 @@ fn unread_declaration_pattern_heads_still_report() {
 /// pattern assignment; its inner formal `value` is no local. Before the
 /// fix `value` staged a row.
 ///
-/// Oracle 3.13.7: FIELD_INITIALIZING_FORMAL_NOT_ASSIGNABLE only.
+/// Oracle 3.13.7: `FIELD_INITIALIZING_FORMAL_NOT_ASSIGNABLE` only.
 #[test]
 fn function_typed_formal_default_stays_silent() {
     let fixture = "class F {\n\
@@ -192,8 +193,8 @@ fn function_typed_formal_default_stays_silent() {
 /// binders still report, and a `final`/`var` head followed by a written
 /// type anchors on the declared name, never on the type token.
 ///
-/// Oracle 3.13.7: UNUSED_LOCAL_VARIABLE at `a` (in `(final int a)`), `b`
-/// and `c` — beside PATTERN_ASSIGNMENT_DECLARES_VARIABLE on each.
+/// Oracle 3.13.7: `UNUSED_LOCAL_VARIABLE` at `a` (in `(final int a)`), `b`
+/// and `c` — beside `PATTERN_ASSIGNMENT_DECLARES_VARIABLE` on each.
 #[test]
 fn typed_binder_after_final_anchors_at_its_name() {
     let fixture = "void sink(Object? o) {}\n\
@@ -218,7 +219,7 @@ fn typed_binder_after_final_anchors_at_its_name() {
 /// statement, switch expression, if-case) spares every branch's binder.
 /// Before the fix the left binders of `a`, `v6`, `v1` and `d` staged rows.
 ///
-/// Oracle 3.13.7: no UNUSED_LOCAL_VARIABLE row.
+/// Oracle 3.13.7: no `UNUSED_LOCAL_VARIABLE` row.
 #[test]
 fn guarded_or_chain_binders_stay_silent() {
     let fixture = "String guarded(Object? x) {\n\
@@ -249,8 +250,8 @@ fn guarded_or_chain_binders_stay_silent() {
 /// spelling spares it. Before the fix the duplicate `v` staged a second
 /// row.
 ///
-/// Oracle 3.13.7: UNUSED_LOCAL_VARIABLE at the first `v` only (plus
-/// DUPLICATE_VARIABLE_PATTERN at both duplicates).
+/// Oracle 3.13.7: `UNUSED_LOCAL_VARIABLE` at the first `v` only (plus
+/// `DUPLICATE_VARIABLE_PATTERN` at both duplicates).
 #[test]
 fn duplicate_binder_reports_only_the_first() {
     let fixture = "String duplicate(Object? x) {\n\
@@ -279,7 +280,7 @@ fn duplicate_binder_reports_only_the_first() {
 /// Cluster B control: a logical-or chain nobody reads reports every
 /// branch's binder.
 ///
-/// Oracle 3.13.7: UNUSED_LOCAL_VARIABLE at both `e` binders.
+/// Oracle 3.13.7: `UNUSED_LOCAL_VARIABLE` at both `e` binders.
 #[test]
 fn unread_or_chain_reports_every_binder() {
     let fixture = "String unread(Object? x) {\n\

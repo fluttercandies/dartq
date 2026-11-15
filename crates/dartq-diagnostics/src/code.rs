@@ -19,6 +19,7 @@
 //! registry; the lint face is #2676) and the dartq-own `dartq/` namespace —
 //! are hand-written below.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use rustc_hash::FxHashMap;
 
 use crate::model::DiagnosticType;
@@ -426,7 +427,7 @@ mod tests {
 
     /// Transition proof (#2677): the syntax tier is byte-equal to the
     /// checked-in `data/syntax-codes.tsv` (itself content-pinned by the
-    /// blake3 test in tests/syntax_codes_tsv.rs) on every shared column —
+    /// blake3 test in `tests/syntax_codes_tsv.rs`) on every shared column —
     /// generalizing build.rs to the full registry table must not move one
     /// byte of the syntax tier's generated output.
     #[test]

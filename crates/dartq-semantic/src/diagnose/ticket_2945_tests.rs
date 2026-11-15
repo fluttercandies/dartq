@@ -17,6 +17,7 @@
 //! keep marking the class — so a bare `Host()` still credits `Host` while
 //! no member-shaped index row is minted.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

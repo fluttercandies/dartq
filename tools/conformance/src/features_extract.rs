@@ -22,6 +22,7 @@
 //! its suite directory (see `LANGUAGE_FLAG_BY_DIR` / `CO19_FLAG_BY_DIR`);
 //! directories with no obvious flag land under `_core`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::case::Case;
 use crate::setup;
 use std::collections::BTreeSet;
@@ -289,7 +290,7 @@ fn extract_one(
     }
     let mut packages: Vec<String> = SUITE_PACKAGES_ALWAYS
         .iter()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
     for name in &imported {
         if SUITE_PACKAGES_ALWAYS.contains(&name.as_str()) {
@@ -338,7 +339,7 @@ fn trim_dart(rel: &str) -> &str {
     rel.strip_suffix(".dart").unwrap_or(rel)
 }
 
-/// Reads the language-version override and the SharedOptions experiments of
+/// Reads the language-version override and the `SharedOptions` experiments of
 /// a test file: `// @dart = X.Y` and `// SharedOptions=--enable-experiment=...`.
 pub fn header_options(content: &str) -> (Option<String>, Vec<String>) {
     let mut language = None;
@@ -349,20 +350,20 @@ pub fn header_options(content: &str) -> (Option<String>, Vec<String>) {
             continue;
         };
         let rest = rest.trim_start();
-        if language.is_none() {
-            if let Some(rest) = rest.strip_prefix("@dart") {
-                let rest = rest.trim_start();
-                if let Some(rest) = rest.strip_prefix('=') {
-                    let version = rest.trim();
-                    let valid = version.split_once('.').is_some_and(|(a, b)| {
-                        !a.is_empty()
-                            && a.bytes().all(|b| b.is_ascii_digit())
-                            && !b.is_empty()
-                            && b.bytes().all(|b| b.is_ascii_digit())
-                    });
-                    if valid {
-                        language = Some(version.to_string());
-                    }
+        if language.is_none()
+            && let Some(rest) = rest.strip_prefix("@dart")
+        {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let version = rest.trim();
+                let valid = version.split_once('.').is_some_and(|(a, b)| {
+                    !a.is_empty()
+                        && a.bytes().all(|b| b.is_ascii_digit())
+                        && !b.is_empty()
+                        && b.bytes().all(|b| b.is_ascii_digit())
+                });
+                if valid {
+                    language = Some(version.to_string());
                 }
             }
         }
@@ -430,7 +431,7 @@ pub fn split_multitest(contents: &str, source_path: &str) -> (Vec<(String, Strin
     let mut outcomes: Vec<(String, BTreeSet<String>)> = Vec::new();
     for line in &lines {
         let Some((key, rest)) = annotation(line) else {
-            for (_, v) in sections.iter_mut() {
+            for (_, v) in &mut sections {
                 v.push(line.to_string());
             }
             continue;
@@ -441,7 +442,7 @@ pub fn split_multitest(contents: &str, source_path: &str) -> (Vec<(String, Strin
         if rest != "continued" && !outcomes.iter().any(|(k, _)| k == &key) {
             outcomes.push((key.clone(), BTreeSet::new()));
         }
-        for (k, v) in sections.iter_mut() {
+        for (k, v) in &mut sections {
             if k == &key {
                 v.push(line.to_string());
                 if rest != "continued" {
@@ -525,10 +526,10 @@ fn line_import(line: &str) -> Option<&str> {
             continue;
         }
         let mut p = start + word.len();
-        if !bytes.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
+        if !bytes.get(p).is_some_and(u8::is_ascii_whitespace) {
             continue;
         }
-        while bytes.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
+        while bytes.get(p).is_some_and(u8::is_ascii_whitespace) {
             p += 1;
         }
         let quote = *bytes.get(p)?;
@@ -564,7 +565,7 @@ fn carry_imports(
     seen: &mut Vec<String>,
     out: &mut FeatureExtraction,
 ) {
-    let dir = rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
     for imp in relative_imports(content) {
         let resolved = normalize_join(dir, &imp);
         if resolved.starts_with("..") {
@@ -806,7 +807,7 @@ mod tests {
         std::fs::write(dir.join("feat/plain_test.dart"), "var ok = 1;\n").expect("writes");
         let out = extract_suite(&dir, "", "language", &is_language_test, &language_flag);
         let mut ids: Vec<&str> = out.cases.iter().map(|c| c.id.as_str()).collect();
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(
             ids,
             vec![

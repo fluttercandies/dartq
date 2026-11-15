@@ -12,6 +12,7 @@
 //! `contextMessages` and `documentation` exactly as the analyzer reports
 //! them on either path.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cmp::Ordering;
 use std::io::{self, Write};
 
@@ -131,10 +132,8 @@ impl Report {
             3
         } else if fatal_warnings && has("WARNING") {
             2
-        } else if fatal_infos && has("INFO") {
-            1
         } else {
-            0
+            u8::from(fatal_infos && has("INFO"))
         }
     }
 }

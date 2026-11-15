@@ -18,6 +18,7 @@
 //! `deprecated_member_use_from_same_package`,
 //! `remove_deprecations_in_breaking_versions`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField};
 use rustc_hash::FxHashMap;
 
@@ -843,8 +844,8 @@ fn modifier_keyword(c: &Check<'_>, ctor: u32, needle: &str) -> Option<u32> {
 /// The official `VariableDeclarationList` span in UTF-16: the declaration
 /// keyword head through the last variable's last token — the trailing `;`
 /// belongs to the statement/field wrapper, not the list node
-/// (`reportAtNode(list)` faces: prefer_const_declarations :62,
-/// specify_nonobvious_property_types :122/:127). The row's own token range
+/// (`reportAtNode(list)` faces: `prefer_const_declarations` :62,
+/// `specify_nonobvious_property_types` :122/:127). The row's own token range
 /// carries the `;` (both seal paths pass it in), so the last non-`;` token
 /// of the range answers the official end even when the initializer's
 /// trailing groups (`const []`, `C.m<int>`) tile as flat siblings that the

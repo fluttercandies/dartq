@@ -3,6 +3,7 @@
 //! (method, top-level function, constructor, factory, local function,
 //! closure), and runs the replay pipeline when the executable ends.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_parser::{
     AssertKind, BlockKind, DeclarationKind, ExperimentalFlag, FormalParameterKind,
     IdentifierContext, MemberKind, Message, ParserListener,
@@ -27,6 +28,7 @@ use crate::ty::NameTypeOps;
 /// `'t` borrows the token table and source so operator tokens classify and
 /// identifier names intern at record time (parser-inserted synthetic
 /// tokens classify conservatively and get unique synthetic names).
+#[allow(clippy::struct_excessive_bools, clippy::struct_field_names)]
 pub struct Flow<'t> {
     tokens: &'t TokenTable,
     source: &'t str,
@@ -247,7 +249,7 @@ pub struct Flow<'t> {
     /// begins at its earliest header token (`late`? modifier or annotation
     /// head), and the official's first-dead-node anchor for a dead
     /// declaration statement spans from there, not from the first
-    /// declared name (dead_code_verifier's node offset — the `Token` of
+    /// declared name (`dead_code_verifier`'s node offset — the `Token` of
     /// `Token token = ...;`, oracle-probed).
     type_head: Option<Token>,
     /// The tested type's head token of the is-check now parsing
@@ -342,11 +344,11 @@ pub struct Flow<'t> {
     /// The unit's sound-flow-analysis posture (official
     /// `TypeAnalyzerOptions.soundFlowAnalysisEnabled` —
     /// `featureSet.isEnabled(Feature.sound_flow_analysis)`,
-    /// type_analyzer_options.dart:20; `enabledIn: 3.9.0`, expired): the
+    /// `type_analyzer_options.dart:20`; `enabledIn: 3.9.0`, expired): the
     /// consumer sets it through [`Flow::set_sound_flow`] from the unit's
     /// settled feature set before the parse. A pre-3.9 unit (`// @dart =
     /// 3.8`) carries `false`, standing down every sound-only reasoning
-    /// step in the replay (flow_analysis.dart gates each site:
+    /// step in the replay (`flow_analysis.dart` gates each site:
     /// `_isTypeCheckGuaranteedToFailWithSoundNullSafety` :7611, the
     /// succeed twin :7645, `tryPromoteForTypeCheck`'s bottom-factor arm
     /// :3218, `isValidPromotionStep` :5989, `ifNullExpression_rightBegin`
@@ -545,7 +547,7 @@ impl<'t> Flow<'t> {
     }
 
     /// The else arm's own last-token end, for the conditional close
-    /// (`flowEnd(elseExpression)`, type_analyzer.dart:2616).
+    /// (`flowEnd(elseExpression)`, `type_analyzer.dart:2616`).
     ///
     /// The parser answers the *follower's* span for an expression whose
     /// last token is a bare leaf (a read or a member chain): the official
@@ -833,6 +835,7 @@ impl<'t> Flow<'t> {
     /// unqualified name stays its own id, and a recovery tail (a `.`
     /// followed by a synthetic or non-identifier token) keeps the last
     /// real identifier seen.
+    #[allow(clippy::while_let_loop)]
     fn qualified_name(&mut self, head: Token) -> u32 {
         let mut index = head.id as usize;
         loop {
@@ -846,7 +849,10 @@ impl<'t> Flow<'t> {
                 break;
             };
             if self.tokens.get(tail).map(|t| t.kind) != Some(dartq_scanner::TokenKind::Identifier)
-                || self.tokens.get(tail).is_none_or(|t| t.is_synthetic())
+                || self
+                    .tokens
+                    .get(tail)
+                    .is_none_or(dartq_scanner::Token::is_synthetic)
             {
                 break;
             }
@@ -887,21 +893,23 @@ impl<'t> Flow<'t> {
                 return false;
             };
             if self.tokens.get(tail).map(|t| t.kind) != Some(dartq_scanner::TokenKind::Identifier)
-                || self.tokens.get(tail).is_none_or(|t| t.is_synthetic())
+                || self
+                    .tokens
+                    .get(tail)
+                    .is_none_or(dartq_scanner::Token::is_synthetic)
             {
                 break;
             }
             index = tail;
         }
-        let mut next = match self.tokens.next(index) {
-            Some(next) => next,
-            None => return false,
+        let Some(mut next) = self.tokens.next(index) else {
+            return false;
         };
         if self.tokens.get(next).map(|t| t.kind) == Some(dartq_scanner::TokenKind::Question) {
-            next = match self.tokens.next(next) {
-                Some(after) => after,
-                None => return false,
+            let Some(after) = self.tokens.next(next) else {
+                return false;
             };
+            next = after;
         }
         self.tokens.get(next).map(|t| t.kind)
             == Some(dartq_scanner::TokenKind::Keyword(
@@ -1110,6 +1118,7 @@ impl<'t> Flow<'t> {
     /// Executables of this unit whose replay exhausted the step budget and
     /// bailed (see [`crate::interp::STEP_BUDGET_PER_EVENT`]) — the bounded
     /// marker the engine can count and surface. Zero on healthy units.
+    #[must_use]
     pub fn bailed_executables(&self) -> u32 {
         self.bail_count
     }
@@ -1117,6 +1126,7 @@ impl<'t> Flow<'t> {
     /// The worst fraction of step budget one executable of this unit
     /// consumed, in thousandths of the budget (1000 = exactly exhausted):
     /// the ratio face behind the budget constant's margin.
+    #[must_use]
     pub fn max_step_ratio_permille(&self) -> u64 {
         self.max_step_permille
     }
@@ -1132,6 +1142,7 @@ impl<'t> Flow<'t> {
     /// InvalidType-scrutinee posture). Shapes the flow lattice cannot
     /// spell never arrive (the stager drops them, the unknown-declared
     /// under-report stands).
+    #[allow(clippy::needless_pass_by_value)]
     pub fn stage_inferred_local(
         &mut self,
         decl_offset: u32,
@@ -1149,6 +1160,7 @@ impl<'t> Flow<'t> {
     /// `Ev::Assign` when its own RHS read is the unknown face; shapes the
     /// flow lattice cannot spell never arrive (the stager drops them, the
     /// unknown-written demotion stands).
+    #[allow(clippy::needless_pass_by_value)]
     pub fn stage_assignment_rhs(
         &mut self,
         target_offset: u32,
@@ -1167,6 +1179,7 @@ impl<'t> Flow<'t> {
     /// fold adopts it at `Ev::Send`/`Ev::SendNoArgs`; shapes the flow
     /// lattice cannot spell never arrive (the stager drops them, the
     /// unknown-result face stands).
+    #[allow(clippy::needless_pass_by_value)]
     pub fn stage_call_result(
         &mut self,
         callee_offset: u32,
@@ -1384,11 +1397,10 @@ impl<'t> Flow<'t> {
         }
         let initial_budget = events.len() as u64 * crate::interp::STEP_BUDGET_PER_EVENT;
         let used = initial_budget - interp.budget;
-        let permille = if initial_budget == 0 {
-            0
-        } else {
-            used * 1000 / initial_budget
-        };
+        let permille = used
+            .saturating_mul(1000)
+            .checked_div(initial_budget)
+            .unwrap_or(0);
         self.max_step_permille = self.max_step_permille.max(permille);
         // The async-gap context face: one linear replay over the same
         // buffer (the ids are interned lazily — already-present names keep
@@ -1618,18 +1630,18 @@ impl ParserListener for Flow<'_> {
         &mut self,
         _begin: Token,
         _abstract_kw: Option<Token>,
-        _sealed_kw: Option<Token>,
+        sealed_kw: Option<Token>,
         _base_kw: Option<Token>,
         _interface_kw: Option<Token>,
         _final_kw: Option<Token>,
         _augment_kw: Option<Token>,
         _mixin_kw: Option<Token>,
-        _name: Token,
+        name: Token,
     ) {
         // The `isSealed` element face (type_system.dart:858): the switch
         // scrutinee's always-exhaustive verdict reads it.
-        if _sealed_kw.is_some() {
-            let name = self.name(_name);
+        if sealed_kw.is_some() {
+            let name = self.name(name);
             self.closed.names.insert(name);
         }
         self.container_depth += 1;
@@ -1659,11 +1671,11 @@ impl ParserListener for Flow<'_> {
         _begin: Token,
         _augment_kw: Option<Token>,
         _enum_keyword: Token,
-        _name: Token,
+        name: Token,
     ) {
         // Enums are sealed by construction (upstream
         // `element is EnumElement` arm, type_system.dart:855-856).
-        let name = self.name(_name);
+        let name = self.name(name);
         self.closed.names.insert(name);
         self.container_depth += 1;
     }
@@ -2273,7 +2285,7 @@ impl ParserListener for Flow<'_> {
             && !self.tv_in_record
         {
             self.ext_type_rep_pending = None;
-            if let crate::ty::Base::Name(head) = base
+            if let crate::ty::Base::Name(_head) = base
                 && !self.rep_head_opens_function(name)
             {
                 self.closed
@@ -3072,10 +3084,10 @@ impl ParserListener for Flow<'_> {
             // name arrives inside its own open executable buffer, so the
             // container gate alone carries the "top-level" check.
             IdentifierContext::TopLevelFunctionDeclaration
-            | IdentifierContext::TypedefDeclaration => {
-                if self.container_depth == 0 {
-                    self.top_fn_name = Some(token);
-                }
+            | IdentifierContext::TypedefDeclaration
+                if self.container_depth == 0 =>
+            {
+                self.top_fn_name = Some(token);
             }
             _ => {}
         }
@@ -3109,9 +3121,9 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::Double { span: token });
     }
 
-    fn end_literal_string(&mut self, interpolation_count: usize, _end: Token) {
+    fn end_literal_string(&mut self, interpolation_count: usize, end: Token) {
         // A simple (non-interpolated) string literal is a single token —
-        // `_end` spans its whole extent, including the opening quote.
+        // `end` spans its whole extent, including the opening quote.
         // `Ev::EndLiteralString` carries no span of its own, so the
         // dead-code operand latch (`Interp::step`'s first-spanned-event
         // read) would leave a `??= 'lit'`/`??= 'lit'` operand unanchored
@@ -3120,7 +3132,7 @@ impl ParserListener for Flow<'_> {
         // delivers the literal's begin offset without shifting the value
         // stack or any begin/end pairing.
         if interpolation_count == 0 {
-            self.record(Ev::ParenBegin { span: _end });
+            self.record(Ev::ParenBegin { span: end });
         }
         self.record(Ev::EndLiteralString {
             interpolation_count,
@@ -3161,7 +3173,7 @@ impl ParserListener for Flow<'_> {
         let args_len = self
             .type_args
             .get(args as usize)
-            .map_or(0, |args| args.len());
+            .map_or(0, std::vec::Vec::len);
         let is_set = match args_len {
             1 => true,
             2 => false,
@@ -3807,7 +3819,7 @@ impl ParserListener for Flow<'_> {
         &mut self,
         first_identifier: Token,
         dot: Option<Token>,
-        _second_identifier: Option<Token>,
+        second_identifier: Option<Token>,
     ) {
         // The bare `Type(...)` head is the pattern's type; a `Type.field`
         // shorthand head names a member and constrains nothing here. The
@@ -3823,10 +3835,10 @@ impl ParserListener for Flow<'_> {
         // prefixed spelling — so the type segment still runs the head test;
         // only a missing segment (recovery) constrains nothing here.
         let head = if dot.is_some() {
-            match _second_identifier {
-                Some(second) => second,
-                None => return,
-            }
+            let Some(second) = second_identifier else {
+                return;
+            };
+            second
         } else {
             first_identifier
         };
@@ -3848,6 +3860,10 @@ impl ParserListener for Flow<'_> {
         });
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "pattern element count is bounded by source size, fits u32"
+    )]
     fn handle_map_pattern(&mut self, count: usize, _left: Token, _right: Token) {
         self.record(Ev::ShapePattern {
             shape: crate::ev::PatternShape::Map {
@@ -3907,6 +3923,10 @@ impl ParserListener for Flow<'_> {
 
 /// A token's own utf16 end, in the parser's `TokenSpan` convention
 /// (`utf16_offset` plus the token text's utf16 length).
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "ASCII byte length and utf16 length are bounded by token size, fit u32"
+)]
 fn token_end(source: &str, token: &dartq_scanner::Token) -> u32 {
     let bytes = &source[token.byte_range()];
     let length = if bytes.is_ascii() {
@@ -3918,6 +3938,7 @@ fn token_end(source: &str, token: &dartq_scanner::Token) -> u32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::assert_is_empty, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::ev::Ev;
@@ -4139,7 +4160,7 @@ mod tests {
 
     /// A chained bound `T extends S, S extends St` recurses through the
     /// boundary table to the enum — same silent outcome (oracle
-    /// nested_bound).
+    /// `nested_bound`).
     #[test]
     fn type_param_chained_bound_reaches_no_body_end() {
         let facts = run_facts(
@@ -4156,7 +4177,7 @@ mod tests {
     /// The conservative arm: an unbounded `T` carries the implicit
     /// `Object?` bound (subtype.dart:313), never always-exhaustive — a
     /// fully covered switch still leaves the end reachable (oracle
-    /// implicit_bound keeps the unmatched path live).
+    /// `implicit_bound` keeps the unmatched path live).
     #[test]
     fn unbounded_type_param_keeps_the_body_end_reachable() {
         let facts = run_facts("int f<T>(T v) {\n  switch (v) {\n    case 1: return 1;\n  }\n}\n");

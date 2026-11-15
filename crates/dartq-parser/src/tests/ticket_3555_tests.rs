@@ -7,15 +7,15 @@
 //!
 //! - `extension_declares_abstract_member` — the whole verifier check is
 //!   skipped under the feature (upstream Dart SDK source, pkg/analyzer/lib/
-//!   src/generated/error_verifier.dart
+//!   `src/generated/error_verifier.dart`
 //!   `_checkForExtensionDeclaresAbstractMember`: `if
 //!   (_featureSet.isEnabled(Feature.augmentations)) return;`); the parser
 //!   side carries the code.
 //! - `abstract_static_field` — `_endClassFields` reports only when
 //!   `staticToken != null && !enableAugmentations` (upstream Dart SDK
-//!   source, pkg/analyzer/lib/src/fasta/ast_builder.dart); the sibling
+//!   source, `pkg/analyzer/lib/src/fasta/ast_builder.dart`); the sibling
 //!   `abstractLateField` arm is ungated.
-//! - top-level `abstract` extraneous_modifier — the fields path of
+//! - top-level `abstract` `extraneous_modifier` — the fields path of
 //!   `parseTopLevelMemberImpl` reports only when
 //!   `!isAugmentationsFeatureEnabled` (upstream Dart SDK source,
 //!   pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart:4372-4374);
@@ -24,10 +24,11 @@
 //!   reach either arm.
 //! - `abstract_extension_field` — a parser pseudo-code the analyzer's
 //!   error converter drops unconditionally (upstream Dart SDK source,
-//!   pkg/analyzer/lib/src/fasta/error_converter.dart); dartq keeps it as
-//!   its own code (the gate_local_pins tripwire), so the drop is mirrored
+//!   `pkg/analyzer/lib/src/fasta/error_converter.dart`); dartq keeps it as
+//!   its own code (the `gate_local_pins` tripwire), so the drop is mirrored
 //!   as the same `!augmentations` gate.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 use dartq_language::{Feature, FeatureSet};
 
@@ -144,7 +145,7 @@ fn abstract_late_field_is_not_gated() {
 
 // —— top-level abstract extraneous_modifier ————————————————————————————
 
-/// `abstract int x;` at top level (the fields path): extraneous_modifier
+/// `abstract int x;` at top level (the fields path): `extraneous_modifier`
 /// with the feature off, silent with it on (upstream
 /// `parseTopLevelMemberImpl` :4372).
 #[test]
@@ -179,7 +180,7 @@ fn top_level_abstract_method_extraneous_ungated() {
 
 /// The early-return recoveries never reach the dispatch arms upstream:
 /// `abstract var (a, b) = (1, 2);` routes straight to `parseFields` from
-/// the pattern check, so no extraneous_modifier fires on either flag
+/// the pattern check, so no `extraneous_modifier` fires on either flag
 /// (the pattern row itself is out of scope here).
 #[test]
 fn top_level_abstract_pattern_recovery_stays_silent() {
@@ -196,7 +197,7 @@ fn top_level_abstract_pattern_recovery_stays_silent() {
 // —— abstract_extension_field ——————————————————————————————————————————
 
 /// `extension E { abstract int x; }`: dartq's own pseudo-code fires with
-/// the feature off (the gate_local_pins tripwire) and drops under the
+/// the feature off (the `gate_local_pins` tripwire) and drops under the
 /// feature, mirroring the converter's drop on enabled corpora.
 #[test]
 fn abstract_extension_field_gated() {

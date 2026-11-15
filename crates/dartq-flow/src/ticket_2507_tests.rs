@@ -23,6 +23,9 @@
 //! * The `nonNulls`-stripped element stays non-null — the corpus posture
 //!   that keeps 136:39/153:39 silent.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -104,8 +107,10 @@ fn read_ty_at(
     (
         rows.into_iter()
             .find(|(offset, _)| *offset == at)
-            .map(|(_, ty)| ty)
-            .unwrap_or_else(|| panic!("no ReadType row at {needle:?} in {source:?}")),
+            .map_or_else(
+                || panic!("no ReadType row at {needle:?} in {source:?}"),
+                |(_, ty)| ty,
+            ),
         ids,
     )
 }

@@ -50,6 +50,7 @@
 //! produce them; a row it cannot express still arrives as the unknown
 //! space and suppresses (under-reports) instead of mis-answering.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
@@ -100,6 +101,7 @@ impl Key {
     /// The `&& Object(name: …)` tail spelling (key.dart `Key.name`):
     /// `[i]` for a head, `[h:-t]` for a rest, `[-i]` for a tail, `[v]`
     /// for a map entry, `$i`/name/`name` for the record/member keys.
+    #[must_use]
     pub fn name_text(&self) -> String {
         match self {
             Key::Head(index) => format!("[{index}]"),
@@ -139,6 +141,10 @@ impl Ord for Key {
                 Key::RecordName(_) | Key::Name(_) => 5,
             }
         }
+        #[expect(
+            clippy::match_same_arms,
+            reason = "different key kinds compare identically by design"
+        )]
         match (self, other) {
             (Key::Head(a), Key::Head(b)) => a.cmp(b),
             (Key::Rest { head: ah, tail: at }, Key::Rest { head: bh, tail: bt }) => {

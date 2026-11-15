@@ -261,13 +261,12 @@ fn record_source_text<'a>(c: &'a Check<'a>, type_row: u32) -> Option<&'a str> {
     let kids = c.collect_direct(parent);
     let idx = kids.iter().position(|&k| k == type_row)?;
     let mut end = c.byte_span(type_row).end;
-    if c.kind(parent) == NodeKind::FormalParameter {
-        if let Some(name) = c
+    if c.kind(parent) == NodeKind::FormalParameter
+        && let Some(name) = c
             .field(parent, PayloadField::Name)
             .filter(|&tok| tok != crate::rules::NONE_TOKEN)
-        {
-            end = crate::rules::byte_span_of_token(c, name).start;
-        }
+    {
+        end = crate::rules::byte_span_of_token(c, name).start;
     }
     for kid in &kids[idx + 1..] {
         end = end.min(c.byte_span(*kid).start);
@@ -666,8 +665,8 @@ fn ext_type_erasure<'a>(c: &'a Check<'a>, name: &'a str) -> &'a str {
             }
             let named = c
                 .field(kid, PayloadField::Name)
-                .filter(|&tok| tok != crate::rules::NONE_TOKEN && c.lexeme(tok) == name)
-                .is_some()
+                .as_ref()
+                .is_some_and(|&tok| tok != crate::rules::NONE_TOKEN && c.lexeme(tok) == name)
                 || c.collect_direct(kid).iter().any(|&k| {
                     c.kind(k) == NodeKind::Identifier && c.lexeme(c.head_token(k)) == name
                 });

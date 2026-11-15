@@ -2,7 +2,7 @@
 //! (#1701): `extension on T { ... }` bodies must resolve unqualified names
 //! exactly like the named twin — upstream treats the two alike on this
 //! face (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart:2138-
+//! `pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart:2138`-
 //! 2141, the lexical scope lookup then the implicit-this getter on the
 //! on-type; an unnamed declaration still yields an `ExtensionElementImpl`
 //! whose `thisType` is the on-type, type_analyzer.dart:1475-1478).
@@ -29,7 +29,7 @@
 //!   own-member arity divergence the named twin does not share is a
 //!   separate same-root-cause consumer (the invocation face's
 //!   `walk_members` + `member_formals_full` arm), outside the
-//!   resolve_bare route this pin set gates.
+//!   `resolve_bare` route this pin set gates.
 
 use std::path::Path;
 

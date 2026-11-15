@@ -13,6 +13,7 @@
 //! official `mayParseFunctionExpressions = false` rider while the
 //! initializer list parses.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, KeywordStyle, TokenKind};
 use dartq_source::SourceRange;
 
@@ -291,13 +292,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     }
 
     /// Top-level modifier walk (official head of `parseTopLevelMemberImpl`).
-    /// Every arm is gated on the official `isModifier` (modifier_context.dart):
+    /// Every arm is gated on the official `isModifier` (`modifier_context.dart)`:
     /// built-in modifier keywords only count when their follower continues a
     /// declaration, so `late;` leaves the keyword in the name slot and the
     /// declaration recovers as a field NAMED `late` (the official
-    /// `!next.isIdentifier` fall-through, parser_impl.dart:4356) instead of a
+    /// `!next.isIdentifier` fall-through, `parser_impl.dart:4356`) instead of a
     /// synthetic-named field — the observable difference is resolution of
-    /// later bare `late` reads (use_late_in_non_nnbd.dart 19:3).
+    /// later bare `late` reads (`use_late_in_non_nnbd.dart` 19:3).
     fn walk_top_level_member_modifiers(&mut self) -> MemberModifiers {
         let mut mods = MemberModifiers::default();
         let mut vfc_done = false;
@@ -1862,17 +1863,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if self.async_state != AsyncModifier::Sync {
             self.report(msg::factory_not_sync(), async_kw);
         }
-        let end;
-        if self.peek_kind() == TokenKind::Eq {
+
+        let end = if self.peek_kind() == TokenKind::Eq {
             if external.is_some() {
                 self.report(msg::external_factory_redirection(), self.peek_span());
             }
-            end = self.parse_redirecting_factory_body();
+            self.parse_redirecting_factory_body()
         } else if external.is_some() {
             if self.peek_kind() != TokenKind::Semicolon {
                 self.report(msg::external_factory_with_body(), self.peek_span());
             }
-            end = self.parse_function_body(false, true);
+            self.parse_function_body(false, true)
         } else {
             // Official `parseFactoryMethod`: a `const` modifier with a real
             // body (the `handleConstFactory` event; external and redirecting
@@ -1893,8 +1894,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             // fragment, and `factory_not_complete_after_augmentations`
             // otherwise. That chain is not visible per unit (augmentations
             // may live in another part file), so this lane must not emit.
-            end = self.parse_function_body(false, self.features.augmentations_enabled);
-        }
+            self.parse_function_body(false, self.features.augmentations_enabled)
+        };
         match kind {
             DeclarationKind::Mixin => self.report(msg::mixin_declares_constructor(), factory),
             DeclarationKind::Extension => {
@@ -2423,7 +2424,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.augment_sigs.push(base);
             let induces_setter = !matches!(
                 mods.var_final_or_const.map(|v| self.cursor.lexeme(v.id)),
-                Some("final") | Some("const")
+                Some("final" | "const")
             );
             if induces_setter {
                 self.augment_sigs.push(crate::parser::BodilessKey {
@@ -3095,6 +3096,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// `super (. name)?` to validate the shape — the `?.` recovery is
     /// sequential, the `=`/`(` checks re-running after the member name
     /// (:4934-4953) — then the expression re-read.
+    #[allow(clippy::redundant_else)]
     fn parse_super_initializer_expression(&mut self) -> TokenSpan {
         let head = self.peek_span();
         // Set by the dispatch arms whose parsed node `buildInitializer` cannot

@@ -8,6 +8,7 @@
 //! The analyze face's default backend is the official analyzer, delegated to
 //! through [`official`]; the engine pass here is the `--engine` backend.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 pub mod official;
 
 use rayon::prelude::*;
@@ -350,7 +351,7 @@ fn file_aim_ids(engine: &Engine, targets: &[Target]) -> Vec<FileId> {
         match target {
             Target::Dir(_) => return Vec::new(),
             Target::File(path) => {
-                if !path.extension().is_some_and(|ext| ext == "dart") {
+                if path.extension().is_none_or(|ext| ext != "dart") {
                     continue;
                 }
                 let Some(file) = engine.file_table().try_file_id(path) else {
@@ -631,7 +632,8 @@ pub struct MergedRun<'a> {
 /// Merges `runs` into one oracle-ordered output view — see [`MergedRun`].
 /// An empty input yields an empty set over an empty table (the writers
 /// render it as the oracle's clean face).
-pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
+#[must_use]
+pub fn merge_runs(runs: Vec<AnalyzeRun<'_>>) -> MergedRun<'_> {
     // The oracle display order (`oracle_cmp`'s keys): severity, path bytes,
     // offset, message — paths resolve through each diagnostic's own run
     // layout until the ids are remapped below.
@@ -1154,7 +1156,7 @@ fn plugin_conflict_rows(
 /// :1538-1545): every *initial* options file whose directory is not the
 /// context root and whose top-level `plugins:` is a map reports at the
 /// section's whole value node, the correction naming the context root — the
-/// oracle's context root, the workspace bound (context_builder.dart passes
+/// oracle's context root, the workspace bound (`context_builder.dart` passes
 /// `contextRoot.root` into every `optionsFileMap` entry's parse, so a
 /// nested file's directory — its own map key — is never the root).
 /// [`AnalysisOptions::has_plugins_map`] encodes both legs, the initial one
@@ -1166,7 +1168,7 @@ fn plugin_conflict_rows(
 /// The rows carry no YAML ignore-comment face: the pinned oracle runs
 /// `IgnoreInfo.forYaml` only in the pubspec validator
 /// (pubspec_validator.dart:80-83) — analysis-options diagnostics pass
-/// through analyzer_cli unfiltered (driver.dart:276-306).
+/// through `analyzer_cli` unfiltered (driver.dart:276-306).
 fn inner_plugins_rows(engine: &Engine) -> Vec<Diagnostic> {
     let context_root = engine.packages().workspace_root();
     let mut inner: Vec<&analysis_options::AnalysisOptions> = engine
@@ -1577,7 +1579,7 @@ fn report_memory(engine: &Engine) {
 /// registry dropped (`unnecessary_type_check`, the lint-tier mirror of the
 /// analyzer hint) reports `undefined_lint` like any unregistered name —
 /// the `analyzer.errors` face stays open to it through
-/// [`analysis_options::is_known_diagnostic_code`] (a real HintCode).
+/// [`analysis_options::is_known_diagnostic_code`] (a real `HintCode`).
 fn is_known_lint_name(name: &str) -> bool {
     crate::lint_names::is_known(name)
 }
@@ -1807,8 +1809,7 @@ mod tests {
         );
         assert!(
             diags.iter().all(|row| row.get("doc").is_none()),
-            "the doc URL is off on this face: {}",
-            document
+            "the doc URL is off on this face: {document}"
         );
     }
 
@@ -1849,7 +1850,7 @@ mod tests {
     /// are pinned by the CLI face's tests over this same builder.
     #[test]
     fn diags_document_row_vocabulary() {
-        let mut table = dartq_source::FileTable::new();
+        let table = dartq_source::FileTable::new();
         let mut files = TableLayout {
             table,
             root: Some(std::path::PathBuf::from("/w/pkg")),
@@ -2425,7 +2426,7 @@ mod tests {
     /// registry texts (diagnostic.g.dart `deprecatedLint`) once the
     /// package's constraint reaches the deprecation's since (3.11.0,
     /// parse_model.dart:1288-1296) — and the row keys on the name alone:
-    /// the rule is implemented in dartq-lints (the flipped rule_states
+    /// the rule is implemented in dartq-lints (the flipped `rule_states`
     /// pin), which must not drop the row (#1322 F1).
     #[test]
     fn run_overlaid_reports_deprecated_lint_rows() {
@@ -2642,11 +2643,15 @@ mod tests {
 
         // Disabled entries never join: no report, no take — the later
         // enabled occurrence is the first taker and stays silent.
-        assert!(
+        assert_eq!(
             rows_for(
                 "linter:\n  rules:\n    avoid_empty_else: false\n    avoid_empty_else: true\n",
-            )
-            .is_empty()
+            ),
+            [] as [(
+                std::string::String,
+                std::option::Option<std::string::String>,
+                u32
+            ); 0]
         );
 
         // A registered-but-unimplemented name takes and reports like any
@@ -2661,7 +2666,14 @@ mod tests {
             )],
             "the registry resolves the unimplemented name"
         );
-        assert!(rows_for("linter:\n  rules:\n    - not_a_lint\n    - not_a_lint\n").is_empty());
+        assert_eq!(
+            rows_for("linter:\n  rules:\n    - not_a_lint\n    - not_a_lint\n"),
+            [] as [(
+                std::string::String,
+                std::option::Option<std::string::String>,
+                u32
+            ); 0]
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2684,8 +2696,14 @@ mod tests {
         let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
         let mut engine = Engine::new(config).expect("engine");
         let mut set = PluginSet::with_dead_plugin("demo", "spawn refused");
-        let run =
-            run_targets(&mut engine, &[], &[root.clone()], &targets, Some(&mut set)).expect("run");
+        let run = run_targets(
+            &mut engine,
+            &[],
+            std::slice::from_ref(&root),
+            &targets,
+            Some(&mut set),
+        )
+        .expect("run");
         set.shutdown();
         let crashes: Vec<_> = run
             .diagnostics
@@ -2704,7 +2722,14 @@ mod tests {
         // the flag's skip seam, one `None` short of the whole weave.
         let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
         let mut engine = Engine::new(config).expect("engine");
-        let run = run_targets(&mut engine, &[], &[root.clone()], &targets, None).expect("run");
+        let run = run_targets(
+            &mut engine,
+            &[],
+            std::slice::from_ref(&root),
+            &targets,
+            None,
+        )
+        .expect("run");
         assert!(
             run.diagnostics
                 .iter()
@@ -2969,17 +2994,21 @@ mod tests {
         );
 
         // A disabled conflicting entry neither reports nor conflicts.
-        assert!(
+        assert_eq!(
             rows_for(
                 "linter:\n  rules:\n    - prefer_double_quotes\n    prefer_single_quotes: false\n",
-            )
-            .is_empty()
+            ),
+            [] as [(
+                std::string::String,
+                std::option::Option<std::string::String>,
+                u32
+            ); 0]
         );
         std::fs::remove_dir_all(&root).ok();
     }
 
     /// The `incompatible_lint_included` face end to end
-    /// (`reportIncompatibleIncluded`, linter_rule_options_validator.dart
+    /// (`reportIncompatibleIncluded`, `linter_rule_options_validator.dart`
     /// :105-186): incompatible rules enabled through *different* include
     /// entries of one file report once — at the later entry's include URI
     /// token, `{0}` the URI text, `{1}` the quoted join of the conflicting
@@ -3075,7 +3104,7 @@ mod tests {
             "linter:\n  rules:\n    - avoid_print\n",
         )
         .expect("b.yaml");
-        assert!(
+        assert_eq!(
             rows_for(concat!(
                 "include:\n",
                 "  - a.yaml\n",
@@ -3083,8 +3112,12 @@ mod tests {
                 "linter:\n",
                 "  rules:\n",
                 "    - avoid_print\n",
-            ))
-            .is_empty()
+            )),
+            [] as [(
+                std::string::String,
+                std::option::Option<std::string::String>,
+                u32
+            ); 0]
         );
 
         // A local disable suppresses the conflict every include contributes
@@ -3095,7 +3128,7 @@ mod tests {
             "linter:\n  rules:\n    - prefer_single_quotes\n",
         )
         .expect("b.yaml");
-        assert!(
+        assert_eq!(
             rows_for(concat!(
                 "include:\n",
                 "  - a.yaml\n",
@@ -3103,14 +3136,18 @@ mod tests {
                 "linter:\n",
                 "  rules:\n",
                 "    prefer_single_quotes: false\n",
-            ))
-            .is_empty()
+            )),
+            [] as [(
+                std::string::String,
+                std::option::Option<std::string::String>,
+                u32
+            ); 0]
         );
         std::fs::remove_dir_all(&root).ok();
     }
 
     /// The `incompatible_lint_files` face end to end
-    /// (`reportIncompatibleWithIncluded`, linter_rule_options_validator.dart
+    /// (`reportIncompatibleWithIncluded`, `linter_rule_options_validator.dart`
     /// :188-225): a *locally* enabled rule conflicting with the include
     /// chain's effective enabled set reports at the local declaration's name
     /// token — `{0}` the local spelling, `{1}` the quoted join of the
@@ -3204,14 +3241,18 @@ mod tests {
         );
 
         // A compatible local enable reports nothing.
-        assert!(
+        assert_eq!(
             rows_for(concat!(
                 "include: inc.yaml\n",
                 "linter:\n",
                 "  rules:\n",
                 "    - avoid_print\n",
-            ))
-            .is_empty()
+            )),
+            [] as [(
+                std::string::String,
+                std::option::Option<std::string::String>,
+                u32
+            ); 0]
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3219,7 +3260,7 @@ mod tests {
     /// The wrapped face: a conflict *inside* an included file reports
     /// through that file's reporter, which wraps the row into
     /// `included_file_warning` at the branch's first include directive in
-    /// the initial file (`_IncludedDiagnosticListener`, include_walker.dart
+    /// the initial file (`_IncludedDiagnosticListener`, `include_walker.dart`
     /// :210-248) — the message names the included file and the inner span's
     /// inclusive end; the inner correction never survives the wrap. The
     /// nested pair's own conflict — sibling includes of `mid.yaml` — lands
@@ -3506,7 +3547,7 @@ mod tests {
 
     /// The Unicode text face through the real pipeline: a bidi code point
     /// in a comment reports on the Dart file it lives in (`lib/test.dart`,
-    /// the row's own FileId), a clean sibling file stays silent, and the
+    /// the row's own `FileId`), a clean sibling file stays silent, and the
     /// row renders the oracle's message, severity, and span — the landed
     /// `options_verifier_pins` row now firing through the engine's
     /// per-file walk.
@@ -3610,7 +3651,7 @@ mod tests {
     /// The inner-options plugins row has no YAML ignore-comment face: the
     /// pinned oracle runs `IgnoreInfo.forYaml` only in the pubspec
     /// validator (pubspec_validator.dart:80-83) — analysis-options
-    /// diagnostics pass through analyzer_cli unfiltered (driver.dart
+    /// diagnostics pass through `analyzer_cli` unfiltered (driver.dart
     /// :276-306) — so a `# ignore_for_file:` citation naming the row's
     /// code keeps the row.
     #[test]
@@ -3726,7 +3767,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The context face end to end: every raw INCOMPATIBLE_LINT row the
+    /// The context face end to end: every raw `INCOMPATIBLE_LINT` row the
     /// initial file reports carries the conflicting rule's anchor as its
     /// `contextMessages`. The enabled pass's row anchors at the conflicting
     /// declaration's name token in the reporting file itself
@@ -4010,7 +4051,7 @@ mod tests {
         };
 
         // The cannot-ignore claim silences the removed-state face entirely.
-        assert!(
+        assert_eq!(
             offsets_for(concat!(
                 "analyzer:\n",
                 "  cannot-ignore:\n",
@@ -4018,8 +4059,8 @@ mod tests {
                 "linter:\n",
                 "  rules:\n",
                 "    - unnecessary_ignore\n",
-            ))
-            .is_empty()
+            )),
+            [] as [u32; 0]
         );
 
         // Without it the duplicate collapses to its first occurrence and the
@@ -4188,7 +4229,7 @@ mod tests {
                     engine,
                     &[],
                     std::slice::from_ref(root),
-                    &[Target::Dir(root.to_path_buf())],
+                    &[Target::Dir(root.clone())],
                     None,
                 )
                 .expect("run")

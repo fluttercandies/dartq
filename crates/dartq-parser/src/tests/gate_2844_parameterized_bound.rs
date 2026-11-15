@@ -15,6 +15,10 @@
 //! zero parser rows; the formal parameter list parses and the surrounding
 //! declarations register.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, setup};
 use crate::parser::Parser;
 

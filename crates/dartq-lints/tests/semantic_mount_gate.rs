@@ -35,7 +35,15 @@
 //! and every rule a scan proves reads one of the mounted faces must be
 //! one of the names it gates.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+#![allow(
+    clippy::too_many_lines,
+    clippy::needless_range_loop,
+    clippy::unnecessary_debug_formatting,
+    clippy::many_single_char_names,
+    clippy::semicolon_if_nothing_returned
+)]
+use rustc_hash::FxHashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use dartq_lints::{Group, SEMANTIC_RULES, rules};
@@ -82,8 +90,8 @@ struct SourceFile {
 struct Scan {
     files: Vec<SourceFile>,
     /// Fn name → every fn item carrying it.
-    by_name: HashMap<String, Vec<(usize, usize)>>,
-    /// reads_fold[file][fn] — the fixed-point result.
+    by_name: FxHashMap<String, Vec<(usize, usize)>>,
+    /// `reads_fold`[file][fn] — the fixed-point result.
     reads: Vec<Vec<bool>>,
     /// The call graph the fixed point ran over — kept so a failure can
     /// name the propagation path back to the direct `.semantics()` read.
@@ -458,16 +466,16 @@ fn parse_file(path: &Path, rel: &str) -> SourceFile {
                 let end = balanced(&text, j, b'(', b')');
                 let inner = &src[j + 1..end.saturating_sub(1).max(j + 1)];
                 // The first string literal is the registered name.
-                if let Some(start) = inner.find('"') {
-                    if let Some(stop) = inner[start + 1..].find('"') {
-                        let name = inner[start + 1..start + 1 + stop].to_owned();
-                        let module = innermost(&mod_ranges, &inner_mods, i);
-                        file.specs.push(SpecItem {
-                            module,
-                            name,
-                            check: "not_dispatched".to_owned(),
-                        });
-                    }
+                if let Some(start) = inner.find('"')
+                    && let Some(stop) = inner[start + 1..].find('"')
+                {
+                    let name = inner[start + 1..start + 1 + stop].to_owned();
+                    let module = innermost(&mod_ranges, &inner_mods, i);
+                    file.specs.push(SpecItem {
+                        module,
+                        name,
+                        check: "not_dispatched".to_owned(),
+                    });
                 }
                 i = end;
                 continue;
@@ -646,8 +654,8 @@ fn calls_in(text: &[u8], body: (usize, usize)) -> Vec<(Option<Vec<String>>, Stri
 /// Build the call graph and mark every fn whose body reaches a
 /// `.semantics()` read.
 fn analyze(files: Vec<SourceFile>, texts: &[Vec<u8>]) -> Scan {
-    let mut by_stem = HashMap::new();
-    let mut by_name: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut by_stem = FxHashMap::default();
+    let mut by_name: FxHashMap<String, Vec<(usize, usize)>> = FxHashMap::default();
     for (fi, file) in files.iter().enumerate() {
         by_stem.insert(file.stem.clone(), fi);
         for (ni, f) in file.fns.iter().enumerate() {
@@ -655,7 +663,7 @@ fn analyze(files: Vec<SourceFile>, texts: &[Vec<u8>]) -> Scan {
         }
     }
     // Inner-mod name → (file, module): a `mod_name::f(` qualifier.
-    let mut by_mod: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut by_mod: FxHashMap<String, Vec<(usize, usize)>> = FxHashMap::default();
     for (fi, file) in files.iter().enumerate() {
         for (mi, module) in file.modules.iter().enumerate() {
             let last = module.rsplit("::").next().unwrap_or(module);
@@ -1206,7 +1214,7 @@ fn every_driver_seam_gate_matches_the_registry_and_the_face_readers() {
                      dartq-commands/src/lints.rs."
                 ));
             }
-            if fold_fed && !SEMANTIC_RULES.iter().any(|&name| name == reader) {
+            if fold_fed && !SEMANTIC_RULES.contains(&reader) {
                 violations.push(format!(
                     "{reader:?} reads the fold-fed {face} face but is absent \
                      from SEMANTIC_RULES — the driver fills that face from \

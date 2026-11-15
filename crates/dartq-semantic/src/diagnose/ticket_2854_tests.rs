@@ -7,6 +7,7 @@
 //! oracle's always-true row, non-matching pairs stay informative, and
 //! the every-check suppress covers the unresolvable faces.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops;
 use crate::diagnose::types::FileReport;
 
@@ -22,7 +23,7 @@ fn type_check_rows(report: &FileReport) -> Vec<(u32, u32)> {
     found
 }
 
-/// —— the completed send's static type ——
+// —— the completed send's static type ——
 
 /// `(Class).toString() is String` (the `class/literal_test` census
 /// shape): the send's static type is the invoked `toString`'s declared
@@ -99,7 +100,7 @@ fn call_result_mismatch_stays_live() {
     );
 }
 
-/// —— the untyped collection literal's inferred type ——
+// —— the untyped collection literal's inferred type ——
 
 /// `[] is List` (the `is/instanceof_test` pin): the empty list's
 /// no-context type is `List<dynamic>`, and the bare-`List` target
@@ -225,7 +226,7 @@ fn empty_braces_not_set() {
     );
 }
 
-/// —— the closure literal's written-signature function type ——
+// —— the closure literal's written-signature function type ——
 
 /// `(x) {} is Function`: any closure's function type is a subtype of
 /// the bare `Function` interface.

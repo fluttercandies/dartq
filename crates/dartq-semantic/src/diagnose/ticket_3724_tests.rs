@@ -48,6 +48,7 @@
 //! and message — with the rig's `CORE_PRELUDE` line shift applied
 //! through [`at`].
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, assert_silent, report_ops};
 
@@ -153,7 +154,7 @@ fn non_nullable_alias_operand_stays_silent() {
     );
 }
 
-/// The null_promotion family over a bare nullable alias — the flow
+/// The `null_promotion` family over a bare nullable alias — the flow
 /// contract: `AAlias1 a` declares `A?`, the `!= null` check stages the
 /// promotion, the in-branch `a.foo()` stands down, and only the
 /// unpromoted trailing read reports. The conditional write keeps the
@@ -275,7 +276,7 @@ fn record_typedef_null_check_promotion_stays_silent() {
     assert_silent(&report);
 }
 
-/// The direct twin of the null_promotion pin — the SAME body over a
+/// The direct twin of the `null_promotion` pin — the SAME body over a
 /// DIRECT `A?` declaration (no alias). This one stands down today: the
 /// in-branch `a.foo()` is silent, the unpromoted trailing read reports.
 /// Oracle (3.13.7): exactly one row — `12|5|3` at the trailing `foo`

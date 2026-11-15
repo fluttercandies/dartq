@@ -17,6 +17,7 @@
 //! `The method 'gone' isn't defined for the type '_Private'.`, the generic
 //! head twin names `_G`, and both static hits stay silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, assert_silent, report_ops_imports, rows};
 
 /// The private-target library every pin imports: one plain class, one

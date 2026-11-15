@@ -4,7 +4,7 @@
 //! plus a scripted in-memory-pipe client that paces the server one turn at
 //! a time.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};

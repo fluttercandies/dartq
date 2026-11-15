@@ -3,6 +3,7 @@
 //! (`report_ops_imports`); every pin asserts the oracle verdict a corpus
 //! row pins, so a regression here is a face gap by construction.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, report_ops_imports};
 use super::*;
 

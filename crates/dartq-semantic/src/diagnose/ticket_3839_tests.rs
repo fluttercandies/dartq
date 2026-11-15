@@ -21,6 +21,7 @@
 //! spelling (`'Bar'`, `'String2'`, `'Exactly<int>'`), never the
 //! expansion the judgment used.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{report_ops, rows};
 
 /// The `type_argument_not_matching_bounds` message texts, source order.

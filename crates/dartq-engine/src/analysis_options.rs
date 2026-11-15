@@ -31,7 +31,7 @@
 //!   or a nested group map recursed exactly one level; unknown shapes
 //!   ignored. Every entry name lowercases at the section boundary
 //!   (`entry.key.toLowerCase()`, config.dart:86-90), so a mixed-case
-//!   spelling resolves the snake_case rule downstream. A `linter:` key that
+//!   spelling resolves the `snake_case` rule downstream. A `linter:` key that
 //!   is present but not a map marks the section invalid, which *clears* the
 //!   rules merged so far (`_applyLinterSection`, parser:278-289).
 //! - **Severity overrides** — `analyzer.errors` is a per-code action map
@@ -128,7 +128,7 @@
 //!   section's value node; the emitting caller is the CLI face's
 //!   loaded-options walk, which owns the initial/context-root knowledge.
 //! - [`text_direction_issues`] is the unicode-text verifier
-//!   (unicode_text_verifier.dart) over one Dart source: every bidi code
+//!   (`unicode_text_verifier.dart`) over one Dart source: every bidi code
 //!   point reports `text_direction_code_point_in_literal` inside a string
 //!   literal region, `text_direction_code_point_in_comment` anywhere else.
 //!   It rides the per-file Dart diagnostic pass (its mounting face).
@@ -139,6 +139,7 @@
 //! The whole face is pure functions over paths + YAML: testable without the
 //! CLI, and cold-path (workspace assembly), so clarity beats micro-cost.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -447,7 +448,7 @@ impl OptionsIssue {
     }
 
     /// The `duplicate_rule` row for one enabled declaration repeating a name
-    /// the pass has already taken (`_processEnabledRule`, parse_model.dart
+    /// the pass has already taken (`_processEnabledRule`, `parse_model.dart`
     /// :1397-1404 — first occurrence wins, every later enabled one reports;
     /// the message names the written spelling).
     #[must_use]
@@ -465,7 +466,7 @@ impl OptionsIssue {
     }
 
     /// The `incompatible_lint` row for one enabled declaration conflicting
-    /// with earlier enabled ones (`_processEnabledRule`, parse_model.dart
+    /// with earlier enabled ones (`_processEnabledRule`, `parse_model.dart`
     /// :1385-1395). `conflicting` carries the earlier rules' written
     /// spellings in the declared rule's `incompatibleRules` order; the
     /// official message nests the quoted join inside the template's own
@@ -490,7 +491,7 @@ impl OptionsIssue {
     /// `incompatible_lint` — the printed code, `lowerCaseName`, is identical
     /// for the whole family; only the message shape differs): a *local*
     /// enabled rule conflicts with the include chain's effective enabled set
-    /// (`reportIncompatibleWithIncluded`, linter_rule_options_validator.dart
+    /// (`reportIncompatibleWithIncluded`, `linter_rule_options_validator.dart`
     /// :188-225). `spelling` is the local rule's written name; `conflicting`
     /// the conflicting included rules' written spellings in the declared
     /// `incompatibleRules` order — the join is quoted inside the template's
@@ -591,7 +592,7 @@ impl OptionsIssue {
     }
 }
 
-/// One context row the INCOMPATIBLE_LINT family attaches to its diagnostic
+/// One context row the `INCOMPATIBLE_LINT` family attaches to its diagnostic
 /// (the census W3 face): the message plus the conflicting rule's location —
 /// `file: None` anchors at the reporting file itself (the local list's
 /// rules), `Some` at the included options file the rule was enabled in,
@@ -605,7 +606,7 @@ struct ContextRow {
 }
 
 /// An [`OptionsIssue`] plus its `contextMessages` payload — the
-/// INCOMPATIBLE_LINT family's context producers. The plain factories build
+/// `INCOMPATIBLE_LINT` family's context producers. The plain factories build
 /// the row alone; these constructors thread each conflicting rule's file
 /// and span alongside it so the row emits with its context messages
 /// attached, one per conflicting rule anchor.
@@ -721,6 +722,7 @@ impl ContextualIssue {
     /// The wrapped row, for callers that re-anchor an included file's row
     /// into `included_file_warning` (the wrap carries the message only —
     /// the context face is the unwrapped row's).
+    #[must_use]
     pub fn inner(&self) -> &OptionsIssue {
         &self.issue
     }
@@ -860,7 +862,7 @@ pub struct DeclarationGroup {
     pub cannot_ignore: Vec<DeclaredError>,
     /// This file's resolved include edges, in declaration order — the
     /// `incompatible_lint_included` walk's per-edge entries at this level
-    /// (`reportIncompatibleIncluded`, linter_rule_options_validator.dart
+    /// (`reportIncompatibleIncluded`, `linter_rule_options_validator.dart`
     /// :105-186; missing or cyclic edges never register one).
     pub includes: Vec<IncludeEdge>,
     /// The file's effective enabled/disabled rule state — its own
@@ -931,7 +933,7 @@ pub struct AnalysisOptions {
     /// set-if-present across the include chain (the official
     /// `AnalysisOptionsImpl.chromeOsManifestChecks` — a nearer file's map
     /// value replaces the farther's; the scalar form `optional-checks:
-    /// chrome-os-manifest-checks` enables the check whole, parse_model
+    /// chrome-os-manifest-checks` enables the check whole, `parse_model`
     /// :1399-1499). `None` (never declared) is the official `false`
     /// default — the manifest pass stays silent.
     pub chrome_os_manifest_checks: Option<bool>,
@@ -1150,7 +1152,7 @@ pub enum PluginSource {
 /// `PluginConfiguration` slice this engine consumes (name, source, the
 /// `diagnostics` map of configured severities keyed lowercased — the
 /// upstream `LinkedHashMap` is case-insensitive). `isEnabled` has no parse
-/// path upstream (`enabled` is unimplemented — parse_model:1612) and is not
+/// path upstream (`enabled` is unimplemented — `parse_model:1612`) and is not
 /// modeled.
 #[derive(Debug)]
 pub struct PluginConfig {
@@ -1263,11 +1265,12 @@ impl AnalysisOptions {
     }
 
     /// The top-level `plugins` section's whole value-node span — the
-    /// `plugins_in_inner_options` anchor (`plugins.span`, parse_model:1543;
+    /// `plugins_in_inner_options` anchor (`plugins.span`, `parse_model:1543`;
     /// [`OptionsIssue::plugins_in_inner_options`] renders the row, the CLI
     /// face's loaded-options walk decides the initial/context-root
     /// condition that fires it). `(0, 0)` when the section or its value
     /// cannot be located.
+    #[must_use]
     pub fn plugins_section_anchor(&self) -> (u32, u32) {
         let Some((text, _)) = &self.layout else {
             return (0, 0);
@@ -2070,7 +2073,7 @@ fn effective_rules(
 /// contribute nothing. Every entry name lowercases at this boundary
 /// (`entry.key.toLowerCase()`, config.dart:86-90 — the registry lookups
 /// downstream are case-insensitive, so a mixed-case spelling resolves the
-/// snake_case rule).
+/// `snake_case` rule).
 fn apply_rules(rules: &Value, merged: &mut FxHashMap<String, bool>) {
     /// One entry's boolean (`_parseRuleConfig`, config.dart:83-104): a YAML
     /// bool, or a severity string — `ConfiguredSeverity` has no `ignore`
@@ -3046,11 +3049,11 @@ fn validate_plugin_entry(
                 };
                 match key {
                     "diagnostics" => {
-                        validate_plugin_diagnostics(issues, text, &section, value_node)
+                        validate_plugin_diagnostics(issues, text, &section, value_node);
                     }
                     "git" => validate_plugin_git(issues, text, &section, value_node),
                     _ if !PLUGINS_OPTIONS.contains(&key) => {
-                        push_plugin_unsupported(issues, text, key, &section, &PLUGINS_OPTIONS)
+                        push_plugin_unsupported(issues, text, key, &section, &PLUGINS_OPTIONS);
                     }
                     _ => {}
                 }
@@ -3327,7 +3330,7 @@ fn parse_diagnostics_section(node: &Value) -> FxHashMap<String, ConfiguredSeveri
 }
 
 /// The plugins rows' anchor: upstream spans every row at the offending YAML
-/// node; serde_yaml keeps no spans, so the row anchors at `token`'s first
+/// node; `serde_yaml` keeps no spans, so the row anchors at `token`'s first
 /// occurrence inside the `plugins` section (the established
 /// [`anchor_in_section`] convention — the `(code, file)` face is exact).
 fn plugin_anchor(text: &str, token: &str) -> (u32, u32) {
@@ -3718,7 +3721,7 @@ fn push_bool_value(issues: &mut Vec<OptionsIssue>, text: &str, name: &str, value
 /// parse_model:1423-1433 passes `optionalChecksOptions
 /// .quotedAndCommaSeparatedWithOr`), so the rendered message carries the
 /// doubled quotes verbatim; the correction is the builder's AND-form
-/// proposal (_ErrorBuilder :133-144).
+/// proposal (_`ErrorBuilder` :133-144).
 fn push_optional_checks_key(issues: &mut Vec<OptionsIssue>, text: &str, key: &str) {
     let (offset, length) = anchor_in_section(text, "optional-checks", key);
     issues.push(OptionsIssue {
@@ -3775,7 +3778,7 @@ fn yaml_scalar_text(value: &Value) -> Option<String> {
 
 /// The `ruleValue.toString()` form of a container node — the
 /// `unsupported_value` row's `invalidValue` argument for a group-map or
-/// list rule value (`parseRule`'s fall-through arm, parse_model.dart
+/// list rule value (`parseRule`'s fall-through arm, `parse_model.dart`
 /// :1272-1284). Upstream's YamlMap/YamlList render through Dart's
 /// `Map`/`List` `toString` — `{k: v, k: v}` / `[a, b]` in insertion order,
 /// scalars bare (`a`, `42`, `true`, `null`), nested containers recursing.
@@ -4678,15 +4681,14 @@ impl<'a> PubspecYaml<'a> {
     /// Parses an inline value at byte `col` on line `i`: a flow collection
     /// (possibly across lines) or a one-line scalar.
     fn parse_inline(&self, i: usize, col: usize) -> (PubspecNode, usize) {
-        match self.bytes.get(col) {
-            Some(b'[') | Some(b'{') => self.parse_flow(col),
-            _ => {
-                let (_, _, content_end) = self.line_content(i).expect("content line");
-                (
-                    self.quoted_or_plain_scalar(col, self.scalar_end(col, content_end)),
-                    i + 1,
-                )
-            }
+        if let Some(b'[' | b'{') = self.bytes.get(col) {
+            self.parse_flow(col)
+        } else {
+            let (_, _, content_end) = self.line_content(i).expect("content line");
+            (
+                self.quoted_or_plain_scalar(col, self.scalar_end(col, content_end)),
+                i + 1,
+            )
         }
     }
 
@@ -4694,35 +4696,32 @@ impl<'a> PubspecYaml<'a> {
     /// closing quote, a plain token at the trailing-whitespace / ` #`
     /// comment trim of the line's content end.
     fn scalar_end(&self, start: usize, content_end: usize) -> usize {
-        match self.bytes.get(start) {
-            Some(q @ (b'\'' | b'"')) => {
-                let mut at = start + 1;
-                while at < content_end {
-                    if self.bytes[at] == *q && !(*q == b'"' && self.bytes[at - 1] == b'\\') {
-                        return at + 1;
-                    }
-                    at += 1;
+        if let Some(q @ (b'\'' | b'"')) = self.bytes.get(start) {
+            let mut at = start + 1;
+            while at < content_end {
+                if self.bytes[at] == *q && !(*q == b'"' && self.bytes[at - 1] == b'\\') {
+                    return at + 1;
                 }
-                content_end
+                at += 1;
             }
-            _ => {
-                let mut end = content_end;
-                let mut at = start;
-                while at < end {
-                    if self.bytes[at] == b'#'
-                        && at > start
-                        && matches!(self.bytes[at - 1], b' ' | b'\t')
-                    {
-                        end = at;
-                        break;
-                    }
-                    at += 1;
+            content_end
+        } else {
+            let mut end = content_end;
+            let mut at = start;
+            while at < end {
+                if self.bytes[at] == b'#'
+                    && at > start
+                    && matches!(self.bytes[at - 1], b' ' | b'\t')
+                {
+                    end = at;
+                    break;
                 }
-                while end > start && matches!(self.bytes[end - 1], b' ' | b'\t' | b'\r') {
-                    end -= 1;
-                }
-                end
+                at += 1;
             }
+            while end > start && matches!(self.bytes[end - 1], b' ' | b'\t' | b'\r') {
+                end -= 1;
+            }
+            end
         }
     }
 
@@ -4869,13 +4868,13 @@ impl<'a> PubspecYaml<'a> {
                     value_at += 1;
                 }
                 let value = match self.bytes.get(value_at) {
-                    Some(b'[') | Some(b'{') => self.parse_flow(value_at).0,
+                    Some(b'[' | b'{') => self.parse_flow(value_at).0,
                     _ => self.quoted_or_plain_scalar(value_at, self.scalar_end(value_at, tail)),
                 };
                 entries.push((key, value));
             } else {
                 items.push(match self.bytes.get(head) {
-                    Some(b'[') | Some(b'{') => self.parse_flow(head).0,
+                    Some(b'[' | b'{') => self.parse_flow(head).0,
                     _ => self.quoted_or_plain_scalar(head, self.scalar_end(head, tail)),
                 });
             }
@@ -5025,7 +5024,7 @@ fn is_yaml_number(text: &str) -> bool {
     }
     let digits = |bytes: &[u8]| bytes.iter().all(u8::is_ascii_digit) && !bytes.is_empty();
     let rest: &[u8] = match text.as_bytes().first() {
-        Some(b'+') | Some(b'-') => &text.as_bytes()[1..],
+        Some(b'+' | b'-') => &text.as_bytes()[1..],
         _ => text.as_bytes(),
     };
     if rest.len() >= 2 && rest[0] == b'0' && (rest[1] | 0x20) == b'x' {
@@ -5045,7 +5044,7 @@ fn is_yaml_number(text: &str) -> bool {
 fn dart_double(text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut at = 0;
-    if matches!(bytes.first(), Some(b'+') | Some(b'-')) {
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
         at = 1;
     }
     let int_start = at;
@@ -5067,7 +5066,7 @@ fn dart_double(text: &str) -> bool {
     }
     if at < bytes.len() && (bytes[at] | 0x20) == b'e' {
         at += 1;
-        if matches!(bytes.get(at), Some(b'+') | Some(b'-')) {
+        if matches!(bytes.get(at), Some(b'+' | b'-')) {
             at += 1;
         }
         let exp_start = at;
@@ -5081,7 +5080,7 @@ fn dart_double(text: &str) -> bool {
     at == bytes.len()
 }
 
-/// The field names the validators read (`PubspecField`, pubspec_validator.dart
+/// The field names the validators read (`PubspecField`, `pubspec_validator.dart`
 /// :90-132).
 const FLUTTER_FIELD: &str = "flutter";
 const ASSETS_FIELD: &str = "assets";
@@ -5098,7 +5097,7 @@ const PLATFORMS_FIELD: &str = "platforms";
 const WORKSPACE_FIELD: &str = "workspace";
 
 /// The fields `fieldValidator` reports (`_deprecatedFields`,
-/// field_validator.dart:9).
+/// `field_validator.dart:9`).
 const DEPRECATED_FIELDS: [&str; 4] = ["author", "authors", "transformers", "web"];
 
 /// The platforms `platformsValidator` accepts (`_knownPlatforms`,
@@ -5110,6 +5109,7 @@ const KNOWN_PLATFORMS: [&str; 6] = ["android", "ios", "linux", "macos", "web", "
 /// verbatim (early returns included). `text` is the file's content, `dir`
 /// the directory containing it (the `packageRoot` every relative path
 /// resolves against).
+#[must_use]
 pub fn pubspec_issues(text: &str, dir: &Path) -> Vec<OptionsIssue> {
     let yaml = PubspecYaml::new(text);
     let root = yaml.parse_document();
@@ -5210,18 +5210,17 @@ fn declared_dependencies<'a>(
     if node.is_null() {
         return Vec::new();
     }
-    match node.as_map() {
-        Some(entries) => entries.iter().map(|(key, value)| (key, value)).collect(),
-        None => {
-            issues.push(pubspec_row(
-                DEPENDENCIES_FIELD_NOT_MAP,
-                format!("The value of the '{field}' field is expected to be a map."),
-                Some("Try converting the value to be a map.".to_owned()),
-                yaml.text,
-                node.raw(),
-            ));
-            Vec::new()
-        }
+    if let Some(entries) = node.as_map() {
+        entries.iter().map(|(key, value)| (key, value)).collect()
+    } else {
+        issues.push(pubspec_row(
+            DEPENDENCIES_FIELD_NOT_MAP,
+            format!("The value of the '{field}' field is expected to be a map."),
+            Some("Try converting the value to be a map.".to_owned()),
+            yaml.text,
+            node.raw(),
+        ));
+        Vec::new()
     }
 }
 
@@ -5239,46 +5238,44 @@ fn validate_path_entries(
     if spec.as_map().is_none() {
         return;
     }
-    if let Some((key, value)) = spec.get_entry(PATH_FIELD) {
-        if let Some(path) = value.as_str() {
-            if path.contains('\\') {
-                issues.push(pubspec_row(
-                    PATH_NOT_POSIX,
-                    format!("The path '{path}' isn't a POSIX-style path."),
-                    Some("Try converting the value to a POSIX-style path.".to_owned()),
-                    yaml.text,
-                    value.raw(),
-                ));
-                return;
-            }
-            let resolved = resolve_dependency_path(dir, path);
-            let folder_exists = resolved.is_dir();
-            if !folder_exists {
-                issues.push(pubspec_row(
-                    PATH_DOES_NOT_EXIST,
-                    format!("The path '{path}' doesn't exist."),
-                    Some(
-                        "Try creating the referenced path or using a path that exists.".to_owned(),
-                    ),
-                    yaml.text,
-                    value.raw(),
-                ));
-            } else if !resolved.join("pubspec.yaml").is_file() {
-                issues.push(pubspec_row(
-                    PATH_PUBSPEC_DOES_NOT_EXIST,
-                    format!("The directory '{path}' doesn't contain a pubspec."),
-                    Some(
-                        "Try creating a pubspec in the referenced directory or using a path \
+    if let Some((key, value)) = spec.get_entry(PATH_FIELD)
+        && let Some(path) = value.as_str()
+    {
+        if path.contains('\\') {
+            issues.push(pubspec_row(
+                PATH_NOT_POSIX,
+                format!("The path '{path}' isn't a POSIX-style path."),
+                Some("Try converting the value to a POSIX-style path.".to_owned()),
+                yaml.text,
+                value.raw(),
+            ));
+            return;
+        }
+        let resolved = resolve_dependency_path(dir, path);
+        let folder_exists = resolved.is_dir();
+        if !folder_exists {
+            issues.push(pubspec_row(
+                PATH_DOES_NOT_EXIST,
+                format!("The path '{path}' doesn't exist."),
+                Some("Try creating the referenced path or using a path that exists.".to_owned()),
+                yaml.text,
+                value.raw(),
+            ));
+        } else if !resolved.join("pubspec.yaml").is_file() {
+            issues.push(pubspec_row(
+                PATH_PUBSPEC_DOES_NOT_EXIST,
+                format!("The directory '{path}' doesn't contain a pubspec."),
+                Some(
+                    "Try creating a pubspec in the referenced directory or using a path \
                          that has a pubspec."
-                            .to_owned(),
-                    ),
-                    yaml.text,
-                    value.raw(),
-                ));
-            }
-            if check_for_path_and_git_deps {
-                issues.push(invalid_dependency_row(yaml, key.raw(), PATH_FIELD));
-            }
+                        .to_owned(),
+                ),
+                yaml.text,
+                value.raw(),
+            ));
+        }
+        if check_for_path_and_git_deps {
+            issues.push(invalid_dependency_row(yaml, key.raw(), PATH_FIELD));
         }
     }
     if let Some((key, _)) = spec.get_entry(GIT_FIELD)
@@ -5379,9 +5376,10 @@ fn flutter_validator(
     };
     for item in items {
         match item {
-            PubspecNode::Scalar { .. } => match item.as_str() {
-                Some(entry) => validate_asset_path(yaml, dir, entry, item.raw(), issues),
-                None => {
+            PubspecNode::Scalar { .. } => {
+                if let Some(entry) = item.as_str() {
+                    validate_asset_path(yaml, dir, entry, item.raw(), issues)
+                } else {
                     issues.push(pubspec_row(
                         ASSET_NOT_STRING_OR_MAP,
                         "An asset value is required to be a file path (string) or map.".to_owned(),
@@ -5391,7 +5389,7 @@ fn flutter_validator(
                     ));
                     return;
                 }
-            },
+            }
             PubspecNode::Map { .. } => match item.get(ASSET_PATH_FIELD) {
                 None => issues.push(pubspec_row(
                     ASSET_MISSING_PATH,
@@ -5407,11 +5405,12 @@ fn flutter_validator(
                         Some("Try converting the value to be a string.".to_owned()),
                         yaml.text,
                         path.raw(),
-                    ))
+                    ));
                 }
-                Some(path) => match path.as_str() {
-                    Some(entry) => validate_asset_path(yaml, dir, entry, path.raw(), issues),
-                    None => {
+                Some(path) => {
+                    if let Some(entry) = path.as_str() {
+                        validate_asset_path(yaml, dir, entry, path.raw(), issues)
+                    } else {
                         issues.push(pubspec_row(
                             ASSET_NOT_STRING,
                             "Assets are required to be file paths (strings).".to_owned(),
@@ -5421,7 +5420,7 @@ fn flutter_validator(
                         ));
                         return;
                     }
-                },
+                }
             },
             _ => issues.push(pubspec_row(
                 ASSET_NOT_STRING_OR_MAP,
@@ -5642,21 +5641,18 @@ fn workspace_validator(
         return;
     };
     for item in items {
-        match item.as_str() {
-            Some(entry) => {
-                validate_directory_path(yaml, dir, entry, item.raw(), issues);
-            }
-            None => {
-                issues.push(pubspec_row(
-                    WORKSPACE_VALUE_NOT_STRING,
-                    "Workspace entries are required to be directory paths (strings).".to_owned(),
-                    Some("Try converting the value to be a string.".to_owned()),
-                    yaml.text,
-                    item.raw(),
-                ));
-                if matches!(item, PubspecNode::Scalar { .. }) {
-                    return;
-                }
+        if let Some(entry) = item.as_str() {
+            validate_directory_path(yaml, dir, entry, item.raw(), issues);
+        } else {
+            issues.push(pubspec_row(
+                WORKSPACE_VALUE_NOT_STRING,
+                "Workspace entries are required to be directory paths (strings).".to_owned(),
+                Some("Try converting the value to be a string.".to_owned()),
+                yaml.text,
+                item.raw(),
+            ));
+            if matches!(item, PubspecNode::Scalar { .. }) {
+                return;
             }
         }
     }
@@ -5863,6 +5859,7 @@ impl ManifestElement {
 /// — `ManifestValidator.validate`, manifest_validator.dart:412-424). `text`
 /// is the `AndroidManifest.xml` content; a malformed document parses to no
 /// rows (the parser never throws, its error result ends the walk silently).
+#[must_use]
 pub fn manifest_issues(text: &str, check_manifest: bool) -> Vec<OptionsIssue> {
     if !check_manifest {
         return Vec::new();
@@ -8824,7 +8821,7 @@ mod unique_name_alias_pins {
 
     /// The dispatch's case (#2131): the second `invalid_null_aware_operator`
     /// constant's `uniqueName` spelling resolves to the shared `name` — the
-    /// spelling the unnecessary_ignore probe must admit and the citation
+    /// spelling the `unnecessary_ignore` probe must admit and the citation
     /// match must canonicalize — while the name-universe face keeps
     /// rejecting it as an `analyzer.errors` key.
     #[test]
@@ -9594,7 +9591,10 @@ mod options_verifier_pins {
             19,
         );
         assert_eq!(declared.len(), 2);
-        assert!(OptionsIssue::duplicate_rule(&declared[0]).offset == at(text, 3, 7));
+        assert_eq!(
+            OptionsIssue::duplicate_rule(&declared[0]).offset,
+            at(text, 3, 7)
+        );
 
         // incompatible_lint /1 — the later declaration conflicts with the
         // earlier enabled one; the message nests the quoted join inside

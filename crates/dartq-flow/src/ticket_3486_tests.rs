@@ -26,6 +26,7 @@
 //! `resolveListLiteral`'s written-arguments arm
 //! (typed_literal_resolver.dart:68-107).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

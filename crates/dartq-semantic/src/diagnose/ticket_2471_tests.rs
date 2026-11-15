@@ -32,6 +32,7 @@
 //! the resolved `TypeOps` mounted, diagnostics read off the joined
 //! report.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::resolved_ops::{LibraryTypes, ResolvedTypeOps};

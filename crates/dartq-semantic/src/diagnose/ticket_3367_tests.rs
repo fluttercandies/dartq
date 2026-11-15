@@ -35,6 +35,7 @@
 //! [`record_extension_face`]: crate::diagnose::row_resolution
 //! [`prefixed_hit`]: crate::diagnose::row_resolution
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{
     RigImport, assert_silent, code_names, report_ops, report_ops_imports,
 };

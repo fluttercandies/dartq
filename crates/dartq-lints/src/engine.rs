@@ -7,6 +7,7 @@
 //! ancestor path so parent questions (`!(x is T)`, else-branch shape) cost
 //! one slice read, never the arena's forward-walk `parent`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -872,10 +873,6 @@ fn collapse_duplicate_rows(out: &mut Vec<Lint>) {
 const PROBLEM_IN_FILE: &str =
     "The diagnostic '{0}' isn't produced in this file so it doesn't need to be ignored.";
 
-#[expect(
-    clippy::implicit_hasher,
-    reason = "FxHashSet is the workspace-mandated concrete hasher               (deterministic iteration, hot-path cost)"
-)]
 fn unnecessary_ignore_rows(
     unit: &Unit<'_>,
     ignore: &IgnoreInfo,
@@ -1591,7 +1588,7 @@ impl<'a> Check<'a> {
     /// parser's `append_inserted` fold (dartq-parser `lib.rs`, single choke
     /// point at parse end), so a `None` here is a stale-id parser bug (an id
     /// held across a cursor reset/detach), never a user-input face — the
-    /// debug_assert keeps the contract loud in debug builds while release
+    /// `debug_assert` keeps the contract loud in debug builds while release
     /// degrades to the caller's `let-else`/`?` (a skipped verdict or a
     /// dropped report anchor, never wrong output).
     #[must_use]
@@ -2327,7 +2324,7 @@ void f(bool c) {
     /// the case event (a bare `default:` consumes only tokens), so the head
     /// snapshot IS the member's first material row. Pinned through the real
     /// bridge: the statement is the case's own child, not a block-level
-    /// phantom (`parent` walked to the SwitchBlock under the off-by-one
+    /// phantom (`parent` walked to the `SwitchBlock` under the off-by-one
     /// snapshot). The statement's read face is the production flat shape —
     /// `ExpressionStatement` is a span leaf whose expression rows tile at the
     /// member level beside it (the same sibling run a `Block` yields).

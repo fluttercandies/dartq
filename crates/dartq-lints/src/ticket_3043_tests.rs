@@ -1,9 +1,16 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::needless_range_loop,
+    clippy::unnecessary_debug_formatting,
+    clippy::many_single_char_names,
+    clippy::semicolon_if_nothing_returned
+)]
 use crate::engine::{Lint, ReachabilityFace};
 use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
-/// The #3043 lint pins: one green pin per fixed shape, each citing the
-/// upstream arm it mirrors (pinned `dart analyze` 3.13.7 oracle
-/// semantics in `conformance/expected.tsv`).
+// The #3043 lint pins: one green pin per fixed shape, each citing the
+// upstream arm it mirrors (pinned `dart analyze` 3.13.7 oracle
+// semantics in `conformance/expected.tsv`).
 
 // —— unreachable_from_main ——————————————————————————————————————————
 // Upstream Dart SDK source, pkg/linter

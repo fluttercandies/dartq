@@ -12,10 +12,11 @@
 //! `Function(int, List)` — a decided miss (`from.required = 2 >
 //! to.required = 1`) where the oracle's tear-off `staticType` proves
 //! the check constant-true. The census's second-largest code family
-//! (the function_type corpus's `mN is Function(...)` rows and the
+//! (the `function_type` corpus's `mN is Function(...)` rows and the
 //! co19 Constructor-tear-offs `C.new`/`C.id` checks) sat silent on
 //! exactly this leg.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -87,7 +88,7 @@ fn ctor_tear_off_with_optional_positional_reports_constant_true() {
     );
 }
 
-/// The alias-typedef target of the function_type corpus: `m3 is
+/// The alias-typedef target of the `function_type` corpus: `m3 is
 /// F3<int>` over `typedef F3<T> = Function(int, [List<Function>])` —
 /// the checked side folds through the parameterized-alias arm, the
 /// operand keeps its declared split, both answer the strict function

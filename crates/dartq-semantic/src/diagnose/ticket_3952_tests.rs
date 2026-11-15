@@ -28,6 +28,7 @@
 //! the pre-fix operator message spelled `'String'`, the annotation's
 //! exact opposite.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

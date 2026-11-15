@@ -25,6 +25,7 @@
 //!   (`element_builder.dart`'s `valueFragment.isExplicitlyCovariant` +
 //!   `_inheritCovariance`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, report_ops_bare};
 

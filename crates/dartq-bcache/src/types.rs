@@ -5,6 +5,7 @@
 //! fields in declaration order and every map is a `BTreeMap`, so equal
 //! values always serialize to identical bytes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -86,7 +87,7 @@ pub struct ToolchainFingerprint {
     pub flutter_version: String,
     /// blake3 of `bin/cache/dart-sdk/lib/_internal/vm_platform_strong.dill`.
     pub platform_strong_dill: BlobId,
-    /// blake3 of the frontend_server snapshot flutter_tools runs:
+    /// blake3 of the `frontend_server` snapshot `flutter_tools` runs:
     /// `bin/cache/dart-sdk/bin/snapshots/frontend_server_aot.dart.snapshot`.
     pub frontend_server_snapshot: BlobId,
 }
@@ -277,11 +278,11 @@ pub struct PlacedFile {
     /// being re-published (see [`crate::ingest_scan`]).
     pub on_disk: Option<BlobId>,
     /// For the bookkeeping flutter rewrites with noise that is not
-    /// content (the materializer's `content_identity`): the FileStore
+    /// content (the materializer's `content_identity`): the `FileStore`
     /// record (`.filecache`) up to its order and its hook-result md5s,
     /// and a hook result (`link_hooks_result.json`,
     /// `dart_build_result.json`) up to its `build_start`/`build_end`
-    /// timestamps. flutter_tools rewrites the record on every build in
+    /// timestamps. `flutter_tools` rewrites the record on every build in
     /// a Dart `HashMap`'s iteration order, which follows the recorded
     /// paths' hash codes — under another tree's root the same records
     /// land in another order — and a hook result whenever its target
@@ -295,6 +296,7 @@ impl PlacedFile {
     /// Whether the bytes on disk are the blob's own bytes — the
     /// placement verified the blob's content and wrote it unchanged, so
     /// a matching stamp proves the file is the blob wherever it sits.
+    #[must_use]
     pub fn verbatim(&self) -> bool {
         self.on_disk == Some(self.blob)
     }
@@ -303,7 +305,7 @@ impl PlacedFile {
 /// One file of a cached build directory.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ManifestFile {
-    /// Path relative to the flutter_build hash dir, e.g.
+    /// Path relative to the `flutter_build` hash dir, e.g.
     /// `flutter_assets.d`.
     pub path: PathBuf,
     pub blob: BlobId,
@@ -333,17 +335,17 @@ pub enum NameRule {
     /// face), so the name is recomputed from the recorded define map and
     /// the root-rewritten output dir.
     RecomputeFromTemplate,
-    /// The `flutter test` kernel cache (flutter_tools 3.47.1 source,
+    /// The `flutter test` kernel cache (`flutter_tools` 3.47.1 source,
     /// TestCompiler): a fixed-name dir (`<buildDir>/test_cache`, default
     /// `build/test_cache`) whose dill file names embed the config md5 —
     /// not a hash dir at all. `name_observed` is the project-relative dir
     /// path at ingest, provenance only: the replay path is re-derived
     /// from the target tree's build dir (which honors
     /// `FLUTTER_BUILD_DIR`), and files land in place, over whatever the
-    /// dir already holds — frontend_server's initialize-from-dill
+    /// dir already holds — `frontend_server`'s initialize-from-dill
     /// validation is the correctness net for a stale payload.
     TestKernelCache,
-    /// The `build bundle` face's asset output dir (flutter_tools 3.47.1
+    /// The `build bundle` face's asset output dir (`flutter_tools` 3.47.1
     /// `build bundle --asset-dir`, default `<buildDir>/flutter_assets`):
     /// `copy_flutter_bundle`'s outputs — the kernel blob, assets, engine
     /// snapshots — a fixed project-relative dir, not a hash dir. Its

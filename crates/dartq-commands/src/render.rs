@@ -21,6 +21,7 @@
 //! severity-exit tier travels beside the bytes (`counts`), never inside
 //! them.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
@@ -39,6 +40,7 @@ use crate::analyze::severity_word;
 ///
 /// The value graph does not encode as LON — non-finite floats and
 /// codec-limit overflows are program bugs, not runtime cases.
+#[must_use]
 pub fn lon_line(value: &Value) -> String {
     // The values are serde_json graphs: no non-finite floats exist in the
     // model, and every producer's depth sits far under the codec's limits
@@ -222,6 +224,7 @@ fn modelable_type(kind: &str) -> Option<()> {
 /// This is the daemon's `FaceRenderer` and the cold path's writer at
 /// once: same rows in, same bytes out, so the resident hit and the
 /// per-run render are byte-identical by construction.
+#[must_use]
 pub fn render_official_face(rows: &[&Row], face: &Face) -> FaceRender {
     let (kept, meta) = face_rows(rows);
     let mut bytes = Vec::new();
@@ -343,9 +346,9 @@ fn bare_eligible(text: &str) -> bool {
     if text.is_empty() {
         return false;
     }
-    let mut chars = text.char_indices();
+    let chars = text.char_indices();
     let last = text.len();
-    while let Some((index, c)) = chars.next() {
+    for (index, c) in chars {
         let code = c as u32;
         let at_edge = index == 0 || index + c.len_utf8() == last;
         if code < 0x80 {
@@ -502,7 +505,7 @@ fn is_non_finite(folded: &str) -> bool {
 
 fn is_non_finite_ascii(bytes: &[u8]) -> bool {
     let mut body = bytes;
-    if matches!(body.first(), Some(b'+') | Some(b'-')) {
+    if matches!(body.first(), Some(b'+' | b'-')) {
         body = &body[1..];
     }
     if body.first() == Some(&b'.') {
@@ -515,7 +518,7 @@ fn is_non_finite_ascii(bytes: &[u8]) -> bool {
 /// could parse as a number rather than a string.
 fn is_numeric_like(bytes: &[u8]) -> bool {
     let body = match bytes.first() {
-        Some(b'+') | Some(b'-') => &bytes[1..],
+        Some(b'+' | b'-') => &bytes[1..],
         _ => bytes,
     };
     decimal_like(body).is_some_and(|end| end == body.len())
@@ -531,9 +534,9 @@ fn decimal_like(body: &[u8]) -> Option<usize> {
     if body.get(i) == Some(&b'.') {
         i = digit_or_underscore_run(body, i + 1);
     }
-    if matches!(body.get(i), Some(&b'e') | Some(&b'E')) {
+    if matches!(body.get(i), Some(&b'e' | &b'E')) {
         i += 1;
-        if matches!(body.get(i), Some(&b'+') | Some(&b'-')) {
+        if matches!(body.get(i), Some(&b'+' | &b'-')) {
             i += 1;
         }
         i = digit_or_underscore_run(body, i);
@@ -799,7 +802,7 @@ mod tests {
             FaceFormat::Lon => write_lon(&mut out, &diags_document(&output)).expect("write"),
             FaceFormat::Json => run.write_json(&mut out).expect("write"),
             FaceFormat::Text => {
-                write_human(&mut out, output.diagnostics, output.files).expect("write")
+                write_human(&mut out, output.diagnostics, output.files).expect("write");
             }
         }
         out

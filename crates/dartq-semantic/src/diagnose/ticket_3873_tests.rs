@@ -23,6 +23,7 @@
 //!   parameter with its own spelling, so an unsolved slot keeps `X`/`Y`
 //!   where a declaration-typed receiver would clamp to the bound.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

@@ -25,6 +25,7 @@
 //! the module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{report_ops_bare, rows};
 

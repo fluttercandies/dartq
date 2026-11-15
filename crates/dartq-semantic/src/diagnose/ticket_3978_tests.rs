@@ -32,6 +32,7 @@
 //! (the outer `!` faults on an int wherever it applies), so it cannot
 //! discriminate the order.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

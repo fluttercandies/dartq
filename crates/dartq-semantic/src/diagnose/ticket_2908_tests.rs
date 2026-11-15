@@ -11,6 +11,7 @@
 //! :737-748); a bound annotation's parent `TypeParameter` is not in the
 //! deny list, so the super pass runs there.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -30,17 +31,17 @@ fn at(source: &str, needle: &str) -> u32 {
 }
 
 /// The alias instantiation at an annotation site
-/// (TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_
-/// interfaceType_parameter): `X<String>` checks `String` against the
+/// (`TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias`_
+/// `interfaceType_parameter)`: `X<String>` checks `String` against the
 /// ALIAS's own `T extends A` and reports at the written argument.
 #[test]
 fn alias_annotation_site_bad_argument_reports_at_the_argument() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 typedef X<T extends A> = Map<int, T>;
 void f(X<String> a) {}
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -61,11 +62,11 @@ void f(X<String> a) {}
 #[test]
 fn alias_satisfied_and_in_scope_bounded_arguments_stay_silent() {
     let satisfied = report_ops(
-        r#"
+        r"
 class A {}
 typedef X<T extends A> = Map<int, T>;
 void f(X<A> a) {}
-"#,
+",
     );
     assert!(
         bounds_rows(&satisfied).is_empty(),
@@ -73,11 +74,11 @@ void f(X<A> a) {}
         satisfied.diagnostics
     );
     let in_scope = report_ops(
-        r#"
+        r"
 class A {}
 typedef X<T extends A> = Map<int, T>;
 void f<T extends A>(X<T> x) {}
-"#,
+",
     );
     assert!(
         bounds_rows(&in_scope).is_empty(),
@@ -91,12 +92,12 @@ void f<T extends A>(X<T> x) {}
 /// reports with no inverted-type context row.
 #[test]
 fn alias_clause_site_bad_argument_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 typedef X<T extends A> = Map<int, T>;
 class Y extends X<B> {}
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -111,16 +112,16 @@ class Y extends X<B> {}
 }
 
 /// The function-type alias instantiation
-/// (TypeArgumentNotMatchingBoundsTest/test_ofFunctionTypeAlias): `F<B>`
+/// (`TypeArgumentNotMatchingBoundsTest/test_ofFunctionTypeAlias)`: `F<B>`
 /// against `F<T extends A>` reports at the written argument.
 #[test]
 fn function_type_alias_instantiation_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 typedef F<T extends A> = void Function();
 F<B> fff = (throw 0);
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -140,12 +141,12 @@ F<B> fff = (throw 0);
 /// this enumeration is the check's only route.
 #[test]
 fn container_bound_annotation_bad_argument_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends A> {}
 class C<T extends G<B>> {}
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -166,12 +167,12 @@ class C<T extends G<B>> {}
 /// bottom, so the inversion moves nothing).
 #[test]
 fn alias_bound_annotation_bad_argument_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends A> {}
 typedef H<P extends G<B>> = void Function();
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -188,12 +189,12 @@ typedef H<P extends G<B>> = void Function();
 /// A satisfied bound annotation stays silent.
 #[test]
 fn satisfied_bound_annotations_stay_silent() {
-    let source = r#"
+    let source = r"
 class A {}
 class G<E extends A> {}
 typedef H<P extends G<A>> = void Function();
 class C<T extends G<A>> {}
-"#;
+";
     let report = report_ops(source);
     assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }

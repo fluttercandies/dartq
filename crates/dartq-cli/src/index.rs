@@ -10,6 +10,7 @@
 //! — the impact/compat convention for the newer command family, not the
 //! query faces' machine grammar.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 

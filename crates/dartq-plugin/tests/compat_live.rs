@@ -224,7 +224,6 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
         .expect("engine feed");
     // `Duration::from_minutes` is not stable on the pinned toolchain, so
     // seconds remain the only expressible unit for this budget.
-    #[expect(clippy::duration_suboptimal_units, reason = "see above")]
     let findings = runtime
         .wait_output(Duration::from_secs(60))
         .expect("plugin findings arrive within the drain budget")
@@ -250,7 +249,6 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
     runtime
         .feed(&engine, &files, &base_config(overrides))
         .expect("engine feed");
-    #[expect(clippy::duration_suboptimal_units, reason = "see above")]
     let findings = runtime
         .wait_output(Duration::from_secs(60))
         .expect("plugin findings arrive within the drain budget")
@@ -340,7 +338,7 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
     assert_eq!(edit.replacement, "/* compat: fixed */");
     assert_eq!(reply.fixes[1].priority, 50);
     assert_eq!(reply.fixes[1].message, "Review this location");
-    assert!(reply.fixes[1].edits.is_empty());
+    assert_eq!(reply.fixes[1].edits, [] as [dartq_plugin::SourceEdit; 0]);
 
     // Applying the edit proves the UTF-16 exchange: offsets 38..42 sit past
     // the emoji, where UTF-16 and byte offsets diverge.
@@ -492,7 +490,6 @@ fn compat_sample_query_mode_serves_reverse_queries_over_a_live_process() {
             },
         )
         .expect("engine feed");
-    #[expect(clippy::duration_suboptimal_units, reason = "see above")]
     let findings = runtime
         .wait_output(Duration::from_secs(60))
         .expect("plugin findings arrive within the drain budget")
@@ -622,7 +619,7 @@ fn compat_sample_query_mode_serves_reverse_queries_over_a_live_process() {
         reply.fixes[0].message,
         "compat query: `unused` has no resolved references; a removal candidate"
     );
-    assert!(reply.fixes[0].edits.is_empty());
+    assert_eq!(reply.fixes[0].edits, [] as [dartq_plugin::SourceEdit; 0]);
 
     // A miss: empty elements is a legal answer, not a failure.
     let reply = runtime
@@ -887,7 +884,6 @@ fn drive_overlay(row: &OverlayRow) {
         .expect("engine feed");
     // `Duration::from_minutes` is not stable on the pinned toolchain, so
     // seconds remain the only expressible unit for this budget.
-    #[expect(clippy::duration_suboptimal_units, reason = "see above")]
     let findings = runtime
         .wait_output(Duration::from_secs(60))
         .expect("overlay findings arrive within the drain budget")

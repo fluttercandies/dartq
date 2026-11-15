@@ -15,7 +15,7 @@
 //!   InvalidConstant.forEntity(entity: element, locatableDiagnostic:
 //!   diag.constEvalForElement)`) plus the site default
 //!   `const_initialized_with_non_constant_value` at the enclosing literal
-//!   (constant_verifier.dart `visitVariableDeclaration` → `_reportError`,
+//!   (`constant_verifier.dart` `visitVariableDeclaration` → `_reportError`,
 //!   at the entity the literal's evaluation failed on). dartq now reports
 //!   both: the listener latches the `for` element's head (`begin_for_control_flow`
 //!   → `begin_ctl_element`) and extent (`end_for_control_flow` /
@@ -37,7 +37,7 @@
 //!   resolution-tier rows (`dot_shorthand_undefined_member`,
 //!   `dot_shorthand_missing_context`) are unregistered in codes.rs.
 //!   Routing: the resolution face for the context-type answer, codes.rs
-//!   for the two resolution codes, const_eval_faces.rs' shorthand gates
+//!   for the two resolution codes, `const_eval_faces.rs`' shorthand gates
 //!   for the ciwncv half.
 //!
 //! - Wildcard field initializer: `const A(this._): y = _` — the bare `_`
@@ -47,8 +47,8 @@
 //!   constant, and `_reportNotPotentialConstants` emits `invalid_constant`
 //!   at it beside `implicit_this_reference_in_initializer`). dartq's
 //!   creation-time walk (`check_ctor_initializers`) binds the formal `_`
-//!   as an opaque CtorBinding, which shadows the field and silences both
-//!   rows. Routing: const_eval_faces.rs (`ctor_init_formals` /
+//!   as an opaque `CtorBinding`, which shadows the field and silences both
+//!   rows. Routing: `const_eval_faces.rs` (`ctor_init_formals` /
 //!   `CtorScope::ident` — a wildcard formal must not bind when the
 //!   wildcards feature is enabled, `Engine::is_wildcard`).
 //!
@@ -70,6 +70,7 @@
 //! (code name, then offset): the helper sorts, so a semantic ordering
 //! ("primary row first") silently fails the equality.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops_bare};
 use super::*;
 
@@ -89,12 +90,12 @@ fn oracle_rows<'a>(report: &FileReport, source: &'a str) -> Vec<(&'static str, u
             )
         })
         .collect();
-    rows.sort();
+    rows.sort_unstable();
     rows
 }
 
 /// Corpus shape `ConstEvalForElementTest/test_listLiteral#0` (upstream Dart
-/// SDK source, pkg/analyzer/test/src/diagnostics/const_eval_for_element_test.dart):
+/// SDK source, `pkg/analyzer/test/src/diagnostics/const_eval_for_element_test.dart)`:
 /// a C-style `for` element in an implicitly const list reports at the whole
 /// for element and the site default at the literal.
 ///
@@ -252,7 +253,7 @@ fn non_const_creation_lhs_reports_at_the_creation() {
 
 /// Corpus shape `InstanceCreationEvaluatorTest/test_wildcard_regularInitializer_initializerList#0`
 /// (upstream Dart SDK source, pkg/analyzer/test/src/dart/constant/
-/// evaluation_test.dart): the initializer `y = _` reads the instance FIELD
+/// `evaluation_test.dart)`: the initializer `y = _` reads the instance FIELD
 /// `_` (the wildcard formal is non-binding), which is not potentially
 /// constant — `invalid_constant` at the field read, beside the
 /// implicit-this face on the same span.

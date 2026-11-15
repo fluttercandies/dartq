@@ -20,6 +20,7 @@
 //!   type-parameter bound no container/alias adopted still reports
 //!   through its own window's bound trees.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 fn range(offset: u32, length: u32) -> SourceRange {

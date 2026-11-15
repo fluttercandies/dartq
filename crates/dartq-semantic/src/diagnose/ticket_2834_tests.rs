@@ -14,6 +14,7 @@
 //! parameters WITH bounds); the byte-exact message pin rides the
 //! argument face, whose display renders the parameters.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{report_ops, rows};
 use crate::diagnose::types::FileReport;
 

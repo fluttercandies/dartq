@@ -30,6 +30,7 @@
 //! ARM's kind, so a `num`-typed arm keeps the `num` join. "int literals are
 //! always lenient" would silence a real oracle row here.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

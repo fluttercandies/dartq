@@ -8,6 +8,7 @@
 //! `whileStatement_conditionBegin`/`_functionExpression_begin` consult
 //! per-node effect sets that only a pre-pass can know).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::ops::Range;
 
 use dartq_parser::TokenSpan;
@@ -20,6 +21,7 @@ use crate::model::{Lists, NIL, ReachArena, Reasons, State};
 use crate::ty::{Base, Classification, Ty, TypeOps};
 
 /// Metadata of one local variable (or parameter).
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct VarMeta {
     /// Declared type (name-level).
     pub ty: Ty,
@@ -132,7 +134,7 @@ pub(crate) struct CollIfFrame {
     /// is the official first dead node); an arm that enters dead under a
     /// dead parent inherits the deadness and folds into the enclosing
     /// interval (upstream: `_firstDeadNode` is already set to the outer
-    /// node, so `flowEnd(arm)` early-returns, dead_code_verifier.dart:223-
+    /// node, so `flowEnd(arm)` early-returns, `dead_code_verifier.dart:223`-
     /// 235). Arms in a dead parent never count [`Interp::arm_dead_depth`].
     pub(crate) parent_live: bool,
     /// The then-element entered dead FROM A LIVE PARENT: its close row
@@ -192,6 +194,7 @@ pub(crate) enum PatternKind {
 }
 
 /// The active top-level pattern context (matched/unmatched states).
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct PatternState {
     pub kind: PatternKind,
     /// State if the pattern did not match (official `_unmatched`).
@@ -341,7 +344,7 @@ pub(crate) enum Frame {
         never_cast: bool,
         /// The arm's first Never-operand cast type head (official
         /// `flowEnd(thenExpression)`/`flowEnd(elseExpression)`'s dead row,
-        /// type_analyzer.dart:2588/2616 — `dead_code_verifier.dart`'s first
+        /// `type_analyzer.dart:2588/2616` — `dead_code_verifier.dart`'s first
         /// dead node is the cast's type annotation, the row runs to the
         /// arm's own end). First cast wins: a later cast in the same arm is
         /// already inside the dead interval.
@@ -543,7 +546,7 @@ pub(crate) struct ForBounds {
     /// The updaters' own last-token end (0 when the header has none): the
     /// trim face — a header-tail-anchored row ends here
     /// (dead_code_verifier.dart:324-326), or at the header's end when no
-    /// updaters exist (`node` stays the ForParts).
+    /// updaters exist (`node` stays the `ForParts`).
     pub upd_end: u32,
 }
 
@@ -557,6 +560,7 @@ impl ForBounds {
     /// cond/upd boundary stays offset-based (the right separator is the
     /// first updater's token, and updater events carry its offset or a
     /// postfix end at or after it).
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn build(
         events: &[Ev],
         begin: usize,
@@ -642,6 +646,7 @@ pub(crate) struct CondVarEntry {
 }
 
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Expr {
     /// Type of the expression (name-level).
     pub ty: Ty,
@@ -822,7 +827,7 @@ pub(crate) const THIS_RECEIVER: u32 = u32::MAX - 1;
 /// The property-key receiver sentinel for `super`: upstream keys the
 /// promotion on the access FORM — `super._f` rides `SuperPropertyTarget`,
 /// an SSA chain independent of `ThisPropertyTarget`'s even when both
-/// resolve to the same field (flow_analysis.dart `PropertyTarget`,
+/// resolve to the same field (`flow_analysis.dart` `PropertyTarget`,
 /// :5524-5529; `super_this_distinction_error_test`). `super` never rebinds
 /// either, so one fixed identity is sound — and a write-side sweep never
 /// reaches it because property writes record no `write_var`.
@@ -853,7 +858,7 @@ pub(crate) const BOUND_RECURSION_LIMIT: u8 = 16;
 pub(crate) const STEP_BUDGET_PER_EVENT: u64 = 128;
 
 /// One open null-shorting context (official `_NullAwareAccessContext`,
-/// flow_analysis.dart:9664): the skip path captured at the `?.`/`?[`/`?..`
+/// `flow_analysis.dart:9664)`: the skip path captured at the `?.`/`?[`/`?..`
 /// and the access-path state the condition face can still read back.
 pub(crate) struct NullShort {
     /// The receiver-was-null path (upstream `shortcutControlPath` —
@@ -878,7 +883,7 @@ pub(crate) struct NullShort {
     /// Whether the access path was already dead when the context opened —
     /// the pre-split state was unreachable, or a never-null/Null-typed
     /// receiver classified it dead (:9214-9221). The member-level dead-node
-    /// poll (`checkUnreachableNode`, type_analyzer.dart:2082) reads the
+    /// poll (`checkUnreachableNode`, `type_analyzer.dart:2082`) reads the
     /// state as the member STARTED — a `throw`/Never inside the member's own
     /// tail (`x?.m(throw _)`) dies after the poll, so it must not anchor the
     /// access row; a dead-at-open path is the genuine dead member.
@@ -918,6 +923,11 @@ pub(crate) struct NullShort {
 /// `_nonPromotableProperties` version chain (`flow_analysis.dart:5707-5719`),
 /// so a later failed read can still name the promotion that WOULD have
 /// stood when the consumer resolves the member's non-promotability.
+#[allow(clippy::needless_range_loop)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "slot index is bounded by props.len() which fits u32 in practice"
+)]
 pub(crate) fn sweep_state_props(
     state: &mut State,
     props: &[(u32, u32)],
@@ -1022,7 +1032,7 @@ pub(crate) struct DeadWindow {
     /// unreachable nodes continue it, a covering `flowEnd` retires it),
     /// so following dead statements extend it; only the emission skips.
     suppressed: bool,
-    /// Frozen row end (the C-style header's ForParts trim,
+    /// Frozen row end (the C-style header's `ForParts` trim,
     /// dead_code_verifier.dart:324-326): set when the anchor sits in the
     /// loop's condition-or-updater region — the row ends at the last
     /// updater's `node.end`, later statement ends never extend it.
@@ -1035,7 +1045,7 @@ impl DeadWindow {
     /// only a covering `flowEnd` resets it — so the interval keeps
     /// folding every later unreachable node into the same span while
     /// emitting nothing of its own (`close_covered`'s suppressed
-    /// early-return). interp_expr.rs's if-null close is the only opener.
+    /// early-return). `interp_expr.rs`'s if-null close is the only opener.
     pub(crate) fn suppressed_at(depth: usize, anchor: TokenSpan) -> Self {
         let mut window = Self::at(depth, anchor);
         window.suppressed = true;
@@ -1164,7 +1174,7 @@ impl DeadWindow {
     }
 
     /// Snaps the do-while split's tail start to a began-dead statement's
-    /// first token (official `semicolon.next`, dead_code_verifier.dart:
+    /// first token (official `semicolon.next`, `dead_code_verifier.dart`:
     /// the second row begins at the statement following the do-while). An
     /// inner poll of that same statement (an argument list's `(`, an
     /// argument node, a member name) fires earlier in the post-order
@@ -1351,7 +1361,7 @@ pub(crate) struct Interp<'o> {
     /// condition operand — invalidated by an intervening write (the
     /// captured write-version check stands in the official's
     /// `ValueVersion` rebasing).
-    pub(crate) cond_vars: std::collections::HashMap<u32, CondVarEntry>,
+    pub(crate) cond_vars: FxHashMap<u32, CondVarEntry>,
     /// The pre-exit state of the last bottom-typed, identifier-rooted read,
     /// keyed on the read's end offset: the official's `_ExpressionInfo`
     /// capture timing (`storeExpressionInfo` runs at the read, before
@@ -1469,6 +1479,7 @@ pub(crate) struct Interp<'o> {
     /// until the right operand's object pattern runs, then `Some(None)`
     /// when it promoted nothing and `Some(Some(face))` when it did —
     /// the close's join decision (`or_pattern_end`).
+    #[allow(clippy::option_option)]
     pub(crate) or_right_face: Option<Option<(Ty, u32)>>,
     pub(crate) type_test_pending: Option<(bool, Ty, u32)>,
     pub(crate) as_cast_pending: Option<Ty>,
@@ -1546,14 +1557,14 @@ pub(crate) struct Interp<'o> {
     pub(crate) death_index: Option<usize>,
     /// The outermost executable's own end offset when it is a `;` (an
     /// arrow body's terminator — the official covering node is the
-    /// ExpressionFunctionBody, whose `node.end` includes it). Zero for
+    /// `ExpressionFunctionBody`, whose `node.end` includes it). Zero for
     /// block bodies (their rows trim to the last statement, never past
     /// it) and for non-`;` ends.
     pub(crate) outer_exec_end: u32,
     /// Whether the flow was already unreachable when the open `as`-cast's
     /// TYPE began (`Ev::AsBegin`): only then is the cast type the official's
     /// first dead node (`x as int` with a Never-typed operand reports
-    /// `int..`, type_analyzer.dart:2090). A cast whose OWN evaluation kills
+    /// `int..`, `type_analyzer.dart:2090`). A cast whose OWN evaluation kills
     /// the flow (the guaranteed-fail nullability/disjointness faces) reaches
     /// its type live and anchors nothing — the next node reports.
     pub(crate) as_began_dead: bool,
@@ -1638,7 +1649,7 @@ pub(crate) struct Interp<'o> {
     pub(crate) or_last_clean: Option<(u32, bool)>,
 
     /// Open null-shorting contexts (official `_NullAwareAccessContext`
-    /// stack, flow_analysis.dart:9664): each entry is the skip-path state
+    /// stack, `flow_analysis.dart:9664)`: each entry is the skip-path state
     /// captured when a `?.`/`?[`/`?..` was reached — the pre-promotion
     /// state of `_nullAwareAccess_rightBegin` (:9206), or unreachable when
     /// the receiver type can never be null (:9217-9221). The chain's
@@ -1831,7 +1842,7 @@ impl<'o> Interp<'o> {
             binding_journal: Vec::new(),
             cond_split_var: None,
             if_branch_folded: false,
-            cond_vars: std::collections::HashMap::new(),
+            cond_vars: FxHashMap::default(),
             cond_exempt: None,
             compound_lvalue_saves: Vec::new(),
             ctor_init_begin: None,
@@ -2111,7 +2122,7 @@ impl<'o> Interp<'o> {
     }
 
     /// The state half of [`Self::write_var`], without the
-    /// AssignedVariables record. Per-iteration initializations — a
+    /// `AssignedVariables` record. Per-iteration initializations — a
     /// declaration's own initializer and a for-in loop variable — move
     /// the flow state but are not writes in the official sets
     /// (`prefer_final_locals` treats the variables as never assigned), so
@@ -2486,14 +2497,14 @@ impl<'o> Interp<'o> {
         let receiver = self
             .exprs
             .last()
-            .map(|e| (e.reference, e.ty, e.args, e.non_null_literal))
-            .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false));
+            .map_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false), |e| {
+                (e.reference, e.ty, e.args, e.non_null_literal)
+            });
         let recv_offset = self
             .exprs
             .last()
             .and_then(|e| e.read_span)
-            .map(|span| span.range.offset)
-            .unwrap_or(0);
+            .map_or(0, |span| span.range.offset);
         self.null_short_begin(receiver, recv_offset);
     }
 
@@ -2504,7 +2515,7 @@ impl<'o> Interp<'o> {
     /// interval at its member/operand poll, and the official's covering
     /// node for such a chain is the ASSIGNMENT expression: `flowEnd` runs
     /// over it at the null-short finish (`handleNullShortingFinished`,
-    /// resolver.dart:1195-1200; type_analyzer.dart:2616), so the row ends
+    /// resolver.dart:1195-1200; `type_analyzer.dart:2616`), so the row ends
     /// at the right-hand side's end and never at the statement's `;` —
     /// `n?.p = i` reports `p = i`. Only a window anchored strictly inside
     /// the null-shorted chain is this write's (the containment rule of
@@ -2517,7 +2528,7 @@ impl<'o> Interp<'o> {
     /// becomes the first dead node. The official `flowEnd` still runs over
     /// the ASSIGNMENT — `handleNullShortingFinished(expression)` fires for
     /// any null-shorted chain at the assignment's boundary
-    /// (resolver.dart:1195-1200, type_analyzer.dart:2616) — so the row is
+    /// (resolver.dart:1195-1200, `type_analyzer.dart:2616`) — so the row is
     /// `0`, never `0;`. The containment rule alone decides ownership;
     /// gating on `dead_at_open` left such rows to the statement's `;`.
     pub(crate) fn close_dead_null_write(&mut self, end: u32) {
@@ -2795,9 +2806,7 @@ impl<'o> Interp<'o> {
             && let Base::Name(id) = t.base
             && let Some(boundary) = self.boundaries.get(id as usize).copied().flatten()
         {
-            return boundary
-                .target
-                .map_or((t, args), |(ty, target_args)| (ty, target_args));
+            return boundary.target.unwrap_or((t, args));
         }
         let promoted = self.ops.promote_to_non_null(t);
         // The opaque-declared face's marker step (#2243, centralized from
@@ -2816,7 +2825,7 @@ impl<'o> Interp<'o> {
     /// subtype-ordered join — `a <: b` gives `b`, `b <: a` gives `a`, and a
     /// name-unordered pair joins to the unknown face (the real hierarchy's
     /// LUB is the resolved back-end's question, not the name layer's). An
-    /// unknown operand is the official's InvalidType — the subtype check
+    /// unknown operand is the official's `InvalidType` — the subtype check
     /// answers `InvalidType <: X` true for every `X`
     /// (subtype.dart:274), so the join lands on the spelled side
     /// (`LUB(InvalidType, String)` = `String`) instead of the unknown
@@ -2919,7 +2928,7 @@ impl<'o> Interp<'o> {
     /// reference) and not a member/prefixed send (those carry no bare
     /// head name). The [`Interp::equality_check`] face applies
     /// (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/resolver/invocation_inferrer.dart
+    /// `pkg/analyzer/lib/src/dart/resolver/invocation_inferrer.dart`
     /// :773-785: the resolved dart:core top-level `identical` with
     /// exactly two arguments).
     pub(crate) fn send_callee_is_core_identical(&self) -> bool {
@@ -3158,7 +3167,7 @@ impl<'o> Interp<'o> {
 
     /// The conditional arm's mid-arm cast-tail row (official
     /// `flowEnd(thenExpression)`/`flowEnd(elseExpression)`,
-    /// type_analyzer.dart:2588/2616): a Never-operand cast inside the arm
+    /// `type_analyzer.dart:2588/2616)`: a Never-operand cast inside the arm
     /// parked its type head on the [`Frame::Cond`] — the cast type is the
     /// first dead node, and the row runs to the arm's own end (`arm_start`
     /// is the arm's begin token, the containment bound the interval is
@@ -3187,11 +3196,11 @@ impl<'o> Interp<'o> {
                 // interval, never parks a row head (upstream
                 // `flowEnd(arm)` early-returns when `_firstDeadNode` sits
                 // outside the arm).
-                if !*parent_live {
+                if *parent_live {
+                    cast_tail.take()
+                } else {
                     cast_tail.take();
                     None
-                } else {
-                    cast_tail.take()
                 }
             }
             _ => None,
@@ -3577,15 +3586,15 @@ impl<'o> Interp<'o> {
         // it), and a depth past the truncation point dies with its scope.
         while self.binding_journal.len() > s.journal_len {
             let undo = self.binding_journal.pop().expect("journal len checked");
-            if let Some(scope) = self.scopes.get_mut(undo.depth) {
-                if scope.scope_id == undo.scope_id {
-                    match undo.prev {
-                        Some(prev) => {
-                            scope.bindings.insert(undo.name, prev);
-                        }
-                        None => {
-                            scope.bindings.remove(&undo.name);
-                        }
+            if let Some(scope) = self.scopes.get_mut(undo.depth)
+                && scope.scope_id == undo.scope_id
+            {
+                match undo.prev {
+                    Some(prev) => {
+                        scope.bindings.insert(undo.name, prev);
+                    }
+                    None => {
+                        scope.bindings.remove(&undo.name);
                     }
                 }
             }
@@ -4243,6 +4252,7 @@ impl Interp<'_> {
     /// The shared C-style `for` body: head split + join, initializers,
     /// condition, body, back-edge continue join, updaters, exit join.
     /// With `collection`, the frame stays until `ForControlFlowEnd`.
+    #[allow(clippy::too_many_lines)]
     fn replay_c_for(
         &mut self,
         bounds: &ForBounds,
@@ -4335,7 +4345,7 @@ impl Interp<'_> {
         // anchor, leaving the freeze to the well-formed headers it pins.
         let cond_begin = events
             .get(bounds.cond.clone())
-            .and_then(|region| region.iter().find_map(|ev| ev.span()))
+            .and_then(|region| region.iter().find_map(super::ev::Ev::span))
             .map(|span| span.range.offset);
         if bounds.upd_end > 0
             && let Some(cond_begin) = cond_begin
@@ -4498,7 +4508,9 @@ impl Interp<'_> {
         // the enclosing one-row fold and keeps ownership.
         if collection
             && body_began_dead
-            && let Some(element) = events[bounds.body.clone()].iter().find_map(|ev| ev.span())
+            && let Some(element) = events[bounds.body.clone()]
+                .iter()
+                .find_map(super::ev::Ev::span)
         {
             if let Some(window) = &mut self.dead {
                 if window.anchor_from(element.range.offset) {
@@ -4578,7 +4590,7 @@ impl Interp<'_> {
                 // (`for (; g(throw 0, 1); 2) {}` reports from `1`,
                 // `test_flowEnd_forParts_condition_throw`).
                 .filter(|event| !matches!(**event, Ev::ExprStmt { .. }))
-                .find_map(|event| event.span())
+                .find_map(super::ev::Ev::span)
         {
             self.dead_code(anchor);
         }
@@ -4686,6 +4698,7 @@ impl Interp<'_> {
         self.for_in_parts_at(events, head_start, i, end, false, match_of);
     }
 
+    #[allow(clippy::too_many_lines, clippy::redundant_guards)]
     fn for_in_parts_at(
         &mut self,
         events: &[Ev],
@@ -4853,7 +4866,7 @@ impl Interp<'_> {
                     // face the official `flow.write` covers.
                     Ev::DotAccess { .. }
                     | Ev::IndexAccess { .. }
-                    | Ev::NullAwareMemberBegin { .. }
+                    | Ev::NullAwareMemberBegin
                     | Ev::NullAwareIndexOperandBegin { .. }
                     | Ev::CascadeAccess { .. } => {
                         composite = true;
@@ -4892,6 +4905,7 @@ impl Interp<'_> {
     /// Processes one event. Construct events that own an extent (loops,
     /// collection-`for`, closures) consume the whole extent and return a
     /// jump.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn step(&mut self, events: &[Ev], i: usize, match_of: &[u32]) -> Control {
         // The termination invariant: one counter decrement per step, and
         // exhaustion flips `bailed` — every driver loop unwinds on it and

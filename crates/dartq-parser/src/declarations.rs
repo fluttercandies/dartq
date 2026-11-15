@@ -9,6 +9,7 @@
 //! dedicated directive grammar (`directives.rs`, #300); this module places
 //! the `DirectiveContext` ordering checks at the official call sites.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind};
 use dartq_source::SourceRange;
 
@@ -800,7 +801,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// intro when the alias RHS is a generalized function type whose
     /// type-variable group never validates, so the official classification
     /// falls back to the bare return type (`computeVoidGFT` /
-    /// `computeIdentifierGFT`, type_info_impl.dart:949/753). The group's
+    /// `computeIdentifierGFT`, `type_info_impl.dart:949/753`). The group's
     /// name position classifies as noType in `ComplexTypeParamOrArgInfo`
     /// `.compute` (reserved heads and the member-keyword built-ins the type
     /// recognizer rejects: `get`/`set`/`factory`/`operator`/`typedef` name)
@@ -1238,8 +1239,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// Annotation junk in a declaration-name position, official
     /// `ClassOrMixinOrExtensionIdentifierContext.ensureIdentifier` /
     /// `EnumDeclarationIdentifierContext.ensureIdentifier` branch 3
-    /// (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/parser/
-    /// identifier_context_impl.dart): `@meta` is not keyword-shaped and
+    /// (upstream Dart SDK source, pkg/_`fe_analyzer_shared/lib/src/parser`/
+    /// `identifier_context_impl.dart)`: `@meta` is not keyword-shaped and
     /// sits outside the templates' insert-before keep-sets, so it is
     /// reported and consumed in doubt —
     /// `rewriter.insertSyntheticIdentifier(identifier)` splices the
@@ -1250,7 +1251,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// which re-anchors every downstream header face on the `@` — the
     /// official zero-width name carries the reports FORWARD onto the junk
     /// identifier that follows it (`findNonZeroLengthToken`, util.dart:56;
-    /// corpus Primary-constructors grammar_A06_t01: the oracle anchors the
+    /// corpus Primary-constructors `grammar_A06_t01`: the oracle anchors the
     /// class/mixin/enum/extension-type header rows on `meta`, never the
     /// `@`).
     fn ensure_declaration_name(&mut self, context: IdentifierContext) -> TokenSpan {
@@ -1568,7 +1569,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
 
     /// The `enhanced-enums` gate (`enabledIn: 2.17`): the analyzer reports
     /// `experiment_not_enabled` from the enum element/header handlers
-    /// (ast_builder.dart:4035/:4094/:4131) when the feature is off.
+    /// (`ast_builder.dart:4035/:4094/:4131`) when the feature is off.
     fn report_enhanced_enums_gate(&mut self, at: TokenSpan) {
         if !self.features.enhanced_enums_enabled {
             self.report(msg::experiment_not_enabled("enhanced-enums"), at);
@@ -2798,7 +2799,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         allow_representation: bool,
     ) -> bool {
         if kind == DeclarationKind::Class
-            && name.is_some()
+            && let Some(name) = name
             && self.peek_kind() == TokenKind::OpenParen
             && !self.peek_is_possible_record_type()
             && matches!(
@@ -2817,7 +2818,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             // as class members (`parseClass` :3105-3114 → `ensureBlock` +
             // `parseClassOrMixinOrExtensionBody`), which is the face the
             // walks below reproduce.
-            return self.recover_class_head_paren_junk(name.unwrap());
+            return self.recover_class_head_paren_junk(name);
         }
         if kind == DeclarationKind::Class
             && self.peek_kind() == TokenKind::OpenParen
@@ -3126,7 +3127,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 // catch-all below and junked them).
                 TokenKind::CloseParen if n == 3 => {}
                 TokenKind::Semicolon | TokenKind::OpenCurly => return false,
-                TokenKind::Eof => return true,
                 TokenKind::Keyword(Keyword::Extends | Keyword::With | Keyword::Implements) => {
                     clause = true;
                 }
@@ -3335,6 +3335,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// scanner pair, with the relocation/EOF row added alongside
     /// (`]` at a mismatching closer AND on the follower / at EOF). Returns
     /// `false`: the tail was consumed.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "token table size is bounded by u32 token id space"
+    )]
     fn recover_class_head_paren_junk(&mut self, name: TokenSpan) -> bool {
         // `endPrimaryConstructor` (outline_builder.dart:1810-1818): the
         // experiment face fires for Class whenever the head parsed — the

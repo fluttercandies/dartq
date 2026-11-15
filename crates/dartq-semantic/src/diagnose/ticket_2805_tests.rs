@@ -14,6 +14,7 @@
 //!   pass is whole-library by element identity);
 //! - a pattern-declaration statement stays all-or-nothing per group.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -45,7 +46,7 @@ fn uv(name: &str, offset: usize) -> String {
 /// `case String s` binder is unused and its arm-mate `a`'s guard use
 /// never spares it (the sentinel group encodes the switch, not one
 /// declaration window — upstream `visitDeclaredVariablePattern` with no
-/// `PatternVariableDeclaration` ancestor, unused_local_elements_
+/// `PatternVariableDeclaration` ancestor, `unused_local_elements`_
 /// verifier.dart:565-579).
 #[test]
 fn switch_statement_arm_binder_reports_individually() {

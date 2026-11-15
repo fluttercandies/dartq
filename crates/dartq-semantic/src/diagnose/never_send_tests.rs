@@ -8,6 +8,7 @@
 //!
 //! Oracle provenance (`dart analyze` 3.13.1): every shape is silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops};
 
 #[test]

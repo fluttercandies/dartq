@@ -24,6 +24,7 @@
 //! (`is F13<int>` beside `is F13<bool>`, `is A<int>` beside
 //! `is A<String>`), turning precision debt into coverage debt.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops;
 
 /// The diagnostics of `source` carrying the family's code, in report

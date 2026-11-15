@@ -11,6 +11,7 @@
 //! Oracle provenance: each fixture was probed against `dart analyze` on
 //! the same sources (the `/tmp/probe2159` family).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

@@ -4,6 +4,7 @@
 //! index-expression `]` close's missing `expectedButGot` follower row
 //! (oracle 3.13.7). Upstream citations live per-test.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -21,7 +22,7 @@ fn code(c: &str, start: u32, end: u32) -> (String, u32, u32) {
     (c.to_string(), start, end)
 }
 
-/// `isIdentifierRecovered` is the RAW token kind (parser_impl.dart:1593:
+/// `isIdentifierRecovered` is the RAW token kind (`parser_impl.dart:1593`:
 /// `next.kind != IDENTIFIER_TOKEN`) — a built-in keyword is NOT an
 /// `IDENTIFIER_TOKEN`, so `typedef void get();` and `typedef get = ...`
 /// route to `ensureIdentifierPotentiallyRecovered` and carry BOTH the
@@ -65,7 +66,7 @@ fn typedef_keyword_name_keeps_raw_identifier_faces() {
 /// name. `class enum E { v }` leaves `enum` for the enum reparse, so the
 /// verifier's `_checkForBuiltInIdentifierAsName` has no name to report;
 /// `class enum { }` keeps `enum` (`{` is a keep follower) and the built-in
-/// row lands (identifier_context_impl.dart:80-86, error_verifier.dart:573).
+/// row lands (identifier_context_impl.dart:80-86, `error_verifier.dart:573`).
 #[test]
 fn class_name_builtin_row_only_when_name_survives() {
     assert_eq!(
@@ -89,7 +90,7 @@ fn class_name_builtin_row_only_when_name_survives() {
 }
 
 /// A scanner-synthetic `]` end-group is relocated by `moveSynthetic`
-/// (parser_impl.dart:8018) — but the `reportRecoverableError(next,
+/// (`parser_impl.dart:8018`) — but the `reportRecoverableError(next,
 /// expectedButGot(']'))` at :8010 fires FIRST at the follower. The relocated
 /// closer's own `unmatchedToken` row (length-1 at the follower) lands beside
 /// it, so `intList[x try }` carries TWO `]` rows at `try`: the full-width

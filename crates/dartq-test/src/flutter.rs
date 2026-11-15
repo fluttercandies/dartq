@@ -54,6 +54,7 @@
 //! are green and clean are final; every other suite reruns under stock
 //! `flutter test`, which reports it exactly as it always does.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -302,16 +303,16 @@ pub fn chunk_entry(index: usize, suites: &[(usize, &Hosted)]) -> String {
             "import {} as s{i};",
             crate::group::dart_string(&file_uri(&suite.path))
         );
-        if let Some(config) = &suite.config {
-            if !configs.contains(&config.as_path()) {
-                let _ = writeln!(
-                    header,
-                    "import {} as c{};",
-                    crate::group::dart_string(&file_uri(config)),
-                    configs.len()
-                );
-                configs.push(config);
-            }
+        if let Some(config) = &suite.config
+            && !configs.contains(&config.as_path())
+        {
+            let _ = writeln!(
+                header,
+                "import {} as c{};",
+                crate::group::dart_string(&file_uri(config)),
+                configs.len()
+            );
+            configs.push(config);
         }
     }
     src.push_str(&TESTER.replacen("// dartq:suites\n", &header, 1));
@@ -723,8 +724,7 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
     for (index, kernel) in kernels.iter().enumerate() {
         let adopted = kernel.is_file()
             && std::fs::read_to_string(kernel.with_extension("dill.key"))
-                .ok()
-                .is_some_and(|stored| stored.trim() == wanted_keys[index]);
+                .is_ok_and(|stored| stored.trim() == wanted_keys[index]);
         if adopted {
             // The sidecar was already written whole when the kernel landed;
             // only the hosted-suite list may still be missing (a run killed
@@ -880,14 +880,13 @@ fn compile_chunks(
                 )?);
             }
             let _ = std::fs::remove_file(&output);
-            let result = match compiler.as_mut().expect("started").compile(&entry) {
-                Ok(result) => result,
-                Err(_) => {
-                    // A crashed compiler: this chunk fails; the next one
-                    // starts a fresh compiler.
-                    compiler = None;
-                    Compiled::Errors(String::new())
-                }
+            let result = if let Ok(result) = compiler.as_mut().expect("started").compile(&entry) {
+                result
+            } else {
+                // A crashed compiler: this chunk fails; the next one
+                // starts a fresh compiler.
+                compiler = None;
+                Compiled::Errors(String::new())
             };
             match result {
                 Compiled::Kernel => {
@@ -918,23 +917,20 @@ fn compile_chunks(
                         .map(|&local| plan.suites[suite_of(local, members)].path.clone())
                         .collect();
                     let broken = crate::group::broken_suites(plan.root, &paths, &text);
-                    match broken.filter(|broken| broken.len() < paths.len()) {
-                        Some(broken) => {
-                            hosted.retain(|&local| {
-                                !broken.contains(&plan.suites[suite_of(local, members)].path)
-                            });
-                            excluded
-                                .lock()
-                                .map_err(|_| io::Error::other("poisoned"))?
-                                .extend(broken);
-                            retried = true;
-                        }
-                        None => {
-                            fail_chunk(plan, &hosted, &kernels[index], excluded, |local| {
-                                suite_of(local, members)
-                            })?;
-                            break;
-                        }
+                    if let Some(broken) = broken.filter(|broken| broken.len() < paths.len()) {
+                        hosted.retain(|&local| {
+                            !broken.contains(&plan.suites[suite_of(local, members)].path)
+                        });
+                        excluded
+                            .lock()
+                            .map_err(|_| io::Error::other("poisoned"))?
+                            .extend(broken);
+                        retried = true;
+                    } else {
+                        fail_chunk(plan, &hosted, &kernels[index], excluded, |local| {
+                            suite_of(local, members)
+                        })?;
+                        break;
                     }
                 }
                 Compiled::Errors(_) => {
@@ -1006,10 +1002,10 @@ pub fn seed_test_cache(recipe: &Recipe, root: &Path) {
     if std::fs::metadata(target).is_ok_and(|meta| meta.len() >= size) {
         return;
     }
-    if let Some(parent) = target.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
+    if let Some(parent) = target.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
     }
     // Copy through a sibling temp file so a shard never reads a
     // partially-written seed.
@@ -1296,16 +1292,15 @@ pub fn closure_digests(root: &Path, sdk: &Path, suites: &[PathBuf]) -> Option<Ve
             let id = ids[&path] as usize;
             let Some(deps) = deps else { continue };
             for dep in deps {
-                let dep_id = match ids.get(&dep) {
-                    Some(&dep_id) => dep_id,
-                    None => {
-                        let dep_id = file_of.len() as u32;
-                        ids.insert(dep.clone(), dep_id);
-                        file_of.push(dep);
-                        deps_of.push(Vec::new());
-                        frontier.push(file_of[dep_id as usize].clone());
-                        dep_id
-                    }
+                let dep_id = if let Some(&dep_id) = ids.get(&dep) {
+                    dep_id
+                } else {
+                    let dep_id = file_of.len() as u32;
+                    ids.insert(dep.clone(), dep_id);
+                    file_of.push(dep);
+                    deps_of.push(Vec::new());
+                    frontier.push(file_of[dep_id as usize].clone());
+                    dep_id
                 };
                 deps_of[id].push(dep_id);
             }
@@ -1459,10 +1454,9 @@ impl Recipe {
         if let Some(stored) = std::fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Stored>(&bytes).ok())
+            && stored.key == key
         {
-            if stored.key == key {
-                return Ok(Some(stored.recipe));
-            }
+            return Ok(Some(stored.recipe));
         }
         let Some(recipe) = Self::probe(flutter, root, args)? else {
             return Ok(None);
@@ -1903,7 +1897,7 @@ mod tests {
             runner_args: &[],
             concurrency: 1,
         };
-        let members = vec![0usize, 1usize];
+        let members = [0usize, 1usize];
         let locals = vec![0usize, 1usize];
         let key = chunk_key(&plan, 0, &locals, |local| members[local]);
         assert_eq!(
@@ -2007,7 +2001,7 @@ mod tests {
             runner_args: &[],
             concurrency: 1,
         };
-        let members = vec![0usize];
+        let members = [0usize];
         let locals = vec![0usize];
         let before = chunk_key(&plan, 0, &locals, |local| members[local]);
         std::fs::write(&suite_file, b"void main() {}\n").expect("write");
@@ -2078,7 +2072,7 @@ mod tests {
             runner_args: &[],
             concurrency: 1,
         };
-        let members = vec![0usize];
+        let members = [0usize];
         let locals = vec![0usize];
         let before = chunk_key(&plan, 0, &locals, |local| members[local]);
         std::fs::write(&config_file, b"// config v2").expect("write");

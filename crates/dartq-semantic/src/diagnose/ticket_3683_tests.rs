@@ -24,6 +24,7 @@
 //! corpus witness the flow layer already keeps silent — the
 //! declared-face contract defers to a differing staged face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{report_ops, rows};
 

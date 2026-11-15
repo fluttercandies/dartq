@@ -16,6 +16,7 @@
 //! top-level declarations. Every expectation below is a verbatim oracle
 //! 3.13.1 row (`dart analyze`, package:meta 1.19.0).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::super::{FileReport, StrictModes, diagnose_with};
 use crate::collector::collect;
 use crate::library::ElementIndex;

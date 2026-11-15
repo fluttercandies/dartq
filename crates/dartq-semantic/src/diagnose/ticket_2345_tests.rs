@@ -20,6 +20,7 @@
 //!   still reports `non_exhaustive_switch_statement` — the narrowed
 //!   type is always-exhaustive where the declared `Object` was not.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops};
 
 /// `is int` on a `dynamic` parameter narrows the scrutinee to `int`: the
@@ -33,9 +34,7 @@ fn ticket_2345_is_narrowed_scrutinee_expression_silent() {
     let report =
         report_ops("void f(dynamic x) { if (x is int) { var y = switch (x) { int i => 1 }; } }");
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "non_exhaustive_switch_expression"),
+        !code_names(&report).contains(&"non_exhaustive_switch_expression"),
         "{:?}",
         code_names(&report)
     );
@@ -50,9 +49,7 @@ fn ticket_2345_unpromoted_scrutinee_expression_reports() {
     let report = report_ops("void f(dynamic x) { var y = switch (x) { int i => 1 }; }");
     let names = code_names(&report);
     assert!(
-        names
-            .iter()
-            .any(|name| *name == "non_exhaustive_switch_expression"),
+        names.contains(&"non_exhaustive_switch_expression"),
         "{names:?}"
     );
 }
@@ -69,9 +66,7 @@ fn ticket_2345_not_null_narrowed_statement_silent() {
            case Color.red: break; case Color.green: break; case Color.blue: break; } } }",
     );
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "non_exhaustive_switch_statement"),
+        !code_names(&report).contains(&"non_exhaustive_switch_statement"),
         "{:?}",
         code_names(&report)
     );
@@ -89,9 +84,7 @@ fn ticket_2345_narrowed_sealed_missing_variant_still_reports() {
     );
     let names = code_names(&report);
     assert!(
-        names
-            .iter()
-            .any(|name| *name == "non_exhaustive_switch_statement"),
+        names.contains(&"non_exhaustive_switch_statement"),
         "{names:?}"
     );
     let row = report
@@ -117,8 +110,5 @@ fn ticket_2345_narrowed_scrutinee_unreachable_case_reports() {
            case Color c: break; case Color.red: break; } } }",
     );
     let names = code_names(&report);
-    assert!(
-        names.iter().any(|name| *name == "unreachable_switch_case"),
-        "{names:?}"
-    );
+    assert!(names.contains(&"unreachable_switch_case"), "{names:?}");
 }

@@ -1,7 +1,7 @@
 //! The #3452 pins: a completed invocation also drops the member chain's
 //! `ref_chain` flag — not just the `reference`/`prop` slots #3435 cleared.
 //!
-//! `x.f`'s own DotAccess correctly sets `ref_chain` (the official
+//! `x.f`'s own `DotAccess` correctly sets `ref_chain` (the official
 //! `propertyGet` hands a property reference to a read rooted at a flow
 //! reference, so `x.f is C` stays open on an invalid face). The `Ev::Send`
 //! close pops that expression as the callee, and #3435 dropped its
@@ -16,6 +16,9 @@
 //! [`InvalidFaceOps`] seam: the invalid-receiver member read inherits the
 //! face and the succeed fold's vacuous answer deads exactly the else arm.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -26,7 +29,7 @@ use dartq_scanner::{ScanConfig, TokenTable};
 
 /// Scans and parses `source` with `ops` mounted when given; returns the
 /// taken facts.
-fn analyze<'t>(source: &'static str, ops: Option<&'t dyn TypeOps>) -> Vec<FlowFact> {
+fn analyze(source: &'static str, ops: Option<&dyn TypeOps>) -> Vec<FlowFact> {
     let result = dartq_scanner::scan(
         source,
         ScanConfig {
@@ -220,6 +223,7 @@ fn healthy_member_of_call_result_keeps_both_arms() {
 struct InvalidFaceOps;
 
 impl InvalidFaceOps {
+    #[allow(clippy::unused_self)]
     fn is_invalid(&self, ty: Ty, names: &[Box<str>]) -> bool {
         match ty.base {
             Base::Name(id) => names

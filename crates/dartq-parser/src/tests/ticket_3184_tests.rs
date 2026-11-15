@@ -13,6 +13,7 @@
 //! Reserved top-level heads still take the splice arm — upstream reaches it
 //! because a reserved word is never `isIdentifier`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.

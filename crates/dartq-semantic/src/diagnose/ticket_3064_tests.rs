@@ -21,6 +21,7 @@
 //! refinement starved (`remainder` fell back to its declared `num`, so
 //! an `int` sink over-reported).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

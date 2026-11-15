@@ -615,7 +615,7 @@ impl<'a> Engine<'a> {
     /// same try is dead too (`dead_code_verifier.dart`, `nextCatchClause`;
     /// the subtype arm, :589-604). Either way the span covers the first dead
     /// clause through the last one, and one dead-catch row per try at most
-    /// (`_done`, dead_code_verifier.dart:414).
+    /// (`_done`, `dead_code_verifier.dart:414`).
     ///
     /// Faces the upstream text pins exactly:
     ///
@@ -626,7 +626,7 @@ impl<'a> Engine<'a> {
     ///   `element.name`/`element.library`). So `on Object?` IS catch-all,
     ///   exactly like `on Object`.
     /// - An `on` head that starts with `(` still resolves: `computeType`
-    ///   accepts the record type annotation (parser_impl.dart:10723 — the
+    ///   accepts the record type annotation (`parser_impl.dart:10723` — the
     ///   records-feature ambiguity resolution), so `exceptionType.type` is
     ///   a `RecordType` — never null, never `isDartCoreObject`. The clause
     ///   takes the subtype arm, where a record shape proves nothing against
@@ -996,7 +996,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The dead-coalesce operand's never-null verdict
-    /// (`_checkForDeadNullCoalesce`'s operand face, error_verifier.dart
+    /// (`_checkForDeadNullCoalesce`'s operand face, `error_verifier.dart`
     /// :4733-4739): the operand's static type as the oracle reads it —
     /// `node.leftOperand.staticType` for `??`, the target's
     /// `ReadResolutionImpl.type` for `??=`.
@@ -1146,10 +1146,10 @@ impl<'a> Engine<'a> {
         if !entry.is_static {
             return None;
         }
-        let ty = if entry.var_ty != Ty::UNKNOWN {
-            entry.var_ty
-        } else {
+        let ty = if entry.var_ty == Ty::UNKNOWN {
             entry.return_ty
+        } else {
+            entry.var_ty
         };
         (ty != Ty::UNKNOWN).then_some(ty)
     }
@@ -1253,7 +1253,7 @@ impl<'a> Engine<'a> {
     /// written schema), the read arm reports `dot_shorthand_missing_context`
     /// at the WHOLE shorthand span (upstream
     /// `dotShorthandMissingContext.at(node)`,
-    /// property_element_resolver.dart:129).
+    /// `property_element_resolver.dart:129`).
     ///
     /// `frame_live` marks rows whose innermost executable still sits on the
     /// frame stack (`self.rows`): `return`/`=>` positions then read the
@@ -1481,7 +1481,7 @@ impl<'a> Engine<'a> {
     /// `dot_shorthand_missing_context` at the WHOLE shorthand span — the
     /// dot through the selector's end (upstream reports the node, not the
     /// name: `dotShorthandMissingContext.at(node)`,
-    /// property_element_resolver.dart:129). The const face emits the same
+    /// `property_element_resolver.dart:129`). The const face emits the same
     /// span for the const roots it reaches, so the emit dedups on it; a
     /// stale-window resweep likewise stays idempotent.
     fn emit_shorthand_missing_context(&mut self, selector: SourceRange) {
@@ -1657,7 +1657,7 @@ impl<'a> Engine<'a> {
     /// resolves against plus the schema text the weaker verdicts render.
     /// Upstream arms the context while walking into the shorthand
     /// (`pushDotShorthandContext` on the `==` right operand
-    /// — binary_expression_resolver.dart:112 — the parent's `contextType`
+    /// — `binary_expression_resolver.dart:112` — the parent's `contextType`
     /// on every other node); this row-level pass recomputes it from the
     /// token before the shorthand's `.`.
     ///
@@ -1829,10 +1829,10 @@ impl<'a> Engine<'a> {
             // return face; a deferred row's executable already closed
             // (`live == false`), so it keeps the context-free answer.
             TK::Keyword(Kw::Return | Kw::Yield) | TK::Function => {
-                if !live {
-                    None
-                } else {
+                if live {
                     self.return_ctx()
+                } else {
+                    None
                 }
             }
             // `&&`/`||` — the language-defined `bool` operand context
@@ -1888,8 +1888,12 @@ impl<'a> Engine<'a> {
                 .and_then(|i| toks.get(i))
                 .map(|t| t.kind)
             {
-                Some(TK::CloseParen | TK::Semicolon | TK::CloseCurly)
-                | Some(TK::Keyword(Kw::Else | Kw::Do)) => Some((None, "_".to_string())),
+                Some(
+                    TK::CloseParen
+                    | TK::Semicolon
+                    | TK::CloseCurly
+                    | TK::Keyword(Kw::Else | Kw::Do),
+                ) => Some((None, "_".to_string())),
                 _ => self.literal_elem_ctx(prev_idx),
             },
             // An expression statement's own shorthand — `.red = 1;`,
@@ -1950,10 +1954,10 @@ impl<'a> Engine<'a> {
         let mut idx = name_idx + 1;
         while let Some(token) = toks.get(idx) {
             match token.kind {
-                TK::OpenParen | TK::OpenSquare => match self.tokens.matching_end(idx) {
-                    Some(end) => idx = end + 1,
-                    None => return None,
-                },
+                TK::OpenParen | TK::OpenSquare => {
+                    let end = self.tokens.matching_end(idx)?;
+                    idx = end + 1;
+                }
                 TK::Period | TK::QuestionPeriod => idx += 2,
                 // A close that ends the operand: only a GROUPING paren wraps
                 // the operand (`(...) == x`); an invocation's `)` belongs to
@@ -2354,7 +2358,7 @@ impl<'a> Engine<'a> {
                 }
                 // A statement boundary ends the declarator run — an
                 // assignment or a shape this walk does not own.
-                TK::Semicolon | TK::OpenCurly | TK::CloseCurly if depth == 0 => return None,
+                TK::Semicolon if depth == 0 => return None,
                 _ => {}
             }
         }
@@ -2368,7 +2372,7 @@ impl<'a> Engine<'a> {
     /// futureOr-base of the folded annotation (`FutureOr<C>` resolves on
     /// `C`); the weak schema display keeps the written `FutureOr<...>`
     /// spelling (`FutureOr<void> v = .id()` reports `'FutureOr<void>'` —
-    /// the visiting schema, semantics_A02).
+    /// the visiting schema, `semantics_A02`).
     fn shorthand_decl_ctx(&self) -> Option<(Option<Ty>, String)> {
         if self.pending_decl_ty_unresolved {
             return Some((None, "_".to_string()));
@@ -2543,8 +2547,7 @@ impl<'a> Engine<'a> {
                                 .rows
                                 .iter()
                                 .chain(self.deferred_miss_rows.iter())
-                                .filter(|c| c.range.offset > open && c.range.end() <= end)
-                                .last()
+                                .rfind(|c| c.range.offset > open && c.range.end() <= end)
                                 .map(|c| self.operand_static_ty(c))
                                 .filter(|ty| *ty != Ty::UNKNOWN)?;
                             return Some((Some(ty), self.ty_display(ty)));
@@ -2569,9 +2572,9 @@ impl<'a> Engine<'a> {
     /// NONE — an unannotated, still-inferring body (`f() { return .a; }`)
     /// — visits its returns under the unknown schema: the read arm
     /// reports `missing_context` and the invocation arm `'_'`
-    /// (type_inference_A03_t01: `return .new()` reports `'_'`); a
+    /// (`type_inference_A03_t01`: `return .new()` reports `'_'`); a
     /// DECLARED `dynamic`/`void` return still spells itself
-    /// (semantics_A02: `'void'`).
+    /// (`semantics_A02`: `'void'`).
     fn return_ctx(&self) -> Option<(Option<Ty>, String)> {
         let ty = self
             .frames
@@ -2731,12 +2734,12 @@ impl<'a> Engine<'a> {
                 .filter(|ty| *ty != Ty::UNKNOWN)
                 .and_then(|ty| self.shorthand_ctx_formal(ty));
         }
-        return formals
+        formals
             .positional
             .get(positional)
             .map(|f| f.ty)
             .filter(|ty| *ty != Ty::UNKNOWN)
-            .and_then(|ty| self.shorthand_ctx_formal(ty));
+            .and_then(|ty| self.shorthand_ctx_formal(ty))
     }
 
     /// The argument-formal context face: a concrete declared type supplies
@@ -2752,9 +2755,9 @@ impl<'a> Engine<'a> {
     /// formal's INSTANTIATED type — alias spellings fold to their element
     /// before the lookup and the schema display (`contextAlias(C)`'s
     /// `.m()` reports `'_C'`, `contextAlias(C<int>)`'s reports
-    /// `'_C<num>'`; private_test), and a `FutureOr<S>` formal resolves
+    /// `'_C<num>'`; `private_test`), and a `FutureOr<S>` formal resolves
     /// against its base (`take(FutureOr<C>)`'s `.instance` miss spells
-    /// `'C'` — semantics_A02's futureOrBase).
+    /// `'C'` — `semantics_A02`'s futureOrBase).
     fn shorthand_ctx_formal(&self, ty: Ty) -> Option<(Option<Ty>, String)> {
         if let Ty::Named { name, .. } = ty {
             let is_param =
@@ -2831,18 +2834,24 @@ impl<'a> Engine<'a> {
             // `C<int> c =`) ends the declarator's type the same way an
             // identifier does; `dynamic`/`void`/bare `Function` spell
             // their annotation through a keyword token.
-            Some(TK::Identifier | TK::CloseParen | TK::Gt | TK::GtGt | TK::GtGtGt)
-            | Some(TK::Keyword(
-                Kw::Var
-                | Kw::Final
-                | Kw::Const
-                | Kw::Late
-                | Kw::Static
-                | Kw::Covariant
-                | Kw::Dynamic
-                | Kw::Void
-                | Kw::Function,
-            )) => self.shorthand_decl_ctx(),
+            Some(
+                TK::Identifier
+                | TK::CloseParen
+                | TK::Gt
+                | TK::GtGt
+                | TK::GtGtGt
+                | TK::Keyword(
+                    Kw::Var
+                    | Kw::Final
+                    | Kw::Const
+                    | Kw::Late
+                    | Kw::Static
+                    | Kw::Covariant
+                    | Kw::Dynamic
+                    | Kw::Void
+                    | Kw::Function,
+                ),
+            ) => self.shorthand_decl_ctx(),
             _ => None,
         }
     }
@@ -2875,7 +2884,7 @@ impl<'a> Engine<'a> {
         match &callee.shape {
             RowShape::Member { recv } => self
                 .member_formals_full(recv, callee.name)
-                .map(|f| f.into_owned()),
+                .map(std::borrow::Cow::into_owned),
             RowShape::Bare(_) => {
                 // An unqualified call inside a container resolves the
                 // member through `this`.
@@ -2896,7 +2905,7 @@ impl<'a> Engine<'a> {
             }
             RowShape::Receiver(recv) => self
                 .member_formals_full(recv, callee.name)
-                .map(|f| f.into_owned()),
+                .map(std::borrow::Cow::into_owned),
             _ => None,
         }
     }
@@ -3052,17 +3061,19 @@ impl<'a> Engine<'a> {
                 .rows
                 .last()
                 .map(|rhs| self.degenerate_rhs_span(rhs.range, rhs_offset))
-                .map(|span| {
-                    let offset = span.offset.min(rhs_offset);
+                .map_or(
                     SourceRange {
-                        offset,
-                        length: span.end().saturating_sub(offset),
-                    }
-                })
-                .unwrap_or(SourceRange {
-                    offset: rhs_offset,
-                    length: 0,
-                }),
+                        offset: rhs_offset,
+                        length: 0,
+                    },
+                    |span| {
+                        let offset = span.offset.min(rhs_offset);
+                        SourceRange {
+                            offset,
+                            length: span.end().saturating_sub(offset),
+                        }
+                    },
+                ),
         };
 
         if !non_null {
@@ -3131,7 +3142,7 @@ impl<'a> Engine<'a> {
 
     /// The closed `??`'s static type (`resolveIfNull`, upstream Dart SDK
     /// source, pkg/analyzer/lib/src/dart/resolver/
-    /// binary_expression_resolver.dart: `LUB(NonNull(T1), T2)`), staged
+    /// `binary_expression_resolver.dart`: `LUB(NonNull(T1), T2)`), staged
     /// for the parenthesized close. Only the plain two-row shape (one left
     /// operand row, one right operand row) is read; the join answers when
     /// the heads are equal or one names a declared supertype of the other
@@ -3260,8 +3271,7 @@ impl<'a> Engine<'a> {
         let rhs_offset = self
             .tokens
             .get(operator.id as usize + 1)
-            .map(|token| token.utf16_offset)
-            .unwrap_or_else(|| operator.range.end());
+            .map_or_else(|| operator.range.end(), |token| token.utf16_offset);
         // The named-target walk covers a bare/member/keyword receiver
         // (`x ??=`, `c.f ??=`, `this.x ??=`); an index target (`a[i] ??=`,
         // `x?[i] ??=`) folds into a `RowShape::Value` stand-in at the `]`
@@ -3460,7 +3470,7 @@ impl<'a> Engine<'a> {
                 // statement-list binding it could meet, so it shadows them
                 // (`var e = switch (r) { Box(:var e) => e, … }` and
                 // `if (parent case PA parent) { parent… }` read the binder).
-                let newest = self.locals[lo..hi].iter().rposition(|d| visible(d));
+                let newest = self.locals[lo..hi].iter().rposition(&visible);
                 if let Some(p) = newest
                     && matches!(self.locals[lo + p].kind, LocalKind::PatternVariable)
                     && self.locals[lo + p]
@@ -3545,9 +3555,7 @@ impl<'a> Engine<'a> {
             .iter()
             .rev()
             .find_map(|f| match &f.kind {
-                FrameKind::Executable {
-                    instance, ret: _, ..
-                } => Some(*instance),
+                FrameKind::Executable { instance, .. } => Some(*instance),
                 _ => None,
             })
             .unwrap_or(false)
@@ -3612,7 +3620,7 @@ impl<'a> Engine<'a> {
             .pending_model_declarators
             .iter()
             .rposition(|(_, range, _)| range.end() <= at)?;
-        self.pending_model_declarators.drain(..=index).last()
+        self.pending_model_declarators.drain(..=index).next_back()
     }
 
     /// The innermost frame's declared slot for a local — the typedness ask
@@ -3760,7 +3768,7 @@ impl<'a> Engine<'a> {
                         depth += 1;
                     }
                     TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                        depth -= 1
+                        depth -= 1;
                     }
                     TokenKind::Keyword(Keyword::As) if depth == 0 => cast = Some(i),
                     _ => {}
@@ -3813,7 +3821,7 @@ impl<'a> Engine<'a> {
                         depth += 1;
                     }
                     TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                        depth -= 1
+                        depth -= 1;
                     }
                     TokenKind::Lt if depth == 0 => {
                         // Typed-collection head (`<T>[...]`/`<K,V>{...}`)
@@ -3901,7 +3909,7 @@ impl<'a> Engine<'a> {
                             depth += 1;
                         }
                         TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                            depth -= 1
+                            depth -= 1;
                         }
                         TokenKind::Comma | TokenKind::Colon if depth == 0 => is_record = true,
                         _ => {}
@@ -3958,24 +3966,24 @@ impl<'a> Engine<'a> {
                             match name {
                                 Some(name) => {
                                     named_seen += 1;
-                                    match shape.named.iter().find(|(n, _)| n == name) {
-                                        Some((_, ty)) => slots.push(*ty),
-                                        None => {
-                                            same_shape = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                                None => match shape.positional.get(positional_cursor) {
-                                    Some(ty) => {
-                                        slots.push(*ty);
-                                        positional_cursor += 1;
-                                    }
-                                    None => {
+                                    if let Some((_, ty)) =
+                                        shape.named.iter().find(|(n, _)| n == name)
+                                    {
+                                        slots.push(*ty)
+                                    } else {
                                         same_shape = false;
                                         break;
                                     }
-                                },
+                                }
+                                None => {
+                                    if let Some(ty) = shape.positional.get(positional_cursor) {
+                                        slots.push(*ty);
+                                        positional_cursor += 1;
+                                    } else {
+                                        same_shape = false;
+                                        break;
+                                    }
+                                }
                             }
                         }
                         if same_shape
@@ -4043,74 +4051,71 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 let fields = self.pattern_fields(cursor, close);
-                match close_kind {
-                    TokenKind::CloseSquare => {
-                        // `List<elementType>` — the written arg, else the
-                        // matched list's element, else `dynamic` for a
-                        // `dynamic` matched face and `Object?` otherwise
-                        // (`analyzeListPattern`, type_analyzer.dart:979-1009).
-                        let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
-                        let element = written
-                            .as_ref()
-                            .and_then(|args| args.first().copied())
-                            .unwrap_or_else(|| {
-                                if matched == Ty::Dynamic {
-                                    Ty::Dynamic
-                                } else {
-                                    self.list_element_of(matched).unwrap_or(object_q)
-                                }
-                            });
-                        let required = {
-                            let list = self.intern("List");
-                            self.boundary
-                                .args
-                                .borrow_mut()
-                                .named(list, false, &[element])
-                        };
-                        if let Some(at) = self.token_span(lo, hi) {
-                            self.emit_irrefutable(at, matched, required);
-                        }
-                        // A rest element's sub-pattern sees the LIST, not
-                        // the element (`analyzeListPattern`:
-                        // `subPatternMatchedType = requiredType`).
-                        for (_, fld_lo, fld_hi, rest) in &fields {
-                            let column = if *rest { required } else { element };
-                            self.irrefutable_node(*fld_lo, *fld_hi, column, assign);
-                        }
-                    }
-                    _ => {
-                        // `Map<keyType, valueType>` — written args, else
-                        // the matched map's entries, else `Object?` both
-                        // (`analyzeMapPattern`). Only the VALUE patterns
-                        // recurse (a key is a constant face).
-                        let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
-                        let (key_ty, val_ty) = match written.as_ref() {
-                            Some(args) if args.len() >= 2 => (args[0], args[1]),
-                            _ => self.map_entries_of(matched).unwrap_or((object_q, object_q)),
-                        };
-                        let required = {
-                            let map = self.intern("Map");
-                            self.boundary
-                                .args
-                                .borrow_mut()
-                                .named(map, false, &[key_ty, val_ty])
-                        };
-                        if let Some(at) = self.token_span(lo, hi) {
-                            self.emit_irrefutable(at, matched, required);
-                        }
-                        for (_, fld_lo, fld_hi, rest) in &fields {
-                            // `fld_lo` here is the value sub-pattern —
-                            // [`Self::pattern_fields`] already split the
-                            // `key: value` pair for `{}`-led groups. A
-                            // map rest is an error face
-                            // (`rest_element_in_map_pattern`) whose
-                            // sub-pattern sees `dynamic` upstream — no
-                            // mismatch row can land there.
-                            if *rest {
-                                continue;
+                if close_kind == TokenKind::CloseSquare {
+                    // `List<elementType>` — the written arg, else the
+                    // matched list's element, else `dynamic` for a
+                    // `dynamic` matched face and `Object?` otherwise
+                    // (`analyzeListPattern`, type_analyzer.dart:979-1009).
+                    let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
+                    let element = written
+                        .as_ref()
+                        .and_then(|args| args.first().copied())
+                        .unwrap_or_else(|| {
+                            if matched == Ty::Dynamic {
+                                Ty::Dynamic
+                            } else {
+                                self.list_element_of(matched).unwrap_or(object_q)
                             }
-                            self.irrefutable_node(*fld_lo, *fld_hi, val_ty, assign);
+                        });
+                    let required = {
+                        let list = self.intern("List");
+                        self.boundary
+                            .args
+                            .borrow_mut()
+                            .named(list, false, &[element])
+                    };
+                    if let Some(at) = self.token_span(lo, hi) {
+                        self.emit_irrefutable(at, matched, required);
+                    }
+                    // A rest element's sub-pattern sees the LIST, not
+                    // the element (`analyzeListPattern`:
+                    // `subPatternMatchedType = requiredType`).
+                    for (_, fld_lo, fld_hi, rest) in &fields {
+                        let column = if *rest { required } else { element };
+                        self.irrefutable_node(*fld_lo, *fld_hi, column, assign);
+                    }
+                } else {
+                    // `Map<keyType, valueType>` — written args, else
+                    // the matched map's entries, else `Object?` both
+                    // (`analyzeMapPattern`). Only the VALUE patterns
+                    // recurse (a key is a constant face).
+                    let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
+                    let (key_ty, val_ty) = match written.as_ref() {
+                        Some(args) if args.len() >= 2 => (args[0], args[1]),
+                        _ => self.map_entries_of(matched).unwrap_or((object_q, object_q)),
+                    };
+                    let required = {
+                        let map = self.intern("Map");
+                        self.boundary
+                            .args
+                            .borrow_mut()
+                            .named(map, false, &[key_ty, val_ty])
+                    };
+                    if let Some(at) = self.token_span(lo, hi) {
+                        self.emit_irrefutable(at, matched, required);
+                    }
+                    for (_, fld_lo, fld_hi, rest) in &fields {
+                        // `fld_lo` here is the value sub-pattern —
+                        // [`Self::pattern_fields`] already split the
+                        // `key: value` pair for `{}`-led groups. A
+                        // map rest is an error face
+                        // (`rest_element_in_map_pattern`) whose
+                        // sub-pattern sees `dynamic` upstream — no
+                        // mismatch row can land there.
+                        if *rest {
+                            continue;
                         }
+                        self.irrefutable_node(*fld_lo, *fld_hi, val_ty, assign);
                     }
                 }
             }
@@ -4443,8 +4448,7 @@ impl<'a> Engine<'a> {
             .rows
             .iter()
             .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
-            .filter(|row| row.range.offset >= equals.range.end() && row.range.end() <= semi)
-            .next_back()?;
+            .rfind(|row| row.range.offset >= equals.range.end() && row.range.end() <= semi)?;
         self.initializer_static_ty(row)
     }
 
@@ -4499,7 +4503,7 @@ impl<'a> Engine<'a> {
                             inner_depth += 1;
                         }
                         TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                            inner_depth -= 1
+                            inner_depth -= 1;
                         }
                         TokenKind::Colon if inner_depth == 0 => {
                             colon = Some(j);
@@ -4733,7 +4737,7 @@ impl<'a> Engine<'a> {
     /// The flat record destructure bind (`final (a, b) = pair()`): the
     /// pattern variables carry no written type — the oracle infers each
     /// from the matched record's positional slots
-    /// (`analyzeRecordPattern`, type_analyzer.dart's positional walk). The
+    /// (`analyzeRecordPattern`, `type_analyzer.dart`'s positional walk). The
     /// initializer's folded row sits between `init_start` (the `=`'s end)
     /// and `semi` (the `;`'s offset); exactly one non-TypeUse row there is
     /// the expression's own. The bind runs only when the whole declaration
@@ -4828,7 +4832,7 @@ impl<'a> Engine<'a> {
     /// container names a static const member, and the constant's static
     /// type is the folded value's (upstream `visitConstantPattern`
     /// evaluates the reference and reads `value.type` — upstream Dart SDK
-    /// source, pkg/analyzer/lib/src/dart/constant/constant_verifier.dart).
+    /// source, `pkg/analyzer/lib/src/dart/constant/constant_verifier.dart`).
     /// Answered only for in-file statics whose value already folded to a
     /// shape the oracle's `hasPrimitiveEquality` accepts unconditionally —
     /// the primitive literals and enum values, the arming set the literal
@@ -4924,10 +4928,10 @@ impl<'a> Engine<'a> {
                     return None;
                 }
                 let ty = self.folded_ty(&value);
-                if ty != Ty::UNKNOWN {
-                    Some(ty)
-                } else {
+                if ty == Ty::UNKNOWN {
                     static_ty
+                } else {
+                    Some(ty)
                 }
             }
             // `Verdict::Constant` — a const expression whose value the
@@ -5089,7 +5093,7 @@ impl<'a> Engine<'a> {
             if self.switch.case_sink_open
                 && !self.switch.if_case_window
                 && depth > 0
-                && depth <= u16::MAX as usize
+                && u16::try_from(depth).is_ok()
             {
                 Some(u32::MAX - depth as u32)
             } else if self.switch.if_case_window {
@@ -5577,7 +5581,7 @@ impl<'a> Engine<'a> {
                 below,
             });
         }
-        return schema;
+        schema
     }
 
     /// [`Self::closure_param_context_ty`]'s schema tail: the callee's
@@ -6081,15 +6085,14 @@ impl<'a> Engine<'a> {
                     None => Ty::Unknown,
                 }
             };
-            let formal = match name {
-                Some(n) => formals.as_ref().and_then(|f| f.named_formal(*n)),
-                None => {
-                    let formal = formals
-                        .as_ref()
-                        .and_then(|f| f.positional.get(positional_index));
-                    positional_index += 1;
-                    formal
-                }
+            let formal = if let Some(n) = name {
+                formals.as_ref().and_then(|f| f.named_formal(*n))
+            } else {
+                let formal = formals
+                    .as_ref()
+                    .and_then(|f| f.positional.get(positional_index));
+                positional_index += 1;
+                formal
             };
             if let Some(formal) = formal
                 && ty != Ty::Unknown
@@ -6338,13 +6341,12 @@ impl<'a> Engine<'a> {
         let mut candidates: Vec<(StringId, Ty)> = Vec::new();
         let mut positional_index = 0usize;
         for (name, ty, _, range) in args {
-            let formal = match name {
-                Some(label) => formals.named_formal(*label),
-                None => {
-                    let formal = formals.positional.get(positional_index);
-                    positional_index += 1;
-                    formal
-                }
+            let formal = if let Some(label) = name {
+                formals.named_formal(*label)
+            } else {
+                let formal = formals.positional.get(positional_index);
+                positional_index += 1;
+                formal
             };
             // The solve-only argument type: an implicit creation argument
             // closes untyped ([`Self::creation_arg_ty`]); `level.args`
@@ -6417,7 +6419,7 @@ impl<'a> Engine<'a> {
         // below the initializer's arming depth).
         if !self.closure_invalid_returns.is_empty()
             && !params.is_empty()
-            && solutions.iter().all(|slot| slot.is_none())
+            && solutions.iter().all(std::option::Option::is_none)
             && closures
                 .iter()
                 .any(|&(start, _)| self.closure_invalid_returns.contains(&start))
@@ -6524,12 +6526,11 @@ impl<'a> Engine<'a> {
         };
         let mut positional = 0usize;
         level.args.iter().any(|(label, ty, _, _)| {
-            let formal = match label {
-                Some(label) => formals.named_formal(*label),
-                None => {
-                    positional += 1;
-                    formals.positional.get(positional - 1)
-                }
+            let formal = if let Some(label) = label {
+                formals.named_formal(*label)
+            } else {
+                positional += 1;
+                formals.positional.get(positional - 1)
             };
             *ty == Ty::UNKNOWN && formal.is_some_and(|formal| nested_mention(formal.ty))
         })
@@ -6988,7 +6989,7 @@ impl<'a> Engine<'a> {
                 .index
                 .get(file)
                 .and_then(|f| f.decl(name))
-                .map_or(true, |decl| {
+                .is_none_or(|decl| {
                     decl.kind != MicroKind::TypeParam && Self::decl_is_type(decl.kind)
                 }),
             ScopedHit::Found(NamespaceEntry::Prefix) | ScopedHit::Ambiguous(_) => false,
@@ -7429,7 +7430,7 @@ impl<'a> Engine<'a> {
                         && !self.prefixed_element_head_resolves(name)
                         && self.graph.declaring_libraries(name).is_empty() =>
                 {
-                    out.push(self.object_question())
+                    out.push(self.object_question());
                 }
                 _ => return None,
             }
@@ -7509,12 +7510,12 @@ impl<'a> Engine<'a> {
             // them — the container's own table answers as the fallback.
             Receiver::Container { name: class, .. } => self
                 .member_formals_full(recv, name)
-                .map(|f| f.into_owned())
+                .map(std::borrow::Cow::into_owned)
                 .or_else(|| self.ctor_schema_formals(*class, name))
                 .or_else(|| self.factory_ctor_formals(*class, name)),
             _ => self
                 .member_formals_full(recv, name)
-                .map(|f| f.into_owned())
+                .map(std::borrow::Cow::into_owned)
                 .or_else(|| self.extension_member_formals(recv, name)),
         }
     }
@@ -8107,7 +8108,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The context type `K` a function literal opens under
-    /// (`inferLocalFunction`, inference_visitor_base.dart:2229): the first
+    /// (`inferLocalFunction`, `inference_visitor_base.dart:2229)`: the first
     /// available of four channels — (i) the declaration initializer's
     /// written type folded through its alias (`Function2<int, String> f =
     /// (x) => …` reads `String Function(int)`); (ii) the assignment
@@ -8462,18 +8463,16 @@ impl<'a> Engine<'a> {
         // against a bare callee parameter (the oracle's context is the
         // solved signature; an unsolved `T` is no context at all).
         let inst = self.closure_schema_instantiate(slot_ty, &recv, callee_name, callee_row);
-        match inst {
-            Some(ty) => Some(ty),
-            None => {
-                let has_open_param = self
-                    .closure_callee_params(&recv, callee_name)
-                    .map(|(params, ..)| {
+        if let Some(ty) = inst {
+            Some(ty)
+        } else {
+            let has_open_param =
+                self.closure_callee_params(&recv, callee_name)
+                    .is_some_and(|(params, ..)| {
                         let names: Vec<StringId> = params.iter().map(|(name, _)| *name).collect();
                         !names.is_empty() && self.ty_names_any(slot_ty, &names)
-                    })
-                    .unwrap_or(false);
-                if has_open_param { None } else { Some(slot_ty) }
-            }
+                    });
+            if has_open_param { None } else { Some(slot_ty) }
         }
     }
 
@@ -8985,7 +8984,7 @@ impl<'a> Engine<'a> {
     /// upstream static type of `e.member` is the getter's declared return
     /// instantiated with the receiver's written type arguments (upstream
     /// Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-    /// property_element_resolver.dart `_executeGetter`); this answers it
+    /// `property_element_resolver.dart` `_executeGetter`); this answers it
     /// only when the result is a provable named type — every other shape
     /// keeps the chain's `Unknown` suppression.
     fn chain_link_receiver(&self, row: &Row) -> Receiver {
@@ -9632,8 +9631,8 @@ impl<'a> Engine<'a> {
     /// body is not a block (the official reports `BlockFunctionBody`s
     /// only), or the branch order stays silent. The order, in the official
     /// shape: (a) a potentially non-nullable return type reports the
-    /// COMPILE_TIME_ERROR twin (`body_might_complete_normally`,
-    /// `isPotentiallyNonNullable`'s pick at type_analyzer.dart:688); (b) a
+    /// `COMPILE_TIME_ERROR` twin (`body_might_complete_normally`,
+    /// `isPotentiallyNonNullable`'s pick at `type_analyzer.dart:688`); (b) a
     /// nullable return type whose `FutureOr` base is
     /// `dynamic`/invalid/unknown/`void`/`Null` stays silent; (c) else the
     /// nullable warning carries the return type's display text.
@@ -9902,7 +9901,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The async body's completion context — official
-    /// `_contextTypeForImposed`'s final arm (body_inference_context.dart)
+    /// `_contextTypeForImposed`'s final arm (`body_inference_context.dart`)
     /// as a `Ty`: the `FutureOr<V>` union over the declared return's
     /// future value type. The verdict reads the union's faces through the
     /// same arms as any written `FutureOr`, and the nullable twin renders
@@ -9921,7 +9920,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// `TypeSystem.futureValueType` at name level (type_system.dart:471):
+    /// `TypeSystem.futureValueType` at name level (`type_system.dart:471)`:
     /// `S?` strips to `S`, a `Future<S>`/`FutureOr<S>` head unwraps to `S`
     /// (a bare head spells `<dynamic>` — its element is `dynamic`),
     /// `dynamic`/`void` stay themselves, and every other head answers
@@ -10234,15 +10233,17 @@ impl<'a> Engine<'a> {
             .bounds
             .container_params(container)
             .filter(|params| !params.is_empty())
-            .map(|params| {
-                let args: Vec<Ty> = params.iter().map(|(p, _, _)| Ty::named(*p)).collect();
-                Ty::Named {
-                    name: container,
-                    nullable: false,
-                    args: self.boundary.intern_list(&args),
-                }
-            })
-            .unwrap_or_else(|| Ty::named(container));
+            .map_or_else(
+                || Ty::named(container),
+                |params| {
+                    let args: Vec<Ty> = params.iter().map(|(p, _, _)| Ty::named(*p)).collect();
+                    Ty::Named {
+                        name: container,
+                        nullable: false,
+                        args: self.boundary.intern_list(&args),
+                    }
+                },
+            );
         if let Some(frame) = self.frames.last_mut()
             && let FrameKind::Executable { ret, .. } = &mut frame.kind
             && ret.is_none()
@@ -10304,7 +10305,7 @@ impl<'a> Engine<'a> {
 #[cfg(test)]
 mod tests_3098 {
     //! The `dead_null_aware_expression` verdict pins: the operand's static
-    //! type (upstream `_checkForDeadNullCoalesce`, error_verifier.dart
+    //! type (upstream `_checkForDeadNullCoalesce`, `error_verifier.dart`
     //! :4733-4739) is read the way the oracle reads it, and the report
     //! anchors the value's own expression span.
     //!

@@ -8,6 +8,7 @@
 //! the condition face (`…as a condition`) answers for a bare `bool?` read
 //! and its guard.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 
@@ -38,8 +39,7 @@ fn assert_unchecked(report: &FileReport, offset: usize, len: u32, message: &str)
     assert_eq!(
         unchecked(report),
         vec![format!(
-            "unchecked_use_of_nullable_value @{}:{} {}",
-            offset, len, message
+            "unchecked_use_of_nullable_value @{offset}:{len} {message}"
         )],
     );
 }

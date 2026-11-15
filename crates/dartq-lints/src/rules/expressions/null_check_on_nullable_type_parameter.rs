@@ -107,7 +107,7 @@ fn check(c: &mut Check<'_>) {
                     .filter(|&send| c.kind(kids[send]) == NodeKind::Send)
                     .and_then(|send| slice::send_parts(c, &kids, send))
                 {
-                    Some((head, _)) => kids[head..head + 1].to_vec(),
+                    Some((head, _)) => kids[head..=head].to_vec(),
                     None => Vec::new(),
                 }
             } else {
@@ -263,7 +263,7 @@ fn operand_field_name<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<(&'a str, bo
 /// it), with hand-built trees nesting it inside the row.
 fn in_scope_type_parameters<'a>(c: &'a Check<'_>) -> Vec<(&'a str, Option<u32>)> {
     let mut parameters = Vec::new();
-    for &ancestor in c.path.iter() {
+    for &ancestor in c.path {
         match c.kind(ancestor) {
             NodeKind::ClassDeclaration | NodeKind::MixinDeclaration | NodeKind::EnumDeclaration => {
                 let owner = c.unit.ast.parent(ancestor).unwrap_or(ancestor);
@@ -385,8 +385,7 @@ fn parameter_potentially_nullable(
 fn bound_face<'a>(c: &'a Check<'_>, variable: u32) -> Option<(&'a str, bool)> {
     let bound = c
         .children(variable)
-        .filter(|&row| c.kind(row) == NodeKind::Type && c.unit.ast.parent(row) == Some(variable))
-        .next()?;
+        .find(|&row| c.kind(row) == NodeKind::Type && c.unit.ast.parent(row) == Some(variable))?;
     let token = c.head_token(bound);
     let nullable = c.byte_span(bound).end > crate::rules::byte_span_of_token(c, token).end;
     Some((c.lexeme(token), nullable))

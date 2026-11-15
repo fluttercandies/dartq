@@ -1,5 +1,6 @@
 //! Feature folding tests.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::listener::ExperimentalFlag;
 use crate::message::experiment_not_enabled_message;
 

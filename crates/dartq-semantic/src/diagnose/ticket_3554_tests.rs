@@ -31,7 +31,7 @@
 //! A member declaration is an augmentation fragment iff it carries its own
 //! `augment` modifier (`fragment.isAugmentation =
 //! node.augmentKeyword != null`, upstream Dart SDK source,
-//! pkg/analyzer/lib/src/summary2/element_builder.dart). A member of an
+//! `pkg/analyzer/lib/src/summary2/element_builder.dart`). A member of an
 //! `augment` container WITHOUT the modifier is an introduction that
 //! fragment makes — it claims into the merged element's scope exactly like
 //! the #3378 pins assert. [`MemberEntry::is_augment`] carries the bit;
@@ -66,6 +66,7 @@
 //! `declaration_already_complete` pair dies (the augment's folded copy no
 //! longer masquerades as the introduction).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{
     code_names, report_ops_augment, report_ops_augment_experiments, report_ops_experiments_with,
     rows,
@@ -236,7 +237,7 @@ fn matching_primary_constructor_augmentation_is_silent() {
 /// ⑥ An extension type's representation primary is one target under the
 /// container's own name: augmenting it as `ET.new` (and a `.new`-spelled
 /// primary augmented bare) stays silent in both directions (the
-/// extension_types_A02 shape, probed silent).
+/// `extension_types_A02` shape, probed silent).
 #[test]
 fn extension_type_primary_augmentations_resolve() {
     let report = report_ops_experiments_with(

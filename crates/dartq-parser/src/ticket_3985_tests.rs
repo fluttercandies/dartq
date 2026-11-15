@@ -16,6 +16,7 @@
 //! oracle's `undefined_annotation ''` row was missed. These pins lock the
 //! restored event.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::parser::Parser;
 use crate::tests::collector::{Collector, latest_features, scan_ok};
 

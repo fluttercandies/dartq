@@ -107,6 +107,7 @@
 //!   whose value is an assignment (`if (b = c)`) or a non-reference
 //!   expression carries no read anchor and emits no row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 pub mod ev;
 pub mod facts;
 pub mod model;

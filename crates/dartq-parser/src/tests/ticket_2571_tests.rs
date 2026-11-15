@@ -18,6 +18,7 @@
 //! section for the flow layer's receiver stack, so those heads keep a
 //! cascade chunk of their own.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::listener::ParserListener;
 use crate::message::Message;
 use crate::token_id::TokenSpan;

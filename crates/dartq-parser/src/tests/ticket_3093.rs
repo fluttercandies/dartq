@@ -9,6 +9,7 @@
 //! single row. The bound-position face (`T extends ,` / `T extends super`)
 //! anchors `expected_type_name` on the offending token.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.

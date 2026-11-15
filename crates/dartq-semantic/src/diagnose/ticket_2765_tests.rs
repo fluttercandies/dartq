@@ -12,6 +12,7 @@
 //! the bare implicit-`this` read (the head latch's real span) were never
 //! affected.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

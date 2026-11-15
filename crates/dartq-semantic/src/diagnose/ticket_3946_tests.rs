@@ -30,6 +30,7 @@
 //! `RETURN_OF_INVALID_TYPE` + `RETURN_OF_INVALID_TYPE_FROM_CLOSURE` on
 //! the `return () => (int i) => <String>[]` fixture (case9).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// The convicted case: `F<int> g = () => (int i) => <int>[];` — the

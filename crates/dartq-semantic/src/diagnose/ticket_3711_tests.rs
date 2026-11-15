@@ -18,6 +18,7 @@
 //! `undefined_getter`/`undefined_method` at the continuation selector and
 //! NO `dot_shorthand_undefined_member` (the constructor resolved).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, assert_silent, report_ops, rows};
 use super::types::FileReport;
 

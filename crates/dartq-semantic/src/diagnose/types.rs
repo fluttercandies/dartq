@@ -1,3 +1,5 @@
+#![allow(clippy::doc_lazy_continuation)]
+
 use super::*;
 
 /// The dart:core top-level annotation names (`sdk/lib/core/annotations.dart`:
@@ -835,7 +837,6 @@ pub(crate) struct Boundary<'a> {
 }
 
 impl<'a> Boundary<'a> {
-    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         index: &'a ElementIndex,
         own: FileId,
@@ -1370,34 +1371,6 @@ impl<'a> Boundary<'a> {
         self.args.borrow_mut().function_required(
             type_params,
             required_positional,
-            return_ty,
-            positional,
-            named,
-            nullable,
-        )
-    }
-
-    /// [`Self::intern_function_ty`] with the signature's own
-    /// `<T extends B>` group spelled (`function_generic`): a generic
-    /// member's tear-off carries its declaration's parameters into the
-    /// substituted face, and the `undefined_operator`/`ty_display` render
-    /// spells the group verbatim (`<T>void Function(T)`). A count-only
-    /// source delegates to the count-only producer (its `type_params`
-    /// would be lost through the names-only slice).
-    pub(crate) fn intern_function_ty_generic(
-        &self,
-        type_params: u16,
-        type_params_named: &[(StringId, Option<Ty>)],
-        return_ty: Ty,
-        positional: &[Ty],
-        named: &[(StringId, Ty)],
-        nullable: bool,
-    ) -> Ty {
-        if type_params_named.is_empty() {
-            return self.intern_function_ty(type_params, return_ty, positional, named, nullable);
-        }
-        self.args.borrow_mut().function_generic(
-            type_params_named,
             return_ty,
             positional,
             named,
@@ -5601,6 +5574,10 @@ pub(crate) struct FfiClauseSpans {
     /// The `implements` entries in written order.
     pub(crate) implements: Vec<SourceRange>,
     /// The `with` entries in written order.
+    #[expect(
+        dead_code,
+        reason = "captured for the ffi clause spans' completeness; no reader consumes the with faces yet"
+    )]
     pub(crate) withs: Vec<SourceRange>,
 }
 
@@ -5750,6 +5727,10 @@ pub(crate) struct FfiAnnoFace {
 #[derive(Clone, Debug)]
 pub(crate) struct FfiSigFace {
     /// The written type argument's own span (inside the `<...>`).
+    #[expect(
+        dead_code,
+        reason = "carries the type argument's span for the ffi signature face; no reader consumes it yet"
+    )]
     pub(crate) range: SourceRange,
     /// The written text (the message display).
     pub(crate) display: Box<str>,
@@ -5971,7 +5952,7 @@ impl FoldHierarchy<'_> {
             })
         };
         (
-            container.superclass.and_then(&hop),
+            container.superclass.and_then(hop),
             container
                 .implements_clause
                 .iter()
@@ -6045,7 +6026,7 @@ impl ModifierHierarchy for FoldHierarchy<'_> {
     }
 }
 
-impl<'a> Engine<'a> {
+impl Engine<'_> {
     /// The `?`-suffixed face (`NullabilitySuffix.question`) — the
     /// dead-chain receiver gate: a written-nullable named type, not
     /// `dynamic` and not the `Null` type.
@@ -6652,69 +6633,6 @@ impl<'a> Engine<'a> {
         ))
     }
 
-    /// The const-ness of one redirect target constructor — the oracle's
-    /// `redirectedElement.isConst` in `_checkForRedirectToNonConstConstructor`
-    /// (error_verifier.dart:7330-7347): `Some(true)`/`Some(false)` when the
-    /// target resolves to a constructor face of this file, `None` when it
-    /// resolves to no constructor at all (the oracle's null
-    /// `redirectedElement`: the gate never reports).
-    ///
-    /// An enum's generative constructors are implicitly const — with the
-    /// primary-constructors feature a generative constructor in an enum body
-    /// may drop the `const` keyword, and an enum primary constructor carries
-    /// it implicitly (`const_constructor_with_non_final_field`'s upstream
-    /// sibling rule, upstream `enum_implicit_const_constructor_test`). The
-    /// written `const` bit alone would read a `const`-less enum constructor
-    /// as non-const, and a primary constructor holds no declaration site at
-    /// all — both over-report a `const` redirect inside the enum. Every
-    /// generative target face inside an enum therefore reads const; an enum
-    /// factory keeps its own written bit (its constness is declarative).
-    pub(crate) fn redirect_target_is_const(
-        &self,
-        container: StringId,
-        selector: StringId,
-    ) -> Option<bool> {
-        let resolved = resolve_container(
-            self.graph,
-            self.namespaces,
-            self.index,
-            self.lib,
-            self.file,
-            container,
-        );
-        // A foreign container's constructor set is not modeled here (the
-        // under-report posture the gate already held).
-        let decl = resolved.and_then(|(decl, owner)| (owner == self.file).then_some(decl));
-        let enum_target = decl.is_some_and(|decl| decl.kind == ContainerKind::Enum);
-        if let Some(site) = self.ctor_decl_site(container, selector) {
-            return Some(site.const_ctor || (enum_target && !site.is_factory));
-        }
-        let decl = decl?;
-        if !self.ctor_face_exists(decl, container, selector) {
-            return None;
-        }
-        // No declaration site: the implicit unnamed default is never const
-        // upstream, while an enum's is the implicit const constructor its
-        // values are instances of.
-        Some(enum_target)
-    }
-
-    /// The declarative const-constructor faces of the container that just
-    /// closed — `_checkForConstConstructorWithNonFinalField`
-    /// (error_verifier.dart:4132-4160, reached from the two constructor
-    /// visitors) and the enum `with`-clause face below, which shares this
-    /// call site because `flush_init_instance_fields` (type_capture.rs) is
-    /// the one declaration-close hook every container kind reaches.
-    ///
-    /// The `const_constructor_with_mixin_with_field[s]` sibling reports from
-    /// the whole-unit mixin-application post-pass instead
-    /// (`enum_verifier.rs`'s `verify_const_constructor_mixin_fields`) —
-    /// upstream decides it first and then stops, so THIS pass stands its own
-    /// row down whenever the mixin list is non-empty (the pre-emption,
-    /// mirrored rather than re-decided). The anchor of both is the
-    /// constructor's `errorRange`: a secondary head's type name through its
-    /// selector, a primary head's `const` keyword through the constructor
-    /// name.
     pub(crate) fn flush_const_ctor_non_final_face(&mut self, container: StringId) {
         let Some(decl) = self
             .index
@@ -7081,7 +6999,7 @@ impl<'a> Engine<'a> {
             .unwrap_or(name);
         let end = if self.lexeme_at(head.offset) == Some(".") {
             self.token_after(head.offset)
-                .map_or(start.end(), |selector| selector.end())
+                .map_or(start.end(), dartq_diagnostics::SourceRange::end)
         } else {
             start.end()
         };
@@ -7207,11 +7125,7 @@ mod extension_type_ctors {
     }
 
     fn code_names(report: &FileReport) -> Vec<&'static str> {
-        report
-            .diagnostics
-            .iter()
-            .map(|d| d.code.name.as_ref())
-            .collect()
+        report.diagnostics.iter().map(|d| d.code.name).collect()
     }
 
     /// The private-selector primary constructor (`X._(bits)` — the

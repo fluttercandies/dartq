@@ -2,6 +2,7 @@
 //! statements, jumps, declarations, and asserts — in the official
 //! decision order.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_parser::TokenSpan;
 use dartq_source::saturate_slot_u32;
 
@@ -2024,8 +2025,8 @@ impl Interp<'_> {
         }
     }
 
-    /// The merged member's `default` head row (`case A: case B: default:
-    /// <body>`): the parser folds every head that shares one body into a
+    /// The merged member's `default` head row (`case A: case B: default: <body>` shape):
+    /// the parser folds every head that shares one body into a
     /// single member, so no head event ever names the trailing `default`
     /// and its member row has no other observable point. The official
     /// driver visits each head with `switchStatement_beginAlternative` ->

@@ -40,6 +40,7 @@
 //! ASCII-only (the official scanner's law), so `to_ascii_lowercase`
 //! folding is exact and a non-ASCII query character can never match.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_source::{StringId, StringTable};
 
 /// The discovery answer's cap: the top slice a search serves, applied
@@ -129,7 +130,7 @@ pub fn rank(candidates: &mut Vec<Candidate>, strings: &StringTable) {
 
 /// ASCII case-insensitive byte equality.
 fn eq_fold(a: u8, b: u8) -> bool {
-    a.to_ascii_lowercase() == b.to_ascii_lowercase()
+    a.eq_ignore_ascii_case(&b)
 }
 
 /// Whether `at` is a word-start position of `name` (module docs: index 0,
@@ -286,7 +287,8 @@ mod tests {
             "class FooBar {}\nvoid foo_bar() {}\nvoid foob() {}\nvoid fb() {}\nvoid xfbx() {}\n",
         );
         for i in 0..35 {
-            source.push_str(&format!("void xfbx{i:02}() {{}}\n"));
+            use std::fmt::Write as _;
+            writeln!(source, "void xfbx{i:02}() {{}}").expect("write to String");
         }
         source
     }

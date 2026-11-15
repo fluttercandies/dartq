@@ -45,6 +45,7 @@
 //! type, which the oracle reads); and barrel-re-exported annotation
 //! classes (the import edge must target the declaring library).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_resolution::{LocalLookup, Lookup, NamespaceEntry};
 use dartq_scanner::{Keyword, TokenKind};
@@ -81,7 +82,7 @@ enum TKind {
     TypedefType,
 }
 
-/// The `TargetKind` enum's `name` → display table (meta_meta.dart's
+/// The `TargetKind` enum's `name` → display table (`meta_meta.dart`'s
 /// `TargetKind._(displayString, name)` pairs).
 const TARGET_KINDS: &[(&str, &str, TKind)] = &[
     ("classType", "classes", TKind::ClassType),
@@ -151,9 +152,8 @@ fn kind_of_name(name: &str) -> Option<TKind> {
 fn display_of_kind(kind: TKind) -> &'static str {
     TARGET_KINDS
         .iter()
-        .find(|(_, .., k)| *k == kind)
-        .map(|(_, display, _)| *display)
-        .unwrap_or("")
+        .find(|(.., k)| *k == kind)
+        .map_or("", |(_, display, _)| *display)
 }
 
 /// The sorted display list joined with the official `or` chain
@@ -307,7 +307,7 @@ impl Engine<'_> {
             // a real field (`FieldElement.isEnumConstant`).
             let constant_end =
                 (container.kind == ContainerKind::Enum).then(|| self.enum_constant_list_end(*name));
-            for (_, entry) in container.members.iter() {
+            for (_, entry) in &container.members {
                 let is_enum_constant = entry.kind == MemberKind::Field
                     && entry.is_static
                     && constant_end.is_some_and(|end| entry.name_range.offset < end);
@@ -321,11 +321,11 @@ impl Engine<'_> {
                     &entry.annotations,
                 ));
             }
-            for (outer, ctors) in elements.ctor_annotations.iter() {
+            for (outer, ctors) in &elements.ctor_annotations {
                 if *outer != *name {
                     continue;
                 }
-                for (_, annotations) in ctors.iter() {
+                for (_, annotations) in ctors {
                     sites.push((SiteKind::Constructor, &annotations[..]));
                 }
             }
@@ -337,7 +337,7 @@ impl Engine<'_> {
                 SiteKind::Container(ContainerKind::Extension),
                 &face.annotations,
             ));
-            for (_, entry) in face.members.iter() {
+            for (_, entry) in &face.members {
                 sites.push((
                     SiteKind::Member {
                         kind: entry.kind,
@@ -376,9 +376,9 @@ impl Engine<'_> {
         }
         // Formal parameters, through the owner join the annotation
         // recognition already reads.
-        for (owner, formals) in elements.formal_annotations.iter() {
+        for (owner, formals) in &elements.formal_annotations {
             let owner_formals = self.owner_formals(*owner);
-            for (formal, annotations) in formals.iter() {
+            for (formal, annotations) in formals {
                 // `isOptional` (the `optionalParameter` arm,
                 // annotation_target.dart:49-51): a formal the owner's
                 // table marks non-required — named optionals and `[...]`
@@ -609,7 +609,7 @@ impl Engine<'_> {
         None
     }
 
-    /// Whether `annotation` is meta_meta's `Target` class constructor as
+    /// Whether `annotation` is `meta_meta`'s `Target` class constructor as
     /// written in `lib` — the name-level twin of the angular-meta getter
     /// test (the import edge must target a library declared
     /// `library meta_meta;`, through the declaring library of the
@@ -645,13 +645,12 @@ impl Engine<'_> {
     fn owner_formals(&self, owner: StringId) -> Option<Box<Formals>> {
         let owner = self.strings.resolve(owner);
         // A top-level executable's join has no dot: its own table.
-        let (container, rest) = match owner.split_once('.') {
-            Some((container, rest)) => (container, rest),
-            None => {
-                let id = self.strings.intern(owner);
-                let file = self.resolve_head_file(None, id)?;
-                return self.index.get(file)?.decl(id)?.formals.clone();
-            }
+        let (container, rest) = if let Some((container, rest)) = owner.split_once('.') {
+            (container, rest)
+        } else {
+            let id = self.strings.intern(owner);
+            let file = self.resolve_head_file(None, id)?;
+            return self.index.get(file)?.decl(id)?.formals.clone();
         };
         let container_id = self.strings.intern(container);
         let file = self.resolve_class_file(self.lib, container_id)?;
@@ -770,10 +769,9 @@ impl Engine<'_> {
                     }
                     index = cursor;
                 }
-                TokenKind::Keyword(Keyword::Import)
-                | TokenKind::Keyword(Keyword::Export)
-                | TokenKind::Keyword(Keyword::Library)
-                | TokenKind::Keyword(Keyword::Part) => {
+                TokenKind::Keyword(
+                    Keyword::Import | Keyword::Export | Keyword::Library | Keyword::Part,
+                ) => {
                     let site = match token.kind {
                         TokenKind::Keyword(Keyword::Import) => SiteKind::ImportDirective,
                         TokenKind::Keyword(Keyword::Export) => SiteKind::ExportDirective,

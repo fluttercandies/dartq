@@ -18,6 +18,7 @@
 //! send's inference), so the zero-argument send's
 //! `not_enough_positional_arguments` is earned by the same resolution.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

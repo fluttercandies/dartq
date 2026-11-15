@@ -18,6 +18,7 @@
 //! pattern written `case const A.a:` — the ConstantPattern node spans
 //! `const` through the expression), not at the capture root's `A`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
@@ -89,7 +90,7 @@ fn at(source: &str, needle: &str) -> u32 {
 }
 
 /// Exactly one row of `name`, warning-severity, spanning
-/// `[offset, offset + length)` — the oracle's STATIC_WARNING tier and
+/// `[offset, offset + length)` — the oracle's `STATIC_WARNING` tier and
 /// node anchor both pin (the inner identifier would offset-shift, the
 /// member tail would length-shrink, and the un-prefixed capture root
 /// would miss the `const` keyword).
@@ -193,7 +194,7 @@ void f(Unrelated u) {
 }
 
 /// The `const`-prefixed spelling anchors at the keyword: the
-/// ConstantPattern node spans `const A.a` (oracle probe p3: `warning
+/// `ConstantPattern` node spans `const A.a` (oracle probe p3: `warning
 /// 7:10` for a pattern written at column 10 — the keyword), not the
 /// capture root's `A.a` the expression-only span used to carry. (The
 /// oracle's companion `invalid_constant_const_prefix` error row is the

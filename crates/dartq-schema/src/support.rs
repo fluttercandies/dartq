@@ -2,6 +2,7 @@
 //! crate: every domain module expresses its contract with these, and
 //! [`crate::SchemaViolation`] is the only error surface.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde_json::{Map, Value};
 
 use crate::SchemaViolation;

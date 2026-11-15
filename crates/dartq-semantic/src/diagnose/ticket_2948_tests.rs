@@ -11,6 +11,8 @@
 //! `.member` merge classified `Receiver::Unknown`, the send's declared
 //! return never resolved, and `check_type_check` suppressed the verdict.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use crate::diagnose::test_rig::{RigImport, report_ops, report_ops_imports};
 use crate::diagnose::types::FileReport;
 
@@ -26,7 +28,7 @@ fn type_check_rows(report: &FileReport) -> Vec<(u32, u32)> {
     found
 }
 
-/// —— the parenthesized type literal's `Type` receiver ——
+// —— the parenthesized type literal's `Type` receiver ——
 
 /// `(C).toString() is String` (the `class/literal_test_*` census family —
 /// 20+ rows): the group's inner `TypeLiteral` types `Type`, so `.toString`
@@ -66,7 +68,7 @@ fn type_literal_group_is_type_reports() {
     );
 }
 
-/// —— the parenthesized creation's container ——
+// —— the parenthesized creation's container ——
 
 /// `(C()).toString() is String` (the brief's reproduction): the
 /// creation's group types `C`, the universal `toString` face answers
@@ -105,7 +107,7 @@ fn creation_group_is_own_type_reports() {
     );
 }
 
-/// —— the parenthesized send's declared return ——
+// —— the parenthesized send's declared return ——
 
 /// `(f()) is int` over an `int` callee: the group's inner send types its
 /// declared return exactly like the unparenthesized face.
@@ -144,7 +146,7 @@ fn paren_send_member_chain_reports() {
     );
 }
 
-/// —— the is! polarity over a parenthesized receiver ——
+// —— the is! polarity over a parenthesized receiver ——
 
 /// `(x).m() is! T`: the constant-true shape reports on `is!` exactly as
 /// upstream's `negated` polarity arm.
@@ -164,7 +166,7 @@ fn paren_receiver_isnot_reports() {
     );
 }
 
-/// —— nested groups ——
+// —— nested groups ——
 
 /// `((e).m()).n() is T`: the inner group's member call is itself an
 /// operand expression — its send result types the outer group's receiver.
@@ -184,7 +186,7 @@ fn nested_group_member_reports() {
     );
 }
 
-/// —— regression controls ——
+// —— regression controls ——
 
 /// The simple operand's verdict is unchanged: a typed local folds as
 /// before.
@@ -290,7 +292,7 @@ fn prefixed_target_unchanged() {
     );
 }
 
-/// —— the C4b bare-creation operand faces ——
+// —— the C4b bare-creation operand faces ——
 
 /// `D() is D` (the unnamed-constructor send operand): the callee row's
 /// `Bare(Container)` head carries no `ty`, and `callee_return_ty`'s
@@ -374,7 +376,7 @@ fn prefixed_creation_operand_reports() {
     );
 }
 
-/// `p.C is Type`: the prefixed TypeLiteral — the non-invoked
+/// `p.C is Type`: the prefixed `TypeLiteral` — the non-invoked
 /// `Member{Prefix}` container head reads `Type` exactly like the bare
 /// `C` face.
 #[test]

@@ -11,6 +11,7 @@
 //! unnamed members → one row), plus `variable_declaration_A06_t02` (seven
 //! unnamed static fields → one row). Oracle: dart 3.13.7.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use crate::FileReport;
 
@@ -53,9 +54,9 @@ fn nameless_field_anchors_at_container_name() {
 
 /// The same remap over a mixin container: `mixin M { var }` parses a
 /// nameless field whose row anchors at `M`, `|0` (the mixin twin of
-/// RecoveryParserTest/test_incompleteField_var). `mixin M { int ; }` is
+/// `RecoveryParserTest/test_incompleteField_var`). `mixin M { int ; }` is
 /// no nameless face: `int` recovers as the field's NAME
-/// (`missing_const_final_var_or_type`, the partial_code
+/// (`missing_const_final_var_or_type`, the `partial_code`
 /// `field_declaration_type_noName_*` family) — a public field, no row.
 #[test]
 fn nameless_field_anchors_at_mixin_name() {

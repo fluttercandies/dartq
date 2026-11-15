@@ -4,6 +4,8 @@
 //! promotion, extension `on` nullable, generic `T` bound, `unary-`
 //! spelling fallback, and `++` spelling fallback.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{code_names, report_ops, rows};
 
 fn unchecked(source: &str) -> Vec<String> {

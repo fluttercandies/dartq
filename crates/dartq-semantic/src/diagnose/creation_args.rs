@@ -25,10 +25,11 @@
 //! is `creation_call_site_ty`'s poison arm, whose upstream rule is the
 //! already-inferred (downward) type returned for a covariant parameter
 //! ahead of any constraint (upstream Dart SDK source,
-//! pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer_operations.dart
+//! pkg/_`fe_analyzer_shared/lib/src/type_inference/type_analyzer_operations.dart`
 //! `inferTypeParameterFromAll`). The pinned reader contract those lanes
 //! must keep is `ticket_3388_tests.rs`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 impl Engine<'_> {
@@ -173,7 +174,7 @@ impl Engine<'_> {
     /// Dependency recorded for the #2918 census face (the ~1200-row
     /// raw-head display residual): the fill belongs where the resolved
     /// `Ty` is produced or rendered — `bind_declared_type` /
-    /// `bind_parameter_type` (scopes_bodies.rs:1282/1303), `fold_alias_ty`
+    /// `bind_parameter_type` (`scopes_bodies.rs:1282/1303`), `fold_alias_ty`
     /// (resolution.rs:56), or `ty_display` (assignability.rs:4182). All
     /// of those files are owned by sibling lanes this round, so the
     /// helper lands here; the adopters call `self.instantiated_head_ty`

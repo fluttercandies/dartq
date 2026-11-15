@@ -10,6 +10,7 @@
 //! Each fixture shape was probed against oracle `dart analyze` (fvm
 //! default) on an isolated broken-import tree before pinning.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -125,7 +126,7 @@ fn family_codes(report: &FileReport) -> Vec<&'static str> {
 
 /// The analyzer corpus' `bundle_reader._formalParameterKind` shape: the
 /// enum is declared in the graph but the unit's import of it is broken, so
-/// the scrutinee's type never resolved in scope. The oracle's InvalidType
+/// the scrutinee's type never resolved in scope. The oracle's `InvalidType`
 /// gate keeps the fully-covered switch silent; the pre-gate engine resolved
 /// the enum through the world's fallback while the case constants stayed
 /// unresolved, and false-positived the covering row.
@@ -179,7 +180,7 @@ fn imported_enum_full_coverage_stays_silent() {
 
 /// The analyzer corpus' nullability face (the `var origin? => …, null => …`
 /// pairs over a member of an unimported type): the broken-import scrutinee
-/// reads as the InvalidType shape, so the oracle's gate suppresses the
+/// reads as the `InvalidType` shape, so the oracle's gate suppresses the
 /// per-case reachability row too. The pre-gate engine latched the
 /// as-written named type, judged it non-nullable, and false-positived the
 /// first arm's `unreachable_switch_case`.
@@ -200,7 +201,7 @@ fn unimported_nullable_scrutinee_suppresses_the_unreachable_row() {
 /// The same nullable-scrutinee shape with the import intact: the
 /// null-check arm's space is the subpattern space ∩ nonNull — never
 /// `null` itself (official `createNullCheckSpace`, upstream Dart SDK
-/// source, pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:
+/// source, pkg/_`fe_analyzer_shared/lib/src/exhaustiveness/shared.dart`:
 /// 780-786) — so `case null:` stays live and the switch reports no
 /// reachability row (#2354: the pre-fix nullable leaf false-positived
 /// exactly this row).

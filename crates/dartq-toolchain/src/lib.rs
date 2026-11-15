@@ -24,6 +24,7 @@
 //! `proc` (unix): the process-tree RSS sum and kill that bound an analyzer's
 //! memory.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -152,9 +153,8 @@ fn resolve_in(
 /// visible in one line. An unresolvable override (absent, dangling symlink)
 /// passes through verbatim — the spawn fails with its own diagnostic later.
 fn non_recursing(tool: &Tool, path: &Path, own: Option<&Path>) -> Option<PathBuf> {
-    let resolved = match fs::canonicalize(path) {
-        Ok(resolved) => resolved,
-        Err(_) => return Some(path.to_path_buf()),
+    let Ok(resolved) = fs::canonicalize(path) else {
+        return Some(path.to_path_buf());
     };
     if let Some(own) = own
         && own == resolved.as_path()

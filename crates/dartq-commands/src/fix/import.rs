@@ -1,13 +1,13 @@
 //! The import-synthesis family — dartq's equivalent of upstream's
 //! `ImportLibrary` producers (upstream Dart SDK source,
-//! pkg/analysis_server/lib/src/services/correction/dart/import_library.dart;
+//! `pkg/analysis_server/lib/src/services/correction/dart/import_library.dart`;
 //! fix kinds `dart.fix.import.library*`, registration
-//! pkg/analysis_server/lib/src/services/correction/fix_internal.dart).
+//! `pkg/analysis_server/lib/src/services/correction/fix_internal.dart`).
 //! An unresolved-name diagnostic whose miss name the maintained index can
 //! attribute to a top-level declaration in another library produces one
 //! patch per candidate library: `import '<uri>';` inserted at the
 //! upstream `_addLibraryImports` position (upstream Dart SDK source,
-//! pkg/analyzer_plugin/lib/src/utilities/change_builder/change_builder_dart.dart
+//! `pkg/analyzer_plugin/lib/src/utilities/change_builder/change_builder_dart.dart`
 //! — the directive-region group ordering and blank-line rules replicated
 //! over the token stream).
 //!
@@ -19,7 +19,12 @@
 //! priority order (`librarySdk` before `libraryProject1..4`); a `part of`
 //! unit (a library part cannot import) yields no rows.
 
-use super::*;
+#![allow(clippy::semicolon_if_nothing_returned)]
+use super::{
+    BUILTIN_SEMANTIC_SOURCE, Diagnostic, FileId, FixRole, FxHashMap, FxHashSet, Keyword, LineIndex,
+    Path, PlannerFuse, RuleFix, TokenKind, TokenTable, anchored_edit, byte_offset_to_utf16,
+    slice16, word_shape,
+};
 
 /// The arm mask bits: which declaration faces a miss code's candidates
 /// admit (the top-level kinds, the SDK library faces).
@@ -30,7 +35,7 @@ const ARM_SDK: u8 = 8;
 
 /// The import-synthesis arm of an emitted semantic code, or `None` for a
 /// code with no import producer. Only the legs a bare name lookup can
-/// serve are wired — upstream's per-code registration (fix_internal.dart)
+/// serve are wired — upstream's per-code registration (`fix_internal.dart`)
 /// minus the member-targeted legs the index cannot prove
 /// (`undefined_setter`/`undefined_operator`'s `forExtensionMember`-only
 /// registrations, the `unchecked_*_of_nullable_value` legs,

@@ -28,6 +28,7 @@
 //!   stays for the iterable/`)` recovery instead of falling to the C-style
 //!   `parseForRest` (`expected ';'` + `unexpected <junk>` cascades).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 
 /// `(code, start, end)` parser rows for `source` under latest features.

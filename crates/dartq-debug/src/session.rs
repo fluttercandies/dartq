@@ -25,6 +25,7 @@
 //! stream showed answers [`Error::IsolateExited`]. One classifier,
 //! `DebugSession::name_exit_state`, decides.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -535,7 +536,7 @@ pub struct DebugSession {
     /// learned from `ServiceRegistered` events and the discovery
     /// probe (see [`DebugSession::flutter_tool_attached`]).
     tool_services: FxHashMap<String, String>,
-    /// Cached answer to "is a flutter_tools behind this service?" —
+    /// Cached answer to "is a `flutter_tools` behind this service?" —
     /// its DDS client namespace once discovered.
     flutter_tool: Option<String>,
     /// Whether the launched child is `flutter run` (drives the
@@ -842,7 +843,7 @@ impl DebugSession {
     }
 
     /// Whether a `flutter run`-style tool is behind this service
-    /// (flutter_tools wrapping the VM service in DDS and registering
+    /// (`flutter_tools` wrapping the VM service in DDS and registering
     /// its orchestration services — the `Service` stream announces
     /// them, replayed to this session's subscription, so the answer is
     /// available right after the handshake).
@@ -850,7 +851,7 @@ impl DebugSession {
         self.tool_namespace().is_some()
     }
 
-    /// The flutter_tools service namespace (`s0` in DDS builds that
+    /// The `flutter_tools` service namespace (`s0` in DDS builds that
     /// prefix tool services this way), taken from the replayed
     /// `ServiceRegistered` events. A bare Dart VM service registers no
     /// client services, so the answer is `None` there.
@@ -1506,26 +1507,25 @@ impl DebugSession {
         expression: &str,
     ) -> Result<VmObject> {
         let isolate_id = self.target(isolate)?;
-        let target = match self.root_libs.get(&isolate_id) {
-            Some(library_id) => library_id.clone(),
-            None => {
-                let fetched: crate::protocol::Isolate = self
-                    .client
-                    .call_typed(
-                        "getIsolate",
-                        json!({ "isolateId": isolate_id }),
-                        self.config.rpc_timeout,
-                    )
-                    .map_err(|error| self.name_exit_state(Some(&isolate_id), error))?;
-                let library_id = fetched.root_lib.map(|library| library.id).ok_or_else(|| {
-                    Error::Protocol(format!(
-                        "isolate {isolate_id} reports no root library (not Runnable yet?)"
-                    ))
-                })?;
-                self.root_libs
-                    .insert(isolate_id.clone(), library_id.clone());
-                library_id
-            }
+        let target = if let Some(library_id) = self.root_libs.get(&isolate_id) {
+            library_id.clone()
+        } else {
+            let fetched: crate::protocol::Isolate = self
+                .client
+                .call_typed(
+                    "getIsolate",
+                    json!({ "isolateId": isolate_id }),
+                    self.config.rpc_timeout,
+                )
+                .map_err(|error| self.name_exit_state(Some(&isolate_id), error))?;
+            let library_id = fetched.root_lib.map(|library| library.id).ok_or_else(|| {
+                Error::Protocol(format!(
+                    "isolate {isolate_id} reports no root library (not Runnable yet?)"
+                ))
+            })?;
+            self.root_libs
+                .insert(isolate_id.clone(), library_id.clone());
+            library_id
         };
         self.evaluate(Some(&isolate_id), &target, expression)
     }
@@ -1711,10 +1711,10 @@ impl DebugSession {
     /// Hot reload (`reloadSources`). Returns whether the reload was
     /// reported successful.
     ///
-    /// On a Flutter session the RPC is fielded by flutter_tools'
+    /// On a Flutter session the RPC is fielded by `flutter_tools`'
     /// tool-registered `reloadSources` service (DDS routes the method
     /// name to the tool), so the reload follows the tool's own
-    /// orchestration — DevFS source push plus reassemble — exactly
+    /// orchestration — `DevFS` source push plus reassemble — exactly
     /// what the tool's `r` key does. On a bare Dart VM the native
     /// reload runs. Either way a compile error in the edited sources
     /// comes back as [`Error::Rpc`] carrying the tool's diagnostics
@@ -1751,17 +1751,17 @@ impl DebugSession {
     }
 
     /// Hot restart through the tool-registered `hotRestart` service
-    /// (flutter_tools registers it over DDS under its client
+    /// (`flutter_tools` registers it over DDS under its client
     /// namespace; a bare VM service has no such method and answers
     /// with an RPC error, surfaced unchanged).
     ///
-    /// Restart semantics (verified against flutter_tools' own hot
+    /// Restart semantics (verified against `flutter_tools`' own hot
     /// restart): every isolate is torn down and rebuilt with fresh
     /// ids, the tool itself removes the old breakpoints, and the app
     /// state resets as the tool's `R` key resets it — the app runs
     /// again immediately. Re-arming breakpoints afterwards is the
     /// *client's* job ("new isolates … will be configured by the
-    /// editor as they are started", flutter_tools source); this
+    /// editor as they are started", `flutter_tools` source); this
     /// session does exactly that: every tracked breakpoint spec is
     /// re-armed against the post-restart main isolate. A breakpoint
     /// in first-frame code (e.g. a widget `build`) may be armed a
@@ -1833,7 +1833,7 @@ impl DebugSession {
     /// Closes the debugger connection and releases the launched
     /// program: the app keeps running under its own steam. Every
     /// isolate the session knows first gets a best-effort `resume`
-    /// (the DevTools detach courtesy): a pause outlives the connection
+    /// (the `DevTools` detach courtesy): a pause outlives the connection
     /// that requested it, so closing while paused would wedge the app
     /// for every later client. The child is moved to a reaper thread
     /// so it never lingers as a zombie; the session is inert afterwards
@@ -2008,7 +2008,7 @@ impl DebugSession {
     }
 
     /// Records one event: ring entry, isolate table, breakpoint
-    /// resolution, pause tracking, WriteEvent output capture.
+    /// resolution, pause tracking, `WriteEvent` output capture.
     fn absorb_event(&mut self, stream: StreamEvent) {
         // Keep the ring's sequence space aligned with the wire: events
         // the bounded feed dropped become skipped numbers, so the hole
@@ -2038,7 +2038,7 @@ impl DebugSession {
     }
 
     /// Applies one event to the session's derived state: isolate
-    /// table, breakpoint resolution, pause tracking, WriteEvent output.
+    /// table, breakpoint resolution, pause tracking, `WriteEvent` output.
     fn apply_event(&mut self, stream_id: &str, event: &Event, seq: u64) {
         let isolate_id = event.isolate.as_ref().map(|isolate| isolate.id.as_str());
         match &event.kind {
@@ -2049,7 +2049,7 @@ impl DebugSession {
             }
             EventKind::IsolateExit => {
                 if let Some(id) = isolate_id {
-                    self.forget_isolate(&id.to_owned());
+                    self.forget_isolate(id);
                 }
             }
             EventKind::IsolateReload => {
@@ -2619,7 +2619,7 @@ fn check_success(value: &Value) -> Result<()> {
 
 /// Whether a flutter_tools-registered service answered success. The
 /// tool's service callbacks return `{"result": {"type": "Success"}}`,
-/// which the vm_service package nests once under `result` — both
+/// which the `vm_service` package nests once under `result` — both
 /// spellings are accepted.
 fn tool_answer_ok(value: &Value) -> Option<()> {
     let tag = value.get("type").and_then(Value::as_str);
@@ -2631,7 +2631,7 @@ fn tool_answer_ok(value: &Value) -> Option<()> {
 ///
 /// * `dart` (the CLI VM):
 ///   `The Dart VM service is listening on http://127.0.0.1:PORT/AUTH=/`
-/// * `flutter run` (flutter_tools prints the DDS address):
+/// * `flutter run` (`flutter_tools` prints the DDS address):
 ///   `A Dart VM Service on macOS is available at: http://127.0.0.1:PORT/AUTH=/`
 ///
 /// The device name in the Flutter banner may contain spaces, so the
@@ -2646,13 +2646,12 @@ fn banner_in(line: &[u8]) -> Option<String> {
         text[start + DART_MARKER.len()..]
             .split_whitespace()
             .next()?
-    } else if let Some(rest) = text.strip_prefix(FLUTTER_PREFIX) {
+    } else {
+        let rest = text.strip_prefix(FLUTTER_PREFIX)?;
         let separator = rest.rfind(FLUTTER_TAIL)?;
         rest[separator + FLUTTER_TAIL.len()..]
             .split_whitespace()
             .next()?
-    } else {
-        return None;
     };
     Some(uri.to_owned())
 }
@@ -2767,7 +2766,7 @@ fn dart_argv(config: &LaunchConfig) -> Vec<OsString> {
     argv
 }
 
-/// The `-t` target as `flutter run` should receive it. flutter_tools
+/// The `-t` target as `flutter run` should receive it. `flutter_tools`
 /// registers the entrypoint's kernel script under its package URI
 /// only when the target is the project-relative path; an absolute
 /// target compiles fine but leaves the script unlisted (and therefore
@@ -2828,8 +2827,7 @@ fn flutter_argv(config: &LaunchConfig) -> Result<Vec<OsString>> {
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
@@ -2878,7 +2876,17 @@ fn children_of(instance: &Instance, offset: usize, max_children: usize) -> Vec<V
         return children;
     }
     let mut children = Vec::new();
-    let shown = if !instance.associations.is_empty() {
+    let shown = if instance.associations.is_empty() {
+        let shown = instance.elements.len().min(max_children);
+        children.extend(instance.elements.iter().take(shown).enumerate().map(
+            |(index, element)| Variable {
+                name: format!("[{}]", offset + index),
+                value: render_value(Some(element)),
+                handle: handle_of(Some(element)),
+            },
+        ));
+        shown
+    } else {
         let shown = instance.associations.len().min(max_children);
         for (index, association) in instance.associations.iter().take(shown).enumerate() {
             let index = offset + index;
@@ -2893,16 +2901,6 @@ fn children_of(instance: &Instance, offset: usize, max_children: usize) -> Vec<V
                 handle: handle_of(association.value.as_ref()),
             });
         }
-        shown
-    } else {
-        let shown = instance.elements.len().min(max_children);
-        children.extend(instance.elements.iter().take(shown).enumerate().map(
-            |(index, element)| Variable {
-                name: format!("[{}]", offset + index),
-                value: render_value(Some(element)),
-                handle: handle_of(Some(element)),
-            },
-        ));
         shown
     };
     // `length` is the full collection size; the page ends at

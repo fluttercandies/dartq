@@ -31,6 +31,7 @@
 //! (`isAssignableTo`'s `fromType is DynamicType` downcast arm,
 //! type_system.dart:919-923).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::hierarchy::{CoreDecls, TypeHierarchy};
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
 use crate::system::TypeSystem;
@@ -140,6 +141,7 @@ fn generic_function_bounds_are_invariant() {
 /// `?? DynamicTypeImpl.instance`: unbounded pairs with an `Object?` bound
 /// (both tops, mutual) still correlate, while `dynamic` vs `int` does not.
 #[test]
+#[allow(clippy::many_single_char_names)]
 fn generic_function_matching_bounds_still_subtype() {
     let (table, hierarchy) = fixture();
     let (int, num) = (itf(&table, INT, &[]), itf(&table, NUM, &[]));

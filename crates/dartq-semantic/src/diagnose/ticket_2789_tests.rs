@@ -1,7 +1,7 @@
 //! The #2789 pins: the types-tier pair against the wave-3 conformance
 //! clusters. The bounds face follows the official
 //! `TypeArgumentsVerifier` (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/error/type_arguments_verifier.dart):
+//! `pkg/analyzer/lib/src/error/type_arguments_verifier.dart)`:
 //! `checkNamedType` runs at every resolved type annotation, so a
 //! supertype/constraint clause (`extends`/`with`/`implements`/`on` and
 //! the class-type-alias `= Super<Mixins>` head) checks its written
@@ -11,7 +11,7 @@
 //! reports with no inverted-type context row), and the offending
 //! argument's own node anchors the report (`_typeArgumentErrorNode`,
 //! :757-768). The assignment faces follow
-//! pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart:
+//! `pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart`:
 //! `resolveIfNull` closes with the same
 //! `_checkForInvalidAssignment(writeAcceptedType, node.value, valueType)`
 //! the plain face uses (:697-703), reported at the right operand
@@ -19,6 +19,7 @@
 //! type — an untyped parameter read under `y is String` writes `String`,
 //! not `dynamic`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -47,16 +48,16 @@ fn at(source: &str, needle: &str) -> u32 {
 }
 
 /// The `extends G<B>` clause cluster
-/// (TypeArgumentNotMatchingBoundsTest/test_extends): the violation
+/// (`TypeArgumentNotMatchingBoundsTest/test_extends)`: the violation
 /// reports at the offending argument with the parameter's written bound.
 #[test]
 fn extends_clause_bad_argument_reports_at_the_argument() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends A> {}
 class C extends G<B> {}
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -70,18 +71,18 @@ class C extends G<B> {}
     );
 }
 
-/// The class-type-alias head (test_classTypeAlias): `class D = G<B> with
+/// The class-type-alias head (`test_classTypeAlias)`: `class D = G<B> with
 /// C;` checks the `=` head's arguments — the `ClassTypeAlias` context
 /// denies the super pass, so the report carries no context row.
 #[test]
 fn class_type_alias_head_checks_its_arguments() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 mixin C {}
 class G<E extends A> {}
 class D = G<B> with C;
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -100,27 +101,27 @@ class D = G<B> with C;
 /// (`MixinOnClause` in the deny list).
 #[test]
 fn on_clause_bad_argument_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends A> {}
 mixin M on G<B> {}
-"#;
+";
     let report = report_ops(source);
     assert_eq!(bounds_rows(&report).len(), 1, "{:?}", report.diagnostics);
 }
 
 /// The `implements` face
-/// (TypeArgumentNotMatchingBoundsTest/test_classTypeAlias_implements
+/// (`TypeArgumentNotMatchingBoundsTest/test_classTypeAlias_implements`
 /// family): the clause context denies the super pass.
 #[test]
 fn implements_clause_bad_argument_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends A> {}
 class C implements G<B> {}
-"#;
+";
     let report = report_ops(source);
     assert_eq!(bounds_rows(&report).len(), 1, "{:?}", report.diagnostics);
 }
@@ -132,11 +133,11 @@ class C implements G<B> {}
 #[test]
 fn satisfied_and_in_scope_bounded_clause_arguments_stay_silent() {
     let satisfied = report_ops(
-        r#"
+        r"
 class A {}
 class G<E extends A> {}
 class C extends G<A> {}
-"#,
+",
     );
     assert!(
         bounds_rows(&satisfied).is_empty(),
@@ -144,11 +145,11 @@ class C extends G<A> {}
         satisfied.diagnostics
     );
     let in_scope = report_ops(
-        r#"
+        r"
 class A {}
 class G<E extends A> {}
 class C<T extends A> extends G<T> {}
-"#,
+",
     );
     assert!(
         bounds_rows(&in_scope).is_empty(),
@@ -157,19 +158,19 @@ class C<T extends A> extends G<T> {}
     );
 }
 
-/// The `??=` face (assignment_static_test_05 family): the plain
+/// The `??=` face (`assignment_static_test_05` family): the plain
 /// assignability question — the RHS against the target's write type —
 /// reported at the right operand, with the target's declared (nullable)
 /// type in the message.
 #[test]
 fn if_null_assignment_checks_the_rhs_against_the_write_type() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 void f(B? b, A a) {
   b ??= a;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         assignment_rows(&report),
@@ -187,12 +188,12 @@ void f(B? b, A a) {
 #[test]
 fn if_null_assignment_with_conforming_rhs_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 class B {}
 void f(B? b, B c) {
   b ??= c;
 }
-"#,
+",
     );
     assert!(
         assignment_rows(&report).is_empty(),
@@ -202,19 +203,19 @@ void f(B? b, B c) {
 }
 
 /// The promoted-RHS-read cluster
-/// (InvalidAssignmentTest/test_localVariable_promotion): an untyped
+/// (`InvalidAssignmentTest/test_localVariable_promotion)`: an untyped
 /// parameter promoted by `y is String` writes `String` into `int` — the
 /// oracle checks the promoted value type, not the declared `dynamic`.
 #[test]
 fn promoted_untyped_rhs_reports_at_the_read() {
-    let source = r#"
+    let source = r"
 void f(y) {
   if (y is String) {
     int x = y;
     print(x);
   }
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         assignment_rows(&report),
@@ -228,11 +229,11 @@ void f(y) {
     );
 }
 
-/// The member-write twin (test_instanceVariable): `a.x = y` reads the
+/// The member-write twin (`test_instanceVariable)`: `a.x = y` reads the
 /// promoted `y` against the field's declared type.
 #[test]
 fn promoted_rhs_reports_through_the_member_write() {
-    let source = r#"
+    let source = r"
 class A {
   int x = 7;
 }
@@ -242,7 +243,7 @@ void f(y) {
     a.x = y;
   }
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         assignment_rows(&report),
@@ -261,12 +262,12 @@ void f(y) {
 #[test]
 fn unpromoted_dynamic_rhs_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 void f(y) {
   int x = y;
   print(x);
 }
-"#,
+",
     );
     assert!(
         assignment_rows(&report).is_empty(),

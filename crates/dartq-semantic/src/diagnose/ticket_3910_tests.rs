@@ -18,6 +18,7 @@
 //! Every fixture below is oracle-verified against `dart analyze
 //! --format=machine` (3.13.7) at the fixture's own language version.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 
@@ -43,14 +44,14 @@ fn rows_of(report: &FileReport, code: &str) -> Vec<(u32, u32, String)> {
 /// the recomputed `int`, never the unpromoted `num`.
 #[test]
 fn promoted_binary_operand_reads_flow_promotion() {
-    let source = r#"
+    let source = r"
 void f(num n) {
   if (n is int) {
     int x = n + 1;
     x = x;
   }
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         rows_of(&report, "invalid_assignment"),
@@ -71,11 +72,11 @@ void f(num n) {
 /// on the current tree.
 #[test]
 fn conditional_async_return_types_context_not_lub() {
-    let source = r#"
+    let source = r"
 Future<int> f(bool x) async {
   return x ? 42 : Future.value(42);
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         rows_of(&report, "return_of_invalid_type"),
@@ -96,13 +97,13 @@ Future<int> f(bool x) async {
 /// presents), so the nullable join reaches the argument check.
 #[test]
 fn if_null_argument_joins_operand_types() {
-    let source = r#"
+    let source = r"
 void take(int x) {}
 
 void f(int? a, int? b) {
   take(a ?? b);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "argument_type_not_assignable");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -122,14 +123,14 @@ void f(int? a, int? b) {
 /// fix for the in-fold consult must keep the post-parse fill in place.
 #[test]
 fn post_pass1_latch_fill_reaches_assignment_rhs() {
-    let source = r#"
+    let source = r"
 void f(num n) {
   if (n is int) {
     int x = n;
     x = x;
   }
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         rows_of(&report, "invalid_assignment"),

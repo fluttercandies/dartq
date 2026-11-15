@@ -4,10 +4,11 @@
 //! Every expected row set below is the frozen machine-captured oracle side
 //! of the case file, converted to `(utf16 start, utf16 end)` spans over the
 //! frozen inputs (verbatim under `tests/fixtures/`); semantic-tier and
-//! lint-tier codes (unused_*, undefined_*, uri_*, duplicate_definition,
-//! extra_positional_arguments, return_of_invalid_type) are outside the
+//! lint-tier codes (unused_*, undefined_*, uri_*, `duplicate_definition`,
+//! `extra_positional_arguments`, `return_of_invalid_type`) are outside the
 //! parser's surface and pinned by their own tickets.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::PathBuf;
 
 use dartq_scanner::{ScanConfig, TokenTable};
@@ -111,9 +112,9 @@ fn ppin_a7c0c7f0_unmatched_open_brace_at_eof_row_shape() {
 
 /// The oracle face for a keyword taking the typedef-name position is the
 /// verifier's isKeyword-and-not-pseudo gate (error_verifier.dart:3760-3766):
-/// RESERVED and built-in words carry the built_in row exactly alike, pseudo
+/// RESERVED and built-in words carry the `built_in` row exactly alike, pseudo
 /// keywords stay silent. Over the frozen corpus file that yields 111
-/// built_in rows + 111 keyword-name rows (56 non-pseudo keywords x 2
+/// `built_in` rows + 111 keyword-name rows (56 non-pseudo keywords x 2
 /// shapes, minus the `typedef void = ...` missing-name face on line 132).
 #[test]
 fn ppin_4241f7cb_typedef_keyword_name_faces() {
@@ -291,7 +292,7 @@ fn ppin_6716c102_library_directive_unterminated_recovery() {
 /// registry `Expected to find '<x>'.` text — pinned here verbatim.
 ///
 /// The `missing_identifier` row anchors on the got token per the official
-/// span law (upstream Dart SDK source, pkg/_fe_analyzer_shared
+/// span law (upstream Dart SDK source, pkg/_`fe_analyzer_shared`
 /// parser/util.dart `findNonZeroLengthToken` + the analyzer
 /// `handleRecoverableError` offset/end formula): the got token here is the
 /// scanner's zero-width synthetic interpolation closer parked at the

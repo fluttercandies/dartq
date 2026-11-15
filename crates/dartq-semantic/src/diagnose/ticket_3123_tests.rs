@@ -33,6 +33,8 @@
 //! `void Function(dynamic)`; `v_typedformal_arg2.dart`
 //! (`f(void g(int x))` + `f((int y)=>0)`) is silent.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{assert_silent, report_ops};
 
 fn rows_named<'d>(

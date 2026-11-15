@@ -531,7 +531,7 @@ fn local_formal_shadows_the_top_level_tear_off_in_arguments() {
 
 /// A member the core table defines, read through a merely-nullable
 /// receiver, reports `unchecked_use_of_nullable_value` at the selector
-/// (nullable_dereference_verifier.dart report — the found-arm the
+/// (`nullable_dereference_verifier.dart` report — the found-arm the
 /// walkable-model face already makes, extended to the
 /// external-primitive face; probe: `int f(String? s) { return
 /// s.length; }` reports at `length`). Declared and inferred
@@ -554,7 +554,7 @@ fn core_type_nullable_receiver_dereference_reports() {
     );
 }
 
-/// The corpus fixture row (sem2 promotion_patterns_flow_records.dart
+/// The corpus fixture row (sem2 `promotion_patterns_flow_records.dart`
 /// 70:18): the `case null` branch's dereference reports at the
 /// selector while the fall-through read below stays clean — the same
 /// pattern demotes inside the branch and promotes `alias` to `String`
@@ -816,11 +816,7 @@ fn count_code(report: &FileReport, name: &str) -> usize {
 }
 
 fn code_names(report: &FileReport) -> Vec<&'static str> {
-    report
-        .diagnostics
-        .iter()
-        .map(|d| d.code.name.as_ref())
-        .collect()
+    report.diagnostics.iter().map(|d| d.code.name).collect()
 }
 
 // —— Field promotion pins (#1409). Each pin cites its upstream
@@ -1001,7 +997,7 @@ fn local_promotion_unchanged_alongside_property_reads() {
 
 /// Pin 11: the catch entry joins models AND property slots (official
 /// `catchBegin`'s discardPromotionsAndMarkNotUnassigned,
-/// flow_analysis.dart:4748) — a receiver written in the try body kills
+/// `flow_analysis.dart:4748`) — a receiver written in the try body kills
 /// the pre-try promotion on the catch path, and the use fires.
 #[test]
 fn pin11_catch_entry_receiver_write_still_fires() {
@@ -1143,7 +1139,7 @@ fn member_access_inside_send_argument_operands_resolves() {
 
 /// `final_not_initialized_constructor` on the extension-type
 /// representation field: every declared constructor that leaves the
-/// representation unbound reports at its own head (error_verifier.dart
+/// representation unbound reports at its own head (`error_verifier.dart`
 /// drives `ConstructorFieldsVerifier.addConstructors` for extension
 /// types like classes).
 #[test]
@@ -1188,7 +1184,7 @@ fn unnamed_creation_miss_reports_default_code() {
     );
 }
 
-/// `factory new()` (the FACTORY_CONSTRUCTOR_NEW_NAME recovery head):
+/// `factory new()` (the `FACTORY_CONSTRUCTOR_NEW_NAME` recovery head):
 /// the bare-`new` spelling IS the unnamed constructor's name, so `K()`
 /// in the body resolves and the unnamed-miss code stays silent — while
 /// the dotted `new.named()` shape keeps the unnamed face absent (the
@@ -1349,7 +1345,7 @@ fn type_argument_face_is_the_direct_parent_and_survives_a_dead_head() {
 /// `non_type_as_type_argument` for the recovered old-style function
 /// typedef: the return type's type arguments resolve beside their dead
 /// head (`typedef e = foo<F>(int x)` — the oracle reports
-/// undefined_class on `foo` and non_type_as_type_argument on `F`, six
+/// `undefined_class` on `foo` and `non_type_as_type_argument` on `F`, six
 /// rows over the corpus's two typedefs).
 #[test]
 fn type_arguments_resolve_beside_a_dead_head() {
@@ -1511,7 +1507,7 @@ fn function_typed_formal_new_style_return_resolves() {
 /// #2144: a typed list literal folds to one row — the `List<int> x =
 /// const <num>[...]` declaration initializer asks its assignability
 /// question of the literal's `List<num>` and reports
-/// `invalid_assignment` (broken_argument_types.dart). The element rows
+/// `invalid_assignment` (`broken_argument_types.dart`). The element rows
 /// drain to pass 2 like the send fold's arguments; without the drain
 /// the `init_mark` single-row window never saw the literal.
 #[test]
@@ -1603,7 +1599,7 @@ fn annotated_set_literal_against_primitive_rejects() {
 }
 /// #2144 probe: the `&&`-chain field promotion — a private final field
 /// tested in a later conjunct promotes into the guarded block, through
-/// an implicit-`this` read inside a getter (promotion_chains.dart's
+/// an implicit-`this` read inside a getter (`promotion_chains.dart`'s
 /// `hasAnnotation`).
 #[test]
 fn and_chain_private_final_field_promotes_into_block() {
@@ -1619,7 +1615,7 @@ fn and_chain_private_final_field_promotes_into_block() {
 }
 /// #2144: a method tear-off's static type is the method's signature —
 /// `var t = C<int>().m; t<A,B>` reports `wrong_number_of_type_arguments_
-/// function` when the written count differs (broken_type_arguments.dart's
+/// function` when the written count differs (`broken_type_arguments.dart`'s
 /// `handle<int, String>` on `M Function<M>(M)`). Without `tearoff_ty`
 /// the local bound `Unknown` and the `_function` face slept.
 #[test]
@@ -1767,7 +1763,7 @@ fn super_named_argument_defined_label_stays_silent() {
 /// #2182: a super-constructor invocation's argument that is not
 /// *potentially* constant — an unresolved name expression — reports
 /// `invalid_constant` at the node (the oracle's
-/// `_reportNotPotentialConstantsArguments`, constant_verifier.dart
+/// `_reportNotPotentialConstantsArguments`, `constant_verifier.dart`
 /// :830-834,863-867).
 #[test]
 fn super_invocation_unresolved_arg_reports_invalid_constant() {

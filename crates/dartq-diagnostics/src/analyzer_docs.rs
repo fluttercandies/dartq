@@ -27,6 +27,7 @@
 //! `dartq/`-namespace codes never spell a table name (`snake_case`
 //! without `/`), so they take no URL by construction.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::code::ANALYZER_PUBLISHED_DOCS;
 
 /// Whether `name` is an official analyzer/parser code with a
@@ -42,7 +43,7 @@ mod tests {
     use super::{ANALYZER_PUBLISHED_DOCS, published};
 
     /// The generated table's contract: sorted and unique (binary
-    /// search's premise) and every name lowercase snake_case (the URL
+    /// search's premise) and every name lowercase `snake_case` (the URL
     /// is spelled from the name verbatim — a casing drift would mint a
     /// dead URL and break the `dartq/` namespace separation argument in
     /// the module docs).

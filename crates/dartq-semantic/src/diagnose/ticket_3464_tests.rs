@@ -13,6 +13,8 @@
 //! and `member.augmentKeyword` members merge into the introductory
 //! element instead of declaring.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+
 use super::super::test_rig::report_ops_experiments_with;
 use crate::diagnose::FileReport;
 use dartq_language::Feature;
@@ -53,11 +55,10 @@ fn dups(source: &str) -> Vec<(u32, u32, String)> {
 fn span(haystack: &str, needle: &str, nth: usize) -> (u32, u32) {
     let mut at = 0usize;
     for _ in 0..nth {
-        at = haystack[at..]
-            .find(needle)
-            .map(|found| at + found)
-            .unwrap_or_else(|| panic!("{needle:?} not found in {haystack:?}"))
-            + 1;
+        at = haystack[at..].find(needle).map_or_else(
+            || panic!("{needle:?} not found in {haystack:?}"),
+            |found| at + found,
+        ) + 1;
     }
     (at as u32 - 1, needle.len() as u32)
 }

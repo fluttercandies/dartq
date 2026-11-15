@@ -20,6 +20,7 @@
 //!
 //! Registered through `diagnose/tests.rs`'s `#[path]` block.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{RigImport, code_names, report_ops, report_ops_imports, rows};
 
 /// Asserts `invalid_assignment` fires at least once for `fixture`.

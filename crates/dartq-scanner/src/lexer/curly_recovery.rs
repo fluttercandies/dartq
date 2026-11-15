@@ -16,6 +16,7 @@
 //! and indentation comparisons are relative and agree with the official
 //! UTF-16 numbers for space-indented source.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::keyword::Keyword;
 use crate::token::{TokenKind, TokenTable};
 use dartq_source::LineIndex;

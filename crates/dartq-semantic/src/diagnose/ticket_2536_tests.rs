@@ -19,6 +19,7 @@
 //! when every constant appears, and the sealed is-chain's else-branches
 //! stay reachable (no `dead_code`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;
@@ -190,7 +191,7 @@ fn codes(report: &FileReport) -> Vec<&'static str> {
 #[test]
 fn double_import_promotion_keeps_supertype_edges() {
     let report = double_import_report(
-        r#"
+        r"
 import 'package:t/kit.dart';
 import 'package:t/kit.dart' as p;
 
@@ -201,8 +202,8 @@ void h(LibraryImportState state) {
     state.importedFile;
   }
 }
-"#,
-        r#"
+",
+        r"
 sealed class LibraryImportState {}
 sealed class LibraryImportWithUri extends LibraryImportState {
   FileState get importedSource => FileState();
@@ -213,7 +214,7 @@ final class LibraryImportWithFile extends LibraryImportWithUri {
 final class FileState {
   bool exists = true;
 }
-"#,
+",
         Some("p"),
     );
     let cs = codes(&report);
@@ -231,7 +232,7 @@ final class FileState {
 #[test]
 fn prefixed_negated_is_promotes_after_early_return() {
     let report = double_import_report(
-        r#"
+        r"
 import 'package:t/kit.dart' as p;
 
 void g(p.LibraryImportState state) {
@@ -240,14 +241,14 @@ void g(p.LibraryImportState state) {
   }
   state.importedFile;
 }
-"#,
-        r#"
+",
+        r"
 sealed class LibraryImportState {}
 final class LibraryImportWithFile extends LibraryImportState {
   FileState get importedFile => FileState();
 }
 final class FileState {}
-"#,
+",
         Some("p"),
     );
     assert!(
@@ -265,7 +266,7 @@ final class FileState {}
 #[test]
 fn prefixed_enum_constant_cases_cover() {
     let full = double_import_report(
-        r#"
+        r"
 import 'package:t/kit.dart';
 import 'package:t/kit.dart' as p;
 
@@ -277,7 +278,7 @@ void f(Msg m) {
       m.level;
   }
 }
-"#,
+",
         "enum Level { a, b }\n\nclass Msg { final Level level; Msg(this.level); }",
         Some("p"),
     );
@@ -287,7 +288,7 @@ void f(Msg m) {
         codes(&full)
     );
     let partial = double_import_report(
-        r#"
+        r"
 import 'package:t/kit.dart';
 import 'package:t/kit.dart' as p;
 
@@ -297,7 +298,7 @@ void f(Msg m) {
       m.level;
   }
 }
-"#,
+",
         "enum Level { a, b }\n\nclass Msg { final Level level; Msg(this.level); }",
         Some("p"),
     );
@@ -308,14 +309,14 @@ void f(Msg m) {
     );
 }
 
-/// The sealed is-chain over prefixed spellings (`fs.dart`'s DirectiveUri
+/// The sealed is-chain over prefixed spellings (`fs.dart`'s `DirectiveUri`
 /// hierarchy): every else-if branch stays reachable — the factored
 /// remainder of one test never swallows the next test's arm, no
 /// `dead_code` on the branches.
 #[test]
 fn prefixed_sealed_is_chain_stays_reachable() {
     let report = double_import_report(
-        r#"
+        r"
 import 'package:t/kit.dart' as p;
 
 class Impl extends p.DirectiveUri {}
@@ -330,13 +331,13 @@ Impl f(p.DirectiveUri self) {
   }
   return Impl();
 }
-"#,
-        r#"
+",
+        r"
 sealed class DirectiveUri {}
 final class WithSource extends DirectiveUri {}
 final class WithString extends DirectiveUri {}
 final class WithUri extends WithString {}
-"#,
+",
         Some("p"),
     );
     assert!(
@@ -353,7 +354,7 @@ final class WithUri extends WithString {}
 #[test]
 fn function_typed_callee_returns_the_shapes_return() {
     let report = unit_report(
-        r#"
+        r"
 typedef Handler = String Function(int x);
 
 class Widget {
@@ -368,7 +369,7 @@ class Widget {
 num useMapper(num Function(String s) m, String s) {
   return m(s);
 }
-"#,
+",
     );
     let cs = codes(&report);
     assert!(
@@ -385,7 +386,7 @@ num useMapper(num Function(String s) m, String s) {
 #[test]
 fn null_promoted_scrutinee_decides_the_covering_gap() {
     let report = unit_report(
-        r#"
+        r"
 sealed class Num {}
 final class IntNum extends Num {}
 
@@ -408,7 +409,7 @@ int h(Num? n) {
     Num() => 2,
   };
 }
-"#,
+",
     );
     let cs = codes(&report);
     assert!(
@@ -432,7 +433,7 @@ int h(Num? n) {
 #[test]
 fn promotion_latched_initializer_rebinds_the_accessor_face() {
     let report = unit_report(
-        r#"
+        r"
 sealed class Num {
   Object get value;
 }
@@ -465,7 +466,7 @@ void keepsAssertFace(Sdk? sourceFactory) {
   final w = v.next;
 }
 
-"#,
+",
     );
     let cs = codes(&report);
     let family = cs
@@ -491,7 +492,7 @@ void keepsAssertFace(Sdk? sourceFactory) {
 #[test]
 fn condition_variable_replays_the_null_comparison_split() {
     let report = unit_report(
-        r#"
+        r"
 class Flags {
   bool contains(String s) => false;
 }
@@ -503,7 +504,7 @@ void f(Flags? flags) {
   sink(hasFlags && flags.contains('q'));
   sink(!hasFlags || flags.contains('x'));
 }
-"#,
+",
     );
     let cs = codes(&report);
     assert!(
@@ -518,7 +519,7 @@ void f(Flags? flags) {
 #[test]
 fn switch_case_promotes_the_scrutinee_for_the_call() {
     let report = unit_report(
-        r#"
+        r"
 class Expr {
   Object call(Object c) => c;
 }
@@ -530,7 +531,7 @@ void f(Object spec) {
       final other = spec(2);
   }
 }
-"#,
+",
     );
     let cs = codes(&report);
     assert!(
@@ -556,7 +557,7 @@ void f(Object spec) {
 #[test]
 fn collect_rollback_keeps_pattern_scrutinee_identity() {
     let report = unit_report(
-        r#"
+        r"
 class W {
   W? next() => null;
 }
@@ -578,7 +579,7 @@ void f(Box box) {
     ws.next();
   }
 }
-"#,
+",
     );
     let cs = codes(&report);
     assert!(
@@ -604,7 +605,7 @@ void f(Box box) {
 #[test]
 fn promoted_receiver_member_rebinds_to_override_face() {
     let report = unit_report(
-        r#"
+        r"
 class Sub {
   List<int> typeParameters = [];
 }
@@ -623,7 +624,7 @@ void f(Base b) {
   var c = t.element;
   var n = c.typeParameters.length;
 }
-"#,
+",
     );
     let cs = codes(&report);
     assert!(
@@ -642,7 +643,7 @@ void f(Base b) {
 #[test]
 fn rebound_local_feeds_operator_operand() {
     let report = unit_report(
-        r#"
+        r"
 sealed class N {
   Object get value => this;
 }
@@ -655,7 +656,7 @@ void f(N arg) {
     print(v ~/ BigInt.two);
   }
 }
-"#,
+",
     );
     let cs = codes(&report);
     assert!(

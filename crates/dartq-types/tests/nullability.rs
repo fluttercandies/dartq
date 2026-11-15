@@ -124,9 +124,9 @@ fn strictly_non_nullable() {
 /// recurses into it, so `FutureOr<Invalid>` reads as the nullable top —
 /// the receiver verdict behind `unchecked_use_of_nullable_value` on a
 /// member send. Anchors: upstream Dart SDK source,
-/// pkg/analyzer/lib/src/dart/element/type_system.dart (isNullable 1216,
+/// `pkg/analyzer/lib/src/dart/element/type_system.dart` (isNullable 1216,
 /// isTop 1277, isObject 1241) and
-/// pkg/analyzer/lib/src/error/nullable_dereference_verifier.dart.
+/// `pkg/analyzer/lib/src/error/nullable_dereference_verifier.dart`.
 #[test]
 fn future_or_over_invalid_normalizes_to_nullable_top() {
     let fx = fixture();

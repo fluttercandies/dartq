@@ -4,7 +4,7 @@
 //! # Item 1 — `invalid_inline_function_type` rides the parser tier
 //!
 //! The oracle's row is the fasta parser's own report
-//! (`parseFormalParameter`'s generalized-function-type arm, parser_impl.dart
+//! (`parseFormalParameter`'s generalized-function-type arm, `parser_impl.dart`
 //! `:2323-2328`), which #3935 landed. The engine already merges parser rows
 //! into the merged report, so both `typeAlias_37733` cases produce the exact
 //! oracle row set with no semantic emitter at all — these pins hold that
@@ -13,7 +13,7 @@
 //! # Item 2 — `concrete_class_with_abstract_member`
 //!
 //! The class arm of `_reportConcreteClassWithAbstractMember`
-//! (inheritance_override.dart `:909-951`, reached from the `:417-437` loop)
+//! (`inheritance_override.dart` `:909-951`, reached from the `:417-437` loop)
 //! reports a bodyless member of a NON-abstract class when its interface has no
 //! concrete implementation of that name. `enum_verifier.rs` gains
 //! `verify_class_abstract_members`, mounted from the same container walk as
@@ -22,6 +22,7 @@
 //! Every expected row below is measured against
 //! `dart analyze --format=machine` (oracle SDK 3.13.7) on the same fixture.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops_bare, rows};
 
 /// `class C {\n  f(<T>());\n}\n` — the `test_method_name_notNull_37733`
@@ -59,7 +60,7 @@ fn concrete_class_with_abstract_member_reports_the_bodyless_member() {
 
 /// Control: an `abstract class` declaring the same bodyless member stays
 /// silent (the dispatch gate is `!container.is_abstract`, upstream
-/// inheritance_override.dart:417).
+/// `inheritance_override.dart:417`).
 #[test]
 fn abstract_class_bodyless_member_is_silent() {
     let report = report_ops_bare("abstract class C {\n  void f();\n}\n");

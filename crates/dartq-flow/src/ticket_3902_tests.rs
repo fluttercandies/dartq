@@ -35,6 +35,7 @@
 //! one-column-short row for every `??= <negative literal>` site
 //! (`int-to-double/assignment_local_variable_t01/t02`, 8 census rows).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 #[cfg(test)]
 mod tests {
     use crate::facts::FlowFact;

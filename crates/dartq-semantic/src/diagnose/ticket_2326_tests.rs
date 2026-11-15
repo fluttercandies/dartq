@@ -9,6 +9,7 @@
 //! probed against oracle `dart analyze` (fvm default) via the isolated
 //! `xmlrepro` tree.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -370,7 +371,7 @@ fn foreign_mixin_single_param_instantiates_from_application_args() {
 }
 
 /// (e) A deprecated SDK library reports once, at the whole import directive
-/// — `usageRange: node.sourceRange` on the ImportDirective (upstream
+/// — `usageRange: node.sourceRange` on the `ImportDirective` (upstream
 /// `element_usage_detector.dart:256`), which for `import 'dart:html';` is
 /// offset 0 / len 19, never the URI literal's offset 7. Probed against the
 /// oracle: INFO-severity `HINT` rows carry the normalized annotation tail
@@ -400,7 +401,7 @@ fn deprecated_sdk_import_anchors_the_whole_directive() {
 
 /// (f) The export face rides the same check (upstream runs `checkUsage` on
 /// export directives too): `export 'dart:svg';` reports at offset 0 / len
-/// 18 — the ExportDirective's own span.
+/// 18 — the `ExportDirective`'s own span.
 #[test]
 fn deprecated_sdk_export_anchors_the_whole_directive() {
     let source = "export 'dart:svg';\n";

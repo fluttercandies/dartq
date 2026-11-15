@@ -26,6 +26,7 @@
 //! `LanguageFeatures/Patterns` fixtures for the typed-leaf and rest
 //! columns.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 use crate::diagnose::FileReport;
 

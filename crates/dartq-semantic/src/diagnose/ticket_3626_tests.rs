@@ -25,6 +25,7 @@
 //!   silent — NORM(FutureOr<Object>) = Object merges with Object
 //! ```
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::FileReport;
 use crate::diagnose::test_rig::{
     CORE_PRELUDE, RigImport, code_names, report_ops, report_ops_imports, rows,

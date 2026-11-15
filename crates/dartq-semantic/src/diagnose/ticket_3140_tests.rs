@@ -29,6 +29,7 @@
 //! an uncovariant intermediate, covariant setters, void returns, named-slot
 //! order).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, assert_silent, report_ops, rows};
 
 /// The absolute fixture offset of `needle` (the prelude the rig prepends

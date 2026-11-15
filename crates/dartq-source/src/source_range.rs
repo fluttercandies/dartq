@@ -1,6 +1,7 @@
 //! The engine's external position convention: UTF-16 based ranges, line
 //! indexing, and the byte/UTF-16 conversions.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// A span of source text: `offset .. offset + length`.
 ///
 /// Both fields are in **UTF-16 code units** — the official Dart analyzer and
@@ -278,7 +279,7 @@ impl LineIndex {
     /// the LOW surrogate's position.
     ///
     /// The conversion is **total**, mirroring the oracle exactly: the
-    /// official `getLocation` (line_info.dart) is a plain binary search with
+    /// official `getLocation` (`line_info.dart`) is a plain binary search with
     /// no bounds check, and the analysis server feeds it end positions
     /// unchanged (`toRange`: `getLocation(offset + length)`, mapping.dart) —
     /// so an offset past the source's UTF-16 length resolves to the last

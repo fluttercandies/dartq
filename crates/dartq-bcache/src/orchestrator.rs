@@ -11,7 +11,7 @@
 //! 1. **Version gate**: the toolchain fingerprint's version stamp must
 //!    name a line of [`SUPPORTED_FLUTTER_LINES`] — the args/option
 //!    tables and the build-dir name formula are pinned to those lines'
-//!    flutter_tools. Anything else passes through before the store is
+//!    `flutter_tools`. Anything else passes through before the store is
 //!    ever touched.
 //! 2. **PRE**: compute the coarse config key (toolchain, filtered define
 //!    vector, target, provenance file contents — no depfile closure and
@@ -28,7 +28,7 @@
 //!    `flutter test` kernel cache into the build dir's `test_cache` —
 //!    where a cross-tree hit rewrites the dill's embedded `file://` URI
 //!    prefixes to this tree (see [`crate::dill_rewrite`]) so
-//!    frontend_server's initialize-from-dill validation keeps the
+//!    `frontend_server`'s initialize-from-dill validation keeps the
 //!    kernel.
 //!
 //!    The rewrite anchor is the WORKTREE root of each tree (git
@@ -45,10 +45,10 @@
 //!    up front (see [`crate::materialize`]).
 //!
 //!    Content divergence the coarse key cannot see is delegated to
-//!    flutter_tools — and that delegation is only sound for paths that
+//!    `flutter_tools` — and that delegation is only sound for paths that
 //!    resolve identically in both trees, which is exactly what the
 //!    anchor rule guarantees: every build re-validates a dir's recorded
-//!    input hashes and rebuilds on mismatch, and frontend_server
+//!    input hashes and rebuilds on mismatch, and `frontend_server`
 //!    invalidates a stale initialize-from-dill dill, so a wasted
 //!    materialization is the entire cost of a stale hit. Any pre-phase
 //!    failure degrades to a miss: the shim never blocks a build.
@@ -77,9 +77,9 @@
 //!    written after a successful compile, so a touched dill is valid
 //!    kernel however red the suite, while a compile failure writes
 //!    nothing. Every other face stays exit-0-gated (a failed build may
-//!    leave partially-written flutter_build state); signal deaths
+//!    leave partially-written `flutter_build` state); signal deaths
 //!    arrive as 128 + signal and take the test-face path, where at
-//!    worst a torn in-place dill copy is bounded by frontend_server's
+//!    worst a torn in-place dill copy is bounded by `frontend_server`'s
 //!    fall-back to a full compile when the initialize-from-dill file
 //!    will not read. A file whose identity this invocation's
 //!    materialization placed, the tree's placement record remembers
@@ -109,6 +109,7 @@
 //! Zero-config lives above this module: with no `build_cache` section
 //! the caller never reaches [`run_shim`] at all.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Display;
@@ -141,7 +142,7 @@ use crate::types::{
     PathAnchors, ToolchainFingerprint,
 };
 
-/// The flutter version lines whose flutter_tools this crate's embedded
+/// The flutter version lines whose `flutter_tools` this crate's embedded
 /// model generation was derived from and verified against — the option
 /// tables ([`crate::args_model`]), the `flutter assemble` argv model
 /// ([`crate::assemble`]), the build-dir name formula
@@ -153,7 +154,7 @@ use crate::types::{
 ///
 /// An entry names the MINOR line it covers — `(3, 44)` admits 3.44.0
 /// and any later 3.44.x patch. A line lands here only after the pinned
-/// flutter_tools regions of its reviewed patches were classified hunk
+/// `flutter_tools` regions of its reviewed patches were classified hunk
 /// by hunk against the model. The harness pins every reviewed patch's
 /// region digest (`REVIEWED_LINES` in the tests, one or more pins per
 /// line) and its `supported_line_patches_match_their_reviewed_regions`
@@ -369,7 +370,7 @@ const SHIM_ENV: &str = "DARTQ_SHIM";
 ///
 /// While the child runs, SIGTERM/SIGHUP/SIGINT are forwarded to it
 /// (audit A11: without forwarding, a signal to the shim killed only the
-/// shim and orphaned flutter_tools under PPID 1). The mechanism is a
+/// shim and orphaned `flutter_tools` under PPID 1). The mechanism is a
 /// minimal sigaction forwarder, not the signal-hook crate: three
 /// signals need no pipe machinery, and the block-spawn-unblock sequence
 /// below closes the fork race that a handler-only approach leaves open.
@@ -381,6 +382,7 @@ pub struct CommandRunner {
 }
 
 impl CommandRunner {
+    #[must_use]
     pub fn new(flutter: PathBuf) -> Self {
         Self { flutter }
     }
@@ -489,10 +491,10 @@ mod forward {
             // without this module, never worse.
             unsafe {
                 let mut action: libc::sigaction = std::mem::zeroed();
-                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigemptyset(&raw mut action.sa_mask);
                 action.sa_sigaction = handler as *const () as usize;
                 action.sa_flags = libc::SA_RESTART;
-                libc::sigaction(signal, &action, slot);
+                libc::sigaction(signal, &raw const action, slot);
             }
         }
         Forwarders { saved }
@@ -518,13 +520,13 @@ mod forward {
         // pthread_sigmask is one of the async-signal-safe calls.
         let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
         unsafe {
-            libc::sigemptyset(&mut blocked);
+            libc::sigemptyset(&raw mut blocked);
             for signal in FORWARDED {
-                libc::sigaddset(&mut blocked, signal);
+                libc::sigaddset(&raw mut blocked, signal);
             }
         }
         let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
-        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) };
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const blocked, &raw mut previous) };
         // SAFETY: pre_exec runs its closure in the forked child before
         // exec, where pthread_sigmask and the sigset_t initializers are
         // async-signal-safe; the closure only touches its moved-in
@@ -534,11 +536,15 @@ mod forward {
             command
                 .pre_exec(move || {
                     let mut unblock: libc::sigset_t = std::mem::zeroed();
-                    libc::sigemptyset(&mut unblock);
+                    libc::sigemptyset(&raw mut unblock);
                     for signal in FORWARDED {
-                        libc::sigaddset(&mut unblock, signal);
+                        libc::sigaddset(&raw mut unblock, signal);
                     }
-                    libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
+                    libc::pthread_sigmask(
+                        libc::SIG_UNBLOCK,
+                        &raw const unblock,
+                        std::ptr::null_mut(),
+                    );
                     Ok(())
                 })
                 .spawn()
@@ -546,7 +552,9 @@ mod forward {
         if let Ok(child) = &spawn {
             CHILD_PID.store(i32::try_from(child.id()).unwrap_or(0), Ordering::SeqCst);
         }
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &raw const previous, std::ptr::null_mut())
+        };
         spawn
     }
 
@@ -1266,9 +1274,9 @@ fn modified_unix(time: &SystemTime) -> u64 {
 }
 
 /// The flutter build dir of this invocation: `$FLUTTER_BUILD_DIR` when
-/// set (flutter_tools routes every output path through it, the test
+/// set (`flutter_tools` routes every output path through it, the test
 /// kernel cache included), else `build`. An empty value counts as
-/// unset, as flutter_tools treats it.
+/// unset, as `flutter_tools` treats it.
 fn flutter_build_dir(env: Option<OsString>) -> PathBuf {
     env.filter(|value| !value.is_empty())
         .map_or_else(|| PathBuf::from("build"), PathBuf::from)
@@ -1328,13 +1336,13 @@ fn coarse_key(
 }
 
 /// The provenance files hashed into every key: `pubspec.yaml`,
-/// `pubspec.lock`, and every `--dart-define-from-file` (flutter_tools
+/// `pubspec.lock`, and every `--dart-define-from-file` (`flutter_tools`
 /// folds their contents into the define list and no depfile records
 /// them). `.dart_tool/package_config.json` is deliberately NOT keyed:
 /// it exists only after flutter's implicit `pub get`, so keying it
 /// would give a fresh worktree a pre-build key that never matches the
 /// key the entry was stored under — the headline use case, dead on
-/// arrival. Divergence is caught anyway: flutter treats package_config
+/// arrival. Divergence is caught anyway: flutter treats `package_config`
 /// as a build input, so its hash rides in every stamp/.filecache and
 /// a replay over a diverged config rebuilds natively. Files that do
 /// not exist (or cannot be read) are skipped — a fresh tree keys on
@@ -1353,7 +1361,7 @@ fn provenance_closure(cwd: &Path, define_files: &[PathBuf]) -> Vec<ClosureFile> 
         let identity_relative = absolute
             .strip_prefix(cwd)
             .ok()
-            .map(|relative| relative.to_path_buf());
+            .map(std::path::Path::to_path_buf);
         push_provenance(&absolute, identity_relative.as_deref(), &mut files);
     }
     files
@@ -1495,10 +1503,10 @@ fn flag_value(extra: &[String], name: &str) -> Option<String> {
     while let Some(token) = tokens.next() {
         if let Some(inline) = token.strip_prefix(&format!("--{name}=")) {
             value = Some(inline.to_owned());
-        } else if token == &format!("--{name}") {
-            if let Some(next) = tokens.next() {
-                value = Some(next.clone());
-            }
+        } else if token == &format!("--{name}")
+            && let Some(next) = tokens.next()
+        {
+            value = Some(next.clone());
         }
     }
     value
@@ -2285,7 +2293,7 @@ fn unix_now() -> u64 {
 }
 
 /// How long a batch command waits at the job gate before it fails.
-const GATE_WAIT: Duration = Duration::from_secs(30 * 60);
+const GATE_WAIT: Duration = Duration::from_mins(30);
 
 /// The flutter command `argv` runs and whether it is batch work: the
 /// first non-option token (`build` with its target), walking pre-command
@@ -2485,7 +2493,7 @@ mod tests {
     /// Fabricates the `.dart_tool/flutter_build/<name>` dir a flutter run
     /// leaves behind: a payload dill, a depfile recording the tree's
     /// sources, and a stamp embedding the project root and the dir's own
-    /// flutter_build path (the rewrite probes). Under
+    /// `flutter_build` path (the rewrite probes). Under
     /// capture-not-predict the name is whatever the run observed, so
     /// callers pick it.
     fn build_fixture(project: &Path, name: &str) -> PathBuf {
@@ -3703,7 +3711,7 @@ mod tests {
     // fvm. `DARTQ_FVM_HOME` relocates the versions root (default
     // `$HOME/fvm`).
 
-    /// Each enabled line's reviewed flutter_tools: EVERY patch whose
+    /// Each enabled line's reviewed `flutter_tools`: EVERY patch whose
     /// [`MODEL_REGIONS`] were classified hunk by hunk against the line's
     /// derivation baseline (see [`SUPPORTED_FLUTTER_LINES`]) with its
     /// [`region_digest`], oldest patch first. 3.47.1 is the model's
@@ -3750,7 +3758,7 @@ mod tests {
         ),
     ];
 
-    /// The flutter_tools source regions the model generation pins, as
+    /// The `flutter_tools` source regions the model generation pins, as
     /// paths under `packages/flutter_tools/`:
     ///
     /// * the runner pair — the GLOBAL option table
@@ -3930,10 +3938,10 @@ mod tests {
             assert!(
                 stamps
                     .windows(2)
-                    .all(|pair| stamp_order(&pair[0], &pair[1]) != std::cmp::Ordering::Greater),
+                    .all(|pair| stamp_order(pair[0], pair[1]) != std::cmp::Ordering::Greater),
                 "{line:?}: pins are sorted oldest-first: {stamps:?}"
             );
-            for (patch, digest) in pins.iter() {
+            for (patch, digest) in *pins {
                 assert_eq!(version_line(patch), Some(*line), "{patch}");
                 assert!(
                     digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -3945,7 +3953,7 @@ mod tests {
 
     /// The enabling backstop: every INSTALLED flutter whose stamp names
     /// a supported line must hash its regions to one of the line's
-    /// reviewed digests — a patch of an enabled line whose flutter_tools
+    /// reviewed digests — a patch of an enabled line whose `flutter_tools`
     /// drifted (or is simply not yet reviewed) fails here instead of
     /// being mis-modeled (see [`SUPPORTED_FLUTTER_LINES`]). Skips when
     /// no fvm versions root exists (CI machines have none).
@@ -4268,7 +4276,7 @@ mod tests {
         assert_eq!(store.stats().expect("stats").entries, 1);
     }
 
-    /// A compile failure ingests nothing: frontend_server writes the
+    /// A compile failure ingests nothing: `frontend_server` writes the
     /// cache dill only after a successful compile, so a failed compile
     /// leaves the cache untouched — and the stale dill of an earlier
     /// run must not ride along on its old mtime.
@@ -4308,7 +4316,7 @@ mod tests {
     /// killed run already compiled is still fresh, and the worst a kill
     /// can do mid-copy — dart:io File.copy writes the destination in
     /// place — is a torn dill whose replay cost is one wasted
-    /// materialization (frontend_server falls back to a full compile
+    /// materialization (`frontend_server` falls back to a full compile
     /// when the initialize-from-dill file will not read).
     #[test]
     fn signal_death_test_run_still_ingests_kernel_cache() {
@@ -4350,7 +4358,7 @@ mod tests {
         assert_eq!(exit_code(ExitStatus::from_raw(9)), 137);
     }
 
-    /// The live test kernel-cache layout flutter_tools writes: the double
+    /// The live test kernel-cache layout `flutter_tools` writes: the double
     /// `build` nesting of `join(buildDir, 'test_cache', <cached kernel
     /// path>)>`.
     const TEST_DILL_REL: &str = "build/ab.cache.dill.track.dill";
@@ -5351,7 +5359,7 @@ mod tests {
         assert_eq!(store.stats().expect("stats").blobs, flipped_blobs);
     }
 
-    /// A FileStore record naming the tree's files as flutter writes it
+    /// A `FileStore` record naming the tree's files as flutter writes it
     /// into `dir`: an input, the payload, and the payload's byte copy
     /// outside every replayed dir (gradle's `kernel_blob.bin`).
     fn write_file_store(project: &Path, dir: &Path) {
@@ -5370,7 +5378,7 @@ mod tests {
         );
     }
 
-    /// flutter's every-build rewrite of the FileStore record, as a run
+    /// flutter's every-build rewrite of the `FileStore` record, as a run
     /// effect: the same records persisted in another hash-map order, the
     /// mtime moved a second on.
     fn rewrite_file_store_reordered(dir: &Path) {
@@ -5471,7 +5479,7 @@ mod tests {
         write(&dir.join("link_hooks_result.json"), result.as_bytes());
     }
 
-    /// The FileStore record of a dir holding a hook result: the result's
+    /// The `FileStore` record of a dir holding a hook result: the result's
     /// md5 (which moves with every timestamp rewrite) and the payload's.
     fn write_file_store_with_hook(dir: &Path, hook_md5: &str) {
         let record = serde_json::json!({
@@ -5499,7 +5507,7 @@ mod tests {
     }
 
     /// #4136: an Android hit's rerun rewrites `link_hooks_result.json`
-    /// with fresh `build_start`/`build_end` (flutter_tools 3.47
+    /// with fresh `build_start`/`build_end` (`flutter_tools` 3.47
     /// `LinkHooks.build`) and `.filecache` with the result's new md5 —
     /// live, every same-tree hit re-ingested those two files. A rewrite
     /// whose only change is the timestamps stores nothing, on a
@@ -6067,7 +6075,7 @@ mod tests {
     /// A11's cacheable face: SIGTERM to the shim is forwarded to the
     /// child, the child dies by that signal, and the shim reports the
     /// child's status (128 + signal) after reaping it — no orphaned
-    /// flutter_tools under PPID 1.
+    /// `flutter_tools` under PPID 1.
     #[cfg(unix)]
     #[test]
     fn forwarded_sigterm_reaches_the_child_and_reports_its_status() {

@@ -2,7 +2,6 @@ use super::{
     Check, NodeKind, RuleSpec, for_each_iterable, is_identifier_token, local_written_type,
     obvious_spelling,
 };
-use crate::rules::last_child;
 
 /// Official: `pkg/linter/lib/src/rules/specify_nonobvious_local_variable_types.dart:68-145`
 /// — a local variable list (:113-115, statement or C-style for
@@ -198,8 +197,7 @@ fn invocation_obvious(c: &Check<'_>, value: u32) -> bool {
         return true;
     }
     crate::rules::same_file_declaration(c, head)
-        .map(|row| c.kind(row) == NodeKind::ClassDeclaration && !class_generic(c, row))
-        .unwrap_or(false)
+        .is_some_and(|row| c.kind(row) == NodeKind::ClassDeclaration && !class_generic(c, row))
 }
 
 /// Whether the same-file class row declares type variables. The
@@ -233,26 +231,26 @@ mod oracle_corpus_pins {
         // (case, source, oracle rows as (line, column, length)).
         let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_as#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_as#0",
+                r"
 f() {
   var d = 1 as num;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_as_dynamic#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_as_dynamic#0",
+                r"
 f() {
   var d = 1 as dynamic;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_cascade#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_cascade#0",
+                r"
 f() {
   var a = A()..x..x..x;
 }
@@ -260,22 +258,22 @@ f() {
 class A {
   final x = 0;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_forEach_inferredList#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_forEach_inferredList#0",
+                r"
 f() {
   for (var i in [1, 2, 'Hello'.length]) {
     print(i);
   }
 }
-"#,
+",
                 &[(3, 8, 5)],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_forEach_listWithNonObviousElement#0"#,
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_forEach_listWithNonObviousElement#0",
                 r#"
 f() {
   int j = "Hello".length;
@@ -285,108 +283,108 @@ f() {
                 &[(4, 8, 5)],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_forEach_noDeclaredType#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_forEach_noDeclaredType#0",
+                r"
 f() {
   for (var i in <int>[1, 2, 3]) { }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_forEach_nonObviousIterable#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_forEach_nonObviousIterable#0",
+                r"
 f() {
   for (int i in list) { }
 }
 var list = <int>[1, 2, 3];
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_forEach_typedList#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_forEach_typedList#0",
+                r"
 f() {
   for (int i in <int>[1, 2, 3]) { }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_paramIsType#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_paramIsType#0",
+                r"
 String f() {
   final h = bar('');
   return h;
 }
 
 T bar<T>(T d) => d;
-"#,
+",
                 &[(3, 3, 17)],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_paramIsType_ok#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_paramIsType_ok#0",
+                r"
 String f() {
   String h = bar('');
   return h;
 }
 
 T bar<T>(T d) => d;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_typeNeededForInference#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_typeNeededForInference#0",
+                r"
 f() {
   var h = bar('');
   return h;
 }
 
 T bar<T>(dynamic d) => d;
-"#,
+",
                 &[(3, 3, 15)],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_typeNeededForInference_ok#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_typeNeededForInference_ok#0",
+                r"
 String f() {
   String h = bar('');
   return h;
 }
 
 T bar<T>(dynamic d) => d;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_typeParamProvided#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_typeParamProvided#0",
+                r"
 String f() {
   var h = bar<String>('');
   return h;
 }
 
 T bar<T>(dynamic d) => d;
-"#,
+",
                 &[(3, 3, 23)],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_typeParamProvided_ok#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_genericInvocation_typeParamProvided_ok#0",
+                r"
 String f() {
   String h = bar<String>('');
   return h;
 }
 
 T bar<T>(dynamic d) => d;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_instanceCreation_generic#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_instanceCreation_generic#0",
+                r"
 f() {
   var a = A(1);
 }
@@ -394,98 +392,98 @@ f() {
 class A<X> {
   A(X x);
 }
-"#,
+",
                 &[(3, 3, 12)],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_instanceCreation_generic_ok1#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_instanceCreation_generic_ok1#0",
+                r"
 f() {
   A<int> a = A<int>();
 }
 
 class A<X> {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_instanceCreation_generic_ok2#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_instanceCreation_generic_ok2#0",
+                r"
 f() {
   A<num> a = A<int>();
 }
 
 class A<X> {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_instanceCreation_nonGeneric#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_instanceCreation_nonGeneric#0",
+                r"
 f() {
   A a = A();
 }
 
 class A {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_bool#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_bool#0",
+                r"
 f() {
   bool b = true;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_double#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_double#0",
+                r"
 f() {
   double d = 1.5;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_doubleTypedInt#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_doubleTypedInt#0",
+                r"
 f() {
   double d = 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_double_negated#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_double_negated#0",
+                r"
 f() {
   var d = -1.5;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_int#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_int#0",
+                r"
 f() {
   int i = 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_null#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_null#0",
+                r"
 f() {
   Null nil = null;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_string#0"#,
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_string#0",
                 r#"
 f() {
   String s = "A string";
@@ -494,65 +492,65 @@ f() {
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_symbol#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_literal_symbol#0",
+                r"
 f() {
   Symbol s = #print;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_local_multiple#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_local_multiple#0",
+                r"
 f() {
   var a = 'a' + 'a', b = 'b' * 2;
 }
-"#,
+",
                 &[(3, 7, 13), (3, 22, 11)],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_local_multiple_ok#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_local_multiple_ok#0",
+                r"
 f() {
   String a = 'a' + 'a', b = 'b'.toString();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_local_promotion#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_local_promotion#0",
+                r"
 f() {
   num local = 2;
   if (local is! int) return;
   var x = local;
   return x;
 }
-"#,
+",
                 &[(5, 3, 13)],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_pattern_list_destructured#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_pattern_list_destructured#0",
+                r"
 f() {
   var [int a] = <int>[1];
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_pattern_map_destructured#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_pattern_map_destructured#0",
+                r"
 f() {
   var {'a': int a} = <String, int>{'a': 1};
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_pattern_object_destructured#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_pattern_object_destructured#0",
+                r"
 class A {
   int a;
   A(this.a);
@@ -560,23 +558,23 @@ class A {
 f() {
   final A(a: int _b) = A(1);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_pattern_record_destructured#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_pattern_record_destructured#0",
+                r"
 f(Object o) {
   switch (o) {
     case (int x, String s):
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_switch_pattern_object#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_switch_pattern_object#0",
+                r"
 class A {
   int a;
   A(this.a);
@@ -587,23 +585,23 @@ f() {
     case A(a: >0 && int b):
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_switch_pattern_record#0"#,
-                r#"
+                r"lints/specify_nonobvious_local_variable_types/SpecifyNonObviousLocalVariableTypesTest/test_switch_pattern_record#0",
+                r"
 f() {
   switch ((1, 2)) {
     case (int a, final int b):
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/doc_bad_0"#,
-                r#"List<List<Ingredient>> possibleDesserts(Set<Ingredient> pantry) {
+                r"lints/specify_nonobvious_local_variable_types/doc_bad_0",
+                r"List<List<Ingredient>> possibleDesserts(Set<Ingredient> pantry) {
   var desserts = genericFunctionDeclaredFarAway(<num>[42], 'Something');
   for (final recipe in cookbook) {
     if (pantry.containsAll(recipe)) {
@@ -615,12 +613,12 @@ f() {
 }
 
 const List<List<Ingredient>> cookbook = ...;
-"#,
+",
                 &[(2, 3, 69), (3, 8, 12)],
             ),
             (
-                r#"lints/specify_nonobvious_local_variable_types/doc_good_0"#,
-                r#"List<List<Ingredient>> possibleDesserts(Set<Ingredient> pantry) {
+                r"lints/specify_nonobvious_local_variable_types/doc_good_0",
+                r"List<List<Ingredient>> possibleDesserts(Set<Ingredient> pantry) {
   List<List<Ingredient>> desserts = genericFunctionDeclaredFarAway(
     <num>[42],
     'Something',
@@ -635,7 +633,7 @@ const List<List<Ingredient>> cookbook = ...;
 }
 
 const List<List<Ingredient>> cookbook = ...;
-"#,
+",
                 &[],
             ),
         ];

@@ -38,6 +38,8 @@
 //! fixture below; every silence pin carries zero rows, and the
 //! `undefined_class` pin carries exactly the row quoted.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{report_ops, report_ops_core_ctor, rows};
 
 /// The two codes a written type position reports when its head fails to

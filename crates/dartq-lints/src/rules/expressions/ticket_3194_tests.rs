@@ -17,6 +17,7 @@
 //! Every expected span is the oracle row for the same shape (`14:8:6` for
 //! the recovered initializer; per-arm spans for the conditionals).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
 /// The rows for `source`, ordered by start: `(start, end)` in UTF-16.

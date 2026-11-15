@@ -1,5 +1,6 @@
 //! Sparse path-to-content mapping backing change detection.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 

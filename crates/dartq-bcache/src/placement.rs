@@ -29,6 +29,7 @@
 //! consulted (the file name selects it, and the record names its key
 //! inside for good measure).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

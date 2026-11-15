@@ -30,6 +30,7 @@
 //! - a kind-mismatched candidate set suppresses upstream
 //!   (`_allSameElementKind`'s gate) and here (the method-only hit filter).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops};
 

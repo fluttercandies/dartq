@@ -14,6 +14,7 @@
 //! pair honestly — matching pairs dead the throw arm, non-matching pairs
 //! stay live.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

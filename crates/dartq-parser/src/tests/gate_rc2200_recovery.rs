@@ -18,6 +18,7 @@
 //! - `>>`-anchored `Expected ';'` rows in the same files were re-parse
 //!   cascades of the two faces above; they close with them.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, setup};
 
 fn parse(source: &'static str) -> Collector {

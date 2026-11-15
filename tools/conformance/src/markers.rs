@@ -15,7 +15,7 @@
 //!
 //! The oracle/runner lanes strip cases with the same functions before
 //! analysis, so until then these surfaces are exercised by the tests only.
-#![allow(dead_code)]
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 /// A caret marker line: whitespace, `//`, whitespace, a `^` run, whitespace.
 pub fn is_caret_line(text: &str) -> bool {
@@ -125,7 +125,7 @@ pub fn remove_expectations(content: &str) -> String {
 }
 
 /// One extracted expectation: the marker name (already converted to the
-/// snake_case code), and the 0-based line / column / UTF-16 length it refers
+/// `snake_case` code), and the 0-based line / column / UTF-16 length it refers
 /// to in the stripped content.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Expectation {
@@ -210,7 +210,7 @@ fn explicit_location(text: &str) -> Option<(usize, usize)> {
     Some((column.saturating_sub(1), length))
 }
 
-/// Converts a `camelCase` marker name to the analyzer's lowercase snake_case
+/// Converts a `camelCase` marker name to the analyzer's lowercase `snake_case`
 /// code name (the inverse of the official `toCamelCase`).
 pub fn camel_to_snake(camel: &str) -> String {
     let mut out = String::with_capacity(camel.len() + 4);
@@ -227,7 +227,7 @@ pub fn camel_to_snake(camel: &str) -> String {
     out
 }
 
-/// Converts a snake_case (or already-lowercase) code name to `camelCase` (the
+/// Converts a `snake_case` (or already-lowercase) code name to `camelCase` (the
 /// official `toCamelCase`).
 pub fn snake_to_camel(snake: &str) -> String {
     let mut out = String::with_capacity(snake.len());

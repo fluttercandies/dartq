@@ -34,6 +34,7 @@
 //! parser rewrites it to `x and ;y;` and reports the missing `;` — analyzer
 //! code `expected_token`, official anchor `ExpectedAfterButGot`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::setup;
 
 const F_BOUNDED: &str = include_str!("fixtures/gate_m0_f_bounded.dart");

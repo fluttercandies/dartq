@@ -4,6 +4,7 @@
 //! the Group A do-not-emit compliance checks (statement codes with no
 //! pinned-oracle corpus surface), and the statement-level termination bombs.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, setup};
 
 fn parse(source: &'static str) -> Collector {
@@ -776,7 +777,7 @@ fn catch_synthetic_comma_never_flips_the_trace_slot() {
         .map(|(_, s, e, _)| (*s, *e))
         .collect();
     assert_eq!(catches, vec![(25, 25), (25, 25)], "{:?}", c.idents);
-    assert!(c.catch_trace_flips.is_empty());
+    assert_eq!(c.catch_trace_flips, [] as [usize; 0]);
 }
 
 #[test]

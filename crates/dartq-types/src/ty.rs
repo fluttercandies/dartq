@@ -26,6 +26,7 @@
 //! lives in the queries (`isDartCoreNull`, type.dart:1201-1204), not in
 //! storage.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ids::{FunctionSigId, RecordShapeId, TypeDeclId, TypeId, TypeParamId};
 use crate::suffix::NullabilitySuffix;
 

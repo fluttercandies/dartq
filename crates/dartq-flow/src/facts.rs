@@ -1,5 +1,6 @@
 //! The observable output of flow analysis: per-executable facts.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_parser::TokenSpan;
 use dartq_source::SourceRange;
 
@@ -36,7 +37,7 @@ pub enum FlowFact {
     /// report `read_potentially_unassigned_final`; non-late,
     /// non-nullable locals report
     /// `not_assigned_potentially_non_nullable_local_variable`
-    /// (type_analyzer.dart `_checkReadOfNotAssignedLocalVariable`,
+    /// (`type_analyzer.dart` `_checkReadOfNotAssignedLocalVariable`,
     /// :4990-5030).
     UnassignedRead {
         /// Span of the read's identifier token.
@@ -46,17 +47,17 @@ pub enum FlowFact {
         /// Whether the variable was declared `final` (or `const`).
         is_final: bool,
         /// The model's `unassigned` bit — upstream's
-        /// `isDefinitelyUnassigned`/`isUnassigned` (flow_analysis.dart
+        /// `isDefinitelyUnassigned`/`isUnassigned` (`flow_analysis.dart`
         /// `:7221`): the variable is unassigned on EVERY incoming path.
         /// `false` marks the potentially-unassigned join face (assigned on
         /// some path, not others), which only the non-late read gates
-        /// (`!isAssigned`, type_analyzer.dart:5010) consume. A
+        /// (`!isAssigned`, `type_analyzer.dart:5010`) consume. A
         /// `definitely_unassigned` read is also `!assigned` — the bits are
         /// exclusive (model.rs `PromotionModel` invariant).
         definitely_unassigned: bool,
         /// Whether the declared type is potentially non-nullable at the
         /// name level (official `isPotentiallyNonNullable`,
-        /// type_analyzer.dart:5016 — nullable, `dynamic`, `Null`, and
+        /// `type_analyzer.dart:5016` — nullable, `dynamic`, `Null`, and
         /// unknown heads suppress the report).
         potentially_non_nullable: bool,
         /// The variable's declared type, when the declaration carried one.
@@ -434,7 +435,7 @@ pub struct NonPromotionEntry {
 
 /// Why a property member is inherently non-promotable — the mirror of
 /// upstream's `PropertyNonPromotabilityReason` (upstream Dart SDK source,
-/// pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+/// pkg/_`fe_analyzer_shared/lib/src/flow_analysis`/
 /// flow_analysis_operations.dart:127-140). The diagnoser's element layer
 /// answers this per member (the official `whyPropertyIsNotPromotable`
 /// operation); a public member name answers [`Self::NotPrivate`]
@@ -455,7 +456,7 @@ pub enum PropertyNonPromotability {
 /// The five-variant reason a promotion failed to hold at a read — the
 /// resolved mirror of upstream's `NonPromotionReason` hierarchy (upstream
 /// Dart SDK source,
-/// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:4552;
+/// pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:4552`;
 /// variants at `:57`, `:90`, `:5453`, `:5503`, `:5962`), shaped for the
 /// diagnoser's `computeWhyNotPromotedMessages` producer
 /// (`type_analyzer.dart:772`; the visitor mapping,

@@ -40,7 +40,7 @@
 //! a member called `values` — any kind except a static setter (and enum
 //! constants, which ride the field arm) — anchored at the member name.
 //!
-//! The remaining mixin-application face is error_verifier.dart's
+//! The remaining mixin-application face is `error_verifier.dart`'s
 //! `_checkForMixinSuperclassConstraints` (:6076-6116).
 //!
 //! # Where it is wired
@@ -65,6 +65,7 @@
 //!   ([`Engine::resolve_clause_face`]) but the spelling-keyed walk below
 //!   cannot follow it further, so the chain stops.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use std::collections::VecDeque;
 
@@ -161,7 +162,7 @@ impl<'a> Engine<'a> {
         let equals = self.intern("==");
         let values = self.intern("values");
         let mut rows: Vec<(SemanticCode, SourceRange, String)> = Vec::new();
-        for (member, entry) in container.members.iter() {
+        for (member, entry) in &container.members {
             if entry.name_range.offset == MISSING_SPAN {
                 continue;
             }
@@ -275,7 +276,7 @@ impl<'a> Engine<'a> {
         // they contribute (upstream `checkMemberNameCombo` over the AST
         // member list, `:910-930`): `(face, display)`.
         let mut faces: Vec<(StringId, String)> = Vec::new();
-        for (member, entry) in container.members.iter() {
+        for (member, entry) in &container.members {
             if entry.name_range.offset == MISSING_SPAN || entry.is_static || !entry.is_abstract {
                 continue;
             }
@@ -367,7 +368,7 @@ impl<'a> Engine<'a> {
             FxHashSet::default()
         };
         let mut rows: Vec<(SourceRange, String)> = Vec::new();
-        for (member, entry) in container.members.iter() {
+        for (member, entry) in &container.members {
             if entry.name_range.offset == MISSING_SPAN
                 || entry.is_static
                 || !entry.is_abstract
@@ -434,7 +435,7 @@ impl<'a> Engine<'a> {
         }
         let scope_lib = self.owner_library_of(self.file, name).unwrap_or(self.lib);
         let mut unresolved_entry = false;
-        for mixin in container.with_clause.iter() {
+        for mixin in &container.with_clause {
             match self.resolve_clause_face(name, self.file, scope_lib, *mixin) {
                 Some((found, _)) => {
                     let is_mixin = found.kind == ContainerKind::Mixin
@@ -604,8 +605,10 @@ impl<'a> Engine<'a> {
                     let super_slots = super_container.and_then(|found| {
                         self.inst_slots(
                             self.file,
-                            Some(container.superclass_args)
-                                .filter(|_| container.superclass.is_some()),
+                            container
+                                .superclass
+                                .is_some()
+                                .then_some(container.superclass_args),
                             found,
                             &[],
                             &[],
@@ -757,14 +760,14 @@ impl<'a> Engine<'a> {
         }
         let scope_lib = self.owner_library_of(self.file, name).unwrap_or(self.lib);
         let mut fields: Vec<String> = Vec::new();
-        for mixin in container.with_clause.iter() {
+        for mixin in &container.with_clause {
             let Some((mixin_container, _)) =
                 self.resolve_clause_face(name, self.file, scope_lib, *mixin)
             else {
                 continue;
             };
             let mixin_display = self.display_of(*mixin);
-            for (member, entry) in mixin_container.members.iter() {
+            for (member, entry) in &mixin_container.members {
                 if entry.kind != MemberKind::Field || entry.is_static {
                     continue;
                 }
@@ -829,10 +832,11 @@ impl<'a> Engine<'a> {
         let mut heads = Vec::new();
         // The primary-constructor header (`class const B(...)`): the
         // declaration's `errorRange` is the `const` keyword itself.
-        if at > 0 && &self.source[tokens[at - 1].byte_range()] == "const" {
-            if let Some(span) = self.token_range(tokens, at - 1, at - 1) {
-                heads.push(span);
-            }
+        if at > 0
+            && &self.source[tokens[at - 1].byte_range()] == "const"
+            && let Some(span) = self.token_range(tokens, at - 1, at - 1)
+        {
+            heads.push(span);
         }
         let mut body = at;
         while body + 1 < tokens.len() {
@@ -855,10 +859,11 @@ impl<'a> Engine<'a> {
                 }
                 _ => {}
             }
-            if depth == 1 && text == "const" {
-                if let Some(head) = self.constructor_head_after(tokens, cursor + 1) {
-                    heads.push(head);
-                }
+            if depth == 1
+                && text == "const"
+                && let Some(head) = self.constructor_head_after(tokens, cursor + 1)
+            {
+                heads.push(head);
             }
             cursor += 1;
         }
@@ -887,10 +892,10 @@ impl<'a> Engine<'a> {
             return None;
         }
         let mut last = start;
-        if text_at(start + 1) == Some(".") {
-            if text_at(start + 2)?.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
-                last = start + 2;
-            }
+        if text_at(start + 1) == Some(".")
+            && text_at(start + 2)?.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        {
+            last = start + 2;
         }
         if text_at(last + 1) != Some("(") {
             return None;
@@ -914,7 +919,7 @@ impl<'a> Engine<'a> {
             let Some(found) = index.get(face_file).and_then(|unit| unit.container(face)) else {
                 continue;
             };
-            for (member, entry) in found.members.iter() {
+            for (member, entry) in &found.members {
                 if entry.is_static {
                     continue;
                 }
@@ -1330,7 +1335,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Whether the interface's IMPLEMENTED map answers `member` (upstream
-    /// `Interface.implemented`, inheritance_manager3.dart): the concrete
+    /// `Interface.implemented`, `inheritance_manager3.dart)`: the concrete
     /// member the abstract-member checks compare against. The walk covers
     /// the container's own concrete member (a declared setter can answer a
     /// `name=` face the sibling abstract entry contributes), the supertype

@@ -30,6 +30,7 @@
 //! * Writes bump the context's epoch; tasks enqueued under older epochs are
 //!   dropped at the single drain point.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fmt;
 use std::path::{Path, PathBuf};
 

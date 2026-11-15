@@ -27,6 +27,7 @@
 //!
 //! [`Analysis::type_of`]: crate::analysis::Analysis::type_of
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::analysis::{Analysis, analyze_unit};
 use crate::diagnose::StrictModes;
 use crate::library::ElementIndex;

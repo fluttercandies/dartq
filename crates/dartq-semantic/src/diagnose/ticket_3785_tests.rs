@@ -16,6 +16,7 @@
 //! fix below — the extension-type spellings ride the identical
 //! restriction faces through `NameWorld::extension_erasure`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -26,7 +27,7 @@ use dartq_scanner::ScanConfig;
 use dartq_source::FileTable;
 use std::path::Path;
 
-/// One-file rig (mirrors `tests.rs::report` plus the ticket_2498 SDK
+/// One-file rig (mirrors `tests.rs::report` plus the `ticket_2498` SDK
 /// face): the live fold pipeline over a single library, with the
 /// dart:core primitives the fixtures name (`num`/`int`/`String`/`bool`/
 /// `double`/`Object`) declared on an unindexed `<dart:core>` node joined

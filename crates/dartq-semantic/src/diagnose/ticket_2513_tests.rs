@@ -16,6 +16,7 @@
 //! now DECIDE (`undefined_method` on a wrong send, `invalid_assignment` on a
 //! wrong write), and a written annotation keeps its model face untouched.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, assert_silent, code_names, report_ops};
 
 /// The absolute fixture offset of `needle` (the prelude the rig prepends

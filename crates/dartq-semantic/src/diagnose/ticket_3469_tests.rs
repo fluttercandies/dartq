@@ -27,6 +27,8 @@
 //! `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze`): every expectation
 //! below is a live verdict, quoted per fixture.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{code_names, report_ops, rows};
 use super::*;
 

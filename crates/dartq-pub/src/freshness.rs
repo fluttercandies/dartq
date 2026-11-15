@@ -23,6 +23,7 @@
 //! The report is structured data; the caller turns non-empty reports into
 //! `dartq/package_config_out_of_date`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;

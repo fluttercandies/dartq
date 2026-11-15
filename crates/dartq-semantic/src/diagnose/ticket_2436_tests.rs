@@ -24,6 +24,8 @@
 //! `invalid_implementation_override` row on the generic-interface shape
 //! pre-fix.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -149,9 +151,9 @@ fn generic_interface_substituted_members_stay_silent() {
 /// return is not a subtype of the interface's `Base`, so `Host.member`
 /// itself reports `invalid_override`. The subclass inherits the concrete
 /// member and reports NOTHING: the oracle's whole-file answer on this
-/// exact fixture is the single `Host.member` row (INVALID_OVERRIDE
-/// "'Host.member' ('Base? Function()') isn't a valid override of
-/// 'Iface.member' ('Base Function()')" at 6:9, dart analyze 3.13.7 — no
+/// exact fixture is the single `Host.member` row (`INVALID_OVERRIDE`
+/// "'Host.member' ('Base? `Function()`') isn't a valid override of
+/// 'Iface.member' ('Base `Function()`')" at 6:9, dart analyze 3.13.7 — no
 /// `invalid_implementation_override` at `Sub`; the earlier expectation
 /// held a second row the oracle never emits, the re-pin records the
 /// disproof). The gate only fires on free type parameters, never on a

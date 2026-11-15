@@ -4,6 +4,11 @@
 //! arena. Goal #303 pins the cross-batch face: a facts-cache hit re-runs
 //! the same per-file derivation (attribution + URI resolution).
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::collections::BTreeMap;

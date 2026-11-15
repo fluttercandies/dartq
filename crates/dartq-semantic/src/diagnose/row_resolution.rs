@@ -74,7 +74,7 @@ fn is_write_follower(kind: Option<dartq_scanner::TokenKind>) -> bool {
 /// `Object` members ride the shared `Object` exemption). The extension
 /// `on`-face walk chain-breaks on the unindexed declaration, so a bare
 /// miss inside an extension body would report where the oracle resolves
-/// through the SDK class (the xml_events `each_event` tap shape). Consulted
+/// through the SDK class (the `xml_events` `each_event` tap shape). Consulted
 /// beside [`CORE_INTERFACE_MEMBERS`] / [`CORE_TYPE_MEMBERS`] by the
 /// frozen-face classification.
 pub(crate) const SDK_FACES_EXTRA: &[(&str, &[&str])] = &[
@@ -191,7 +191,7 @@ enum AdjacentOp {
 enum ExtShadow {
     /// A read the extension's member map claims but does not answer — the
     /// basename never reaches the enclosing scope (upstream
-    /// `ExtensionMemberScope`, lexical_lookup.dart).
+    /// `ExtensionMemberScope`, `lexical_lookup.dart`).
     ReadMiss,
     /// An invocation the extension claims with no callable face — the send
     /// falls to `this`, and the `on` type's own lookup reports the miss.
@@ -242,44 +242,44 @@ impl<'a> Engine<'a> {
         // the callee element resolves like `check_super_constructor`, and
         // `super(name: v)` reads the unnamed constructor's table while
         // `super.named(name: v)` reads the selector's).
-        if self.initializer_depth > 0 {
-            if let Some((container, selector)) = self.init_super_callee() {
-                // The label's declaring owner — the resolved
-                // super-constructor's own spelling — feeds the deprecated-
-                // parameter face (`element_usage_detector.dart`'s
-                // `_visitParametersAndArguments`).
-                let owner = self.super_ctor_owner(container, selector);
-                // An unresolvable super-constructor (missing superclass, an
-                // external container the index does not model) stays silent
-                // at the labels — the unresolved-callee posture, same as the
-                // invokes-stack path below; the initializer's own
-                // constructor faces own that report. The names table still
-                // carries the miss only when the callee resolved (the main
-                // path's `!defined` shape: an unresolved callee's label is
-                // not a miss).
-                let (resolved, defined) = match self.super_ctor_named_formals(container, selector) {
-                    // The membership test is the call-site face's own
-                    // (`named_formal_for`): a `super(x: v)` label binds a
-                    // `this._x` formal's public name like every other
-                    // invocation (upstream keys `NamedExpression.name`
-                    // against `ParameterElement.name`, which is the public
-                    // spelling — `correspondingPublicName`,
-                    // token_impl.dart:364).
-                    Some(formals) => (true, self.named_formal_for(&formals, name).is_some()),
-                    None => (false, false),
-                };
-                if let Some((decl_file, owner_key)) = owner {
-                    self.check_formal_arg_annotations(range, name, decl_file, owner_key);
-                }
-                if resolved && !defined {
-                    let text = self.strings.resolve(name).to_string();
-                    self.emit(SemanticCode::UndefinedNamedParameter, range, &text, "");
-                }
-                if !defined {
-                    self.record_miss(name, range, false, NameUse::NamedArgument);
-                }
-                return;
+        if self.initializer_depth > 0
+            && let Some((container, selector)) = self.init_super_callee()
+        {
+            // The label's declaring owner — the resolved
+            // super-constructor's own spelling — feeds the deprecated-
+            // parameter face (`element_usage_detector.dart`'s
+            // `_visitParametersAndArguments`).
+            let owner = self.super_ctor_owner(container, selector);
+            // An unresolvable super-constructor (missing superclass, an
+            // external container the index does not model) stays silent
+            // at the labels — the unresolved-callee posture, same as the
+            // invokes-stack path below; the initializer's own
+            // constructor faces own that report. The names table still
+            // carries the miss only when the callee resolved (the main
+            // path's `!defined` shape: an unresolved callee's label is
+            // not a miss).
+            let (resolved, defined) = match self.super_ctor_named_formals(container, selector) {
+                // The membership test is the call-site face's own
+                // (`named_formal_for`): a `super(x: v)` label binds a
+                // `this._x` formal's public name like every other
+                // invocation (upstream keys `NamedExpression.name`
+                // against `ParameterElement.name`, which is the public
+                // spelling — `correspondingPublicName`,
+                // token_impl.dart:364).
+                Some(formals) => (true, self.named_formal_for(&formals, name).is_some()),
+                None => (false, false),
+            };
+            if let Some((decl_file, owner_key)) = owner {
+                self.check_formal_arg_annotations(range, name, decl_file, owner_key);
             }
+            if resolved && !defined {
+                let text = self.strings.resolve(name).to_string();
+                self.emit(SemanticCode::UndefinedNamedParameter, range, &text, "");
+            }
+            if !defined {
+                self.record_miss(name, range, false, NameUse::NamedArgument);
+            }
+            return;
         }
         let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
             return;
@@ -450,9 +450,9 @@ impl<'a> Engine<'a> {
         callee_row: Option<usize>,
     ) -> Option<(Formals, FileId, StringId)> {
         let callee = self.invokes.last().and_then(|slot| *slot).or(callee_row)?;
-        let (shape, name, qualified) = match self.rows.get(callee) {
-            Some(row) => (row.shape.clone(), row.name, row.qualified),
-            None => return None,
+        let (shape, name, qualified) = {
+            let row = self.rows.get(callee)?;
+            (row.shape.clone(), row.name, row.qualified)
         };
         match &shape {
             // `c.m(0)` / `super.m(0)` — the merged member row.
@@ -1238,7 +1238,7 @@ impl<'a> Engine<'a> {
                 ty
             }
         };
-        for (range, ty) in self.read_types.iter_mut() {
+        for (range, ty) in &mut self.read_types {
             let Some(&decl) = self.local_decl_at_read.get(&range.offset) else {
                 continue;
             };
@@ -1247,7 +1247,7 @@ impl<'a> Engine<'a> {
             };
             *ty = reflow(*ty, parse_ty, corrected);
         }
-        for (range, ty) in promotions.rows.iter_mut() {
+        for (range, ty) in &mut promotions.rows {
             let Some(&decl) = self.local_decl_at_read.get(&range.offset) else {
                 continue;
             };
@@ -1796,7 +1796,7 @@ impl<'a> Engine<'a> {
     /// consumed — `list[x]`, `list[x] = v` and `list[x] += v` all report at
     /// the index expression when its static type is `void`. The receiver's
     /// void face is the bracket-anchored twin beside this one
-    /// (`_reportUnresolvedIndex`, property_element_resolver.dart:181), and
+    /// (`_reportUnresolvedIndex`, `property_element_resolver.dart:181`), and
     /// the two never collide: this walk only reads rows strictly INSIDE the
     /// bracket pair, the receiver row sits wholly before it.
     ///
@@ -1898,10 +1898,8 @@ impl<'a> Engine<'a> {
                     depth -= 1;
                 }
                 b';' | b',' | b'{' | b'}' if depth == 0 => return false,
-                b'.' if depth == 0 => {
-                    if b > 0 && src[b - 1] == b'.' {
-                        return true;
-                    }
+                b'.' if depth == 0 && b > 0 && src[b - 1] == b'.' => {
+                    return true;
                 }
                 _ => {}
             }
@@ -2391,7 +2389,7 @@ impl<'a> Engine<'a> {
         let redecided = match promoted {
             Ty::Unknown => {
                 let non_null = Self::non_null_form(static_ty);
-                (non_null != static_ty).then(|| Receiver::Typed {
+                (non_null != static_ty).then_some(Receiver::Typed {
                     type_name,
                     ty: non_null,
                 })
@@ -3232,7 +3230,7 @@ impl<'a> Engine<'a> {
                                             face @ (Ty::Record { .. } | Ty::Function { .. }) => {
                                                 Some(
                                                     face.render(
-                                                        &self.strings,
+                                                        self.strings,
                                                         &self.boundary.pool(),
                                                     ),
                                                 )
@@ -3625,7 +3623,7 @@ impl<'a> Engine<'a> {
                             }
                         } else {
                             let rescued = initializer_container.is_some()
-                                || self.write_target_rescues(&row, this_type);
+                                || self.write_target_rescues(row, this_type);
                             // A class-context bare read/write that loses to
                             // TWO+ applicable extensions reports the
                             // ambiguity verdict beside the lexical miss — the
@@ -3698,8 +3696,8 @@ impl<'a> Engine<'a> {
     }
 
     /// The extension-internal basename shadow for a bare row (upstream Dart
-    /// SDK source, pkg/analyzer/lib/src/dart/scope/lexical_lookup.dart's
-    /// `ExtensionMemberScope` + resolver/extension_member_resolver.dart's
+    /// SDK source, `pkg/analyzer/lib/src/dart/scope/lexical_lookup.dart`'s
+    /// `ExtensionMemberScope` + `resolver/extension_member_resolver.dart`'s
     /// implicit-`this` consult): an unqualified name inside an extension
     /// body resolves against the extension's OWN member map first, and the
     /// claim covers the whole BASENAME — a `set n` alone blocks the
@@ -3818,13 +3816,14 @@ impl<'a> Engine<'a> {
                     TokenKind::CloseCurly | TokenKind::StringInterpolationExpression => {
                         depth += 1;
                     }
-                    TokenKind::OpenCurly => match depth.checked_sub(1) {
-                        Some(next) => depth = next,
-                        None => {
+                    TokenKind::OpenCurly => {
+                        if let Some(next) = depth.checked_sub(1) {
+                            depth = next
+                        } else {
                             open = Some(cursor);
                             break;
                         }
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -3853,9 +3852,9 @@ impl<'a> Engine<'a> {
                         }
                         return None;
                     }
-                    TokenKind::Keyword(Keyword::Class)
-                    | TokenKind::Keyword(Keyword::Mixin)
-                    | TokenKind::Keyword(Keyword::Enum) => return None,
+                    TokenKind::Keyword(Keyword::Class | Keyword::Mixin | Keyword::Enum) => {
+                        return None;
+                    }
                     _ => {}
                 }
             }
@@ -3872,7 +3871,7 @@ impl<'a> Engine<'a> {
     /// Member tear-offs and shape receivers (no `RefTarget::Decl`) keep the
     /// ordinary render.
     fn generic_fn_display(&mut self, row: &Row, ty: Ty) -> String {
-        let rendered = ty.render(&self.strings, &self.boundary.pool());
+        let rendered = ty.render(self.strings, &self.boundary.pool());
         let Ty::Function { shape, .. } = ty else {
             return rendered;
         };
@@ -3912,7 +3911,7 @@ impl<'a> Engine<'a> {
                 && bound != Ty::Dynamic
             {
                 group.push_str(" extends ");
-                group.push_str(&bound.render(&self.strings, &self.boundary.pool()));
+                group.push_str(&bound.render(self.strings, &self.boundary.pool()));
             }
         }
         group.push('>');
@@ -3982,13 +3981,14 @@ impl<'a> Engine<'a> {
             for at in (0..close).rev() {
                 match tokens[at].kind {
                     K::CloseParen | K::CloseSquare | K::CloseCurly => depth += 1,
-                    K::OpenParen | K::OpenSquare | K::OpenCurly => match depth.checked_sub(1) {
-                        Some(next) => depth = next,
-                        None => {
+                    K::OpenParen | K::OpenSquare | K::OpenCurly => {
+                        if let Some(next) = depth.checked_sub(1) {
+                            depth = next
+                        } else {
                             open = Some(at);
                             break;
                         }
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -4105,11 +4105,11 @@ impl<'a> Engine<'a> {
                     | K::OpenSquare
                     | K::OpenCurly
                     | K::StringInterpolationExpression => {
-                        if let Some(close) = self.tokens.matching_end(at) {
-                            if close < hi {
-                                at = close + 1;
-                                continue;
-                            }
+                        if let Some(close) = self.tokens.matching_end(at)
+                            && close < hi
+                        {
+                            at = close + 1;
+                            continue;
                         }
                         at += 1;
                     }
@@ -4282,8 +4282,7 @@ impl<'a> Engine<'a> {
                 Some(
                     TokenKind::OpenCurly
                         | TokenKind::Function
-                        | TokenKind::Keyword(Keyword::Async)
-                        | TokenKind::Keyword(Keyword::Sync)
+                        | TokenKind::Keyword(Keyword::Async | Keyword::Sync)
                 )
             );
             if !declared {
@@ -4301,20 +4300,15 @@ impl<'a> Engine<'a> {
                 let mut after = close_paren + 1;
                 while matches!(
                     toks.get(after).map(|t| t.kind),
-                    Some(
-                        TokenKind::Keyword(Keyword::Async)
-                            | TokenKind::Keyword(Keyword::Sync)
-                            | TokenKind::Star
-                    )
+                    Some(TokenKind::Keyword(Keyword::Async | Keyword::Sync) | TokenKind::Star)
                 ) {
                     after += 1;
                 }
                 match toks.get(after).map(|t| t.kind) {
-                    Some(TokenKind::OpenCurly) => self
-                        .tokens
-                        .matching_end(after)
-                        .map(|end| token_end(&toks[end]))
-                        .unwrap_or_else(|| self.utf16_of(self.source.len())),
+                    Some(TokenKind::OpenCurly) => self.tokens.matching_end(after).map_or_else(
+                        || self.utf16_of(self.source.len()),
+                        |end| token_end(&toks[end]),
+                    ),
                     Some(TokenKind::Function) => {
                         // `=>` bodies are expressions: angle brackets are
                         // ambiguous (comparison vs type argument), so only
@@ -4356,7 +4350,7 @@ impl<'a> Engine<'a> {
                     // comparison's `>` scanning backward is not a closer,
                     // and `<` cannot open a context the name sits inside.
                     TokenKind::CloseCurly | TokenKind::CloseParen | TokenKind::CloseSquare => {
-                        depth += 1
+                        depth += 1;
                     }
                     TokenKind::OpenCurly | TokenKind::OpenParen | TokenKind::OpenSquare => {
                         depth -= 1;
@@ -4370,21 +4364,21 @@ impl<'a> Engine<'a> {
                         }
                     }
                     TokenKind::Colon
-                    | TokenKind::Keyword(Keyword::If)
-                    | TokenKind::Keyword(Keyword::Else)
-                    | TokenKind::Keyword(Keyword::For)
-                    | TokenKind::Keyword(Keyword::While)
-                    | TokenKind::Keyword(Keyword::Do)
-                    | TokenKind::Keyword(Keyword::Try)
-                    | TokenKind::Keyword(Keyword::Catch)
-                    | TokenKind::Keyword(Keyword::Finally)
-                    | TokenKind::Keyword(Keyword::Switch)
-                    | TokenKind::Keyword(Keyword::Case)
-                    | TokenKind::Keyword(Keyword::Default)
-                    | TokenKind::Keyword(Keyword::Assert)
-                    | TokenKind::Keyword(Keyword::On)
-                        if depth == 0 =>
-                    {
+                    | TokenKind::Keyword(
+                        Keyword::If
+                        | Keyword::Else
+                        | Keyword::For
+                        | Keyword::While
+                        | Keyword::Do
+                        | Keyword::Try
+                        | Keyword::Catch
+                        | Keyword::Finally
+                        | Keyword::Switch
+                        | Keyword::Case
+                        | Keyword::Default
+                        | Keyword::Assert
+                        | Keyword::On,
+                    ) if depth == 0 => {
                         non_block = true;
                         break;
                     }
@@ -4403,10 +4397,10 @@ impl<'a> Engine<'a> {
                 // through `HiddenElements`, a different family).
                 (
                     toks[open_index].utf16_offset,
-                    self.tokens
-                        .matching_end(open_index)
-                        .map(|end| token_end(&toks[end]))
-                        .unwrap_or_else(|| self.utf16_of(self.source.len())),
+                    self.tokens.matching_end(open_index).map_or_else(
+                        || self.utf16_of(self.source.len()),
+                        |end| token_end(&toks[end]),
+                    ),
                 )
             } else {
                 // No enclosing `{`: a top-level declaration — not a local.
@@ -4515,18 +4509,20 @@ impl<'a> Engine<'a> {
                 | K::StringInterpolationIdentifier
                 | K::CloseParen
                 | K::CloseSquare
-                | K::Keyword(dartq_scanner::Keyword::This)
-                | K::Keyword(dartq_scanner::Keyword::Super)
-                | K::Keyword(dartq_scanner::Keyword::True)
-                | K::Keyword(dartq_scanner::Keyword::False)
-                | K::Keyword(dartq_scanner::Keyword::Null)
+                | K::Keyword(
+                    dartq_scanner::Keyword::This
+                        | dartq_scanner::Keyword::Super
+                        | dartq_scanner::Keyword::True
+                        | dartq_scanner::Keyword::False
+                        | dartq_scanner::Keyword::Null
+                )
         )
     }
 
     /// Whether a scope parameter's bound declares the operator spelling —
     /// upstream resolves a type-parameter receiver through
     /// `resolveToBound(leftType)` before the property consult
-    /// (binary_expression_resolver.dart:461), so `T extends num` resolves
+    /// (`binary_expression_resolver.dart:461`), so `T extends num` resolves
     /// `+` on `num`'s face. The captured windows survive the pass-2 frame
     /// teardown ([`Self::param_bound_of`]); a class-generic parameter
     /// resolves through its DECLARING container's captured bounds —
@@ -4651,7 +4647,7 @@ impl<'a> Engine<'a> {
     /// same — the bound chain is what makes the parameter head invalid).
     /// The question is the operand staging pass's own
     /// [`Engine::checked_operand_ty`] verdict: `None` there IS that pass's
-    /// InvalidType read (an unresolvable head on the operand's own type or
+    /// `InvalidType` read (an unresolvable head on the operand's own type or
     /// on a bound hop, a `refs` miss on the operand or on a selector
     /// tail's receiver), so the two passes share one implementation of the
     /// rule. The operand's tail token comes from the row's own span; a
@@ -4898,10 +4894,10 @@ impl<'a> Engine<'a> {
                 // verdict by harvesting the enclosing group's names).
                 if let Some((lo, hi)) = self.gft_param_group_covering(row.range.offset) {
                     let name_bytes = self.strings.resolve(row.name).as_bytes();
-                    let mut window = (lo..hi).filter_map(|at| self.byte_at(at));
+                    let window = (lo..hi).filter_map(|at| self.byte_at(at));
                     let mut word: Vec<u8> = Vec::new();
                     let mut declared = false;
-                    while let Some(b) = window.next() {
+                    for b in window {
                         match b {
                             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$' => word.push(b),
                             _ => {
@@ -5074,7 +5070,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Emits a clause-entry miss through its ledger tag
-    /// (scope_analyzer.dart `_resolveType`'s clause switch): the `on`
+    /// (`scope_analyzer.dart` `_resolveType`'s clause switch): the `on`
     /// constraint is additive — the oracle keeps the resolver's
     /// `undefined_class` beside `mixin_super_class_constraint_non_interface`.
     pub(crate) fn emit_clause_miss(&mut self, tag: ClauseTag, range: SourceRange, name_text: &str) {
@@ -5140,8 +5136,8 @@ impl<'a> Engine<'a> {
     /// (probe: `var;`/`final;`/`const;`/`dynamic;`/`void;` emit nothing
     /// upstream). Every other keyword consumed as a name DOES resolve —
     /// `ensureIdentifier` returns `isIdentifier` spellings directly
-    /// (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/parser/
-    /// identifier_context_impl.dart:397) and `isKeywordOrIdentifier`
+    /// (upstream Dart SDK source, pkg/_`fe_analyzer_shared/lib/src/parser`/
+    /// `identifier_context_impl.dart:397`) and `isKeywordOrIdentifier`
     /// fallbacks are consumed with `expectedIdentifierButGotKeyword`
     /// (:435-440), so `assert`, `class`, `in`, `as`, `when`, `late`,
     /// `static`, `covariant` all report `undefined_identifier` upstream.
@@ -5335,7 +5331,7 @@ impl<'a> Engine<'a> {
     /// The name-level join of a `??`/`?:` receiver's arm faces — the
     /// upstream `least_upper_bound` the resolver stamps on the composite's
     /// `staticType` (binary_expression_resolver.dart:69-109 for `??`,
-    /// conditional_expression_resolver for `?:`). Arms re-derive through
+    /// `conditional_expression_resolver` for `?:`). Arms re-derive through
     /// [`Self::recv_expression_ty`] so promoted reads and chained sends
     /// type the same way the walk above types them. `None` when the span
     /// holds no top-level `??`/`?:` (the caller falls to the chain walk)
@@ -5376,11 +5372,11 @@ impl<'a> Engine<'a> {
                 | dartq_scanner::TokenKind::OpenParen
                 | dartq_scanner::TokenKind::OpenSquare
                 | dartq_scanner::TokenKind::Lt => {
-                    if let Some(close) = self.tokens.matching_end(at) {
-                        if close < last {
-                            at = close + 1;
-                            continue;
-                        }
+                    if let Some(close) = self.tokens.matching_end(at)
+                        && close < last
+                    {
+                        at = close + 1;
+                        continue;
                     }
                     at += 1;
                 }
@@ -5410,11 +5406,11 @@ impl<'a> Engine<'a> {
                     | dartq_scanner::TokenKind::OpenParen
                     | dartq_scanner::TokenKind::OpenSquare
                     | dartq_scanner::TokenKind::Lt => {
-                        if let Some(close) = self.tokens.matching_end(scan) {
-                            if close < last {
-                                scan = close + 1;
-                                continue;
-                            }
+                        if let Some(close) = self.tokens.matching_end(scan)
+                            && close < last
+                        {
+                            scan = close + 1;
+                            continue;
                         }
                         scan += 1;
                     }
@@ -5499,13 +5495,14 @@ impl<'a> Engine<'a> {
                 | dartq_scanner::TokenKind::CloseCurly => depth += 1,
                 dartq_scanner::TokenKind::OpenParen
                 | dartq_scanner::TokenKind::OpenSquare
-                | dartq_scanner::TokenKind::OpenCurly => match depth.checked_sub(1) {
-                    Some(next) => depth = next,
-                    None => {
+                | dartq_scanner::TokenKind::OpenCurly => {
+                    if let Some(next) = depth.checked_sub(1) {
+                        depth = next
+                    } else {
                         open = Some(at);
                         break;
                     }
-                },
+                }
                 _ => {}
             }
         }
@@ -5638,8 +5635,8 @@ impl<'a> Engine<'a> {
             (_, Ty::Unknown) => Some(a),
             (Ty::Never, _) => Some(b),
             (_, Ty::Never) => Some(a),
-            (Ty::Dynamic, _) | (Ty::Void, _) => Some(a),
-            (_, Ty::Dynamic) | (_, Ty::Void) => Some(b),
+            (Ty::Dynamic | Ty::Void, _) => Some(a),
+            (_, Ty::Dynamic | Ty::Void) => Some(b),
             (Ty::Null, other) | (other, Ty::Null) => Some(match other {
                 Ty::Named { name, args, .. } => Ty::Named {
                     name,
@@ -5780,7 +5777,7 @@ impl<'a> Engine<'a> {
                 let name_len = self.strings.resolve(reference.name).len() as u32;
                 let bytes = self.source.as_bytes();
                 let mut at = self.byte_of(decl_offset + name_len);
-                while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+                while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
                     at += 1;
                 }
                 match bytes.get(at) {
@@ -5838,7 +5835,7 @@ impl<'a> Engine<'a> {
                     }
                     Some(b'=') => {
                         let mut at = at + 1;
-                        while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+                        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
                             at += 1;
                         }
                         (bytes.get(at) == Some(&b'(')).then(|| self.closure_init_ty(bytes, at))
@@ -6537,7 +6534,6 @@ impl<'a> Engine<'a> {
                     }
                     let display = self.render_ty(record);
                     self.check_shape_receiver(row, record, &display, receiver_nullable);
-                    return;
                 }
             }
             Receiver::Prefix { name: prefix } => {
@@ -7155,10 +7151,10 @@ impl<'a> Engine<'a> {
                 // A `static` extension member never answers an instance
                 // access (`extension_member_resolver` instantiates the
                 // extension and looks the member up in the instance face).
-                if !face
+                if face
                     .members
                     .get(&member)
-                    .is_some_and(|entry| !entry.is_static)
+                    .is_none_or(|entry| entry.is_static)
                 {
                     return false;
                 }
@@ -7176,7 +7172,7 @@ impl<'a> Engine<'a> {
                                 .is_some_and(|index| {
                                     matches!(
                                         face.type_param_bounds.get(index).copied(),
-                                        None | Some(Ty::Dynamic) | Some(Ty::Unknown)
+                                        None | Some(Ty::Dynamic | Ty::Unknown)
                                     )
                                 })
                     }
@@ -7361,7 +7357,7 @@ impl<'a> Engine<'a> {
     ///
     /// Upstream resolves an interface-typed alias head exactly like the
     /// class it names — `_resolveTargetInterfaceElement`
-    /// (pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart:
+    /// (`pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart`:
     /// 507-517) and `_resolveReceiverTypeLiteral`
     /// (method_invocation_resolver.dart:168-179) both hand the ALIASED
     /// element to the static face — so such a head is never the `Type`
@@ -7573,13 +7569,13 @@ impl<'a> Engine<'a> {
                 // face is alias-gated — so their invoke reports here.
                 Intent::Invoke if is_alias => {}
                 Intent::Invoke => {
-                    self.emit(SemanticCode::UndefinedMethod, row.range, name_text, "Type")
+                    self.emit(SemanticCode::UndefinedMethod, row.range, name_text, "Type");
                 }
                 Intent::Read => {
-                    self.emit(SemanticCode::UndefinedGetter, row.range, name_text, "Type")
+                    self.emit(SemanticCode::UndefinedGetter, row.range, name_text, "Type");
                 }
                 Intent::Write | Intent::ReadWrite => {
-                    self.emit(SemanticCode::UndefinedSetter, row.range, name_text, "Type")
+                    self.emit(SemanticCode::UndefinedSetter, row.range, name_text, "Type");
                 }
                 Intent::Operator(..) => {}
             }
@@ -7727,7 +7723,7 @@ impl<'a> Engine<'a> {
         let read_span = read_span?;
         match promotions.promoted(read_span) {
             Some(promoted @ Ty::Named { .. }) => Some(promoted),
-            other => None,
+            _ => None,
         }
     }
 
@@ -8084,21 +8080,15 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 if kind == ContainerKind::Extension && matches!(recv, Receiver::This { .. }) {
-                    match self.enclosing_extension_on_type(container) {
-                        Some(on) => {
-                            if !matches!(
-                                self.frozen_member_verdict(on, row.name),
-                                FrozenFace::Absent
-                            ) {
-                                self.record_miss(row.name, row.range, true, NameUse::Read);
-                                return;
-                            }
-                            report_on = on;
-                        }
-                        None => {
+                    if let Some(on) = self.enclosing_extension_on_type(container) {
+                        if !matches!(self.frozen_member_verdict(on, row.name), FrozenFace::Absent) {
                             self.record_miss(row.name, row.range, true, NameUse::Read);
                             return;
                         }
+                        report_on = on;
+                    } else {
+                        self.record_miss(row.name, row.range, true, NameUse::Read);
+                        return;
                     }
                 }
             }
@@ -8178,7 +8168,8 @@ impl<'a> Engine<'a> {
                         Receiver::This { container, kind } => self.this_static_ty(container, kind),
                         _ => Ty::UNKNOWN,
                     };
-                    let applied = !matches!(
+
+                    !matches!(
                         self.extension_application(
                             container,
                             receiver_ty,
@@ -8187,9 +8178,7 @@ impl<'a> Engine<'a> {
                             receiver_nullable
                         ),
                         ExtensionApp::None
-                    );
-
-                    applied
+                    )
                 } =>
                 {
                     // The application resolved the operator-merged read
@@ -8464,32 +8453,29 @@ impl<'a> Engine<'a> {
                             );
                         } else {
                             let param_text = self.strings.resolve(container).to_string();
-                            match row.intent {
-                                Intent::Invoke => {
+                            if row.intent == Intent::Invoke {
+                                self.emit(
+                                    SemanticCode::UndefinedMethod,
+                                    row.range,
+                                    name_text,
+                                    "<unknown>",
+                                );
+                            } else {
+                                if getter_miss {
                                     self.emit(
-                                        SemanticCode::UndefinedMethod,
+                                        SemanticCode::UndefinedGetter,
                                         row.range,
                                         name_text,
-                                        "<unknown>",
+                                        &param_text,
                                     );
                                 }
-                                _ => {
-                                    if getter_miss {
-                                        self.emit(
-                                            SemanticCode::UndefinedGetter,
-                                            row.range,
-                                            name_text,
-                                            &param_text,
-                                        );
-                                    }
-                                    if setter_miss {
-                                        self.emit(
-                                            SemanticCode::UndefinedSetter,
-                                            row.range,
-                                            name_text,
-                                            &param_text,
-                                        );
-                                    }
+                                if setter_miss {
+                                    self.emit(
+                                        SemanticCode::UndefinedSetter,
+                                        row.range,
+                                        name_text,
+                                        &param_text,
+                                    );
                                 }
                             }
                         }
@@ -9447,9 +9433,9 @@ impl<'a> Engine<'a> {
     }
 
     /// Whether a `?`-less `FutureOr<A>` receiver is potentially nullable
-    /// (type_system.dart `_isNonNullable`: `FutureOr<A>` answers `A`'s
+    /// (`type_system.dart` `_isNonNullable`: `FutureOr<A>` answers `A`'s
     /// verdict): `A` written with `?`, a top/`Null` argument, an
-    /// InvalidType spelling the file failed to resolve, or a nested
+    /// `InvalidType` spelling the file failed to resolve, or a nested
     /// `FutureOr` of one. A type-parameter argument stays non-nullable here
     /// (its bound is not modeled — the under-report direction).
     pub(crate) fn future_or_potentially_nullable(&self, ty: Ty) -> bool {
@@ -9706,20 +9692,17 @@ impl<'a> Engine<'a> {
             for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
                 pending.push_back((*super_face, found_owner));
             }
-            match found.superclass {
-                Some(superclass) => {
-                    scope_lib = owner_lib;
-                    name = superclass;
-                    owner = found_owner;
-                }
-                None => {
-                    let Some((next, next_owner)) = pending.pop_front() else {
-                        break;
-                    };
-                    name = next;
-                    owner = next_owner;
-                    scope_lib = owner_lib;
-                }
+            if let Some(superclass) = found.superclass {
+                scope_lib = owner_lib;
+                name = superclass;
+                owner = found_owner;
+            } else {
+                let Some((next, next_owner)) = pending.pop_front() else {
+                    break;
+                };
+                name = next;
+                owner = next_owner;
+                scope_lib = owner_lib;
             }
         }
         if undecidable {
@@ -10093,7 +10076,7 @@ impl<'a> Engine<'a> {
     /// (`on void Function()`, `on T Function(T)`) answers only the faces
     /// that spell a function type. The oracle's `_lookupExtension` runs
     /// against the receiver type ITSELF (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/resolver/type_property_resolver.dart
+    /// `pkg/analyzer/lib/src/dart/resolver/type_property_resolver.dart`
     /// :229-232), and a function type subtypes the two named heads no
     /// shape face spells — `Function` and `Object` — plus a bare
     /// own-parameter `on T` whose bound admits it. The consult carries the
@@ -10290,7 +10273,7 @@ impl<'a> Engine<'a> {
     /// while the oracle's write resolution resolves the `name=` element and
     /// checks the source against ITS type (`AssignmentExpressionImpl
     /// .writeType` — upstream Dart SDK source, pkg/analyzer/lib/src/dart/
-    /// resolver/assignment_expression_resolver.dart:54/:83/:361; the write
+    /// `resolver/assignment_expression_resolver.dart:54/:83/:361`; the write
     /// element is the setter, whose type IS the value formal).
     ///
     /// The verdict is [`Self::bare_write_target_exists`]'s implicit-`this`
@@ -10441,8 +10424,7 @@ impl<'a> Engine<'a> {
             }
             let asserted = self
                 .invocation_span(row.range)
-                .map(|span| self.null_asserted_after(span, send))
-                .unwrap_or(send);
+                .map_or(send, |span| self.null_asserted_after(span, send));
             if send == Ty::UNKNOWN
                 || row.ty == asserted
                 || (row.ty != Ty::UNKNOWN && row.ty == Self::non_null_form(send))
@@ -10779,7 +10761,7 @@ impl<'a> Engine<'a> {
                     Ty::UNKNOWN
                 };
                 let name = self.strings.resolve(parent.name);
-                self.refine_numeric_context(&name, recv_ty, context)
+                self.refine_numeric_context(name, recv_ty, context)
             }
         }
     }
@@ -10868,7 +10850,7 @@ impl<'a> Engine<'a> {
         let (formals, params): (Option<Formals>, Box<[StringId]>) = match &row.shape {
             RowShape::Member { recv } => (
                 self.member_formals_full(recv, row.name)
-                    .map(|formals| formals.into_owned()),
+                    .map(std::borrow::Cow::into_owned),
                 self.send_formal_params(row),
             ),
             RowShape::Bare(_) => {
@@ -10914,7 +10896,7 @@ impl<'a> Engine<'a> {
     /// `int` for a hex or plain-digit run, `double` once a `.`, `e`, or
     /// `E` marker appears outside the hex prefix — the same read the
     /// call-return ladder's `numeric_literal_face` makes
-    /// (engine_core.rs:10272); a binary operand's literal LHS (`1 + (…)`)
+    /// (`engine_core.rs:10272`); a binary operand's literal LHS (`1 + (…)`)
     /// carries no typed receiver row, so the downward context reads the
     /// literal's own face. Anything else answers `None`.
     fn send_numeric_literal_face(&self, range: SourceRange) -> Option<Ty> {
@@ -10922,7 +10904,7 @@ impl<'a> Engine<'a> {
         for i in range.offset..range.end() {
             bytes.push(self.byte_at(i)?);
         }
-        if !bytes.first().is_some_and(|b| b.is_ascii_digit())
+        if !bytes.first().is_some_and(u8::is_ascii_digit)
             || !bytes
                 .iter()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_'))
@@ -11115,7 +11097,7 @@ impl<'a> Engine<'a> {
     /// there), and every `var` declarator the read initializes stays
     /// untyped without it, so an extension use reached through the local
     /// never credits (`element.ffiClass` over `var element =
-    /// elementAnnotation?.element` — the ffi_verifier census shape). The
+    /// elementAnnotation?.element` — the `ffi_verifier` census shape). The
     /// `?.` short-circuit's result nullability re-arms on the answer
     /// (`var a = c?.id` keeps `a` nullable). Every shape neither arm
     /// answers stays [`Ty::UNKNOWN`] — the under-report direction; a
@@ -11397,7 +11379,7 @@ impl<'a> Engine<'a> {
             && let Some(index) = face.type_param_names.iter().position(|&n| n == on_head)
         {
             return match face.type_param_bounds.get(index).copied() {
-                None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
+                None | Some(Ty::Dynamic | Ty::Unknown) => true,
                 Some(bound) => {
                     let bound = Self::non_null_form(self.boundary.ty(face_file, bound));
                     self.resolved_subtype(Self::non_null_form(receiver), bound)
@@ -11438,7 +11420,7 @@ impl<'a> Engine<'a> {
                         name,
                         args: ArgListId::EMPTY,
                         ..
-                    } if face.type_param_names.contains(&name))
+                    } if face.type_param_names.contains(name))
                 })
     }
 
@@ -11571,20 +11553,20 @@ impl<'a> Engine<'a> {
                 // (property_element_resolver.dart:183-186 precedes the
                 // member consult) — that family owns the index row, so the
                 // bracket stays silent here.
-                Ty::Void => {
+                Ty::Void
                     if [read, write].into_iter().flatten().any(|spelling| {
                         spelling != self.intern("[]") && spelling != self.intern("[]=")
-                    }) {
-                        let Intent::Operator(op, _) = row.intent else {
-                            return;
-                        };
-                        let op_text = self.strings.resolve(op).to_string();
-                        self.emit_unchecked_nullable(
-                            op_range,
-                            &op_text,
-                            UncheckedNullableKind::Operator,
-                        );
-                    }
+                    }) =>
+                {
+                    let Intent::Operator(op, _) = row.intent else {
+                        return;
+                    };
+                    let op_text = self.strings.resolve(op).to_string();
+                    self.emit_unchecked_nullable(
+                        op_range,
+                        &op_text,
+                        UncheckedNullableKind::Operator,
+                    );
                 }
                 // `dynamic`/`InvalidType` (`Ty::Unknown`)/`Never` receivers
                 // never reach `undefined_operator` upstream: the
@@ -11775,7 +11757,6 @@ impl<'a> Engine<'a> {
         target: Option<(FileId, StringId, StringId)>,
     ) {
         if let Some((target_file, target_name, target_container)) = target {
-            if row.range.offset == 0 && row.range.length == 0 {}
             self.report.member_refs.push(MemberRef {
                 range: row.range,
                 kind,
@@ -12100,7 +12081,7 @@ impl<'a> Engine<'a> {
     /// [`Self::final_local_face`]; the verdict mirrors
     /// `AssignmentExpressionShared.checkFinalAlreadyAssigned` (upstream Dart
     /// SDK source,
-    /// pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver
+    /// `pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver`
     /// .dart:395-425): `late` locals and the `const` rows own their own
     /// codes, and a `final int x;` declaration's first write is the legal
     /// one (reporting starts once the variable can be assigned).
@@ -12157,7 +12138,7 @@ impl<'a> Engine<'a> {
     /// Whether a top-level `name=` setter answers the write — the oracle's
     /// `resolveForWrite` consults the setter namespace before the
     /// assignment-to-* family runs (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/resolver/lexical_lookup.dart
+    /// `pkg/analyzer/lib/src/dart/resolver/lexical_lookup.dart`
     /// `preferSetter`), so an explicit `set name` (same file or imported)
     /// makes the write legal. A `var`/`late final x;` declarator's INDUCED
     /// setter is unreachable here: the call sites run only for a
@@ -12264,9 +12245,10 @@ impl<'a> Engine<'a> {
                                 | dartq_scanner::TokenKind::Colon
                                 | dartq_scanner::TokenKind::AmpersandAmpersand
                                 | dartq_scanner::TokenKind::BarBar
-                        ) | Some(dartq_scanner::TokenKind::Keyword(
-                            dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Required,
-                        ))
+                                | dartq_scanner::TokenKind::Keyword(
+                                    dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Required
+                                )
+                        )
                     ) || matches!(
                         pred,
                         Some(
@@ -12369,23 +12351,25 @@ impl<'a> Engine<'a> {
                         // `catch (`, `assert (`) opens the STATEMENT's
                         // head, not a pattern or a formal list — the walk
                         // stops at the declaration's boundary.
-                        Some(dartq_scanner::TokenKind::Keyword(
-                            dartq_scanner::Keyword::For
-                            | dartq_scanner::Keyword::If
-                            | dartq_scanner::Keyword::While
-                            | dartq_scanner::Keyword::Switch
-                            | dartq_scanner::Keyword::Catch
-                            | dartq_scanner::Keyword::On
-                            | dartq_scanner::Keyword::Assert
-                            | dartq_scanner::Keyword::Return
-                            | dartq_scanner::Keyword::Throw
-                            | dartq_scanner::Keyword::Await
-                            | dartq_scanner::Keyword::Do
-                            | dartq_scanner::Keyword::Else,
-                        ))
-                        | Some(dartq_scanner::TokenKind::Function)
-                        | Some(dartq_scanner::TokenKind::Eq)
-                        | Some(dartq_scanner::TokenKind::Semicolon) => break,
+                        Some(
+                            dartq_scanner::TokenKind::Keyword(
+                                dartq_scanner::Keyword::For
+                                | dartq_scanner::Keyword::If
+                                | dartq_scanner::Keyword::While
+                                | dartq_scanner::Keyword::Switch
+                                | dartq_scanner::Keyword::Catch
+                                | dartq_scanner::Keyword::On
+                                | dartq_scanner::Keyword::Assert
+                                | dartq_scanner::Keyword::Return
+                                | dartq_scanner::Keyword::Throw
+                                | dartq_scanner::Keyword::Await
+                                | dartq_scanner::Keyword::Do
+                                | dartq_scanner::Keyword::Else,
+                            )
+                            | dartq_scanner::TokenKind::Function
+                            | dartq_scanner::TokenKind::Eq
+                            | dartq_scanner::TokenKind::Semicolon,
+                        ) => break,
                         // Any other predecessor — `final`, `(`, `,`, `:`
                         // — is a pattern group opener; the walk
                         // continues toward the pattern's head keyword.
@@ -12710,22 +12694,20 @@ impl<'a> Engine<'a> {
                     }
                     depth -= 1;
                 }
-                TokenKind::Semicolon => {
-                    if depth == 0 {
-                        // An unbraced clause boundary: `x = 1; else …`
-                        // (then-statement), or a `case`'s last statement
-                        // before the next clause head.
-                        let Some(next) = tokens.get(probe + 1) else {
-                            return false;
-                        };
-                        match next.kind {
-                            TokenKind::Keyword(Keyword::Else) => {
-                                return self.write_in_clause(probe + 1, end)
-                                    || self.chain_continues(probe + 1, end);
-                            }
-                            TokenKind::Keyword(Keyword::Case | Keyword::Default) => return true,
-                            _ => {}
+                TokenKind::Semicolon if depth == 0 => {
+                    // An unbraced clause boundary: `x = 1; else …`
+                    // (then-statement), or a `case`'s last statement
+                    // before the next clause head.
+                    let Some(next) = tokens.get(probe + 1) else {
+                        return false;
+                    };
+                    match next.kind {
+                        TokenKind::Keyword(Keyword::Else) => {
+                            return self.write_in_clause(probe + 1, end)
+                                || self.chain_continues(probe + 1, end);
                         }
+                        TokenKind::Keyword(Keyword::Case | Keyword::Default) => return true,
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -12742,50 +12724,47 @@ impl<'a> Engine<'a> {
         use dartq_scanner::TokenKind;
         let tokens = self.tokens.as_slice();
         let cursor = head + 1;
-        match tokens.get(cursor).map(|t| t.kind) {
-            Some(TokenKind::OpenCurly) => {
-                let mut depth: u32 = 1;
-                let mut probe = cursor + 1;
-                while let Some(token) = tokens.get(probe) {
-                    match token.kind {
-                        TokenKind::OpenCurly | TokenKind::OpenParen | TokenKind::OpenSquare => {
-                            depth += 1;
-                        }
-                        TokenKind::CloseCurly | TokenKind::CloseParen | TokenKind::CloseSquare => {
-                            depth -= 1;
-                            if depth == 0 {
-                                return probe >= end;
-                            }
-                        }
-                        _ => {}
+        if let Some(TokenKind::OpenCurly) = tokens.get(cursor).map(|t| t.kind) {
+            let mut depth: u32 = 1;
+            let mut probe = cursor + 1;
+            while let Some(token) = tokens.get(probe) {
+                match token.kind {
+                    TokenKind::OpenCurly | TokenKind::OpenParen | TokenKind::OpenSquare => {
+                        depth += 1;
                     }
-                    probe += 1;
-                }
-                false
-            }
-            _ => {
-                // A single-statement clause (`else x = 2;`): the write
-                // lands inside iff no `;` at depth 0 precedes it.
-                let mut depth: u32 = 0;
-                let mut probe = cursor;
-                while probe < end {
-                    match tokens[probe].kind {
-                        TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
-                            depth += 1
+                    TokenKind::CloseCurly | TokenKind::CloseParen | TokenKind::CloseSquare => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return probe >= end;
                         }
-                        TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                            if depth == 0 {
-                                return false;
-                            }
-                            depth -= 1;
-                        }
-                        TokenKind::Semicolon if depth == 0 => return false,
-                        _ => {}
                     }
-                    probe += 1;
+                    _ => {}
                 }
-                true
+                probe += 1;
             }
+            false
+        } else {
+            // A single-statement clause (`else x = 2;`): the write
+            // lands inside iff no `;` at depth 0 precedes it.
+            let mut depth: u32 = 0;
+            let mut probe = cursor;
+            while probe < end {
+                match tokens[probe].kind {
+                    TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                        depth += 1;
+                    }
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                        if depth == 0 {
+                            return false;
+                        }
+                        depth -= 1;
+                    }
+                    TokenKind::Semicolon if depth == 0 => return false,
+                    _ => {}
+                }
+                probe += 1;
+            }
+            true
         }
     }
 
@@ -12801,49 +12780,46 @@ impl<'a> Engine<'a> {
         // (the write then sits past the construct — the prior write IS
         // flow-preceding there and counts).
         let cursor = head + 1;
-        let clause_end = match tokens.get(cursor).map(|t| t.kind) {
-            Some(TokenKind::OpenCurly) => {
-                let mut depth: u32 = 1;
-                let mut probe = cursor + 1;
-                loop {
-                    let Some(token) = tokens.get(probe) else {
-                        return false;
-                    };
-                    match token.kind {
-                        TokenKind::OpenCurly | TokenKind::OpenParen | TokenKind::OpenSquare => {
-                            depth += 1;
-                        }
-                        TokenKind::CloseCurly | TokenKind::CloseParen | TokenKind::CloseSquare => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break probe + 1;
-                            }
-                        }
-                        _ => {}
+        let clause_end = if let Some(TokenKind::OpenCurly) = tokens.get(cursor).map(|t| t.kind) {
+            let mut depth: u32 = 1;
+            let mut probe = cursor + 1;
+            loop {
+                let Some(token) = tokens.get(probe) else {
+                    return false;
+                };
+                match token.kind {
+                    TokenKind::OpenCurly | TokenKind::OpenParen | TokenKind::OpenSquare => {
+                        depth += 1;
                     }
-                    probe += 1;
+                    TokenKind::CloseCurly | TokenKind::CloseParen | TokenKind::CloseSquare => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break probe + 1;
+                        }
+                    }
+                    _ => {}
                 }
+                probe += 1;
             }
-            _ => {
-                // Single-statement clause — its `;` at depth 0.
-                let mut depth: u32 = 0;
-                let mut probe = cursor;
-                loop {
-                    let Some(token) = tokens.get(probe) else {
-                        return false;
-                    };
-                    match token.kind {
-                        TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
-                            depth += 1
-                        }
-                        TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                            depth = depth.saturating_sub(1)
-                        }
-                        TokenKind::Semicolon if depth == 0 => break probe + 1,
-                        _ => {}
+        } else {
+            // Single-statement clause — its `;` at depth 0.
+            let mut depth: u32 = 0;
+            let mut probe = cursor;
+            loop {
+                let Some(token) = tokens.get(probe) else {
+                    return false;
+                };
+                match token.kind {
+                    TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                        depth += 1;
                     }
-                    probe += 1;
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                        depth = depth.saturating_sub(1);
+                    }
+                    TokenKind::Semicolon if depth == 0 => break probe + 1,
+                    _ => {}
                 }
+                probe += 1;
             }
         };
         if clause_end >= end {
@@ -12874,7 +12850,6 @@ impl<'a> Engine<'a> {
     /// The offset of the innermost function-body `{`/`=>` enclosing the
     /// token position `at`, `None` at file top level.
     fn function_body_boundary(&self, at: u32) -> Option<u32> {
-        use dartq_scanner::Keyword;
         use dartq_scanner::TokenKind;
         let tokens = self.tokens.as_slice();
         let start = tokens.partition_point(|token| token.utf16_offset < at);
@@ -12967,7 +12942,7 @@ impl<'a> Engine<'a> {
                 while let Some(at) = cursor.checked_sub(1) {
                     match tokens[at].kind {
                         TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                            depth += 1
+                            depth += 1;
                         }
                         TokenKind::OpenParen | TokenKind::OpenSquare => {
                             if depth == 0 {
@@ -13009,7 +12984,7 @@ impl<'a> Engine<'a> {
     /// `FunctionExpressionInvocation` whose `function` node is that whole
     /// property expression (`_rewriteAsFunctionExpressionInvocation`,
     /// method_invocation_resolver.dart:1347-1459), and the nullable check
-    /// reports on that node (function_expression_invocation_resolver.dart
+    /// reports on that node (`function_expression_invocation_resolver.dart`
     /// :68-71) — the anchor spans receiver-through-selector, never the
     /// member token alone (`a.child.cb()` anchors `a.child.cb`, `a?.cb()`
     /// anchors `a?.cb`, `a!..cb()` anchors `..cb`).
@@ -13251,7 +13226,7 @@ impl<'a> Engine<'a> {
                     self.check_member_callee_function_nullable(row);
                 }
             }
-            if matches!(walk, Walk::Missing) {}
+            matches!(walk, Walk::Missing);
             let core_claim = matches!(walk, Walk::Missing)
                 && crate::member_face::core_member_return(
                     self.strings.resolve(container),
@@ -13301,15 +13276,15 @@ impl<'a> Engine<'a> {
                         self.extension_application(container, receiver_ty, row.name, write, true),
                         ExtensionApp::Single
                     );
-                    if !extension_wins {
+                    if extension_wins {
+                        self.extension_nullable_resolved.insert(row.range.offset);
+                    } else {
                         let name_text = self.strings.resolve(row.name);
                         self.emit_unchecked_nullable(
                             row.range,
                             name_text,
                             access_kind(&row.intent),
                         );
-                    } else {
-                        self.extension_nullable_resolved.insert(row.range.offset);
                     }
                 }
                 return true;
@@ -13344,14 +13319,14 @@ impl<'a> Engine<'a> {
                     self.extension_application(container, receiver_ty, row.name, write, true),
                     ExtensionApp::Single
                 );
-                if !extension_wins {
-                    let name_text = self.strings.resolve(row.name);
-                    self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
-                } else {
+                if extension_wins {
                     // The nullable-`on` extension resolved the access: the
                     // member's result keeps the extension's own nullability
                     // (the staged nullable-condition face stands down).
                     self.extension_nullable_resolved.insert(row.range.offset);
+                } else {
+                    let name_text = self.strings.resolve(row.name);
+                    self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
                 }
             }
             return true;
@@ -13423,7 +13398,7 @@ impl<'a> Engine<'a> {
     /// an inherited claimant resolves the row before it ever reaches the
     /// miss faces (the lexical-shadow gate for the implicit-`this`
     /// application — upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/resolver/extension_member_resolver.dart
+    /// `pkg/analyzer/lib/src/dart/resolver/extension_member_resolver.dart`
     /// runs only when the interface lookup found nothing).
     pub(crate) fn container_declares_member(
         &mut self,
@@ -14036,11 +14011,10 @@ impl<'a> Engine<'a> {
                         unresolved = true;
                         continue;
                     };
-                    if !seen.contains(&(owner, name)) {
-                        seen.push((owner, name));
-                    } else {
+                    if seen.contains(&(owner, name)) {
                         continue;
                     }
+                    seen.push((owner, name));
                     if name == on_head && owner == face_file {
                         return true;
                     }
@@ -14154,7 +14128,7 @@ impl<'a> Engine<'a> {
                         return false;
                     };
                     match face.type_param_bounds.get(index).copied() {
-                        None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
+                        None | Some(Ty::Dynamic | Ty::Unknown) => true,
                         Some(bound) => match boundary.ty(face_file, bound) {
                             Ty::Named { name, .. } => name == object || reaches(receiver, name),
                             _ => false,
@@ -14553,7 +14527,7 @@ impl<'a> Engine<'a> {
                             .position(|&param| param == head)
                     })
                     .is_some_and(|index| match face.type_param_bounds.get(index).copied() {
-                        None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
+                        None | Some(Ty::Dynamic | Ty::Unknown) => true,
                         Some(bound) => matches!(
                             boundary.ty(face_file, bound),
                             Ty::Named { nullable: true, .. }
@@ -14741,7 +14715,7 @@ impl<'a> Engine<'a> {
                 && let Some(index) = face.type_param_names.iter().position(|&n| n == on_head)
             {
                 match face.type_param_bounds.get(index).copied() {
-                    None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
+                    None | Some(Ty::Dynamic | Ty::Unknown) => true,
                     Some(bound) => {
                         let bound = Self::non_null_form(self.boundary.ty(face_file, bound));
                         self.resolved_subtype(Self::non_null_form(receiver), bound)
@@ -15160,7 +15134,7 @@ impl<'a> Engine<'a> {
                 && let Some(index) = face.type_param_names.iter().position(|&n| n == on_head)
             {
                 let applies = match face.type_param_bounds.get(index).copied() {
-                    None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
+                    None | Some(Ty::Dynamic | Ty::Unknown) => true,
                     Some(bound) => {
                         let bound = Self::non_null_form(self.boundary.ty(face_file, bound));
                         self.resolved_subtype(Self::non_null_form(receiver), bound)
@@ -15314,7 +15288,7 @@ impl<'a> Engine<'a> {
             let mut push = |faces: &mut Vec<(&'a ExtensionFace, FileId)>,
                             face: &'a ExtensionFace,
                             file: FileId| {
-                if seen.insert(face as *const ExtensionFace) {
+                if seen.insert(std::ptr::from_ref::<ExtensionFace>(face)) {
                     faces.push((face, file));
                 }
             };
@@ -15415,7 +15389,7 @@ impl<'a> Engine<'a> {
             .map(|&bound| self.boundary.ty(face_file, bound))
             .collect();
         let pool = self.boundary.pool();
-        let on_type = on_ty.render(&self.strings, &pool);
+        let on_type = on_ty.render(self.strings, &pool);
         let name = face.name.map(|n| self.strings.resolve(n).to_string());
         let params: Vec<String> = face
             .type_param_names
@@ -15427,7 +15401,7 @@ impl<'a> Engine<'a> {
                 // parameter writes its name alone.
                 if !matches!(bound, Ty::Dynamic) {
                     text.push_str(" extends ");
-                    text.push_str(&bound.render(&self.strings, &pool));
+                    text.push_str(&bound.render(self.strings, &pool));
                 }
                 text
             })
@@ -15746,10 +15720,9 @@ impl<'a> Engine<'a> {
         match token.kind {
             dartq_scanner::TokenKind::Int => Some(Ty::named(self.members.primitive_ids[0])),
             dartq_scanner::TokenKind::Double => Some(Ty::named(self.members.primitive_ids[1])),
-            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::True)
-            | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::False) => {
-                Some(Ty::named(self.members.primitive_ids[3]))
-            }
+            dartq_scanner::TokenKind::Keyword(
+                dartq_scanner::Keyword::True | dartq_scanner::Keyword::False,
+            ) => Some(Ty::named(self.members.primitive_ids[3])),
             dartq_scanner::TokenKind::String => Some(Ty::named(self.members.primitive_ids[4])),
             dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Null) => Some(Ty::Null),
             _ => None,
@@ -15885,7 +15858,7 @@ impl<'a> Engine<'a> {
     /// Whether the `return` at `offset` belongs directly to an
     /// anonymous-method BLOCK body (#3419): upstream swaps the return
     /// check's context to the body's own INFERRED return type (the
-    /// context swap in error_verifier.dart's block-body arm —
+    /// context swap in `error_verifier.dart`'s block-body arm —
     /// `fragment.returnType = parent.staticType`), which the body's own
     /// returns can never violate by construction, so the enclosing
     /// executable's checks stand down entirely. Only a DIRECT body
@@ -16246,10 +16219,8 @@ impl<'a> Engine<'a> {
                     }
                     depth -= 1;
                 }
-                K::OpenCurly | K::CloseCurly => {
-                    if depth == 0 {
-                        return None;
-                    }
+                K::OpenCurly | K::CloseCurly if depth == 0 => {
+                    return None;
                 }
                 _ => {}
             }
@@ -16406,11 +16377,11 @@ impl<'a> Engine<'a> {
 /// oracle (analyzer 8.1.1, the 3.13.1 SDK of record) consults
 /// `shouldIgnoreUndefined` only on the unqualified/prefixed *name* faces —
 /// `undefined_function` (`_reportUndefinedFunction`,
-/// method_invocation_resolver.dart:403) and `undefined_identifier`
-/// (`shouldIgnoreUndefinedIdentifier`, simple_identifier_resolver.dart:222)
+/// `method_invocation_resolver.dart:403`) and `undefined_identifier`
+/// (`shouldIgnoreUndefinedIdentifier`, `simple_identifier_resolver.dart:222`)
 /// plus the named-type family (`shouldIgnoreUndefinedNamedType`,
-/// named_type_resolver.dart:326) and `undefined_prefixed_name`
-/// (property_element_resolver.dart:891). The member faces — the
+/// `named_type_resolver.dart:326`) and `undefined_prefixed_name`
+/// (`property_element_resolver.dart:891`). The member faces — the
 /// `undefined_method`/`_getter`/`_setter` trio — never consult it
 /// (`_reportUndefinedMethodOrNew` is guard-free, same file :424-431), and
 /// `undefined_identifier_await` fires before the guard in its else-if
@@ -16845,7 +16816,7 @@ mod tests {
         fold.report
     }
 
-    /// #2190 shape 1 — the drift3_preview `abstract interface class
+    /// #2190 shape 1 — the `drift3_preview` `abstract interface class
     /// DriftSession` face: its abstract getter and method members are own
     /// members of a same-library declaration, resolved through a declared
     /// parameter type. The oracle's interface walk resolves both silently.
@@ -17679,7 +17650,7 @@ mod tests {
 
     /// The `super(name:)` public-name join (#2214's face, routed through
     /// `named_formal_for`): a `this._x` field formal's element carries the
-    /// public `x` (`correspondingPublicName`, token_impl.dart:364), so
+    /// public `x` (`correspondingPublicName`, `token_impl.dart:364`), so
     /// `super(x: 0)` binds silently while `super(y: 0)` keeps its
     /// `undefined_named_parameter` miss — and, the named miss leaving the
     /// required formal uncovered, its `missing_required_argument` row at
@@ -18277,10 +18248,6 @@ mod ticket_f1_tests;
 #[cfg(test)]
 #[path = "ticket_3646_tests.rs"]
 mod ticket_3646_tests;
-
-#[cfg(test)]
-#[path = "ticket_3619_tests.rs"]
-mod ticket_3619_tests;
 
 // The #3857 pins — the promoted-record stand-down hands the shape check the
 // NON-NULL face: a `typedef R1 = (int, String)?` receiver under its own null

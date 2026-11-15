@@ -6,6 +6,9 @@
 //! constant's margin ran against the retired vendored corpus; the margin
 //! re-derives from pub-cache packages via conformance/realworld.toml.)
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 /// An exhausted budget deterministically bails: the drivers unwind, the
 /// body contributes no flow facts (a partial replay's state is not
 /// evidence), and the same stream under the production budget runs to

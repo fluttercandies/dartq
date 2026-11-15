@@ -13,6 +13,7 @@
 //! The answers are tier-invariant (every field a locator or a verdict),
 //! so there is no `--verbosity` axis.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -460,7 +461,7 @@ mod tests {
             exit::USAGE,
             "a file outside the analyzed view is usage"
         );
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
 
         // A comment position is uncovered: exit 0, the null hit verdict.
         let (code, out) = run_with("lib/b.dart:1:1");

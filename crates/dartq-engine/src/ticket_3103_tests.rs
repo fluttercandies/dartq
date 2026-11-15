@@ -32,6 +32,7 @@
 //! `ensureSemicolon` too), and its `library_directive_not_first` rows come
 //! from the parser face rather than the directive-fact walk.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_pub::{LockFile, Pubspec, build_graph};
 
@@ -144,7 +145,7 @@ fn analyze_files(files: &[(&str, &str)]) -> (PathBuf, Vec<Diagnostic>) {
 }
 
 /// The written-URI row message (`uri_does_not_exist` keeps the source
-/// spelling, library_analyzer.dart:732/:993/:1031).
+/// spelling, `library_analyzer.dart:732/:993/:1031`).
 fn missing_uri(uri: &str) -> String {
     format!("Target of URI doesn't exist: '{uri}'.")
 }

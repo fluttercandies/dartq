@@ -81,6 +81,7 @@
 //! - The graph is sized entirely by its input (libraries × names × edges);
 //!   nothing grows after [`LibraryGraphBuilder::finish`].
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::collections::hash_map;
@@ -806,10 +807,10 @@ impl<'t> LibraryGraphBuilder<'t> {
     /// Registration is first-wins per included file, and an edge that would
     /// close a cycle is dropped at [`Self::finish`] — a malformed include
     /// chain must never make a scope walk spin.
-    pub fn part(&mut self, lib: LibraryId, includer: FileId, included: FileId) {
+    pub fn part(&mut self, lib: LibraryId, parent: FileId, child: FileId) {
         self.nodes[lib.index() as usize]
             .part_links
-            .push((includer, included));
+            .push((parent, child));
     }
 
     /// Seeds the implicit `dart:core` import every Dart library carries
@@ -857,6 +858,7 @@ impl<'t> LibraryGraphBuilder<'t> {
     ///
     /// Panics when the export-flow count or any library count exceeds
     /// [`u32::MAX`] — a program bug at any realistic scale.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn finish(self) -> LibraryGraph {
         let strings = self.strings;
@@ -999,7 +1001,7 @@ impl<'t> LibraryGraphBuilder<'t> {
                 // The scope faces: the part tree first (it reads the unit
                 // set), then the import runs regrouped by writing unit.
                 let part_parents = part_parents(&node.part_links, &node.units);
-                let (imports, import_runs) = group_imports(node.imports, node.import_owners);
+                let (imports, import_runs) = group_imports(node.imports, &node.import_owners);
                 LibraryNode {
                     uri: node.uri,
                     name: node.name,
@@ -1039,7 +1041,7 @@ impl<'t> LibraryGraphBuilder<'t> {
 /// Returns the regrouped rows and the run starts `(file, first row index)`.
 fn group_imports(
     rows: Vec<ImportEdge>,
-    owners: Vec<Option<FileId>>,
+    owners: &[Option<FileId>],
 ) -> (Vec<ImportEdge>, Vec<(FileId, u32)>) {
     if owners.iter().all(Option::is_none) {
         return (rows, Vec::new());
@@ -1607,6 +1609,7 @@ impl LibraryGraph {
 }
 
 #[cfg(test)]
+#[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
     use dartq_source::FileTable;

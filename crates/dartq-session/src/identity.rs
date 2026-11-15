@@ -24,6 +24,7 @@
 //! stamp on their next call, see the mismatch, and re-elect: the upgrade
 //! behavior, one syscall per process.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::Path;
 
 /// One file's metadata stamp, hashed into an identity leg. Presence is a
@@ -227,7 +228,7 @@ mod tests {
     }
 
     /// The binary leg is a stat and a memo, not a read: the digest is
-    /// stable across calls inside one process (the OnceLock) and the
+    /// stable across calls inside one process (the `OnceLock`) and the
     /// helper's cost is one `symlink_metadata` per process — it can
     /// never be proportional to the executable's size, because nothing
     /// opens the file.

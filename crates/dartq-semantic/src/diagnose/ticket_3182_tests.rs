@@ -17,6 +17,7 @@
 //!    span — upstream's `deadCodeLateWildcardVariableInitializer` shares
 //!    the `dead_code` name (`diagnostic.g.dart:3493`), same feature gate.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, report_ops_wildcards, rows};
 
 fn dead_ranges(source: &str) -> Vec<(usize, usize)> {
@@ -65,7 +66,7 @@ fn ticket_3182_named_local_function_stays_live() {
 fn ticket_3182_wildcard_fn_silent_without_feature() {
     let report = report_ops_wildcards("void f() {\n  void _() {}\n}", false);
     assert!(
-        !code_names(&report).iter().any(|name| *name == "dead_code"),
+        !code_names(&report).contains(&"dead_code"),
         "{:?}",
         rows(&report)
     );
@@ -123,7 +124,7 @@ fn ticket_3182_late_wildcard_initializer_dead() {
 fn ticket_3182_late_wildcard_silent_without_feature() {
     let report = report_ops_wildcards("void f() {\n  late var _ = 0;\n}", false);
     assert!(
-        !code_names(&report).iter().any(|name| *name == "dead_code"),
+        !code_names(&report).contains(&"dead_code"),
         "{:?}",
         rows(&report)
     );
@@ -135,7 +136,7 @@ fn ticket_3182_late_wildcard_silent_without_feature() {
 fn ticket_3182_late_named_and_nonlate_wildcard_stay_live() {
     let report = report_ops("void f() {\n  var _ = 0;\n  late var x = 0;\n}");
     assert!(
-        !code_names(&report).iter().any(|name| *name == "dead_code"),
+        !code_names(&report).contains(&"dead_code"),
         "{:?}",
         rows(&report)
     );

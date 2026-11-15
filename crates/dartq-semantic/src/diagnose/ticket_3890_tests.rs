@@ -148,6 +148,7 @@
 //! Offsets are UTF-16; `at` shifts by [`CORE_PRELUDE`] because the rig
 //! carries the fixture behind it on one line. All fixtures are ASCII.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -173,12 +174,12 @@ fn at(source: &str, needle: &str) -> u32 {
 /// disagreeing declaration reports the inferred instantiation.
 #[test]
 fn control_var_map_literal_binds_primitive_args() {
-    let source = r#"
+    let source = r"
 void f() {
   var x = {1: 'x', 2: 'y'};
   Map<int, int> bad = x;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -196,7 +197,7 @@ void f() {
 /// `Map` receiver.
 #[test]
 fn control_index_write_user_operator_checks_key() {
-    let source = r#"
+    let source = r"
 class M2 {
   void operator []=(int k, String v) {}
   String operator [](int k) => '';
@@ -204,15 +205,14 @@ class M2 {
 void f(M2 m2) {
   m2['hi'] = 'w';
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "argument_type_not_assignable");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
     assert_eq!(
         rows[0].0,
         at(source, "m2['hi'") + "m2[".len() as u32,
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
 }
 
@@ -228,12 +228,12 @@ void f(M2 m2) {
 /// fires and names the inferred face.
 #[test]
 fn control_map_literal_uniform_leaves_join_exact() {
-    let source = r#"
+    let source = r"
 void f() {
   var x = {3.0: 'a', 1.0: 'b'};
   Map<int, String> bad = x;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -246,19 +246,18 @@ void f() {
 /// `const` must join, not disturb.
 #[test]
 fn control_declared_map_context_checks_entries() {
-    let source = r#"
+    let source = r"
 void f() {
   Map<int, String> m = {'hi': 'w'};
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "map_key_type_not_assignable");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
     assert_eq!(
         rows[0].0,
         at(source, "= {'hi'") + "= {".len() as u32,
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
 }
 
@@ -271,11 +270,11 @@ void f() {
 /// must keep.
 #[test]
 fn control_index_write_map_receiver_checks_key() {
-    let source = r#"
+    let source = r"
 void f(Map<int, String> m) {
   m['hi'] = 'w';
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "argument_type_not_assignable");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -296,12 +295,12 @@ void f(Map<int, String> m) {
 /// side (`checkAssignment` reads `writeElement.type`).
 #[test]
 fn index_write_value_checks_against_value_formal() {
-    let source = r#"
+    let source = r"
 void f(List<int> l, Map<int, String> m) {
   l[0] = 'bad';
   m[3] = 42;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 2, "{:#?}", report.diagnostics);
@@ -325,7 +324,7 @@ void f(List<int> l, Map<int, String> m) {
 #[test]
 #[ignore = "leaf faces read row.ty raw (resolution.rs:4115, engine_core.rs:4827) and join unrelated classes at dynamic/Object instead of the superinterface LUB (least_upper_bound.dart) — 1 extra + 2 missing census rows; re-verified 2026-11-05: still fails"]
 fn creation_leaf_joins_shared_superinterface() {
-    let source = r#"
+    let source = r"
 class Pattern {}
 class RegExp implements Pattern {
   RegExp(String source) {}
@@ -335,7 +334,7 @@ void f() {
   Map<num, Pattern> good = x;
   Map<int, String> bad = x;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -353,11 +352,11 @@ void f() {
 #[test]
 #[ignore = "literal_context_ty (listener.rs:15004) only reads the byte before the braces; a const prefix and the default-value world donate no context — 5 census rows; re-verified 2026-11-05: still fails (0 map_key_type_not_assignable rows, expected 1)"]
 fn const_map_literal_inherits_declared_context() {
-    let source = r#"
+    let source = r"
 void f() {
   const Map<int, String> m = const {'hi': 'w'};
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "map_key_type_not_assignable");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);

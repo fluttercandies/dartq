@@ -80,14 +80,13 @@ fn check(c: &mut Check<'_>) {
                 // precedes `beginMethod`), never as a child.
                 if let Some(parent) = c.unit.ast.parent(node) {
                     let siblings = c.collect_direct(parent);
-                    if let Some(pos) = siblings.iter().position(|&kid| kid == node) {
-                        if siblings[..pos]
+                    if let Some(pos) = siblings.iter().position(|&kid| kid == node)
+                        && siblings[..pos]
                             .iter()
                             .rev()
                             .any(|&kid| c.kind(kid) == NodeKind::OperatorName)
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
                 }
                 if fixed_signature(c, node) {
@@ -248,7 +247,7 @@ mod tests {
     /// are pinned (co-reported `unused_element` faces are other diagnostics).
     ///
     /// 30 single-file cases pinned (13 oracle rows), every mismatch collected before the single panic.
-    /// Cross-file residuals not representable in a single-source fixture (oracle rows on `lib/a.dart`): test_augmentationConstructor#0, test_augmentationFunction#0, test_augmentationMethod#0.
+    /// Cross-file residuals not representable in a single-source fixture (oracle rows on `lib/a.dart`): `test_augmentationConstructor#0`, `test_augmentationFunction#0`, `test_augmentationMethod#0`.
     #[test]
     fn avoid_positional_boolean_parameters_oracle_corpus_pins() {
         // (case, source, oracle rows as (line, column, length)).

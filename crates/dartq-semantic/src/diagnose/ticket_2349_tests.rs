@@ -29,6 +29,7 @@
 //! without an arithmetic face, so a `num` receiver also stages the member
 //! walk's `undefined_operator` artifact; the pins filter to the sink.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 
@@ -79,7 +80,7 @@ fn dynamic_operand_reads_num() {
     );
 }
 
-/// An InvalidType RECEIVER never resolves an operator, so the node reports
+/// An `InvalidType` RECEIVER never resolves an operator, so the node reports
 /// nothing of its own — only the receiver's `undefined_identifier`.
 #[test]
 fn invalid_receiver_stays_silent() {

@@ -24,6 +24,7 @@
 //!   64 usage (malformed spec, unknown file, illegal new name, an edit
 //!   outside the workspace), 4 internal.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -114,12 +115,11 @@ pub(crate) fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
-    let path = match path.canonicalize() {
-        Ok(path) => path,
-        Err(_) => {
-            eprintln!("error: Directory or file doesn't exist: {}", args.target);
-            return exit::USAGE;
-        }
+    let path = if let Ok(path) = path.canonicalize() {
+        path
+    } else {
+        eprintln!("error: Directory or file doesn't exist: {}", args.target);
+        return exit::USAGE;
     };
     // The resident consult (#2629), the dry run only: the daemon answers
     // the edit-set document over the analyzed view; `--write` routes never
@@ -161,10 +161,10 @@ pub(crate) fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
         }
     };
 
-    if args.write {
-        if let Err(code) = apply(&plan, &args.new_name, &dir, args.format) {
-            return code;
-        }
+    if args.write
+        && let Err(code) = apply(&plan, &args.new_name, &dir, args.format)
+    {
+        return code;
     }
 
     let document = rename::to_json(&plan, &args.new_name);
@@ -458,12 +458,12 @@ mod tests {
         let missing = format!("{}:1:1", root.join("lib/missing.dart").display());
         let (code, out) = run_with(&[missing.as_str(), "--new-name", "gb", "--sdk", &sdk]);
         assert_eq!(code, exit::USAGE);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
 
         let target = format!("{}:1:6", root.join("lib/a.dart").display());
         let (code, out) = run_with(&[target.as_str(), "--new-name", "class", "--sdk", &sdk]);
         assert_eq!(code, exit::USAGE);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
 
         // A file that exists on disk but is not part of the analyzed
         // workspace is refused at the anchor gate — the file table never
@@ -474,7 +474,7 @@ mod tests {
         let target = format!("{}:1:6", stranger.display());
         let (code, out) = run_with(&[target.as_str(), "--new-name", "gb", "--sdk", &sdk]);
         assert_eq!(code, exit::USAGE);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
         fs::remove_file(&stranger).ok();
 
         fs::remove_dir_all(&root).ok();

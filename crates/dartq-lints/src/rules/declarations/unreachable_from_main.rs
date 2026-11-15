@@ -282,7 +282,7 @@ fn judge_container(
     if let Some(name) = name {
         judge(
             c,
-            &face,
+            face,
             graph,
             arms,
             single_file,
@@ -465,7 +465,7 @@ fn judge_container(
 /// same-file ancestors answer name-level; the cross-file remainder
 /// anchors the semantic bridge's inheritance walk (every written
 /// supertype clause, abstract members included — the concrete cut is
-/// off), gated on the InterfaceElement containers only (extensions and
+/// off), gated on the `InterfaceElement` containers only (extensions and
 /// extension types pass `containerElement: null` upstream). An
 /// unmounted bridge or an unresolved chain answers through the
 /// same-file arm alone (the documented under-reach posture).
@@ -515,24 +515,21 @@ fn judge_constructor(
     container: &str,
 ) {
     let written = constructor_name_node(c, row);
-    let (name_token, member) = match written {
-        Some(node) => {
-            let lexeme = c.lexeme(c.head_token(node));
-            if lexeme == container {
-                // The unnamed face: the row anchors at the class-name
-                // echo.
-                (c.head_token(node), "new")
-            } else {
-                (c.head_token(node), lexeme)
-            }
+    let (name_token, member) = if let Some(node) = written {
+        let lexeme = c.lexeme(c.head_token(node));
+        if lexeme == container {
+            // The unnamed face: the row anchors at the class-name
+            // echo.
+            (c.head_token(node), "new")
+        } else {
+            (c.head_token(node), lexeme)
         }
-        None => {
-            let head = c.head_token(row);
-            let lexeme = c.lexeme(head);
-            // The row head is the class-name echo for the unnamed face
-            // and the written name for a `new`-prefixed declaration.
-            (head, if lexeme == container { "new" } else { lexeme })
-        }
+    } else {
+        let head = c.head_token(row);
+        let lexeme = c.lexeme(head);
+        // The row head is the class-name echo for the unnamed face
+        // and the written name for a `new`-prefixed declaration.
+        (head, if lexeme == container { "new" } else { lexeme })
     };
     let display = format!("{container}.{member}");
     judge(
@@ -969,8 +966,7 @@ fn subclass_walks_super(
         // supertype clause or an instantiation alike), or a counted
         // use.
         let walked_by_flag = container_name_token(c, subclass.row)
-            .map(|token| face.is_reachable(utf16_token_span(c, token).start) == Some(true))
-            .unwrap_or(false);
+            .is_some_and(|token| face.is_reachable(utf16_token_span(c, token).start) == Some(true));
         return walked_by_flag || uses.get(&subclass.name).copied().unwrap_or(0) > 0;
     }
     subclass.ctors.iter().any(|(member, unnamed, super_init)| {
@@ -1291,10 +1287,10 @@ impl ReferenceGraph {
                         // `_isEntryPoint`: a function (or accessor) named
                         // `main`, or one carrying an entry annotation —
                         // read after the alias scan below completes.
-                        if let Some(name) = member_name(c, row) {
-                            if c.lexeme(c.head_token(name)) == "main" {
-                                entries.insert("main".to_owned());
-                            }
+                        if let Some(name) = member_name(c, row)
+                            && c.lexeme(c.head_token(name)) == "main"
+                        {
+                            entries.insert("main".to_owned());
                         }
                     }
                     _ => {}
@@ -1455,10 +1451,10 @@ impl ReferenceGraph {
             // `_addDeclaration`'s enclosing-top-level arm: a plain-name
             // reference to a member also marks the member's container.
             for key in keys {
-                if !key.contains('.') {
-                    if let Some(container) = member_containers.get(key) {
-                        attribution.push(container.clone());
-                    }
+                if !key.contains('.')
+                    && let Some(container) = member_containers.get(key)
+                {
+                    attribution.push(container.clone());
                 }
             }
             for source in &attribution {
@@ -1672,20 +1668,20 @@ impl ReferenceGraph {
                     // redirect's `: this()` marks the target constructor
                     // and its class; `: this.name()` the named target.
                     let next = c.unit.ast.token_range(row).end.min(last);
-                    if next <= last {
-                        if let Some(container) = enclosing_container_name(c, row) {
-                            match c.lexeme(next) {
-                                "(" => {
-                                    keys.push(container.clone());
-                                    keys.push(format!("{container}.new"));
-                                }
-                                "." if next + 1 < c.unit.tokens.len() as u32 => {
-                                    let member = c.lexeme(next + 1);
-                                    keys.push(container.clone());
-                                    keys.push(format!("{container}.{member}"));
-                                }
-                                _ => {}
+                    if next <= last
+                        && let Some(container) = enclosing_container_name(c, row)
+                    {
+                        match c.lexeme(next) {
+                            "(" => {
+                                keys.push(container.clone());
+                                keys.push(format!("{container}.new"));
                             }
+                            "." if next + 1 < c.unit.tokens.len() as u32 => {
+                                let member = c.lexeme(next + 1);
+                                keys.push(container.clone());
+                                keys.push(format!("{container}.{member}"));
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2201,19 +2197,19 @@ mod oracle_corpus_pins {
     /// 138 single-file cases pinned (56 oracle rows).
     /// Not representable in a single-source fixture (aux files or packages):
     /// `UnreachableFromMainTest/test_class_instanceMethod_reachable_overrides_imported#0` (imported a.dart declares the overridden method).
-    /// `UnreachableFromMainTest/test_class_reachable_mainInPart#0` (multi_file).
-    /// `UnreachableFromMainTest/test_class_unreachable_mainInPart#0` (multi_file).
-    /// `UnreachableFromMainTest/test_classInPart_reachable#0` (multi_file).
-    /// `UnreachableFromMainTest/test_classInPart_reachable_mainInPart#0` (multi_file).
-    /// `UnreachableFromMainTest/test_classInPart_unreachable#0` (multi_file).
-    /// `UnreachableFromMainTest/test_classInPart_unreachable_mainInPart#0` (multi_file).
+    /// `UnreachableFromMainTest/test_class_reachable_mainInPart#0` (`multi_file`).
+    /// `UnreachableFromMainTest/test_class_unreachable_mainInPart#0` (`multi_file`).
+    /// `UnreachableFromMainTest/test_classInPart_reachable#0` (`multi_file`).
+    /// `UnreachableFromMainTest/test_classInPart_reachable_mainInPart#0` (`multi_file`).
+    /// `UnreachableFromMainTest/test_classInPart_unreachable#0` (`multi_file`).
+    /// `UnreachableFromMainTest/test_classInPart_unreachable_mainInPart#0` (`multi_file`).
     #[test]
     fn unreachable_from_main_oracle_corpus_pins() {
         // (case, source, oracle rows as (line, column, length)).
         let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_reachable_matchedInPattern#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_reachable_matchedInPattern#0",
+                r"
 void main() {
   var x = switch (C(1)) {
     C(:final f) => f.round(),
@@ -2225,12 +2221,12 @@ class C {
   final int f;
   C(this.f);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_reachable_overrides_local#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_reachable_overrides_local#0",
+                r"
 void main() {
   B();
 }
@@ -2242,12 +2238,12 @@ class A {
 class B extends A {
   int? f;
 }
-"#,
+",
                 &[(7, 8, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_reachable_read#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_reachable_read#0",
+                r"
 void main() {
   C().f;
 }
@@ -2255,12 +2251,12 @@ void main() {
 class C {
   int? f;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_reachable_write#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_reachable_write#0",
+                r"
 void main() {
   C().f = 0;
 }
@@ -2268,12 +2264,12 @@ void main() {
 class C {
   int? f;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_unreachable#0",
+                r"
 void main() {
   C();
 }
@@ -2281,12 +2277,12 @@ void main() {
 class C {
   int? f;
 }
-"#,
+",
                 &[(7, 8, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceGetter_reachable_invoked#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceGetter_reachable_invoked#0",
+                r"
 void main() {
   C().foo;
 }
@@ -2294,12 +2290,12 @@ void main() {
 class C {
   int get foo => 0;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceGetter_reachable_overrides#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceGetter_reachable_overrides#0",
+                r"
 void main() {
   B();
 }
@@ -2311,12 +2307,12 @@ class A {
 class B extends A {
   int get foo => 0;
 }
-"#,
+",
                 &[(7, 11, 3)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceGetter_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceGetter_unreachable#0",
+                r"
 void main() {
   C();
 }
@@ -2324,12 +2320,12 @@ void main() {
 class C {
   int get foo => 0;
 }
-"#,
+",
                 &[(7, 11, 3)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceMethod_reachable_invoked#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceMethod_reachable_invoked#0",
+                r"
 void main() {
   C().foo();
 }
@@ -2337,12 +2333,12 @@ void main() {
 class C {
   void foo() {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceMethod_reachable_invoked_generic#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceMethod_reachable_invoked_generic#0",
+                r"
 void main() {
   C<int>().foo(null);
 }
@@ -2350,12 +2346,12 @@ void main() {
 class C<T> {
   void foo(T? _) {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceMethod_reachable_overrides_local#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceMethod_reachable_overrides_local#0",
+                r"
 void main() {
   B();
 }
@@ -2367,12 +2363,12 @@ class A {
 class B extends A {
   void foo() {}
 }
-"#,
+",
                 &[(7, 8, 3)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceMethod_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceMethod_unreachable#0",
+                r"
 void main() {
   C();
 }
@@ -2380,12 +2376,12 @@ void main() {
 class C {
   void foo() {}
 }
-"#,
+",
                 &[(7, 8, 3)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceSetter_reachable_invoked#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceSetter_reachable_invoked#0",
+                r"
 void main() {
   C().foo = 0;
 }
@@ -2393,12 +2389,12 @@ void main() {
 class C {
   set foo(int _) {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceSetter_reachable_overrides#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceSetter_reachable_overrides#0",
+                r"
 void main() {
   B();
 }
@@ -2410,12 +2406,12 @@ class A {
 class B extends A {
   set foo(int _) {}
 }
-"#,
+",
                 &[(7, 7, 3)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceSetter_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceSetter_unreachable#0",
+                r"
 void main() {
   C();
 }
@@ -2423,12 +2419,12 @@ void main() {
 class C {
   set foo(int _) {}
 }
-"#,
+",
                 &[(7, 7, 3)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachableViaAnnotation#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachableViaAnnotation#0",
+                r"
 void main() {
   f();
 }
@@ -2439,22 +2435,22 @@ class C {
 
 @C()
 void f() {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachableViaComment#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachableViaComment#0",
+                r"
 /// See [C].
 void main() {}
 
 class C {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachableViaDefaultValueType#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachableViaDefaultValueType#0",
+                r"
 void main() {
   f();
 }
@@ -2464,12 +2460,12 @@ class C {
 }
 
 void f([Object? p = const C()]) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedDeepInTypeAnnotation_externalMethodDeclaration#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedDeepInTypeAnnotation_externalMethodDeclaration#0",
+                r"
 void main() {
   D().f;
 }
@@ -2479,12 +2475,12 @@ class C {}
 class D {
   external C Function() f();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedDeepInTypeArgument#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedDeepInTypeArgument#0",
+                r"
 void main() {
   C<D Function()>();
 }
@@ -2492,12 +2488,12 @@ void main() {
 class C<T> {}
 
 class D {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedInTypeAnnotation_externalFieldDeclaration#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedInTypeAnnotation_externalFieldDeclaration#0",
+                r"
 void main() {
   D().c;
 }
@@ -2507,12 +2503,12 @@ class C {}
 class D {
   external C? c;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedInTypeAnnotation_externalMethodDeclaration#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedInTypeAnnotation_externalMethodDeclaration#0",
+                r"
 void main() {
   D().f;
 }
@@ -2522,12 +2518,12 @@ class C {}
 class D {
   external C f();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedInTypeArgument#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedInTypeArgument#0",
+                r"
 void main() {
   C<D>();
 }
@@ -2535,12 +2531,12 @@ void main() {
 class C<T> {}
 
 class D {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedInTypeArgument_genericGenericType#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_referencedInTypeArgument_genericGenericType#0",
+                r"
 class A {}
 
 void main() {
@@ -2548,23 +2544,23 @@ void main() {
 }
 
 void f([List<List<A>>? l]) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_typeLiteral#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachable_typeLiteral#0",
+                r"
 void main() {
   C;
 }
 
 class C {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_referencedInObjectPattern#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_referencedInObjectPattern#0",
+                r"
 class C {}
 
 void main() {
@@ -2574,21 +2570,21 @@ void main() {
 void f([Object? c]) {
   if (c case C()) {}
 }
-"#,
+",
                 &[(2, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable#0",
+                r"
 void main() {}
 
 class C {}
-"#,
+",
                 &[(4, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_foundInAsExpression#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_foundInAsExpression#0",
+                r"
 class A {}
 
 void main() {
@@ -2598,12 +2594,12 @@ void main() {
 void f([Object? o]) {
   o as A;
 }
-"#,
+",
                 &[(2, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_foundInAsPattern#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_foundInAsPattern#0",
+                r"
 class A {}
 
 void main() {
@@ -2613,12 +2609,12 @@ void main() {
 void f([(Object, )? l]) {
   var (_ as A, ) = l!;
 }
-"#,
+",
                 &[(2, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_foundInIsExpression#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_foundInIsExpression#0",
+                r"
 class A {}
 
 void main() {
@@ -2628,24 +2624,24 @@ void main() {
 void f([Object? o]) {
   o is A;
 }
-"#,
+",
                 &[(2, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_hasNamedConstructors#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_hasNamedConstructors#0",
+                r"
 void main() {}
 
 class C {
   C();
   C.named();
 }
-"#,
+",
                 &[(4, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_referencedInParameter_externalMethodDeclaration#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_referencedInParameter_externalMethodDeclaration#0",
+                r"
 void main() {
   D().f;
 }
@@ -2655,12 +2651,12 @@ class C {}
 class D {
   external f(C c);
 }
-"#,
+",
                 &[(6, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_referencedInTypeAnnotation_fieldDeclaration#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_referencedInTypeAnnotation_fieldDeclaration#0",
+                r"
 void main() {
   D().c;
 }
@@ -2670,12 +2666,12 @@ class C {}
 class D {
   C? c;
 }
-"#,
+",
                 &[(6, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_referencedInTypeAnnotation_parameter#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_referencedInTypeAnnotation_parameter#0",
+                r"
 void main() {
   f();
 }
@@ -2683,12 +2679,12 @@ void main() {
 void f([C? c]) {}
 
 class C {}
-"#,
+",
                 &[(8, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_referencedInTypeAnnotation_topLevelVariable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_referencedInTypeAnnotation_topLevelVariable#0",
+                r"
 void main() {
   print(c);
 }
@@ -2696,23 +2692,23 @@ void main() {
 C? c;
 
 class C {}
-"#,
+",
                 &[(8, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_referencedInTypeAnnotation_variableDeclaration#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_referencedInTypeAnnotation_variableDeclaration#0",
+                r"
 void main() {
   C? c;
 }
 
 class C {}
-"#,
+",
                 &[(6, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_typeArgumentBound#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_class_unreachable_typeArgumentBound#0",
+                r"
 void main() {
   f();
 }
@@ -2720,12 +2716,12 @@ void main() {
 class C {}
 
 void f<T extends C>() {}
-"#,
+",
                 &[(6, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_new#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_new#0",
+                r"
 void main() {
   C;
 }
@@ -2733,12 +2729,12 @@ void main() {
 class C {
   new named();
 }
-"#,
+",
                 &[(7, 7, 5)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_onEnum#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_onEnum#0",
+                r"
 void main() {
   E.one;
   E.two;
@@ -2750,12 +2746,12 @@ enum E {
   const E();
   const E.named();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_reachableViaDirectCall#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_reachableViaDirectCall#0",
+                r"
 void main() {
   C.named();
 }
@@ -2763,12 +2759,12 @@ void main() {
 class C {
   C.named();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_reachableViaExplicitSuperCall#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_reachableViaExplicitSuperCall#0",
+                r"
 void main() {
   D();
 }
@@ -2780,12 +2776,12 @@ class C {
 class D extends C {
   D() : super.named();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_reachableViaRedirectedConstructor#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_reachableViaRedirectedConstructor#0",
+                r"
 void main() {
   C.two();
 }
@@ -2794,12 +2790,12 @@ class C {
   C.named();
   factory C.two() = C.named;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_reachableViaRedirection#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_reachableViaRedirection#0",
+                r"
 void main() {
   C.two();
 }
@@ -2809,12 +2805,12 @@ class C {
 
   C.two() : this.named();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_reachableViaTearoff#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_reachableViaTearoff#0",
+                r"
 void main() {
   C.named;
 }
@@ -2822,12 +2818,12 @@ void main() {
 class C {
   C.named();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_named_unreachable#0",
+                r"
 void main() {
   C;
 }
@@ -2835,12 +2831,12 @@ void main() {
 class C {
   C.named();
 }
-"#,
+",
                 &[(7, 5, 5)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_reachableViaTestReflectiveLoader#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_reachableViaTestReflectiveLoader#0",
+                r"
 import 'package:test_reflective_loader/test_reflective_loader.dart';
 
 void main() {
@@ -2852,12 +2848,12 @@ void main() {
 class A {
   A() {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaDefaultImplicitSuperCall#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaDefaultImplicitSuperCall#0",
+                r"
 void main() {
   D();
 }
@@ -2869,12 +2865,12 @@ class C {
 class D extends C {
   // Just a default constructor.
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaDirectCall#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaDirectCall#0",
+                r"
 void main() {
   C();
 }
@@ -2882,12 +2878,12 @@ void main() {
 class C {
   C();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaExplicitSuperCall#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaExplicitSuperCall#0",
+                r"
 void main() {
   D();
 }
@@ -2899,12 +2895,12 @@ class C {
 class D extends C {
   D() : super();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaImplicitSuperCall#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaImplicitSuperCall#0",
+                r"
 void main() {
   D();
 }
@@ -2916,12 +2912,12 @@ class C {
 class D extends C {
   D();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaImplicitSuperCall_indirectly#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaImplicitSuperCall_indirectly#0",
+                r"
 void main() {
   E();
 }
@@ -2937,12 +2933,12 @@ class D extends C {
 class E extends D {
   E();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaImplicitSuperCall_superParameters#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaImplicitSuperCall_superParameters#0",
+                r"
 void main() {
   D(1);
 }
@@ -2954,12 +2950,12 @@ class C {
 class D extends C {
   D(super.p);
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaRedirectedConstructor#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaRedirectedConstructor#0",
+                r"
 void main() {
   C.two();
 }
@@ -2968,12 +2964,12 @@ class C {
   C();
   factory C.two() = C;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaRedirection#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaRedirection#0",
+                r"
 void main() {
   C.two();
 }
@@ -2983,12 +2979,12 @@ class C {
 
   C.two() : this();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaTearoff#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_reachableViaTearoff#0",
+                r"
 void main() {
   C.new;
 }
@@ -2996,12 +2992,12 @@ void main() {
 class C {
   C();
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_referencedInConstantPattern#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_referencedInConstantPattern#0",
+                r"
 class C {
   const C();
 }
@@ -3013,12 +3009,12 @@ void main() {
 void f([C? c]) {
   if (c case const C()) {}
 }
-"#,
+",
                 &[(2, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_referencedInConstantPattern_generic#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_referencedInConstantPattern_generic#0",
+                r"
 class C<T> {
   const C();
 }
@@ -3030,12 +3026,12 @@ void main() {
 void f([C? c]) {
   if (c case const C<int>()) {}
 }
-"#,
+",
                 &[(2, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_unreachable#0",
+                r"
 void main() {
   C;
 }
@@ -3043,12 +3039,12 @@ void main() {
 class C {
   C();
 }
-"#,
+",
                 &[(7, 3, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_unreachable_otherHasRedirection#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_constructor_unnamed_unreachable_otherHasRedirection#0",
+                r"
 void main() {
   C.two();
 }
@@ -3058,32 +3054,32 @@ class C {
   C.one();
   C.two() : this.one();
 }
-"#,
+",
                 &[(7, 3, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_enum_reachableViaValue#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_enum_reachableViaValue#0",
+                r"
 void main() {
   E.one;
 }
 
 enum E { one, two }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_enum_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_enum_unreachable#0",
+                r"
 void main() {}
 
 enum E { one, two }
-"#,
+",
                 &[(4, 6, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_constructor_named_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_constructor_named_unreachable#0",
+                r"
 void main() {
   E(7);
 }
@@ -3091,12 +3087,12 @@ void main() {
 extension type E(int it) {
   E.named(this.it);
 }
-"#,
+",
                 &[(7, 5, 5)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_instanceMethod_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_instanceMethod_reachable#0",
+                r"
 void main() {
   E(1).m();
 }
@@ -3104,12 +3100,12 @@ void main() {
 extension type E(int i) {
   void m() {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_instanceMethod_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_instanceMethod_unreachable#0",
+                r"
 void main() {
   E(1);
 }
@@ -3117,12 +3113,12 @@ void main() {
 extension type E(int i) {
   void m() {}
 }
-"#,
+",
                 &[(7, 8, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_member_redeclare_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_member_redeclare_unreachable#0",
+                r"
 void main() {
   var c = C();
   c.m();
@@ -3136,12 +3132,12 @@ class C {
 extension type E(C c) implements C {
   void m() {}
 }
-"#,
+",
                 &[(13, 8, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_primaryConstructorBody_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_primaryConstructorBody_reachable#0",
+                r"
 void main() {
   E(1);
   print(E(1).i);
@@ -3152,56 +3148,56 @@ extension type E(int i) {
     print(i);
   }
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_reachable_referencedInTypeAnnotation_asExpression#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_reachable_referencedInTypeAnnotation_asExpression#0",
+                r"
 void main() {
   1 as E;
 }
 
 extension type E(int it) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_representation_private_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_representation_private_unreachable#0",
+                r"
 void main() {
   E(1);
 }
 
 extension type E(int _i) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_representation_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_representation_reachable#0",
+                r"
 void main() {
   E(1).i;
 }
 
 extension type E(int i) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_representation_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_representation_unreachable#0",
+                r"
 void main() {
   E(1);
 }
 
 extension type E(int i) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_staticMethod_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_staticMethod_unreachable#0",
+                r"
 void main() {
   E(1);
 }
@@ -3209,30 +3205,30 @@ void main() {
 extension type E(int i) {
   static void f() {}
 }
-"#,
+",
                 &[(7, 15, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extensionType_unreachable#0",
+                r"
 void main() {}
 
 extension type E(int i) {}
-"#,
+",
                 &[(4, 16, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_extension_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_extension_unreachable#0",
+                r"
 void main() {}
 
 extension IntExtension on int {}
-"#,
+",
                 &[(4, 11, 12)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_instanceFieldOnExtension_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_instanceFieldOnExtension_unreachable#0",
+                r"
 void main() {
   E.f;
 }
@@ -3241,12 +3237,12 @@ extension E on int {
   static int f = 1;
   void m() {}
 }
-"#,
+",
                 &[(8, 8, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_instanceMethod_reachable_toJson#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_instanceMethod_reachable_toJson#0",
+                r"
 import 'dart:convert';
 
 void main() async {
@@ -3256,12 +3252,12 @@ void main() async {
 class C {
   List<Object> toJson() => ['c'];
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_mixin_reachable_implemented#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_mixin_reachable_implemented#0",
+                r"
 void main() {
   A();
 }
@@ -3269,12 +3265,12 @@ void main() {
 mixin M {}
 
 class A implements M {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_mixin_reachable_mixed#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_mixin_reachable_mixed#0",
+                r"
 void main() {
   A();
 }
@@ -3282,21 +3278,21 @@ void main() {
 mixin M {}
 
 class A with M {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_mixin_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_mixin_unreachable#0",
+                r"
 void main() {}
 
 mixin M {}
-"#,
+",
                 &[(4, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_index#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_index#0",
+                r"
 void main() {
   print(V()[0]);
 }
@@ -3304,12 +3300,12 @@ void main() {
 class V {
   int operator [](int index) => 7;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_indexAssignment#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_indexAssignment#0",
+                r"
 void main() {
   V()[0] = 2;
 }
@@ -3317,12 +3313,12 @@ void main() {
 class V {
   void operator []=(int index, int value) {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_lessThan#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_lessThan#0",
+                r"
 void main() {
   if (V() < V()) {
     print('ok');
@@ -3332,12 +3328,12 @@ void main() {
 class V {
   bool operator <(V other) => false;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_postfixIncrement#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_postfixIncrement#0",
+                r"
 void main() {
   var v = V();
   v++;
@@ -3346,12 +3342,12 @@ void main() {
 class V {
   V operator +(int other) => this;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_prefixIncrement#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_prefixIncrement#0",
+                r"
 void main() {
   var v = V();
   ++v;
@@ -3360,12 +3356,12 @@ void main() {
 class V {
   V operator +(int other) => this;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_unary#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_operator_unary#0",
+                r"
 void main() {
   print(~V());
 }
@@ -3373,12 +3369,12 @@ void main() {
 class V {
   V operator ~() => this;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_setUpClass_class_static_member_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_setUpClass_class_static_member_reachable#0",
+                r"
 void main() {
   A();
 }
@@ -3386,21 +3382,21 @@ void main() {
 final class A {
   static setUpClass() {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_setUpClass_top_level_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_setUpClass_top_level_unreachable#0",
+                r"
 void main() {}
 
 setUpClass() {}
-"#,
+",
                 &[(4, 1, 10)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticFieldOnClass_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticFieldOnClass_reachable#0",
+                r"
 void main() {
   C.f;
 }
@@ -3408,12 +3404,12 @@ void main() {
 class C {
   static int f = 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticFieldOnEnum_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticFieldOnEnum_reachable#0",
+                r"
 void main() {
   E.f;
 }
@@ -3422,12 +3418,12 @@ enum E {
   one, two, three;
   static int f = 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticFieldOnExtension_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticFieldOnExtension_reachable#0",
+                r"
 void main() {
   E.f;
 }
@@ -3435,12 +3431,12 @@ void main() {
 extension E on int {
   static int f = 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticFieldOnExtension_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticFieldOnExtension_unreachable#0",
+                r"
 void main() {
   E(1).m();
 }
@@ -3449,12 +3445,12 @@ extension E on int {
   static int f = 1;
   void m() {}
 }
-"#,
+",
                 &[(7, 14, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticFieldOnMixin_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticFieldOnMixin_reachable#0",
+                r"
 void main() {
   M.f;
 }
@@ -3462,12 +3458,12 @@ void main() {
 mixin M {
   static int f = 1;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticField_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticField_unreachable#0",
+                r"
 void main() {
   C;
 }
@@ -3475,12 +3471,12 @@ void main() {
 class C {
   static int f = 1;
 }
-"#,
+",
                 &[(7, 14, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticGetter_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticGetter_reachable#0",
+                r"
 void main() {
   C.g;
 }
@@ -3488,12 +3484,12 @@ void main() {
 class C {
   static int get g => 7;
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticGetter_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticGetter_unreachable#0",
+                r"
 void main() {
   C;
 }
@@ -3501,12 +3497,12 @@ void main() {
 class C {
   static int get g => 7;
 }
-"#,
+",
                 &[(7, 18, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticMethodOnClass_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticMethodOnClass_reachable#0",
+                r"
 void main() {
   C.f();
 }
@@ -3514,12 +3510,12 @@ void main() {
 class C {
   static void f() {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticMethodOnEnum_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticMethodOnEnum_reachable#0",
+                r"
 void main() {
   E.f();
 }
@@ -3528,12 +3524,12 @@ enum E {
   one, two, three;
   static void f() {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticMethodOnExtension_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticMethodOnExtension_reachable#0",
+                r"
 void main() {
   E.f();
 }
@@ -3541,12 +3537,12 @@ void main() {
 extension E on int {
   static void f() {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticMethodOnMixin_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticMethodOnMixin_reachable#0",
+                r"
 void main() {
   M.f();
 }
@@ -3554,12 +3550,12 @@ void main() {
 mixin M {
   static void f() {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticMethod_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticMethod_unreachable#0",
+                r"
 void main() {
   C;
 }
@@ -3567,12 +3563,12 @@ void main() {
 class C {
   static void f() {}
 }
-"#,
+",
                 &[(7, 15, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticSetter_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticSetter_reachable#0",
+                r"
 void main() {
   C.s = 1;
 }
@@ -3580,12 +3576,12 @@ void main() {
 class C {
   static set s(int value) {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_staticSetter_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_staticSetter_unreachable#0",
+                r"
 void main() {
   C;
 }
@@ -3593,12 +3589,12 @@ void main() {
 class C {
   static set s(int value) {}
 }
-"#,
+",
                 &[(7, 14, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_tearDownClass_class_static_member_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_tearDownClass_class_static_member_reachable#0",
+                r"
 void main() {
   A();
 }
@@ -3606,21 +3602,21 @@ void main() {
 final class A {
   static tearDownClass() {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_tearDownClass_top_level_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_tearDownClass_top_level_unreachable#0",
+                r"
 void main() {}
 
 tearDownClass() {}
-"#,
+",
                 &[(4, 1, 13)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_reachable#0",
+                r"
 void main() {
   f1();
 }
@@ -3630,114 +3626,114 @@ void f1() {
 }
 
 void f2() {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_reachable_private#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_reachable_private#0",
+                r"
 void main() {
   _f();
 }
 
 void _f() {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_unreachable#0",
+                r"
 void main() {}
 
 void f() {}
-"#,
+",
                 &[(4, 6, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_unreachable_unrelatedPragma#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_unreachable_unrelatedPragma#0",
+                r"
 void main() {}
 
 @pragma('other')
 void f() {}
-"#,
+",
                 &[(5, 6, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_unreachable_visibleForTesting#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_unreachable_visibleForTesting#0",
+                r"
 import 'package:meta/meta.dart';
 void main() {}
 
 @visibleForTesting
 void f() {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_vmEntryPoint#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_vmEntryPoint#0",
+                r"
 void main() {}
 
 @pragma('vm:entry-point')
 void f6() {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_vmEntryPoint_const#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelFunction_vmEntryPoint_const#0",
+                r"
 void main() {}
 
 const entryPoint = pragma('vm:entry-point');
 @entryPoint
 void f6() {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelGetter_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelGetter_reachable#0",
+                r"
 void main() {
   g;
 }
 
 int get g => 7;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelGetter_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelGetter_unreachable#0",
+                r"
 void main() {}
 
 int get g => 7;
-"#,
+",
                 &[(4, 9, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelSetter_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelSetter_reachable#0",
+                r"
 void main() {
   s = 7;
 }
 
 set s(int value) {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelSetter_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelSetter_unreachable#0",
+                r"
 void main() {}
 
 set s(int value) {}
-"#,
+",
                 &[(4, 5, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelVariable_reachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelVariable_reachable#0",
+                r"
 void main() {
   _f();
 }
@@ -3747,21 +3743,21 @@ void _f() {
 }
 
 int x = 1;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelVariable_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_topLevelVariable_unreachable#0",
+                r"
 void main() {}
 
 int x = 1;
-"#,
+",
                 &[(4, 5, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedAsInstanceCreation_named#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedAsInstanceCreation_named#0",
+                r"
 void main() {
   T.named();
 }
@@ -3771,12 +3767,12 @@ class C {
 }
 
 typedef T = C;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedAsInstanceCreation_unnamed#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedAsInstanceCreation_unnamed#0",
+                r"
 void main() {
   T();
 }
@@ -3784,12 +3780,12 @@ void main() {
 class C {}
 
 typedef T = C;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInObjectPattern#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInObjectPattern#0",
+                r"
 typedef T = int;
 
 void main() {
@@ -3799,35 +3795,35 @@ void main() {
 void f([Object? c]) {
   if (c case T()) {}
 }
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_asExpression#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_asExpression#0",
+                r"
 void main() {
   1.5 as T;
 }
 
 typedef T = int;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_castPattern#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_castPattern#0",
+                r"
 void main() {
   var r = (1.5, );
   var (s as T, ) = r;
 }
 
 typedef T = int;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_genericFunctionType#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_genericFunctionType#0",
+                r"
 void main() {
   t = () => 7;
 }
@@ -3835,23 +3831,23 @@ void main() {
 T? Function()? t;
 
 typedef T = int;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_isExpression#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_isExpression#0",
+                r"
 void main() {
   1.5 is T;
 }
 
 typedef T = int;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_parameter#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_parameter#0",
+                r"
 void main() {
   f(() {});
 }
@@ -3859,12 +3855,12 @@ void main() {
 void f([Cb? c]) {}
 
 typedef Cb = void Function();
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_recordType#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_recordType#0",
+                r"
 void main() {
   t = (1, );
 }
@@ -3872,12 +3868,12 @@ void main() {
 (T, )? t;
 
 typedef T = int;
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_topLevelVariable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_topLevelVariable#0",
+                r"
 void main() {
   c = () {};
 }
@@ -3885,32 +3881,32 @@ void main() {
 Cb? c;
 
 typedef Cb = void Function();
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_variableDeclaration#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_reachable_referencedInTypeAnnotation_variableDeclaration#0",
+                r"
 void main() {
   Cb c = () {};
 }
 
 typedef Cb = void Function();
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_unreachable#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_typedef_unreachable#0",
+                r"
 void main() {}
 
 typedef T = String;
-"#,
+",
                 &[(4, 9, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_classInstanceMethod#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_classInstanceMethod#0",
+                r"
 import 'package:flutter/widgets.dart';
 import 'package:flutter/widget_previews.dart';
 
@@ -3922,12 +3918,12 @@ class B {
   @Preview()
   Widget foo() => Text('');
 }
-"#,
+",
                 &[(7, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_classStaticMethod#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_classStaticMethod#0",
+                r"
 import 'package:flutter/widgets.dart';
 import 'package:flutter/widget_previews.dart';
 
@@ -3937,12 +3933,12 @@ class B {
   @Preview()
   static Widget foo() => Text('');
 }
-"#,
+",
                 &[(7, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_constructor#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_constructor#0",
+                r"
 import 'package:flutter/widget_previews.dart';
 
 void main() {}
@@ -3951,12 +3947,12 @@ class B {
   @Preview()
   const B();
 }
-"#,
+",
                 &[(6, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_factoryConstructor#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_factoryConstructor#0",
+                r"
 import 'package:flutter/widget_previews.dart';
 
 void main() {}
@@ -3968,12 +3964,12 @@ class B {
 
   const B();
 }
-"#,
+",
                 &[(6, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_privatePreview#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_privatePreview#0",
+                r"
 // Widget previews can't be defined with private functions.
 import 'package:flutter/widget_previews.dart';
 import 'package:flutter/widgets.dart';
@@ -3992,12 +3988,12 @@ class B {
 
 @Preview()
 void _f6() {}
-"#,
+",
                 &[(7, 7, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_topLevelFunction#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_topLevelFunction#0",
+                r"
 import 'package:flutter/widget_previews.dart';
 
 void main() {}
@@ -4005,24 +4001,24 @@ void main() {}
 // ignore: invalid_widget_preview_application
 @Preview()
 void f6() {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_topLevelFunction_const#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_topLevelFunction_const#0",
+                r"
 import 'package:flutter/widget_previews.dart';
 void main() {}
 
 const preview = Preview();
 @preview
 void f6() {}
-"#,
+",
                 &[],
             ),
             (
-                r#"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_topLevelFunction_customPreviewClass#0"#,
-                r#"
+                r"lints/unreachable_from_main/UnreachableFromMainTest/test_widgetPreview_topLevelFunction_customPreviewClass#0",
+                r"
 void main() {}
 
 class Preview {
@@ -4032,23 +4028,23 @@ class Preview {
 // This isn't from package:flutter/widget_previews.dart and shouldn't be exempt.
 @Preview()
 void f6() {}
-"#,
+",
                 &[(4, 7, 7), (10, 6, 2)],
             ),
             (
-                r#"lints/unreachable_from_main/doc_bad_0"#,
-                r#"main() {}
+                r"lints/unreachable_from_main/doc_bad_0",
+                r"main() {}
 void f() {}
-"#,
+",
                 &[(2, 6, 1)],
             ),
             (
-                r#"lints/unreachable_from_main/doc_good_0"#,
-                r#"main() {
+                r"lints/unreachable_from_main/doc_good_0",
+                r"main() {
   f();
 }
 void f() {}
-"#,
+",
                 &[],
             ),
         ];

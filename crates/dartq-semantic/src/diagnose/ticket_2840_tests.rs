@@ -16,6 +16,7 @@
 //! instanceof/type_checks corpora prove emits — so each pin isolates the
 //! span, not the verdict.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -46,7 +47,7 @@ fn at(fixture: &str, needle: &str) -> usize {
     CORE_PRELUDE.len() + fixture.find(needle).unwrap()
 }
 
-/// The function_type9 shape: a written function type's trailing formal
+/// The `function_type9` shape: a written function type's trailing formal
 /// list — the formals' names and closing paren, over a function-typed
 /// return type with its own optional formals — joins the span (the
 /// corpus's `788:19|52` against the armed slot's `788:19|49`). The
@@ -134,7 +135,7 @@ fn nullable_function_type_span_covers_the_question() {
 }
 
 /// The parenthesized-operand anchor (the instanceof corpus shape): the
-/// outer verdict anchors at the group's `(` — the ParenthesizedExpression's
+/// outer verdict anchors at the group's `(` — the `ParenthesizedExpression`'s
 /// own offset, `) is bool` before the fix — with the whole-expression
 /// extent through the checked type.
 #[test]

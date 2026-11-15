@@ -1,6 +1,6 @@
 //! The #2652 pins: the reference surface answers a name with that name's
 //! rows only — the name-keyed run group, never a neighboring group's —
-//! whatever the StringId allocation order of the session. The fixture
+//! whatever the `StringId` allocation order of the session. The fixture
 //! mirrors the shape that surfaced the defect: an interface with sibling
 //! members (several sharing long prefixes), an implementer, callers
 //! reaching the members through interface-typed receivers across library
@@ -8,6 +8,30 @@
 //! sibling name is queried and every answer row must spell its own
 //! queried name at its own range.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use common::Fixture;
@@ -156,7 +180,7 @@ fn row_shapes(engine: &Engine, answer: &SymbolAnswer<'_>) -> Vec<(String, u32, u
 /// Every sibling's answer rows spell the queried name at their range —
 /// the cross-name invariant over the whole serving chain (fold mint,
 /// library surface, name-keyed run groups, workspace join), whatever
-/// order the session's StringId allocation gave the names.
+/// order the session's `StringId` allocation gave the names.
 #[test]
 fn sibling_answers_spell_their_own_name() {
     let fixture = workspace();
@@ -189,11 +213,10 @@ fn sibling_answers_spell_their_own_name() {
             "{sibling}: the service library's send must be among the rows"
         );
         for (tail, offset, length, _kind) in &rows {
-            let source = sources
-                .iter()
-                .find(|(name, _)| name == tail)
-                .map(|(_, text)| text)
-                .unwrap_or_else(|| panic!("{sibling}: source of {tail} not found"));
+            let source = sources.iter().find(|(name, _)| name == tail).map_or_else(
+                || panic!("{sibling}: source of {tail} not found"),
+                |(_, text)| text,
+            );
             let units = source.encode_utf16().collect::<Vec<_>>();
             let start = *offset as usize;
             let end = start + *length as usize;

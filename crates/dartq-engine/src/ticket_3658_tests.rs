@@ -28,13 +28,14 @@
 //! * Negative controls — a used unprefixed import stays silent; a used
 //!   doc `[Name]` releases through the written scope.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_pub::{LockFile, Pubspec, build_graph};
 
 /// The `unused_import` rows of a diagnostic set as `(file_name,
 /// offset, length, message)` — file identity matters here (part-file
 /// rows anchor on the part, not the library unit), so `files` supplies
-/// the FileId → basename resolution the engine's table held.
+/// the `FileId` → basename resolution the engine's table held.
 fn unused_import_rows(
     diagnostics: &[Diagnostic],
     files: &FxHashMap<FileId, String>,
@@ -147,7 +148,7 @@ fn pin_engine() -> (PathBuf, Engine) {
 
 /// Analyzes a fresh workspace holding `files` (lib-relative paths) and
 /// returns the workspace root, the full diagnostic set, and the
-/// FileId → file-basename map the row assertions read.
+/// `FileId` → file-basename map the row assertions read.
 fn analyze_files(files: &[(&str, &str)]) -> (PathBuf, Vec<Diagnostic>, FxHashMap<FileId, String>) {
     let (root, mut engine) = pin_engine();
     let lib = root.join("lib");

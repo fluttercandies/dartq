@@ -12,6 +12,7 @@
 //! stays flow-scoped: a read after the guard's block still reports,
 //! and an unguarded read never loses its row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -24,7 +25,7 @@ fn count_code(rep: &FileReport, name: &str) -> usize {
 
 /// The rows of a report over `full` rendered as
 /// `SEVERITY|code|line:col|len|message` (source order), mirroring the
-/// ticket_2765 rig's renderer (1-based UTF-16 line:col).
+/// `ticket_2765` rig's renderer (1-based UTF-16 line:col).
 fn rows(full: &str, rep: &FileReport) -> Vec<String> {
     let mut line_starts = vec![0u32];
     for (index, byte) in full.bytes().enumerate() {

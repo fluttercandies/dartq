@@ -5,10 +5,11 @@
 //! argument compared against a bare scope-parameter argument the torn-down
 //! window lost (`List<T>` over the enclosing class's own `T extends Enum`
 //! — a head the name level cannot order keeps the face, exactly as the
-//! oracle's InvalidType subtypes every bound). Oracle provenance:
-//! `dart analyze` 3.13.1 — scope_context.dart's `visitWithOverride` and
+//! oracle's `InvalidType` subtypes every bound). Oracle provenance:
+//! `dart analyze` 3.13.1 — `scope_context.dart`'s `visitWithOverride` and
 //! the drift converters' `values.byName` census shapes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops};
 
 /// `extension<T extends AstNode> on T` applies to every receiver the

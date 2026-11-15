@@ -39,6 +39,7 @@
 //! leftover's type), `p8`/`p9`/`p10` (creation and null-aware targets, the
 //! `!`-chain RHS).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;
@@ -219,7 +220,7 @@ void f(Token token) {
 /// the RHS resolves inside the index-section cascade — the second
 /// section's fold lands on the `toJS` getter row and must not turn it
 /// into a phantom `undefined_getter` on the receiver's type (probed p2:
-/// oracle silent, with the js_interop getters modeled as plain declared
+/// oracle silent, with the `js_interop` getters modeled as plain declared
 /// extensions on the receiver classes).
 #[test]
 fn extension_getter_in_index_cascade_resolves() {

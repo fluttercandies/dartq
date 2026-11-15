@@ -20,6 +20,7 @@
 //! and their widths are pinned by the width transcript
 //! (`tests::COLLAPSE_MAP_WIDTHS`) like every other kind.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::kind::NodeKind;
 
 /// One named payload word. The vocabulary is shared across kinds: the same

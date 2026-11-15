@@ -22,6 +22,7 @@
 //!
 //! Oracle provenance: `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze
 //! --format=machine` — every fixture probed there.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{report_ops, rows};
 use super::{StrictModes, fold_unit_with_ops, merge_source_ordered};
@@ -39,7 +40,7 @@ use dartq_scanner::ScanConfig;
 use dartq_source::{FileTable, StringTable};
 use std::path::Path;
 
-/// The `dart:core` names-only stub — the same spelling set test_rig mounts.
+/// The `dart:core` names-only stub — the same spelling set `test_rig` mounts.
 const CORE_STUB_NAMES: [&str; 10] = [
     "Object", "Never", "Null", "Function", "Future", "FutureOr", "Record", "Enum", "Type", "Symbol",
 ];

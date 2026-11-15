@@ -27,6 +27,7 @@
 //!   `verifyReturnStatement`, :155-289); a bare `return;` reads `void`,
 //!   whose only fit is the `void`/`dynamic` host (the `RETURN_WITHOUT_
 //!   VALUE` arm is a separate code — :222-226).
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_bare};
 use crate::FileReport;

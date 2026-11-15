@@ -3,6 +3,7 @@
 //! `dartq-commands`' packages module (one implementation the later
 //! faces share).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
@@ -150,13 +151,13 @@ fn lon_document(listing: &dartq_commands::packages::PackageInventory) -> serde_j
         .report
         .packages
         .iter()
-        .map(|entry| pkg_row(entry))
+        .map(pkg_row)
         .collect::<Vec<_>>();
     let bounds = listing
         .report
         .boundaries
         .iter()
-        .map(|boundary| boundary_row(boundary))
+        .map(boundary_row)
         .collect::<Vec<_>>();
     let mut document = serde_json::json!({
         "v": dartq_commands::SCHEMA_VERSION,
@@ -329,7 +330,7 @@ mod tests {
             .expect("member row");
         assert!(
             member_row.contains("workspace-member")
-                && member_row.contains("a")
+                && member_row.contains('a')
                 && member_row.contains("resolved"),
             "{member_row}"
         );

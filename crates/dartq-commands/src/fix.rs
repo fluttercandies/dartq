@@ -95,7 +95,7 @@
 //! [`crate::fix_table`]'s [`FixSource::Parser`] rows serve them through
 //! [`from_parser`]: every parser code the official non-lint registry
 //! serves with a mechanical producer (upstream Dart SDK source,
-//! pkg/analysis_server/lib/src/services/correction/fix_internal.dart —
+//! `pkg/analysis_server/lib/src/services/correction/fix_internal.dart` —
 //! the `RemoveLexeme` modifier family, the keyword and comma deletions,
 //! the separator swaps, the body insertions, the `expected_token` trio,
 //! the constructor / on-clause / getter-parameter removals, the
@@ -112,8 +112,8 @@
 //! # Ignore-diagnostic fixes
 //!
 //! Three producers serve every diagnostic the way the official registry
-//! does (upstream Dart SDK source, pkg/analysis_server_plugin,
-//! ignore_diagnostic.dart): a `// ignore: <code>` comment on the line
+//! does (upstream Dart SDK source, `pkg/analysis_server_plugin`,
+//! `ignore_diagnostic.dart)`: a `// ignore: <code>` comment on the line
 //! before the hit, an `// ignore_for_file: <code>` line beside the file's
 //! header, and an `analyzer: errors: <code>: ignore` entry in the
 //! governing `analysis_options.yaml`. All three are text surgery over the
@@ -135,7 +135,7 @@
 //! apply run writes only the selected role ([`select_by_role`]) — the
 //! default `primary` answers one code change per diagnostic, upstream
 //! `dart fix --apply`'s bulk-fix posture (upstream Dart SDK source,
-//! pkg/analysis_server/lib/src/services/correction/bulk_fix_processor.dart
+//! `pkg/analysis_server/lib/src/services/correction/bulk_fix_processor.dart`
 //! — `_fixSingleDiagnostic` applies the first producer's fix per
 //! diagnostic, and its multi-producer guard keeps candidate lists like
 //! the import synthesis from all applying at once). Ignore comments are
@@ -169,6 +169,7 @@
 //! layers contribute no assists); it answers [`AssistAnswer`]s whose rows
 //! keep the change grouping the fix document flattens away.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -337,11 +338,13 @@ pub struct Edit {
 /// downstream; plugin candidates are [`FixRole::Primary`] by nature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum FixRole {
     /// A code change that resolves the diagnostic. The only role an
     /// apply run writes by default — one candidate per diagnostic
     /// ([`select_by_role`]), the upstream `dart fix --apply` bulk-fix
     /// posture.
+    #[default]
     Primary,
     /// A `// ignore: <code>` comment on the line before the hit.
     IgnoreLine,
@@ -350,12 +353,6 @@ pub enum FixRole {
     /// An `analyzer: errors: <code>: ignore` entry in the governing
     /// `analysis_options.yaml`.
     Suppress,
-}
-
-impl Default for FixRole {
-    fn default() -> Self {
-        Self::Primary
-    }
 }
 
 impl FixRole {
@@ -441,11 +438,12 @@ pub struct FileFixSet {
 
 /// The `--code` selection face (upstream `dart fix --code`,
 /// `BulkFixProcessor._codesToFix` — upstream Dart SDK source,
-/// pkg/analysis_server/lib/src/services/correction/bulk_fix_processor.dart):
+/// `pkg/analysis_server/lib/src/services/correction/bulk_fix_processor.dart)`:
 /// the requested codes lower-case into a set and every row whose
 /// diagnostic code matches exactly (case-insensitively) stays — no code,
 /// no filter; unknown codes simply select nothing. The plugin proposals
 /// are not diagnostic-code-addressable and drop with the filter.
+#[must_use]
 pub fn select_by_codes(per_file: Vec<FileFixSet>, codes: &[String]) -> Vec<FileFixSet> {
     if codes.is_empty() {
         return per_file;
@@ -475,6 +473,7 @@ pub fn select_by_codes(per_file: Vec<FileFixSet>, codes: &[String]) -> Vec<FileF
 /// code, and options file. Sets left without rows drop. Rows filtered
 /// out here never reach an apply record (the record carries only the
 /// selected rows); the proposal document keeps listing every candidate.
+#[must_use]
 pub fn select_by_role(per_file: Vec<FileFixSet>, role: FixRole) -> Vec<FileFixSet> {
     let mut per_file = per_file;
     for set in &mut per_file {

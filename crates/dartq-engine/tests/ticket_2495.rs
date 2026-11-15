@@ -20,6 +20,30 @@
 //! same stale payload under the current generation's keys still serves —
 //! proving the rejection is the version fork, not a broken staging path.
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::path::Path;
@@ -41,7 +65,7 @@ const PRE_BUMP_SEMANTIC_VERSION: u32 = (14 << 16) | 8;
 /// `undefined_getter`; a bounds-empty (stale) model reads the bound as
 /// `Dynamic`, the face over-admits, and the access goes silent — the
 /// exact wrong-output shape the staleness defects produce.
-const SOURCE: &str = r#"class Num {}
+const SOURCE: &str = r"class Num {}
 class Str {}
 extension E<T extends Num> on List<T> {
   int get probe => 1;
@@ -49,7 +73,7 @@ extension E<T extends Num> on List<T> {
 void use(List<Str> xs) {
   xs.probe;
 }
-"#;
+";
 
 /// The code names reported for the file whose path ends with `tail`,
 /// sorted and deduped.

@@ -6,6 +6,7 @@
 //! the correctness gate: a row that does not match the source produces
 //! no patch at all.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_lints::{Lint, rule_by_name};
 use dartq_plugin::SourceEdit;
 use dartq_source::LineIndex;
@@ -5940,7 +5941,7 @@ fn assert_surround(source: &str, from: &str, through: &str, title: &str, expecte
 }
 
 /// The surround family on a two-statement run, one golden per kind
-/// (upstream surround_with.dart's nine producers minus the
+/// (upstream `surround_with.dart`'s nine producers minus the
 /// flutter-gated `setState`, whose `classElement.isState` guard needs
 /// the flutter element seam).
 #[test]
@@ -7288,7 +7289,7 @@ fn take_name_row_consumes_exactly_one_recorded_miss() {
     assert_eq!(strings.resolve(first.name), "aa");
     let last = take_name_row(&mut rows, 30).expect("the tail row");
     assert_eq!(strings.resolve(last.name), "cc");
-    assert!(rows.is_empty());
+    assert_eq!(rows, [] as [dartq_semantic::NameRow; 0]);
     // Offsets with no recorded row answer none — the drop posture.
     let mut rows = vec![row(10, "aa")];
     assert!(take_name_row(&mut rows, 15).is_none());
@@ -7558,7 +7559,7 @@ fn evidence_rows_ties_order_by_the_total_key() {
     let diagnostic = |length: u32| {
         Diagnostic::new(
             dartq_diagnostics::DiagnosticType::CompileTimeError.severity(),
-            field_code.clone(),
+            field_code,
             "The non-nullable variable 'f' must be initialized.",
             file,
             dartq_source::SourceRange { offset: 0, length },
@@ -7604,7 +7605,7 @@ fn evidence_rows_ties_order_by_the_total_key() {
 }
 
 /// The evidence document: the rows render under the fix document's
-/// conventions (file, schema_version, sorted map keys), the miss name
+/// conventions (file, `schema_version`, sorted map keys), the miss name
 /// object carries the recorded shape, and two independent runs answer
 /// byte-identical documents — the HashMap-ordered pass behind the
 /// face must not leak into the output.
@@ -7617,9 +7618,12 @@ fn evidence_json_is_stable_and_carries_the_recorded_shape() {
     let target = root.join("lib/a.dart");
     let run = || {
         let mut hosts = PluginHosts::empty();
-        let (_, evidence) =
-            collect_set_with_evidence(&[target.clone()], &mut hosts, Some(&root.join("sdk")))
-                .expect("collect");
+        let (_, evidence) = collect_set_with_evidence(
+            std::slice::from_ref(&target),
+            &mut hosts,
+            Some(&root.join("sdk")),
+        )
+        .expect("collect");
         hosts.shutdown();
         evidence
     };
@@ -8583,7 +8587,7 @@ fn import_zero_candidates_silent() {
 }
 
 /// The machine face: a produced import row passes the published
-/// FixPatch schema through `patch_json`, provenance and anchor intact.
+/// `FixPatch` schema through `patch_json`, provenance and anchor intact.
 #[test]
 fn import_rows_pass_the_fixpatch_schema() {
     let source = "void f() { helper(); }\n";
@@ -8802,7 +8806,7 @@ fn missing_switch_case_without_correction_produces_nothing() {
     assert!(fixes.is_empty());
 }
 
-/// The switch-cases rows validate against the FixPatch schema and
+/// The switch-cases rows validate against the `FixPatch` schema and
 /// carry the `builtin-semantic` provenance tag.
 #[test]
 fn missing_switch_case_passes_the_fixpatch_schema() {

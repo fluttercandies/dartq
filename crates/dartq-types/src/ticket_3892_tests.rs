@@ -31,6 +31,7 @@
 //!   survives the inverted pass and reports `NotWellBounded` — never
 //!   `SuperBounded`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::generic_function::{Boundedness, is_well_bounded, regular_bounded_issues};
 use crate::hierarchy::{CoreDecls, TypeHierarchy};
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};

@@ -13,6 +13,7 @@
 //! collected — the under-report direction for the rare generic-callable
 //! formal, never a wrong substitution.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::model::{ArgListId, ArgPool, Ty};
 use dartq_source::StringId;
 

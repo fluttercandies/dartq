@@ -25,6 +25,7 @@
 //! fold aliases — oracle reports `class_used_as_mixin` alone. The pins
 //! assert this face's own rows and leave that row to its owner lane.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{
     CORE_PRELUDE, RigImport, assert_silent, report_ops, report_ops_imports, report_ops_with, rows,
 };
@@ -125,7 +126,7 @@ fn chained_alias_reports_terminal_element() {
 
 /// A nullable right-hand side still reports the element —
 /// `typedef A = C?` draws `class_used_as_mixin 'C'` beside the
-/// nullable-clause face (oracle /tmp/t3765/f_cq.dart).
+/// nullable-clause face (oracle /`tmp/t3765/f_cq.dart`).
 #[test]
 fn nullable_rhs_alias_reports_element() {
     let fixture = "class C {}\ntypedef A = C?;\nclass D with A {}\n";
@@ -234,7 +235,7 @@ fn function_alias_reports_no_class_used_as_mixin() {
 }
 
 /// A self-referencing alias never unfolds — no `class_used_as_mixin`
-/// (oracle /tmp/t3765/f_self.dart: the self-reference face plus
+/// (oracle /`tmp/t3765/f_self.dart`: the self-reference face plus
 /// `mixin_of_non_class`, never this row).
 #[test]
 fn self_referencing_alias_reports_no_class_used_as_mixin() {
@@ -284,7 +285,7 @@ fn dart_core_restricted_element_suppresses_mixin_use() {
 
 /// The same gate over a parameterized spelling — `with FutureOr<int>`
 /// over a `dart:async`-mounted `FutureOr` reports the disallowed face
-/// and never `class_used_as_mixin` (oracle /tmp/t3765/f_fto.dart). The
+/// and never `class_used_as_mixin` (oracle /`tmp/t3765/f_fto.dart`). The
 /// `mixin_of_non_class` row the span also draws is the clause-legality
 /// walk's own gap (it does not read the disallowed arm), outside this
 /// face's scope.
@@ -316,7 +317,7 @@ fn dart_async_restricted_element_suppresses_mixin_use() {
 /// The gate keys on the RESOLVED element's library, not the spelling: a
 /// user-declared `String` (the prelude's) used as a mixin is a plain
 /// class — `class_used_as_mixin` still reports (oracle
-/// /tmp/t3765/f_shadow.dart: `CLASS_USED_AS_MIXIN 'String'`).
+/// /`tmp/t3765/f_shadow.dart`: `CLASS_USED_AS_MIXIN 'String'`).
 #[test]
 fn user_shadow_of_restricted_spelling_still_reports() {
     let fixture = "class D with String {}\n";

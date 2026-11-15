@@ -18,6 +18,7 @@
 //! `forwarded_ctor_formals`'s existing `patch_field_formals` call
 //! (invocation.rs:2250-2252) onto the explicit-keyword path.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops_experiments_with, rows};
 use dartq_language::Feature;
 

@@ -1,6 +1,7 @@
 //! The `cases.manifest`: sorted `id<TAB>blake3` rows, one per extracted
 //! case, proving that the pin produced exactly these case bytes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// One manifest row.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Row {

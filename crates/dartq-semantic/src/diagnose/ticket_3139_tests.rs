@@ -17,6 +17,7 @@
 //! statement region (`void f() { C(final this.x); }`) is not a
 //! declaration at all. Every pin below mirrors the oracle `3.13.7` row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops_bare;
 use super::*;
 
@@ -38,7 +39,7 @@ fn anchor(source: &str, needle: &str, nth: usize) -> u32 {
 }
 
 /// `A(final int this.a)` — the typed field formal reports at the `final`
-/// keyword (parser_impl.dart `parseFormalParameter` parses the type atom
+/// keyword (`parser_impl.dart` `parseFormalParameter` parses the type atom
 /// before the `this` arm; the node keeps the `finalKeyword`).
 #[test]
 fn uf3139_typed_field_formal_fires() {

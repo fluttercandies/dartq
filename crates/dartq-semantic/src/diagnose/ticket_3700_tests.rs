@@ -5,7 +5,7 @@
 //! Clusters covered:
 //!   - the enum declared-constructor self-leak (`enum_declares_ctor`): the
 //!     oracle leaks `usedElements.elements` only through a *declared*
-//!     constructor's `returnType` NamedType — an implicit unnamed
+//!     constructor's `returnType` `NamedType` — an implicit unnamed
 //!     constructor writes no `NamedType`, so a constructorless enum still
 //!     reports (`visitEnumDeclaration` → `_visitClassElement`).
 //!   - the operator display-name fold: `operator []=`'s element
@@ -15,6 +15,8 @@
 //!     type is a private-named declaration like any other — the wildcard
 //!     exemption applies to LOCALS only (`_isNamedWildcard`,
 //!     upstream :985-994).
+
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::{assert_silent, report_ops, report_ops_wildcards, rows};
 
@@ -28,7 +30,7 @@ fn unused_element(source: &str) -> Vec<String> {
 // —— enum declared-constructor self-leak ——————————————————————————————
 
 /// `enum _E { e0; }` declares no constructor: the implicit unnamed one
-/// writes no `returnType` NamedType, so the oracle's self-leak never arms
+/// writes no `returnType` `NamedType`, so the oracle's self-leak never arms
 /// and `_E` reports (upstream :590-595 → `_isUsedElement`).
 #[test]
 fn enum_with_only_implicit_ctor_reports() {
@@ -45,7 +47,7 @@ fn enum_with_only_implicit_ctor_reports() {
 }
 
 /// The leak needs a DECLARED constructor: `const _E(this._f)`'s
-/// `returnType` NamedType visits `_useIdentifierElement` with
+/// `returnType` `NamedType` visits `_useIdentifierElement` with
 /// `_enclosingClass == null` — the enum element joins
 /// `usedElements.elements` and the declaration stays silent.
 #[test]

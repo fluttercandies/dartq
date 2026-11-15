@@ -309,6 +309,7 @@
 //! rides the sets the pass already kept (zero hot-path cost); the
 //! per-file diagnostic behavior is unchanged.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
@@ -1076,7 +1077,7 @@ pub struct UnitFold {
 ///
 /// The formal-parameter scope splits the row in two codes: two colliding
 /// `this.x` formals report `duplicate_field_formal_parameter` (same span,
-/// same context row, the pair text — duplicate_definition_verifier.dart:
+/// same context row, the pair text — `duplicate_definition_verifier.dart`:
 /// 433-442), everything else `duplicate_definition`. The capture decides
 /// the split (`DuplicateDecl::field_formal`), so the bake and the fold
 /// render the same code from the same log.
@@ -1249,7 +1250,7 @@ fn unassigned_read_suppressed(
     span: Token,
     declared_type: Option<SourceRange>,
     tokens: &TokenTable,
-    engine: &Engine,
+    engine: &Engine<'_>,
     name: &str,
 ) -> bool {
     let toks = tokens.as_slice();
@@ -2016,7 +2017,7 @@ pub fn fold_unit_with_ops<'t>(
             FlowFact::WhyNotPromoted { span, .. }
             | FlowFact::NonPromotedPropertyRead { span, .. }
             | FlowFact::ThisNotPromoted { span, .. } => {
-                engine.stage_non_promotion(&flow, &fact, span);
+                engine.stage_non_promotion(&flow, fact, span);
             }
         }
     }
@@ -2120,7 +2121,7 @@ pub fn fold_unit_with_ops<'t>(
                         .is_some_and(|t| {
                             unassigned.staged(SourceRange {
                                 offset: t.utf16_offset,
-                                length: t.byte_len as u32,
+                                length: t.byte_len,
                             })
                         })
             };
@@ -2492,11 +2493,9 @@ pub fn fold_unit_with_ops<'t>(
                     // sits after an expression case's pattern and would
                     // exclude the constant node from its own window.
                     let start = case.flow_anchor.offset.min(case.anchor.offset);
-                    let end = ctx
-                        .cases
-                        .get(index + 1)
-                        .map(|next| next.flow_anchor.offset.min(next.anchor.offset))
-                        .unwrap_or(u32::MAX);
+                    let end = ctx.cases.get(index + 1).map_or(u32::MAX, |next| {
+                        next.flow_anchor.offset.min(next.anchor.offset)
+                    });
                     dead_windows.push((start, end));
                 }
             }
@@ -4296,7 +4295,7 @@ fn suppress_dead_code_inside_dead_clauses(diagnostics: &mut Vec<Diagnostic>) {
 /// (`d.f()` over `D?`), a nullable function member (`F? f; e.f()`), a
 /// non-function member result, an unresolved climb, and rows that name no
 /// member read all stand (fail-open, the under-report direction).
-fn gate_non_nullable_callee_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Engine) {
+fn gate_non_nullable_callee_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Engine<'_>) {
     let function_head = engine.intern("Function");
     diagnostics.retain(|row| {
         if row.code.name != UNCHECKED_NAME || row.message.as_str() != UNCHECKED_FUNCTION_TEXT {
@@ -4328,7 +4327,7 @@ fn gate_non_nullable_callee_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Eng
 /// nullable-accepting extension already resolved.
 ///
 /// The oracle asks the nullable-dereference verifier (`_checkForUseOfNullable`
-/// behind `checkNullable`, nullable_dereference_verifier.dart) only for an
+/// behind `checkNullable`, `nullable_dereference_verifier.dart`) only for an
 /// access whose member resolution went through the INSTANCE face: the
 /// resolution consults the applicable extensions against the receiver's
 /// static type first, and an extension whose instantiated `on` type accepts
@@ -4348,7 +4347,7 @@ fn gate_non_nullable_callee_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Eng
 /// exact; an access resolved through a NON-nullable `on` face over a nullable
 /// receiver (`extension E on C` over `C?` — the unsafe single) keeps its row,
 /// because that offset never enters the set.
-fn gate_extension_resolved_nullable_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Engine) {
+fn gate_extension_resolved_nullable_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Engine<'_>) {
     if engine.extension_nullable_resolved.is_empty() {
         return;
     }
@@ -4364,7 +4363,7 @@ fn gate_extension_resolved_nullable_rows(diagnostics: &mut Vec<Diagnostic>, engi
 /// `null` — a written function type without `?`, or the bare `Function`
 /// head without `?` (an alias fold runs first, the same face the member
 /// tables hand the resolution arms).
-fn non_nullable_function_face(engine: &Engine, ty: Ty, function_head: StringId) -> bool {
+fn non_nullable_function_face(engine: &Engine<'_>, ty: Ty, function_head: StringId) -> bool {
     match engine.fold_alias_ty(ty) {
         Ty::Function {
             nullable: false, ..
@@ -4384,7 +4383,7 @@ fn non_nullable_function_face(engine: &Engine, ty: Ty, function_head: StringId) 
 /// import-prefixed container are non-nullable by construction; `this` takes
 /// its enclosing container's static face (an `extension on A?` body reads
 /// `A?`), and a declaration-typed receiver answers its declared type.
-fn non_nullable_callee_container(engine: &Engine, recv: Receiver) -> Option<StringId> {
+fn non_nullable_callee_container(engine: &Engine<'_>, recv: Receiver) -> Option<StringId> {
     match recv {
         Receiver::This { container, kind } | Receiver::Super { container, kind } => {
             let face = engine.this_static_ty(container, kind);
@@ -4425,7 +4424,7 @@ fn non_nullable_callee_container(engine: &Engine, recv: Receiver) -> Option<Stri
 ///
 /// The oracle's exhaustiveness verifier reads the scrutinee's resolved
 /// static type first: an `InvalidType` scrutinee
-/// (`patternConverter.hasInvalidType`, constant_verifier.dart:1035) gates
+/// (`patternConverter.hasInvalidType`, `constant_verifier.dart:1035`) gates
 /// the whole pass off — `computeExhaustiveness`, the per-case
 /// `unreachable_switch_case` walk, and the covering report all sit behind
 /// `if (!patternConverter.hasInvalidType)` (:1095). dartq's engine answers
@@ -4496,7 +4495,7 @@ fn gate_invalid_scrutinee_switches(
         *resolvable.entry(name).or_insert_with(|| {
             !scrutinee_head_is_invalid(graph, namespaces, index, strings, lib, file, name)
         })
-    })
+    });
 }
 
 /// The gate's decidable arm: whether the scrutinee's bare `Ty::Named` head
@@ -4630,7 +4629,7 @@ fn switch_scrutinee_head(offset: u32, tokens: &TokenTable) -> Option<u32> {
                     _ => {}
                 }
             }
-            let header_open = header_open? as usize;
+            let header_open = header_open?;
             if !slice
                 .get(header_open.wrapping_sub(1))
                 .is_some_and(|t| t.kind == SWITCH)
@@ -4648,7 +4647,7 @@ fn switch_scrutinee_head(offset: u32, tokens: &TokenTable) -> Option<u32> {
     (only.kind == dartq_scanner::TokenKind::Identifier).then_some(only.utf16_offset)
 }
 
-/// Synthesizes the switch dead-case rows the oracle's InvalidType coverage
+/// Synthesizes the switch dead-case rows the oracle's `InvalidType` coverage
 /// face owes (#2340).
 ///
 /// Upstream `promoteForPattern` (flow_analysis.dart:7708-7768) marks the
@@ -4781,8 +4780,9 @@ fn synthesize_invalid_scrutinee_dead_cases(
                 continue;
             }
             match slice[j].kind {
-                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Case)
-                | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Default) => {
+                dartq_scanner::TokenKind::Keyword(
+                    dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Default,
+                ) => {
                     clauses.push((j, None));
                 }
                 dartq_scanner::TokenKind::Colon => {
@@ -4827,10 +4827,9 @@ fn synthesize_invalid_scrutinee_dead_cases(
             let mut p = kw + 1;
             if matches!(
                 slice.get(p).map(|t| t.kind),
-                Some(
-                    dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Final)
-                        | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Var)
-                )
+                Some(dartq_scanner::TokenKind::Keyword(
+                    dartq_scanner::Keyword::Final | dartq_scanner::Keyword::Var
+                ))
             ) {
                 p += 1;
             }
@@ -5100,7 +5099,7 @@ fn object_pattern_property_invalid(
 /// Whether an undefined-name row anchors inside the bare scrutinee
 /// identifier's value chain — its nearest declaring initializer
 /// (`name = expr;`, a later assignment shadowing an earlier declaration) or
-/// for-in iterable (`for (... name in iterable)`). The InvalidType posture
+/// for-in iterable (`for (... name in iterable)`). The `InvalidType` posture
 /// the synthesizer mirrors rides an unresolved reference in that chain
 /// (upstream `InvalidType` propagates only through unresolved names — the
 /// `var preliminaryName = pop();` face, where the undefined-method row the
@@ -5464,8 +5463,9 @@ fn build_switch_clauses(
             continue;
         }
         match slice[j].kind {
-            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Case)
-            | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Default) => {
+            dartq_scanner::TokenKind::Keyword(
+                dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Default,
+            ) => {
                 *statement = true;
                 clauses.push(SwitchClause {
                     head: j,
@@ -5582,10 +5582,9 @@ fn switch_clause_absorber(
         }
         if matches!(
             slice.get(p).map(|t| t.kind),
-            Some(
-                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Final)
-                    | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Var)
-            )
+            Some(dartq_scanner::TokenKind::Keyword(
+                dartq_scanner::Keyword::Final | dartq_scanner::Keyword::Var
+            ))
         ) {
             p += 1;
         }
@@ -5641,7 +5640,7 @@ fn switch_clause_absorber(
 /// emission walks tokens only: the verdict's offset locates the enclosing
 /// `if (` group by backward depth-scan, the `(`-group's `matching_end`
 /// locates the `)`, and the arm's extent follows — `{`-block arm reports
-/// `{`..matching `}` (matching_end), statement arm reports its first token
+/// `{`..matching `}` (`matching_end`), statement arm reports its first token
 /// through the depth-0 `;`. An `else if` chain's dead arm is the nested
 /// `if` statement's own extent (`else` next-heads `if` — the `if` IS the
 /// else arm's statement).
@@ -6156,7 +6155,7 @@ mod suppression_tests {
     }
 
     /// The `type=` family face (`IgnoredDiagnosticType._matches`):
-    /// `type=warning` hits the STATIC_WARNING rows of the line, `type=lint`
+    /// `type=warning` hits the `STATIC_WARNING` rows of the line, `type=lint`
     /// the lints; hints and non-ignorable families stay.
     #[test]
     fn type_family_citations_match_their_family_only() {

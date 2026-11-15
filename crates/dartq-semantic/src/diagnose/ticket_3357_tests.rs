@@ -2,7 +2,7 @@
 //! (`invalid_use_of_protected_member`,
 //! `invalid_use_of_visible_for_testing_member`,
 //! `invalid_use_of_visible_for_overriding_member` — upstream Dart SDK
-//! source, pkg/analyzer/lib/src/error/best_practices_verifier.dart
+//! source, `pkg/analyzer/lib/src/error/best_practices_verifier.dart`
 //! `_checkForOtherInvalidAccess` :1824-1905) and the
 //! `type_annotation_deferred_class` arm (`error_verifier.dart`
 //! `_checkForTypeAnnotationDeferredClass` :7132-7139).
@@ -13,6 +13,7 @@
 //! same-library access, the override's own `super.x`, a supertype clause,
 //! a function type's return type, and a non-deferred prefix.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::library::ElementIndex;
 use crate::model::MicroKind;
@@ -26,7 +27,7 @@ use std::path::Path;
 /// The package:meta stand-ins the access annotations resolve through
 /// (`library meta;` — the library name `_isPackageMetaGetter` reads,
 /// element.dart:1661/:2010-2012).
-const META_MOCK: &str = r#"library meta;
+const META_MOCK: &str = r"library meta;
 
 const protected = _Protected();
 const visibleForTesting = _VisibleForTesting();
@@ -35,7 +36,7 @@ const visibleForOverriding = _VisibleForOverriding();
 class _Protected { const _Protected(); }
 class _VisibleForTesting { const _VisibleForTesting(); }
 class _VisibleForOverriding { const _VisibleForOverriding(); }
-"#;
+";
 
 fn code_rows<'a>(report: &'a FileReport, name: &str) -> Vec<&'a Diagnostic> {
     report

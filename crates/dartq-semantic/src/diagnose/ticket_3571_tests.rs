@@ -13,11 +13,11 @@
 //!   `args.spans[index]`) and the bounds-face argument anchor
 //!   (`emit_bounded_issue`, `issue.range`) kept the 8-char `Function`
 //!   keyword head of a function-type-literal type argument; the oracle's
-//!   `_typeArgumentErrorNode` anchors the whole written TypeAnnotation
+//!   `_typeArgumentErrorNode` anchors the whole written `TypeAnnotation`
 //!   (`Function()` spans 10, `Function(int, [String])` spans 23),
 //! - the creation-inference `could_not_infer` anchor
 //!   (`check_creation_inference_at`) kept the bare class head; the
-//!   oracle writes at the whole ConstructorName chain (`A.named()`
+//!   oracle writes at the whole `ConstructorName` chain (`A.named()`
 //!   spans 7).
 //!
 //! # The contract
@@ -43,11 +43,12 @@
 //!   the argument anchor; dartq no row);
 //! - the named and keyword creations (`B.named()`, `new B()` — the
 //!   oracle reports the twin at the head and the `could_not_infer` over
-//!   the whole ConstructorName chain; dartq no row — the callee row
+//!   the whole `ConstructorName` chain; dartq no row — the callee row
 //!   never reaches the creation-inference face, so its
 //!   `written_name_chain_span` widening has no firing shape today; the
 //!   unnamed-form pin below carries the face's extent contract).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops_bare;
 
 /// The `(offset, length)` of every row of `code`, in report order. The

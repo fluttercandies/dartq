@@ -19,6 +19,7 @@
 //! `--update-baseline` flag; `--baseline` force-records (bootstrap or
 //! deliberate re-record). A plain run never writes the file.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::analyze_json;
 use crate::rows::{Row, sort_rows};
 use crate::runner;
@@ -93,9 +94,10 @@ pub fn realworld_command(args: &RealworldArgs) -> i32 {
         }
     };
     let selected: Vec<&(String, String)> = match &args.package {
-        Some(name) => match packages.iter().find(|(n, _)| n == name) {
-            Some(entry) => vec![entry],
-            None => {
+        Some(name) => {
+            if let Some(entry) = packages.iter().find(|(n, _)| n == name) {
+                vec![entry]
+            } else {
                 eprintln!(
                     "error: package {name} is not in {}; known packages: {}",
                     args.list_path.display(),
@@ -107,7 +109,7 @@ pub fn realworld_command(args: &RealworldArgs) -> i32 {
                 );
                 return 2;
             }
-        },
+        }
         None => packages.iter().collect(),
     };
 
@@ -215,35 +217,32 @@ pub fn realworld_command(args: &RealworldArgs) -> i32 {
                 _ => diff_n += 1,
             }
             verdict.to_string()
-        } else {
-            match stored.get(name).filter(|row| row.has_numbers()) {
-                Some(baseline) => match gate_check(baseline, &diff) {
-                    Err(reason) => {
-                        fail_n += 1;
-                        eprintln!("realworld: {name} FAIL: {reason}");
-                        "fail".to_string()
-                    }
-                    Ok(()) if diff.is_green() => {
-                        pass_n += 1;
-                        eprintln!("realworld: {name} PASS{}", diff.stats_line());
-                        "pass".to_string()
-                    }
-                    Ok(()) => {
-                        diff_n += 1;
-                        let hint = if *baseline == BaselineRow::recorded(name, &diff, "diff") {
-                            " (unchanged divergence)".to_string()
-                        } else {
-                            " — run with --update-baseline to record".to_string()
-                        };
-                        eprintln!("realworld: {name} DIFF{}{hint}", diff.stats_line());
-                        "diff".to_string()
-                    }
-                },
-                None => {
-                    no_baseline.push(name.clone());
-                    "no-baseline".to_string()
+        } else if let Some(baseline) = stored.get(name).filter(|row| row.has_numbers()) {
+            match gate_check(baseline, &diff) {
+                Err(reason) => {
+                    fail_n += 1;
+                    eprintln!("realworld: {name} FAIL: {reason}");
+                    "fail".to_string()
+                }
+                Ok(()) if diff.is_green() => {
+                    pass_n += 1;
+                    eprintln!("realworld: {name} PASS{}", diff.stats_line());
+                    "pass".to_string()
+                }
+                Ok(()) => {
+                    diff_n += 1;
+                    let hint = if *baseline == BaselineRow::recorded(name, &diff, "diff") {
+                        " (unchanged divergence)".to_string()
+                    } else {
+                        " — run with --update-baseline to record".to_string()
+                    };
+                    eprintln!("realworld: {name} DIFF{}{hint}", diff.stats_line());
+                    "diff".to_string()
                 }
             }
+        } else {
+            no_baseline.push(name.clone());
+            "no-baseline".to_string()
         };
         results.push((name.clone(), diff, verdict));
     }
@@ -253,10 +252,7 @@ pub fn realworld_command(args: &RealworldArgs) -> i32 {
             eprintln!(
                 "error: baseline not recorded: {}",
                 if crashes.is_empty() {
-                    format!(
-                        "{} package(s) regressed against the stored baseline",
-                        fail_n
-                    )
+                    format!("{fail_n} package(s) regressed against the stored baseline")
                 } else {
                     format!("dartq crashed on: {}", crashes.join(", "))
                 }
@@ -380,10 +376,10 @@ fn parse_packages(text: &str) -> Result<Vec<(String, String)>, String> {
 /// The local pub cache root: `$PUB_CACHE` when set (pub's own override),
 /// else `$HOME/.pub-cache`.
 fn pub_cache_dir() -> Result<PathBuf, String> {
-    if let Ok(dir) = std::env::var("PUB_CACHE") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir));
-        }
+    if let Ok(dir) = std::env::var("PUB_CACHE")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir));
     }
     let home = std::env::var("HOME").map_err(|_| {
         "cannot locate the pub cache: neither $PUB_CACHE nor $HOME is set".to_string()
@@ -482,7 +478,7 @@ fn attribute(diags: &[analyze_json::Diag], pkg_dir: &Path) -> (Vec<Row>, usize) 
 /// One package's oracle-vs-dartq comparison, decomposed the way the tsv
 /// reports it: rows whose key (`severity|code|file|line:col`) is unmatched
 /// on the other side are missing/extra; key-matched rows differing in
-/// message or length are message_only pairs; jaccard runs over the full row
+/// message or length are `message_only` pairs; jaccard runs over the full row
 /// text sets.
 #[derive(Default, Debug, PartialEq, Clone)]
 struct PackageDiff {
@@ -665,8 +661,7 @@ impl BaselineRow {
     fn render(&self, name: &str) -> String {
         let jaccard = self
             .jaccard
-            .map(|j| format!("{j:.4}"))
-            .unwrap_or_else(|| "-".to_string());
+            .map_or_else(|| "-".to_string(), |j| format!("{j:.4}"));
         format!(
             "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{jaccard}\t{}",
             self.cases,

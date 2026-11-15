@@ -15,6 +15,7 @@
 //! of their own (`final [(1), 2] = [1, 2];` reports exactly the two
 //! constant elements).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

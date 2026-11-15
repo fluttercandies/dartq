@@ -18,6 +18,7 @@
 //! reports nothing; every required/identical polarity in the family
 //! reports exactly one `unnecessary_type_check` ("always 'true'") row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

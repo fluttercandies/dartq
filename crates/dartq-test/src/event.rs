@@ -9,6 +9,7 @@
 //! must be unique across the merged stream) and the `time` stamps (which
 //! are relative to the merged run) rewritten.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};

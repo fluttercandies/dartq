@@ -17,6 +17,7 @@
 //! `throw`, switch expressions/statements, non-`!` prefix ops) resolve in
 //! co-tenant seams and stay out of scope here.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 use crate::diagnose::types::FileReport;
 
@@ -45,7 +46,7 @@ fn assert_void_rows(report: &FileReport, expected: &[(usize, u32)], others: &[&s
 
 /// A `void f()`-returning callee and a `void v`-typed read both fold the
 /// `Void` static type; the binary LEFT operand is checked for every
-/// operator (error_verifier.dart:482). A `MethodInvocation` operand
+/// operator (`error_verifier.dart:482`). A `MethodInvocation` operand
 /// anchors at the callee's name token — `v` inside `v() + 1`, length 1
 /// (error_detection_helpers.dart:250-252 `.at(methodName)`). The `+`
 /// operator's own nullable-operand face reports beside it — the oracle
@@ -76,13 +77,13 @@ fn ticket_3164_binary_left_invocation_anchors_method_name() {
 }
 
 /// A `void`-typed local read as the binary LEFT operand anchors at its own
-/// expression span (error_detection_helpers.dart:254 `.at(expression)`) —
+/// expression span (`error_detection_helpers.dart:254` `.at(expression)`) —
 /// `v` inside `v + 1`, length 1. The declaration `var v = f()` reports
 /// nothing: the local's type is inferred from the initializer, so the
 /// write type is `void` and `checkForAssignableExpressionAtType`'s
 /// `expectedStaticType is! VoidType` gate
-/// (variable_declaration_resolver.dart:104 →
-/// error_detection_helpers.dart:107) skips the void use. The 3.13.7
+/// (`variable_declaration_resolver.dart:104` →
+/// `error_detection_helpers.dart:107`) skips the void use. The 3.13.7
 /// oracle answers that single row beside
 /// `main_first_positional_parameter_type` (the `void Function()` formal)
 /// and `unchecked_use_of_nullable_value` (the `+` on a `void` receiver).
@@ -146,7 +147,7 @@ fn ticket_3164_binary_right_non_logical_reports_void_use() {
     let report = report_ops("void v() {}\nvoid main() {\n  1 + v();\n}");
     let codes = code_names(&report);
     assert!(
-        codes.iter().any(|name| *name == "use_of_void_result"),
+        codes.contains(&"use_of_void_result"),
         "the void operand of `1 + v()` owes a use_of_void_result row; got {:?}",
         rows(&report)
     );
@@ -172,8 +173,8 @@ fn ticket_3164_negation_operand_fires_void_not_non_bool() {
 }
 
 /// The `!`-postfix operand's void check anchors at the WHOLE `x!` node
-/// (error_verifier.dart:1692 `checkForUseOfVoidResult(node)` — `node` is
-/// the PostfixExpression, so the anchor spans operand + `!`,
+/// (`error_verifier.dart:1692` `checkForUseOfVoidResult(node)` — `node` is
+/// the `PostfixExpression`, so the anchor spans operand + `!`,
 /// `.at(expression)` on a non-MethodInvocation operand).
 #[test]
 fn ticket_3164_null_assert_operand_anchors_whole_bang_expression() {
@@ -276,9 +277,7 @@ fn ticket_3164_ternary_condition_reports_void() {
 fn ticket_3164_expression_statement_discard_stays_silent() {
     let report = report_ops("void v() {}\nvoid main() {\n  v();\n}");
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "use_of_void_result"),
+        !code_names(&report).contains(&"use_of_void_result"),
         "{:?}",
         rows(&report)
     );

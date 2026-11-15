@@ -9,6 +9,7 @@
 //! pubspec" face is unreachable), and normalization of the stored values
 //! is a resolution-time concern dartq has not reached.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// A URI reference split the way Dart's lenient `Uri.parse` splits it
 /// (sdk/lib/core/uri.dart `_Uri.parse`: pure component splitting, no
 /// percent-encoding, IPv6 or port validation).

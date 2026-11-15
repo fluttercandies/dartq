@@ -34,6 +34,7 @@
 //! [`DEBUG_SHUTDOWN`] face — every held session is detached (its paused
 //! isolates resumed) before the daemon dies.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -54,7 +55,7 @@ use serde_json::{Value, json};
 use crate::jsonrpc::{RequestId, Response, codes};
 
 /// The `dartq/debug/*` method names — the debug family's closed request
-/// set. `pub` so the drift gate (tests/rpc_schema.rs) can pin the served
+/// set. `pub` so the drift gate (`tests/rpc_schema.rs`) can pin the served
 /// family as one fact with the dispatch table below.
 pub const DEBUG_LAUNCH: &str = "dartq/debug/launch";
 pub const DEBUG_ATTACH: &str = "dartq/debug/attach";
@@ -402,13 +403,12 @@ fn origin_line(origin: &Origin, id: u32) -> String {
 /// domain misses (the several case lists every candidate so the caller
 /// can pick).
 fn select_session(manager: &mut DebugManager, requested: Option<u32>) -> Result<u32, DebugError> {
-    match requested {
-        Some(id) => Ok(id),
-        None => {
-            let mut ids: Vec<u32> = manager.sessions.keys().copied().collect();
-            ids.sort_unstable();
-            sole_or_ambiguous(&ids, |id| origin_line(&manager.sessions[&id].origin, id))
-        }
+    if let Some(id) = requested {
+        Ok(id)
+    } else {
+        let mut ids: Vec<u32> = manager.sessions.keys().copied().collect();
+        ids.sort_unstable();
+        sole_or_ambiguous(&ids, |id| origin_line(&manager.sessions[&id].origin, id))
     }
 }
 
@@ -508,10 +508,7 @@ impl DebugDispatch {
             Err(TrySendError::Full(DebugJob { id, .. })) => Some(Response::error(
                 Some(id),
                 codes::DEBUG_SESSION,
-                format!(
-                    "DARTQ/DEBUG/BUSY: {} requests already queued",
-                    DEBUG_QUEUE_CAPACITY
-                ),
+                format!("DARTQ/DEBUG/BUSY: {DEBUG_QUEUE_CAPACITY} requests already queued"),
             )),
             Err(TrySendError::Disconnected(DebugJob { id, .. })) => Some(Response::error(
                 Some(id),
@@ -1198,7 +1195,7 @@ fn reload_row(started: Instant, outcome: Result<bool, dartq_debug::Error>) -> Va
 }
 
 /// Writes the fresh session's manifest and consumes the stale trail it
-/// supersedes — any prior manifest naming the same ws_uri (a re-attach
+/// supersedes — any prior manifest naming the same `ws_uri` (a re-attach
 /// owns the program now).
 fn record_manifest(root: &Path, id: u32, ws_uri: &str, kind: &str, pid: Option<u32>) {
     let dir = manifests_dir(root);
@@ -1232,7 +1229,7 @@ fn orphan_row(id: u32, manifest: &SessionManifest) -> Value {
     row
 }
 
-/// One `status` row: the origin (script or ws_uri), the isolate set, and
+/// One `status` row: the origin (script or `ws_uri`), the isolate set, and
 /// the breakpoint tally.
 fn status_row(id: u32, managed: &ManagedSession) -> Value {
     let session = &managed.session;
@@ -1419,14 +1416,14 @@ mod tests {
             serde_json::from_value(json!({ "script": "bin/main.dart" })).expect("decodes");
         assert_eq!(decoded.script, PathBuf::from("bin/main.dart"));
         assert_eq!(decoded.kind.as_deref(), None);
-        assert!(decoded.args.is_empty());
-        assert!(decoded.vm_flags.is_empty());
+        assert_eq!(decoded.args, [] as [std::string::String; 0]);
+        assert_eq!(decoded.vm_flags, [] as [std::string::String; 0]);
         assert!(decoded.pause_on_start);
         assert!(decoded.cwd.is_none());
         assert!(decoded.device.is_none());
         assert!(decoded.flavor.is_none());
-        assert!(decoded.dart_defines.is_empty());
-        assert!(decoded.flutter_args.is_empty());
+        assert_eq!(decoded.dart_defines, [] as [std::string::String; 0]);
+        assert_eq!(decoded.flutter_args, [] as [std::string::String; 0]);
 
         let decoded: LaunchParams = serde_json::from_value(json!({
             "script": "bin/main.dart",
@@ -1732,8 +1729,9 @@ mod tests {
         });
         assert_eq!(error["kind"], "error");
         assert_eq!(error["message"], "undefined name");
-        assert!(
-            vm_object_row(&VmObject::Other(json!({ "type": "Script" })))["raw"]["type"] == "Script"
+        assert_eq!(
+            vm_object_row(&VmObject::Other(json!({ "type": "Script" })))["raw"]["type"],
+            "Script"
         );
     }
 
@@ -2083,7 +2081,7 @@ mod tests {
     /// #2619: the orphan manifest trail round-trips on disk — written
     /// with only the fields it has (pid/released serialize when
     /// present), rewritten `released: true` by a graceful shutdown,
-    /// consumed by a re-attach to the same ws_uri, deleted at a
+    /// consumed by a re-attach to the same `ws_uri`, deleted at a
     /// client-requested end.
     #[test]
     fn manifest_trail_round_trips_release_consumption_and_deletion() {
@@ -2140,7 +2138,7 @@ mod tests {
 
     /// #2619: `status` always answers a document — even both-empty is a
     /// printed document (never blank output for a machine face) — and a
-    /// seeded trail lists as orphans: id, ws_uri, kind, since, and
+    /// seeded trail lists as orphans: id, `ws_uri`, kind, since, and
     /// `released` only where the daemon that held it released the app.
     #[test]
     fn status_answers_the_document_and_lists_orphans() {

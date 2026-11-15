@@ -1,13 +1,13 @@
 //! The #3065 pins — the `unused_element_parameter` accessibility and
 //! constructor-credit faces (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/error/unused_local_elements_verifier.dart):
+//! `pkg/analyzer/lib/src/error/unused_local_elements_verifier.dart)`:
 //!
 //! * `_isPubliclyAccessible`'s extension arm (:852-876) answers
 //!   `enclosingElement.isPublic` outright for extension members, and
 //!   `ExtensionElement.isPublic` requires a name (element.dart:3264-3267)
 //!   — an unnamed extension's optional parameters report exactly like a
 //!   private extension's, while a public named extension's stay spared.
-//! * `_isUsedElement`'s FormalParameterElement arm (:910-982) credits a
+//! * `_isUsedElement`'s `FormalParameterElement` arm (:910-982) credits a
 //!   parameter as used when its constructor is invoked with the argument
 //!   (`_addParametersForArguments`, :394-399) — an unannotated
 //!   constructor's givens ride the call-site supply, annotation-free.
@@ -15,6 +15,7 @@
 //!   field formals report like a body constructor's — the collector's
 //!   `ctor_formals` table carries both.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

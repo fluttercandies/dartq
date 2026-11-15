@@ -5,6 +5,7 @@
 //! checkout; full-load and error-path tests against complete SDK layouts
 //! live in the crate's `tests/` suite.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use dartq_language::{Feature, FeatureSet, LanguageVersion};
@@ -62,7 +63,10 @@ fn real_libraries_json_resolves_targets() {
     // Web targets gate conditional imports on io/isolate/ffi.
     let ddc = libraries.get("dartdevc").expect("dartdevc segment");
     assert!(!ddc.libraries["io"].support_conditional_import);
-    assert!(ddc.libraries["ffi"].support_direct_import != Importability::Always);
+    assert_ne!(
+        ddc.libraries["ffi"].support_direct_import,
+        Importability::Always
+    );
 }
 
 #[test]
@@ -258,7 +262,7 @@ embedded_server_libraries:
         libraries["_http"].support_direct_import,
         Importability::Always
     );
-    assert!(libraries["core"].patches.is_empty());
+    assert_eq!(libraries["core"].patches, [] as [std::string::String; 0]);
 }
 
 #[test]

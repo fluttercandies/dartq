@@ -29,6 +29,7 @@
 //!   substitutes through the call's solve before the ask — the
 //!   horizontal-inference instance-method shape stays silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 
 /// Item 2, covariant column (the `typedef_static_t22` shape):
@@ -110,7 +111,7 @@ void main() {
 #[test]
 fn lambda_context_chain_head_stays_uncontexted() {
     let report = report_ops(
-        r#"
+        r"
 typedef check<X> = void Function(X x);
 T id<T>(T x) => x;
 
@@ -119,7 +120,7 @@ void f<X>(check<X> Function() g) => g();
 void main() {
   f(() => id(true).toString());
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(
@@ -262,7 +263,7 @@ void main() {
 #[test]
 fn creation_failed_inference_falls_back_to_i2b() {
     let report = report_ops(
-        r#"
+        r"
 class A<T> {
   const A();
 }
@@ -280,7 +281,7 @@ void main() {
   const A<int> a = const B<int>();
   const C.subtyped(a);
 }
-"#,
+",
     );
     let rows = rows(&report);
     assert!(
@@ -304,7 +305,7 @@ void main() {
 #[test]
 fn enum_const_never_super_formal_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 mixin M {
   void set x(int val) {}
 }
@@ -315,7 +316,7 @@ enum E1 with M {
 
   const E1(super.x);
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(
@@ -337,7 +338,7 @@ enum E1 with M {
 #[test]
 fn instance_method_closure_formal_reads_solved_param() {
     let report = report_ops(
-        r#"
+        r"
 abstract class B {
   T instanceMethod<T>(T t, void Function(T) f);
 }
@@ -352,7 +353,7 @@ void main() {
 class C extends B {
   T instanceMethod<T>(T t, void Function(T) f) => t;
 }
-"#,
+",
     );
     let names = code_names(&report);
     assert!(

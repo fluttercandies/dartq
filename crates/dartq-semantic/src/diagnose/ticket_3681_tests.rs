@@ -11,6 +11,7 @@
 //! Oracle provenance: `dart analyze` 3.13.1 — every pin below is silent
 //! on the oracle.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, assert_silent, report_ops, report_ops_imports};
 
 /// The co19 `StaticType`/`Exactly<T>` extension the census cases use.
@@ -134,7 +135,7 @@ fn if_null_assignment_double_int_types_num() {
 /// re-interns `FutureOr<T>` by WRITING the same pool. The unwrap used to
 /// sit inside the re-intern's argument list — a method receiver is
 /// evaluated before its arguments, so the unwrap's shared `pool()` read
-/// hit the live `RefMut` and panicked ("RefCell already mutably
+/// hit the live `RefMut` and panicked ("`RefCell` already mutably
 /// borrowed") on the listener-driven walk
 /// (`end_conditional_expression` → `fold_conditional` →
 /// `return_expression_context`). The unwrap now completes before the
@@ -158,7 +159,7 @@ fn conditional_return_async_future_context_no_pool_reentry() {
 /// named face with written arguments re-interns its projected list into
 /// the diagnosing pool (`types.rs` projecting tail). The face used to be
 /// projected with the pool's shared `Ref` still live in this frame — the
-/// re-intern's `borrow_mut` then panicked ("RefCell already borrowed") on
+/// re-intern's `borrow_mut` then panicked ("`RefCell` already borrowed") on
 /// the whole-unit listener walk. The projection now completes before the
 /// borrow, the caller-holding hoist; the verdict is unchanged (the
 /// constraint `A<B>` is satisfied by the superclass `A<B>`, so the

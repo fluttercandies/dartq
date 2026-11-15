@@ -9,6 +9,7 @@
 //! `staticType`). `xs.map((t) => t.element)` therefore solves `map`'s own
 //! `R` — `Iterable<int>`, never the `Iterable<void>` the stub forced.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// The headline shape: a member send whose OWN inference parameter only
@@ -95,9 +96,7 @@ fn a_typed_formal_body_still_reports_its_own_row() {
          }",
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|name| *name == "return_of_invalid_type_from_closure"),
+        code_names(&report).contains(&"return_of_invalid_type_from_closure"),
         "{:?}",
         rows(&report)
     );

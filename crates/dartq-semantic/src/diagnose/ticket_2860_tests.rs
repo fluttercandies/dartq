@@ -13,6 +13,7 @@
 //! rows invented (the over-deading guard). The join stays idempotent:
 //! each dead row reports exactly once.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::resolved_ops::{LibraryTypes, ResolvedTypeOps};

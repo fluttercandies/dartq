@@ -27,6 +27,7 @@
 //! with a body, the same class body without the stray `;`, and the
 //! abstract-legal (non-static) `;` member.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;

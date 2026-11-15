@@ -36,6 +36,7 @@
 //! pin (`case == (.x)` → `'Object'`; `case == .x` → the scrutinee head;
 //! `C(1) == .x` → `'C'`), and the same file through both engines.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 use crate::diagnose::FileReport;
 

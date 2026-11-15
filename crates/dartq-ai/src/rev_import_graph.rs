@@ -28,6 +28,7 @@
 //! and silently misstate impact, which is exactly the caller bug the
 //! contract exists to catch.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// The import graph inverted: per imported library, its ascending importer
 /// rows, as one flat CSR array pair built once and shared by every
 /// reverse-dependency consumer.

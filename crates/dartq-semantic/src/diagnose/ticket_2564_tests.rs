@@ -18,6 +18,7 @@
 //! (`ticket_2472_tests` carries the same rule — the harness's bare world
 //! seeds no core spellings, keywords excepted).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

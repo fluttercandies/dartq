@@ -33,6 +33,7 @@
 //! defining library, extensions.dart:259-270), and constant values
 //! spelled differently over the same instance (`E._(0x1)` vs `E._(1)`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, mod_flags};
 use dartq_scanner::{KeywordStyle, TokenKind, TokenTable};
 

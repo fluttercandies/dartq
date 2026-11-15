@@ -4,7 +4,7 @@
 //! source, pkg/analyzer/lib/src/dart/ast/ast.dart:19479), the three
 //! emission faces the conversion grant routes through (declaration
 //! initializers, plain assignments, call arguments — `_checkForOutOfRange`'s
-//! double arm, error_verifier.dart:6789), and the anchor/negation/message
+//! double arm, `error_verifier.dart:6789`), and the anchor/negation/message
 //! shapes (the literal token only, the lexeme `-`-prefixed under an
 //! immediately-negated operand, the nearest valid double in the
 //! correction slot).
@@ -14,6 +14,8 @@
 //! representation/min/max rows, and the `double_literal_coercion_error`
 //! multitest arguments (census rank 4: 292 fail rows, pure
 //! under-detection).
+
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
 
 use super::*;
 use crate::collector::collect;

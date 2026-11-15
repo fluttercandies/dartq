@@ -16,6 +16,7 @@
 //! type". Narrowing it needs the literal's own element inference, which
 //! lives outside this helper.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 impl Engine<'_> {

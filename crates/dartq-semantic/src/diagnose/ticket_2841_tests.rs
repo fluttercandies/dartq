@@ -10,6 +10,7 @@
 //! `invocation_of_non_function_expression` rows across the
 //! nonfunction_typedef suites (A5 recon P4).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 
@@ -66,13 +67,13 @@ const ALIAS_INFER_MESSAGE: &str = "Couldn't infer type parameter 'X'.\n\nTried t
 /// the same 4:3 anchor for this exact fixture).
 #[test]
 fn grounded_alias_creation_infers_the_alias_parameters() {
-    let src = r#"
+    let src = r"
 class C<X extends C<X>> {}
 typedef A<X extends C<X>> = C<X>;
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "A();");
     assert_row(&report, "could_not_infer", offset, 1, ALIAS_INFER_MESSAGE);
@@ -88,12 +89,12 @@ main() {
 }
 
 /// The materialized registry shape (`_misc`
-/// InstanceCreationTestCases/test_typeAlias_generic_class_generic_unnamed_infer_all#0,
+/// `InstanceCreationTestCases/test_typeAlias_generic_class_generic_unnamed_infer_all#0`,
 /// oracle silent): a satisfiable alias creation with an argument keeps
 /// every face silent — the misroute's extra row dies.
 #[test]
 fn satisfiable_alias_creation_stays_silent() {
-    let src = r#"
+    let src = r"
 class A<T> {
   A(T t);
 }
@@ -101,7 +102,7 @@ typedef B<U> = A<U>;
 void f() {
   B(0);
 }
-"#;
+";
     let report = report_ops(src);
     assert_none(&report, "could_not_infer");
     assert_none(&report, "invocation_of_non_function_expression");
@@ -113,12 +114,12 @@ void f() {
 /// invocation report — the route fix must not widen the silence.
 #[test]
 fn genuine_non_function_callee_still_reports() {
-    let src = r#"
+    let src = r"
 main() {
   int x = 0;
   x();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "x();");
     assert_row(
@@ -134,14 +135,14 @@ main() {
 /// route gate skips and the ordinary invocation face reports.
 #[test]
 fn local_shadowing_the_alias_keeps_the_invocation_report() {
-    let src = r#"
+    let src = r"
 class C<X> {}
 typedef A<X> = C<X>;
 main() {
   int A = 0;
   A();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "A();");
     assert_row(
@@ -159,12 +160,12 @@ main() {
 /// function-shaped RHS.
 #[test]
 fn function_alias_callee_keeps_the_registry_verdict() {
-    let src = r#"
+    let src = r"
 typedef Binary = int Function(int, int);
 int f() {
   return Binary(1, 2);
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "Binary(1, 2)");
     assert_row(

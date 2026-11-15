@@ -14,6 +14,7 @@
 //! non-nullable `[]` return) and for `n0[index] ??= value` on the
 //! promoted local; the same verdict covers the plain `a[i] ??= v` arm.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 
 /// `(offset, length)` of `needle`'s LAST occurrence inside the FIXTURE

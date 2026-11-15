@@ -24,6 +24,7 @@
 //! below (`type_argument_not_matching_bounds` at the written argument /
 //! clause site).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{assert_silent, report_ops, rows};
 
@@ -107,7 +108,7 @@ fn non_function_argument_still_rejects() {
 /// positional both fail the bound — the same signature-binder read from
 /// the bound side's inline spelling.
 ///
-/// BLOCKED out-of-scope (same drop as ticket_3684's pair): the judged
+/// BLOCKED out-of-scope (same drop as `ticket_3684`'s pair): the judged
 /// bound's inline `num Function<U>(num)` never reaches
 /// `check_call_type_arg_bounds` as a function type — `Snapshot::tree_of`'s
 /// Function arm (bounds.rs) drops the signature's own binder row, so the

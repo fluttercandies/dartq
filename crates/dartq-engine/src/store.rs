@@ -110,6 +110,7 @@
 //! writer; single-shot CLI runs put and flush without counting (the
 //! pure-LRU mode).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
@@ -130,7 +131,7 @@ pub const DEFAULT_SIZE_LIMIT: u64 = 10 * 1024 * 1024 * 1024;
 /// The books' entry-count cap — the RAM bound the byte cap cannot provide.
 /// The books are advisory lifecycle rows whose memory grows with the *disk*
 /// store population, decoupled from any workspace: ~72 B/entry (40 B of
-/// `ContentId` + `EntryMeta` row plus BTree node fan-out), so a 10 GiB
+/// `ContentId` + `EntryMeta` row plus `BTree` node fan-out), so a 10 GiB
 /// store of ~1 KB blobs would amass ~10⁷ rows ≈ 0.5–0.8 GB of RAM. 2²⁰
 /// rows hold that face to ≈ 72 MB — ten times the ~10⁵ entries a 10⁵-file
 /// workspace books — while the byte cap stays the primary bound for
@@ -671,6 +672,7 @@ impl ContentStore {
     /// manifest bytes move and the books lock stays untaken. Never called
     /// on the read path ([`Self::open`] stays free of it); `dartq cache
     /// gc` is the caller.
+    #[must_use]
     pub fn sweep_debris(&self) -> SweepReport {
         let mut report = SweepReport::default();
         let Ok(shards) = fs::read_dir(&self.dir) else {
@@ -1131,7 +1133,7 @@ impl ContentStore {
                 }
                 // Contention past the wait, or the lock primitive itself
                 // failed — both leave the books unlocked, not failed.
-                Err(fs::TryLockError::WouldBlock) | Err(fs::TryLockError::Error(_)) => {
+                Err(fs::TryLockError::WouldBlock | fs::TryLockError::Error(_)) => {
                     return None;
                 }
             }

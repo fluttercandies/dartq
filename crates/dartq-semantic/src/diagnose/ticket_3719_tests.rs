@@ -33,6 +33,8 @@
 //! receiver's type arguments at lookup; `pkg/analyzer`'s
 //! `InterfaceType.asInstanceOf` composes it for inherited hits).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 

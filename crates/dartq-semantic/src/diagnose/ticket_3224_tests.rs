@@ -42,6 +42,7 @@
 //! the module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves — the same convention `ticket_3215_tests.rs` keeps).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// The message the oracle spells for every face (messages.yaml

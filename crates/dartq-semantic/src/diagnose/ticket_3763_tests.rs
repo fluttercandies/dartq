@@ -12,6 +12,7 @@
 //! element alone (the getter still reports), and a never-touched accessor
 //! pair reports on both faces.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 /// The `unused_element` rows of `source` that name `member`.

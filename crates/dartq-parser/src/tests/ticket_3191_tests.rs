@@ -16,6 +16,7 @@
 //! `@a @b` reported 6..10 instead of 6..8 — the ticket's 2-char overshoot
 //! (ours 13/21 vs oracle 11/19).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.

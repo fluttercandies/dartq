@@ -17,18 +17,19 @@
 //!   treats `_` as an ordinary name and stays silent (the census's 5
 //!   preWildcards rows).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, report_ops_wildcards};
 
 /// Both arm positions of the least-upper-bound corpus shape: the dead
 /// cast tail reports in each arm that holds the cast, from the cast type's
 /// head token to the arm's own end. The condition is a TOP-LEVEL `var` —
 /// the corpus's own posture — because a provably-true LOCAL is a
-/// non-trivial write (`isNonTrivial`, flow_analysis.dart:155), so
+/// non-trivial write (`isNonTrivial`, `flow_analysis.dart:155`), so
 /// `conditionVariableState` folds both arms and the else arms report dead
 /// alongside the cast tails.
 #[test]
 fn dead_cast_tail_reports_in_conditional_arms() {
-    let source = r#"
+    let source = r"
 class C1<X> {}
 var condition = true;
 void main() {
@@ -40,7 +41,7 @@ void main() {
   }
 }
 void use(Object? x) {}
-"#;
+";
     // The rig prepends its core prelude (ASCII), so rows index the joined
     // string; the snippets render against that.
     let full = format!("{}{source}", super::test_rig::CORE_PRELUDE);
@@ -61,14 +62,14 @@ void use(Object? x) {}
 #[test]
 fn dead_cast_tail_initializer_face_stays() {
     let report = report_ops(
-        r#"
+        r"
 Never f() => throw 0;
 void main() {
   var a = f() as int;
   use(a);
 }
 void use(Object? x) {}
-"#,
+",
     );
     assert!(
         code_names(&report).contains(&"dead_code"),
@@ -82,12 +83,12 @@ void use(Object? x) {}
 #[test]
 fn wildcard_local_fn_dead_code_silent_pre_wildcards() {
     let report = report_ops_wildcards(
-        r#"
+        r"
 void main() {
   void _() {}
   _();
 }
-"#,
+",
         false,
     );
     assert!(
@@ -102,12 +103,12 @@ void main() {
 #[test]
 fn wildcard_local_fn_dead_code_emits_with_wildcards() {
     let report = report_ops_wildcards(
-        r#"
+        r"
 void main() {
   void _() {}
   _();
 }
-"#,
+",
         true,
     );
     assert!(

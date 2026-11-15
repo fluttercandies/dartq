@@ -23,6 +23,7 @@
 //! oracle's `chooseFinalTypes` resolves `T`'s bound `S` to `int`, not a
 //! bare `S`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::FileReport;
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 

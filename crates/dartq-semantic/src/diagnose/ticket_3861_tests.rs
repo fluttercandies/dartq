@@ -37,6 +37,7 @@
 //! with a degraded source spelling (a capture face recorded as residual,
 //! owned by the written-group capture, not this pin's contract).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 fn invalid_assignment_rows(report: &super::FileReport) -> Vec<(u32, u32, String)> {
@@ -57,7 +58,7 @@ fn at(source: &str, needle: &str) -> u32 {
 /// The four class shapes the cluster's cases declare (`A` direct, `B`
 /// through the swapped supertype `A<T, S>`, `C` through the `B<S, S>`
 /// chain, `D` through `B<T, int>`).
-const FIXTURE_HEAD: &str = r#"
+const FIXTURE_HEAD: &str = r"
 class A<S, T> {
   S x;
   T y;
@@ -76,7 +77,7 @@ class D<S, T> extends B<T, int> {
   D(T a) : super(a, 3);
   D.named(T a) : super.named(a, 3);
 }
-"#;
+";
 
 /// The `A<int, dynamic>` / `A<dynamic, dynamic>` rows (case lines 39-40):
 /// the direct instantiation's invariance leg asks `dynamic <: String` and

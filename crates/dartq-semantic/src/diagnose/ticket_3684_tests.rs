@@ -44,6 +44,7 @@
 //! typedef3_A01_*` with clause-site checks for the bound-conformance
 //! verdicts.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{assert_silent, report_ops, rows};
 

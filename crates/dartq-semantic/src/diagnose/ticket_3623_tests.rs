@@ -32,6 +32,7 @@
 //! static-const alike), and the `d.new` / `Undefined.new` pair matches the
 //! corpus expectations verbatim.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// The messages of `report`'s rows carrying `code`, in emission order.
@@ -115,7 +116,7 @@ fn wildcard_bare_read_without_any_binding_still_reports() {
 
 /// A receiver whose static type is `dynamic` names 'dynamic' in the
 /// `new`-selector miss — the oracle reports against the resolved
-/// receiverType (type_property_resolver.dart's `name == 'new'` arm runs
+/// receiverType (`type_property_resolver.dart`'s `name == 'new'` arm runs
 /// before the dynamic-bounded silence), never `InvalidType`.
 #[test]
 fn new_selector_miss_names_the_dynamic_receiver_type() {

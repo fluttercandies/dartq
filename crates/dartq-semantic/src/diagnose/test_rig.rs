@@ -8,6 +8,7 @@
 //! `Never`, `Null`, …) and [`CORE_PRELUDE`] declares the member-bearing
 //! core classes a fixture may name.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::{FileReport, StrictModes, fold_unit_with_ops, merge_source_ordered};
 use crate::collector::collect;
 use crate::library::ElementIndex;

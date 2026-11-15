@@ -33,6 +33,7 @@
 //! reduces the `forCorrespondingPairs` face of package_analyzer's
 //! `collection.dart` with the `informative_data.dart` call shape.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

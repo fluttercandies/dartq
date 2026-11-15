@@ -26,6 +26,7 @@
 //! `SetBase`/`SetMixin` completeness naming against the real
 //! `dart:collection`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, assert_silent, report_ops, rows};
 
 /// The absolute fixture offset of `needle` (the prelude the rig prepends

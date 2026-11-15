@@ -689,9 +689,8 @@ fn operand_rows_have_call(c: &Check<'_>, use_node: u32, rows: &[u32]) -> bool {
         && c.kind(*target) == NodeKind::ThisExpression
     {
         return crate::rules::type_face_of_field(c, c.lexeme(c.head_token(*name)))
-            .and_then(|face| Some(face.name?))
-            .map(|type_name| same_file_class_has_call(c, type_name))
-            .unwrap_or(false);
+            .and_then(|face| face.name)
+            .is_some_and(|type_name| same_file_class_has_call(c, type_name));
     }
     // A bare read followed only by marker pieces (`c<int>` — the
     // tear-off's `TypeArguments` tails the name inside the operand
@@ -805,9 +804,7 @@ fn target_is_function(c: &Check<'_>, use_node: u32, name: &str) -> bool {
     if let Some((_, written)) = super::same_file::binding(c, use_node, name) {
         return written.is_some_and(|row| written_row_is_function(c, Some(row)));
     }
-    crate::rules::type_face_of_field(c, name)
-        .map(|face| face_is_function_typed(c, &face))
-        .unwrap_or(false)
+    crate::rules::type_face_of_field(c, name).is_some_and(|face| face_is_function_typed(c, &face))
 }
 
 /// The operand's type verdict: a class with an instance `call` method.

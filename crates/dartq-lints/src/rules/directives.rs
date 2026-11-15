@@ -11,6 +11,7 @@
 //! opens declaration nodes after `parseMetadataStar`), so `library_annotations`
 //! reads the annotated node as the star's next sibling.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
@@ -489,10 +490,10 @@ pub(crate) mod library_annotations {
             if head == 0 {
                 continue;
             }
-            if let Some(prev) = c.unit.tokens.get(head as usize - 1) {
-                if prev.kind == dartq_scanner::TokenKind::Period {
-                    kinds.push(c.lexeme(head).to_owned());
-                }
+            if let Some(prev) = c.unit.tokens.get(head as usize - 1)
+                && prev.kind == dartq_scanner::TokenKind::Period
+            {
+                kinds.push(c.lexeme(head).to_owned());
             }
         }
         Some(kinds)

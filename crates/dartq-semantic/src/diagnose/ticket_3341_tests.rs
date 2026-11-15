@@ -27,6 +27,7 @@
 //! flagged when a class its right-hand side names carries a bound
 //! mentioning it), and the fold→`dynamic` collapse.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::FileReport;
 

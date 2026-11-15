@@ -16,6 +16,7 @@
 //! read after the increment must carry the promoted head, not the declared
 //! one.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 #[cfg(test)]
 mod tests {
     use crate::facts::FlowFact;

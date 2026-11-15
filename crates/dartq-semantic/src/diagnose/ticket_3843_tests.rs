@@ -38,6 +38,7 @@
 //! owned by the invocation layer (`associated_super_formal_ty`,
 //! `diagnose/invocation.rs`), which this pass has no handle on.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::FileReport;
 use crate::diagnose::test_rig::{report_ops_augment_experiments, report_ops_experiments_with};
 use dartq_language::Feature;

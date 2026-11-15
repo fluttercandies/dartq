@@ -26,6 +26,7 @@
 //! Oracle provenance: the #2922 census rows — all citations
 //! `conformance/expected.tsv` (Dart 3.13).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, fold_unit, merge_source_ordered};
 use crate::library::ElementIndex;
@@ -130,17 +131,15 @@ fn superinterface_downward_solve_reports_substituted_formals() {
     assert_eq!(rows.len(), 2, "both substituted formals reject: {rows:?}");
     let texts: Vec<&str> = rows.iter().map(|(_, _, m)| m.as_str()).collect();
     assert!(
-        texts
-            .iter()
-            .any(|m| *m
-                == "The argument type 'int' can't be assigned to the parameter type 'String'. "),
+        texts.contains(
+            &"The argument type 'int' can't be assigned to the parameter type 'String'. "
+        ),
         "int into String formal: {rows:?}"
     );
     assert!(
-        texts
-            .iter()
-            .any(|m| *m
-                == "The argument type 'String' can't be assigned to the parameter type 'int'. "),
+        texts.contains(
+            &"The argument type 'String' can't be assigned to the parameter type 'int'. "
+        ),
         "String into int formal: {rows:?}"
     );
 }
@@ -200,7 +199,7 @@ fn superinterface_downward_solve_climbs_two_hops() {
 // —— face 2: folded-creation generic-method inference ——
 
 /// `new C().m(42)` — `m<T>(T x)` binds `T := int` upward; the oracle is
-/// silent (test_inferGenericMethodType_required#0's only row is the
+/// silent (`test_inferGenericMethodType_required#0`'s only row is the
 /// unused-local warning).
 #[test]
 fn created_receiver_generic_method_solves_upward() {
@@ -220,7 +219,7 @@ fn created_receiver_generic_method_solves_upward() {
 }
 
 /// `new C().m(1, c: 2.0)` — the named `c: T` binds `T := double` upward;
-/// oracle silent (test_inferGenericMethodType_named#0).
+/// oracle silent (`test_inferGenericMethodType_named#0`).
 #[test]
 fn created_receiver_generic_method_named_arg_solves_upward() {
     let report = report(

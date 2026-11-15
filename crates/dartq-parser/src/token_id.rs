@@ -1,6 +1,7 @@
 //! Token handles: ids that uniformly address scanned and parser-inserted
 //! tokens, plus the span payload carried by listener events.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_source::SourceRange;
 
 /// Handle to one token: an index into the [`TokenTable`](dartq_scanner::TokenTable)

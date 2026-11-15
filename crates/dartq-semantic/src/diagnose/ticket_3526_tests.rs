@@ -13,7 +13,7 @@
 //! `FutureOr<A?>`/`FutureOr<Function>` local's declared type carries are
 //! minted in the ENGINE's diagnosis pool — a caller that reached the unit
 //! model's pool instead indexed another universe (`len is 1 but the index
-//! is 1`, rc=4 on user input: the census's eight nnbd static_errors cases,
+//! is 1`, rc=4 on user input: the census's eight nnbd `static_errors` cases,
 //! `null_assertion_ambiguous_test`, and `equality_static_test`).
 //!
 //! # The contract
@@ -47,6 +47,7 @@
 //! [`ArgPool`]: crate::model::ArgPool
 //! [`ArgPool::get_checked`]: crate::model::ArgPool::get_checked
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// Every `(code, offset, len)` diagnostic `fixture` produces — the

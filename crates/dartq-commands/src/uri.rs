@@ -7,6 +7,7 @@
 //! path and are reported as [`to_path`] → `None`; the server skips such
 //! documents.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 

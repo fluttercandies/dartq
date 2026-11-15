@@ -10,6 +10,7 @@
 //! (comments are outside the token table), so comment-free bodies are
 //! byte-identical.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 

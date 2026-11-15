@@ -24,6 +24,7 @@
 //! the non-nullable returns); the offsets are the oracle's own
 //! `.at(node.expression)` anchors.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
@@ -48,9 +49,7 @@ fn spread_rows(report: &FileReport) -> Vec<(u32, u32, String)> {
     report
         .diagnostics
         .iter()
-        .filter(|d| {
-            d.code.name == "unchecked_use_of_nullable_value" && d.message.to_string() == SPREAD
-        })
+        .filter(|d| d.code.name == "unchecked_use_of_nullable_value" && d.message == SPREAD)
         .map(|d| (d.range.offset, d.range.length, d.message.to_string()))
         .collect()
 }

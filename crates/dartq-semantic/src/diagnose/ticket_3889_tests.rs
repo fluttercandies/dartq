@@ -23,6 +23,7 @@
 //! `new F0<int>(["hello"])` / `f(["hello"])` fixtures; `BODY_MIGHT …
 //! 'int'` on the `Foo<int>` fixture, silent on the raw-`T` control.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 use crate::diagnose::FileReport;
 

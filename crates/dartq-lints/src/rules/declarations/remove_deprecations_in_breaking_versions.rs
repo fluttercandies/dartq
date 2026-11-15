@@ -42,7 +42,7 @@ pub fn is_breaking_version(version: &str) -> bool {
 /// `pub_semver`'s `major.minor.patch[-prerelease][+build]` shape, the
 /// four facts the verdict reads. A prerelease suffix is cut at the
 /// first `-`; anything past the third numeric segment fails. Upstream
-/// pub_semver 2.2.1 requires at least one identifier character per
+/// `pub_semver` 2.2.1 requires at least one identifier character per
 /// optional segment, so `1.0.0-` and `1.0.0+` fail `Version.parse`
 /// (the official gate never registers) — they fail closed here too,
 /// rather than reading as a bare breaking `1.0.0`.

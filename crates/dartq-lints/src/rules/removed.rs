@@ -27,6 +27,7 @@
 //! never dispatches it — with the `removed_lint` template as the spec's
 //! message of record.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::registry::{Group, RuleSpec};
 
 /// The `removed_lint` problemMessage (`pkg/analyzer/lib/src/diagnostic/

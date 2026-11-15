@@ -43,6 +43,7 @@
 //! record/list/map-pattern face already matched the oracle; the
 //! object-pattern field loop was the one divergent face (fixed here).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 
 fn rows_with(source: &'static str) -> Vec<(String, u32, u32)> {
@@ -122,7 +123,7 @@ fn object_pattern_hole_with_empty_case_body_is_clean_after_close() {
 /// context: the `,` separates, only the hole's `missing_identifier` fires.
 /// The declaration context legitimately adds the hole constant pattern's
 /// `refutable_pattern_in_irrefutable_context` row (a dartq parser-emitted
-/// mirror of the oracle's resolution-tier row — ticket_2231 suite); the
+/// mirror of the oracle's resolution-tier row — `ticket_2231` suite); the
 /// contract here is the absence of any `expected_token` row.
 #[test]
 fn object_pattern_hole_in_declaration_context_has_no_separator_row() {

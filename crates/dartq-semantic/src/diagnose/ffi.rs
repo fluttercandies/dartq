@@ -14,6 +14,7 @@
 //! the clause spans, the annotation faces); everything else re-derives
 //! from the element model and source walks.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_scanner::{Keyword, TokenKind};
 use dartq_source::byte_offset_to_utf16;
@@ -346,23 +347,24 @@ impl<'a> Engine<'a> {
         let mut cursor = name_at + name_len;
         let utf16 = |byte: usize| byte_offset_to_utf16(self.source, start + byte);
         // The written `<T>` (the `@Native` signature).
-        if cursor < bytes.len() && bytes[cursor] == b'<' {
-            if let Some(close) = matching_close(bytes, cursor, b'<', b'>') {
-                let inner = &text[cursor + 1..close];
-                face.sig = Some(FfiSigFace {
-                    range: SourceRange {
-                        offset: utf16(cursor + 1),
-                        length: utf16(close) - utf16(cursor + 1),
-                    },
-                    display: inner.trim().to_owned().into_boxed_str(),
-                    ret_head: first_ident_head(inner, self),
-                    param_heads: function_param_heads(inner)
-                        .into_iter()
-                        .map(|head| self.strings.intern(&head))
-                        .collect(),
-                });
-                cursor = close + 1;
-            }
+        if cursor < bytes.len()
+            && bytes[cursor] == b'<'
+            && let Some(close) = matching_close(bytes, cursor, b'<', b'>')
+        {
+            let inner = &text[cursor + 1..close];
+            face.sig = Some(FfiSigFace {
+                range: SourceRange {
+                    offset: utf16(cursor + 1),
+                    length: utf16(close) - utf16(cursor + 1),
+                },
+                display: inner.trim().to_owned().into_boxed_str(),
+                ret_head: first_ident_head(inner, self),
+                param_heads: function_param_heads(inner)
+                    .into_iter()
+                    .map(|head| self.strings.intern(&head))
+                    .collect(),
+            });
+            cursor = close + 1;
         }
         // The argument group.
         if cursor >= bytes.len() || bytes[cursor] != b'(' {
@@ -556,9 +558,7 @@ fn first_ident(text: &str) -> Option<(usize, usize)> {
 /// The head spelling of a written type (`Pointer<Int8>` → `Pointer`,
 /// `Void Function(Int8)` → `Void`).
 fn first_ident_head(text: &str, engine: &Engine<'_>) -> StringId {
-    first_ident(text)
-        .map(|(s, e)| engine.strings.intern(&text[s..e]))
-        .unwrap_or(StringId::NONE)
+    first_ident(text).map_or(StringId::NONE, |(s, e)| engine.strings.intern(&text[s..e]))
 }
 
 /// A clause entry's `(leaf, head)` parts from its written text: strips
@@ -712,10 +712,7 @@ fn named_arg_is_true(args_text: &str, name: &str) -> bool {
 /// The first top-level argument of the group text, as `(start, len)` into
 /// it.
 fn first_top_level_arg(args_text: &str) -> Option<(usize, usize)> {
-    split_top_level(args_text, b',')
-        .into_iter()
-        .map(|(rel, len)| (rel, len))
-        .next()
+    split_top_level(args_text, b',').into_iter().next()
 }
 
 /// `@Array`'s dimension face, per constructor spelling (upstream
@@ -915,7 +912,7 @@ impl<'a> Engine<'a> {
         let containers: Vec<(StringId, &'a Container)> = self
             .index
             .get(self.file)
-            .map(|elements| elements.containers().map(|(name, c)| (name, c)).collect())
+            .map(|elements| elements.containers().collect())
             .unwrap_or_default();
         for (name, container) in &containers {
             self.ffi_check_container(*name, container);
@@ -962,11 +959,7 @@ impl<'a> Engine<'a> {
         let name_start = self.byte_of(name16);
         let bytes = self.source.as_bytes();
         let mut cursor = name_start;
-        while cursor > 0
-            && bytes
-                .get(cursor - 1)
-                .is_some_and(|b| b.is_ascii_whitespace())
-        {
+        while cursor > 0 && bytes.get(cursor - 1).is_some_and(u8::is_ascii_whitespace) {
             cursor -= 1;
         }
         if cursor == 0 {
@@ -979,11 +972,7 @@ impl<'a> Engine<'a> {
         let type_end = cursor;
         if bytes.get(cursor - 1) == Some(&b'?') {
             cursor -= 1;
-            while cursor > 0
-                && bytes
-                    .get(cursor - 1)
-                    .is_some_and(|b| b.is_ascii_whitespace())
-            {
+            while cursor > 0 && bytes.get(cursor - 1).is_some_and(u8::is_ascii_whitespace) {
                 cursor -= 1;
             }
             if cursor == 0 {
@@ -1012,11 +1001,7 @@ impl<'a> Engine<'a> {
                 return None;
             }
             let mut head_end = open;
-            while head_end > 0
-                && bytes
-                    .get(head_end - 1)
-                    .is_some_and(|b| b.is_ascii_whitespace())
-            {
+            while head_end > 0 && bytes.get(head_end - 1).is_some_and(u8::is_ascii_whitespace) {
                 head_end -= 1;
             }
             let mut head_start = head_end;
@@ -1133,11 +1118,7 @@ impl<'a> Engine<'a> {
         let mut out = Vec::new();
         let mut cursor = name_start;
         loop {
-            while cursor > 0
-                && bytes
-                    .get(cursor - 1)
-                    .is_some_and(|b| b.is_ascii_whitespace())
-            {
+            while cursor > 0 && bytes.get(cursor - 1).is_some_and(u8::is_ascii_whitespace) {
                 cursor -= 1;
             }
             // Skip a trailing `)` of an argument group. `cursor == 0`
@@ -1165,11 +1146,7 @@ impl<'a> Engine<'a> {
                     at -= 1;
                 }
                 cursor = at;
-                while cursor > 0
-                    && bytes
-                        .get(cursor - 1)
-                        .is_some_and(|b| b.is_ascii_whitespace())
-                {
+                while cursor > 0 && bytes.get(cursor - 1).is_some_and(u8::is_ascii_whitespace) {
                     cursor -= 1;
                 }
             }
@@ -1258,7 +1235,7 @@ impl<'a> Engine<'a> {
 
     /// A written type's rendered display (the message slot face).
     fn ffi_render(&self, ty: Ty) -> String {
-        ty.render(&self.strings, &self.boundary.args.borrow())
+        ty.render(self.strings, &self.boundary.args.borrow())
     }
 
     /// A written function type's rendered display (`R Function(P, ...)` —
@@ -1613,11 +1590,7 @@ impl<'a> Engine<'a> {
             .alignment
             .is_some_and(|(value, _)| PACKED_ALIGNMENTS.contains(&value));
         if !supported {
-            let at = first
-                .face
-                .alignment
-                .map(|(_, span)| span)
-                .unwrap_or(first.at);
+            let at = first.face.alignment.map_or(first.at, |(_, span)| span);
             self.emit(SemanticCode::PackedAnnotationAlignment, at, "", "");
         }
     }
@@ -1880,7 +1853,7 @@ impl<'a> Engine<'a> {
     }
 }
 
-impl<'a> Engine<'a> {
+impl Engine<'_> {
     /// The last external instance field's name offset of the container, in
     /// written order (upstream `fields.reversed.where(...)`).
     fn ffi_last_external_field(
@@ -1904,16 +1877,13 @@ impl<'a> Engine<'a> {
     /// The model annotation's whole written span (`@` through the argument
     /// group).
     fn ffi_model_annotation_span(&self, anno: &crate::model::Annotation) -> SourceRange {
-        let args_len = anno
-            .args_text
-            .map(|text| {
-                self.strings
-                    .resolve(text)
-                    .chars()
-                    .map(char::len_utf16)
-                    .sum::<usize>() as u32
-            })
-            .unwrap_or(0);
+        let args_len = anno.args_text.map_or(0, |text| {
+            self.strings
+                .resolve(text)
+                .chars()
+                .map(char::len_utf16)
+                .sum::<usize>() as u32
+        });
         SourceRange {
             offset: anno.range.offset,
             length: anno.range.length + args_len,
@@ -2083,7 +2053,7 @@ impl<'a> Engine<'a> {
             })
             .map(|(index, site)| (index, site.clone()))
             .collect();
-        for (index, site) in sites.iter() {
+        for (index, site) in &sites {
             let mut native_annos: Vec<FfiDeclAnno> =
                 self.ffi_native_annos(*index).into_iter().cloned().collect();
             // The const-alias arm (upstream reads `element.metadata`'s
@@ -2105,7 +2075,6 @@ impl<'a> Engine<'a> {
                     "",
                 );
             }
-            let mut native_annos = native_annos;
             let anno = native_annos.remove(0);
             // A bare `@Native` (no argument group) is a malformed
             // annotation — upstream's `annotation.arguments` gate rejects
@@ -2227,7 +2196,7 @@ impl<'a> Engine<'a> {
 
     /// The declared faces of a `@Native` site: the variable type (fields),
     /// the return type (executables), and the formal table.
-    fn ffi_decl_types(&self, site: &DeclSite) -> (Ty, Ty, Option<&'a Box<Formals>>) {
+    fn ffi_decl_types(&self, site: &DeclSite) -> (Ty, Ty, Option<&'a Formals>) {
         let Some(elements) = self.index.get(self.file) else {
             return (Ty::UNKNOWN, Ty::UNKNOWN, None);
         };
@@ -2236,24 +2205,20 @@ impl<'a> Engine<'a> {
                 let decl = elements.decl(site.name);
                 (
                     Ty::UNKNOWN,
-                    decl.map(|d| d.return_ty).unwrap_or(Ty::UNKNOWN),
-                    decl.and_then(|d| d.formals.as_ref()),
+                    decl.map_or(Ty::UNKNOWN, |d| d.return_ty),
+                    decl.and_then(|d| d.formals.as_deref()),
                 )
             }
             DeclKind::TopLevelVar => {
                 let decl = elements.decl(site.name);
-                (
-                    decl.map(|d| d.var_ty).unwrap_or(Ty::UNKNOWN),
-                    Ty::UNKNOWN,
-                    None,
-                )
+                (decl.map_or(Ty::UNKNOWN, |d| d.var_ty), Ty::UNKNOWN, None)
             }
             DeclKind::Member { container, .. } => {
                 if let Some(member) = elements
                     .container(*container)
                     .and_then(|c| c.members.get(&site.name))
                 {
-                    return (member.var_ty, member.return_ty, member.formals.as_ref());
+                    return (member.var_ty, member.return_ty, member.formals.as_deref());
                 }
                 // An unnamed extension's members live on its
                 // `ExtensionFace` (collector.rs:1963-1981 — the face owns
@@ -2265,9 +2230,9 @@ impl<'a> Engine<'a> {
                     .filter(|face| face.name.is_none())
                     .find_map(|face| face.members.get(&site.name));
                 (
-                    member.map(|m| m.var_ty).unwrap_or(Ty::UNKNOWN),
-                    member.map(|m| m.return_ty).unwrap_or(Ty::UNKNOWN),
-                    member.and_then(|m| m.formals.as_ref()),
+                    member.map_or(Ty::UNKNOWN, |m| m.var_ty),
+                    member.map_or(Ty::UNKNOWN, |m| m.return_ty),
+                    member.and_then(|m| m.formals.as_deref()),
                 )
             }
             _ => (Ty::UNKNOWN, Ty::UNKNOWN, None),
@@ -2278,7 +2243,7 @@ impl<'a> Engine<'a> {
     /// validity faces over the written signature (upstream
     /// ffi_verifier.dart:641-829).
     ///
-    /// `ffiParameterTypes` is the flattened VarArgs list (`VarArgs<(A,B)>`
+    /// `ffiParameterTypes` is the flattened `VarArgs` list (`VarArgs<(A,B)>`
     /// → `[A,B]`); `ffiParameters` is the raw formal list. Both are sliced
     /// after the receiver for instance members; the extension-like arm
     /// slices `ffiParameterTypes` but keeps `ffiParameters` whole because
@@ -2287,13 +2252,11 @@ impl<'a> Engine<'a> {
         &mut self,
         site: &DeclSite,
         sig: &FfiSigFace,
-        formals: Option<&'a Box<Formals>>,
+        formals: Option<&'a Formals>,
         instance_member: bool,
         face: &FfiAnnoFace,
     ) {
-        let dart_param_count = formals
-            .map(|f| f.positional.len() + f.named.len())
-            .unwrap_or(0);
+        let dart_param_count = formals.map_or(0, |f| f.positional.len() + f.named.len());
         let flat_params = ffi_flatten_varargs(&sig.display, self.strings);
         let ret_head = first_ident_head(&sig.display, self);
         if face.is_leaf {
@@ -2791,7 +2754,7 @@ impl<'a> Engine<'a> {
     }
 }
 
-impl<'a> Engine<'a> {
+impl Engine<'_> {
     // —— the invocation pass ——————————————————————————————————————————
 
     /// The captured invocation faces, dispatched on the selector spelling
@@ -3020,8 +2983,7 @@ impl<'a> Engine<'a> {
         let at = invocation
             .type_arg
             .as_ref()
-            .map(|native| native.span)
-            .unwrap_or(invocation.head);
+            .map_or(invocation.head, |native| native.span);
         self.emit(
             SemanticCode::NonNativeFunctionTypeArgumentToPointer,
             at,
@@ -3120,18 +3082,17 @@ impl<'a> Engine<'a> {
         // signature; `subtype` is the Dart face, `supertype` the native).
         if let Some(written) = self.ffi_type_arg(invocation)
             && let Some((dart_ret, dart_params)) = self.ffi_type_arg_shape(&written)
+            && !self.ffi_compatible_functions(&dart_ret, &dart_params, &sig_ret, &sig_params)
         {
-            if !self.ffi_compatible_functions(&dart_ret, &dart_params, &sig_ret, &sig_params) {
-                let dart_display = self.ffi_render_function(&dart_ret, &dart_params);
-                let native_display = self.ffi_render_function(&sig_ret, &sig_params);
-                self.emit3(
-                    SemanticCode::MustBeASubtype,
-                    invocation.whole,
-                    &dart_display,
-                    &native_display,
-                    "asFunction",
-                );
-            }
+            let dart_display = self.ffi_render_function(&dart_ret, &dart_params);
+            let native_display = self.ffi_render_function(&sig_ret, &sig_params);
+            self.emit3(
+                SemanticCode::MustBeASubtype,
+                invocation.whole,
+                &dart_display,
+                &native_display,
+                "asFunction",
+            );
         }
     }
 
@@ -3496,7 +3457,7 @@ impl<'a> Engine<'a> {
         let head = invocation.head;
         let bytes = self.source.as_bytes();
         let mut cursor = self.byte_of(head.end());
-        while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
         if bytes.get(cursor) == Some(&b'<') {
@@ -3504,7 +3465,7 @@ impl<'a> Engine<'a> {
                 return head;
             };
             cursor = close + 1;
-            while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
                 cursor += 1;
             }
         }
@@ -3537,8 +3498,7 @@ impl<'a> Engine<'a> {
             return invocation
                 .args
                 .get(index)
-                .map(|(_, shape)| shape.range)
-                .unwrap_or(invocation.head);
+                .map_or(invocation.head, |(_, shape)| shape.range);
         };
         let bytes = self.source.as_bytes();
         let mut cursor = self.byte_of(shape.range.offset).min(bytes.len());
@@ -3591,10 +3551,10 @@ impl<'a> Engine<'a> {
             .as_ref()
             .is_some_and(|(ret, params)| self.ffi_valid_native_signature(ret, params));
         if !valid {
-            let display = native
-                .as_ref()
-                .map(|native| native.display.to_string())
-                .unwrap_or_else(|| "Function".to_string());
+            let display = native.as_ref().map_or_else(
+                || "Function".to_string(),
+                |native| native.display.to_string(),
+            );
             let at = self.ffi_constructor_name_span(invocation);
             self.emit(
                 SemanticCode::MustBeANativeFunctionType,
@@ -3624,22 +3584,21 @@ impl<'a> Engine<'a> {
             .and_then(|head| self.ffi_tearoff_type(head));
         if let (Some((dart_ret, dart_params)), Some((_, shape))) =
             (&dart_fn, invocation.args.first())
+            && !self.ffi_compatible_functions_d2n(dart_ret, dart_params, &ret, &params)
         {
-            if !self.ffi_compatible_functions_d2n(dart_ret, dart_params, &ret, &params) {
-                let dart_display = self.ffi_render_function(dart_ret, dart_params);
-                let written = self
-                    .ffi_type_arg(invocation)
-                    .map(|native| native.display.to_string())
-                    .unwrap_or_default();
-                self.emit3(
-                    SemanticCode::MustBeASubtype,
-                    shape.range,
-                    &dart_display,
-                    &written,
-                    "NativeCallable",
-                );
-                return;
-            }
+            let dart_display = self.ffi_render_function(dart_ret, dart_params);
+            let written = self
+                .ffi_type_arg(invocation)
+                .map(|native| native.display.to_string())
+                .unwrap_or_default();
+            self.emit3(
+                SemanticCode::MustBeASubtype,
+                shape.range,
+                &dart_display,
+                &written,
+                "NativeCallable",
+            );
+            return;
         }
         if self.strings.resolve(ret) != "Void" {
             let display = self.ffi_render(ret_ty(ret));
@@ -3668,22 +3627,21 @@ impl<'a> Engine<'a> {
             .and_then(|head| self.ffi_tearoff_type(head));
         if let (Some((dart_ret, dart_params)), Some((_, shape))) =
             (&dart_fn, invocation.args.first())
+            && !self.ffi_compatible_functions_d2n(dart_ret, dart_params, &ret, &params)
         {
-            if !self.ffi_compatible_functions_d2n(dart_ret, dart_params, &ret, &params) {
-                let dart_display = self.ffi_render_function(dart_ret, dart_params);
-                let written = self
-                    .ffi_type_arg(invocation)
-                    .map(|native| native.display.to_string())
-                    .unwrap_or_default();
-                self.emit3(
-                    SemanticCode::MustBeASubtype,
-                    shape.range,
-                    &dart_display,
-                    &written,
-                    "NativeCallable",
-                );
-                return;
-            }
+            let dart_display = self.ffi_render_function(dart_ret, dart_params);
+            let written = self
+                .ffi_type_arg(invocation)
+                .map(|native| native.display.to_string())
+                .unwrap_or_default();
+            self.emit3(
+                SemanticCode::MustBeASubtype,
+                shape.range,
+                &dart_display,
+                &written,
+                "NativeCallable",
+            );
+            return;
         }
         let ret_text = self.strings.resolve(ret).to_owned();
         let void_like = ret_text == "Void"
@@ -3838,7 +3796,7 @@ impl<'a> Engine<'a> {
     fn ffi_callable_type_arg(&self, head: SourceRange) -> Option<FfiTypeArg> {
         let bytes = self.source.as_bytes();
         let mut cursor = self.byte_of(head.end());
-        while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
         if bytes.get(cursor) != Some(&b'<') {
@@ -3890,7 +3848,7 @@ impl<'a> Engine<'a> {
                 b'F' if depth_angle == 0 && depth_paren == 0 => {
                     let word_end = i + "Function".len();
                     let word_before =
-                        i == 0 || bytes.get(i - 1).is_some_and(|b| b.is_ascii_whitespace());
+                        i == 0 || bytes.get(i - 1).is_some_and(u8::is_ascii_whitespace);
                     if word_before
                         && text[i..].starts_with("Function")
                         && bytes.get(word_end) == Some(&b'(')
@@ -4062,7 +4020,7 @@ impl<'a> Engine<'a> {
             }
             // Skip whitespace and comments after the annotation.
             while cursor < bytes.len() {
-                while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
                     cursor += 1;
                 }
                 if cursor + 1 < bytes.len() && bytes[cursor] == b'/' && bytes[cursor + 1] == b'/' {
@@ -4090,7 +4048,7 @@ impl<'a> Engine<'a> {
             }
             let mut chain = cursor;
             loop {
-                while bytes.get(chain).is_some_and(|b| b.is_ascii_whitespace()) {
+                while bytes.get(chain).is_some_and(u8::is_ascii_whitespace) {
                     chain += 1;
                 }
                 // Skip comments inside the annotation chain.
@@ -4120,7 +4078,7 @@ impl<'a> Engine<'a> {
                         chain += 1;
                     }
                     let name_end = chain;
-                    while bytes.get(chain).is_some_and(|b| b.is_ascii_whitespace()) {
+                    while bytes.get(chain).is_some_and(u8::is_ascii_whitespace) {
                         chain += 1;
                     }
                     if bytes.get(chain) == Some(&b'(')

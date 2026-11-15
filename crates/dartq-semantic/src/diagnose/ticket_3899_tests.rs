@@ -21,12 +21,13 @@
 //!   oracle renders the INVERTED argument verbatim with its quantifier —
 //!   `'Never Function<T extends int>()'` — because the official inversion
 //!   keeps a function type's own parameters verbatim
-//!   (replace_top_bottom_visitor.dart:56, `typeParameters:
+//!   (`replace_top_bottom_visitor.dart:56`, `typeParameters:
 //!   type.typeParameters`) and `getDisplayString` writes the binder list
 //!   beside its bounds. The inverted-type context row spells the whole
 //!   inverted instantiation the same way. Both texts must keep the binder
 //!   list: the written-argument face renders it from the written tree and
 //!   the TypeId-level faces render it from the signature's own parameters.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::test_rig::report_ops;
 use crate::FileReport;

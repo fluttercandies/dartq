@@ -10,6 +10,7 @@
 //! arguments; until the call-site inference solves it, the under-report
 //! direction is the only sound stand-in.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 impl Engine<'_> {
@@ -171,8 +172,7 @@ impl Engine<'_> {
                 let bound = found
                     .type_param_bounds
                     .get(index)
-                    .map(|&bound| self.boundary.ty(owner, bound))
-                    .unwrap_or(Ty::Dynamic);
+                    .map_or(Ty::Dynamic, |&bound| self.boundary.ty(owner, bound));
                 let mut self_referential = false;
                 self.boundary.pool().visit_named(bound, &mut |named| {
                     if let Ty::Named { name, .. } = named

@@ -1,6 +1,7 @@
 //! Declaration grammar tests (#18): top-level declarations, class members,
 //! typedefs, enums, extensions, extension types, and their recovery paths.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok, setup};
 use crate::listener::{ParserListener, Token};
 use crate::parser::Parser;
@@ -1075,10 +1076,10 @@ fn class_head_paren_off_matches_oracle_face_set() {
 // —— class-head `(` junk family, paired-empty sub-shape (3.13.7) —————————
 
 /// Paired empty named section with no body (`class C({})` at EOF): the
-/// oracle junks the head — unexpected_token on the `(` (1|8|1),
-/// expected_token(';') on the `{` (1|9|1), missing_identifier +
-/// missing_const_final_var_or_type on the `}` (1|10|1 each), and
-/// expected_executable on the real `)` (1|11|1).
+/// oracle junks the head — `unexpected_token` on the `(` (1|8|1),
+/// `expected_token`(';') on the `{` (1|9|1), `missing_identifier` +
+/// `missing_const_final_var_or_type` on the `}` (1|10|1 each), and
+/// `expected_executable` on the real `)` (1|11|1).
 #[test]
 fn class_head_paired_empty_named_section_junks_at_eof() {
     let (table, text) = scan_ok("class C({})\n");
@@ -1122,7 +1123,7 @@ fn class_head_paired_empty_follower_reparses_clean() {
 }
 
 /// A stray closer after the real `)` adds its own row (oracle `class
-/// C({}) }`: expected_executable at both closers, 1|11|1 and 1|13|1).
+/// C({}) }`: `expected_executable` at both closers, 1|11|1 and 1|13|1).
 #[test]
 fn class_head_paired_empty_stray_closer_gets_own_row() {
     let (table, text) = scan_ok("class C({}) }\n");
@@ -1149,7 +1150,7 @@ fn class_head_paired_empty_stray_closer_gets_own_row() {
 /// p01): the `({})` parses as primary-constructor formals — the empty
 /// named section takes `missing_identifier` on the `}` (1|10|1) and the
 /// body is clean. Upstream: `parseFormalParametersRest`
-/// (parser_impl.dart:1916) → `parseOptionalNamedParameters` empty-section
+/// (`parser_impl.dart:1916`) → `parseOptionalNamedParameters` empty-section
 /// arm; the junk discriminator walks past the group's own `)` closer.
 #[test]
 fn class_head_paired_empty_with_body_parses_formals() {
@@ -1191,7 +1192,7 @@ fn class_head_paired_empty_extends_body_parses_formals() {
 
 /// Scanner-unpaired `(` with a `;` tail (`class C(;`, oracle c22): the
 /// formals bail (missing first-formal name over the `;`,
-/// parser_impl.dart:1916/:1985), `ensureBlock` anchors `expected_body` on
+/// `parser_impl.dart:1916/:1985`), `ensureBlock` anchors `expected_body` on
 /// the name, and the junk re-parses as members — `expected_executable` on
 /// the `(`, the field-remnant triple on the `;`, then the EOF remnant
 /// member (`expected_executable` + `missing_const_final_var_or_type`,
@@ -1376,7 +1377,7 @@ fn class_head_semicolon_follower_face() {
 /// token — `expected_executable` spanning `void` (1|13|4) — and the
 /// moveSynthetic relocation adopts the parked closer at the boundary, so
 /// the unmatched-group row `expected_token ')'` (1|13|1) rides the follower
-/// too (parser_impl.dart:1985 via :5028-5037) instead of the EOF park. The
+/// too (`parser_impl.dart:1985` via :5028-5037) instead of the EOF park. The
 /// follower re-parses cleanly at top level.
 #[test]
 fn class_head_paren_follower_exec_face() {
@@ -1466,7 +1467,7 @@ fn class_head_paired_empty_off_experiment_row() {
 /// the name (identifier_context_impl.dart:328-334), and the verifier's
 /// built-in-name face rides the keyword name
 /// (error_verifier.dart:846-849, gate `isKeyword && isPseudo != true` at
-/// :3372). The semantic tier adds enum_without_constants over the
+/// :3372). The semantic tier adds `enum_without_constants` over the
 /// keyword-name span downstream.
 #[test]
 fn enum_reserved_name_keyword_face() {

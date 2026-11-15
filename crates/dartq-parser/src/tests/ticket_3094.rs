@@ -4,10 +4,11 @@
 //! through the shared expression engine
 //! (`parse_initializer_expression_rest` → the assignment arm), so the row
 //! rides the arm's existing `reportErrorIfSuper(rhs)` face
-//! (ast_builder.dart:3653) — the pins lock the lane routing, the
+//! (`ast_builder.dart:3653`) — the pins lock the lane routing, the
 //! per-entry scope (a plain `y = 1` entry stays silent), and the
 //! repeat-entry shape.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.

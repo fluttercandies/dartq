@@ -25,6 +25,7 @@
 //! provenance: `dart analyze` 3.13.1 machine format, every expectation
 //! below probed against the real binary first.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, assert_silent, report_ops};
 
 /// The `undefined_getter` rows of `source`, rendered `@offset: message`

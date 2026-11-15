@@ -20,6 +20,7 @@
 //! `type_argument_not_matching_bounds` spelling the corpus carries for the
 //! same shape.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 
 /// The `type_argument_not_matching_bounds` rows of `report` as

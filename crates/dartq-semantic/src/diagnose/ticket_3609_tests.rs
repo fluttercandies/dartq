@@ -8,6 +8,7 @@
 //! carries the oracle's own answer (dart analyze 3.13.7,
 //! `--format=machine`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, code_names, report_ops_imports, rows};
 
 /// The co19 `Expect.throws` face verbatim: a class-static send whose

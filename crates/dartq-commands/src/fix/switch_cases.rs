@@ -1,8 +1,8 @@
 //! The missing-switch-cases family — dartq's equivalent of upstream's
 //! `AddMissingSwitchCases` producer (upstream Dart SDK source,
-//! pkg/analysis_server/lib/src/services/correction/dart/add_missing_switch_cases.dart;
+//! `pkg/analysis_server/lib/src/services/correction/dart/add_missing_switch_cases.dart`;
 //! fix kind `dart.fix.add.missingSwitchCases`, registration
-//! pkg/analysis_server/lib/src/services/correction/fix_internal.dart —
+//! `pkg/analysis_server/lib/src/services/correction/fix_internal.dart` —
 //! `nonExhaustiveSwitchStatement` / `nonExhaustiveSwitchExpression`).
 //! The diagnostic's correction slot carries the first missing pattern
 //! text the witness engine rendered (the `{a2}` placeholder of the
@@ -11,7 +11,7 @@
 //! that match '<pattern>'."); this family un-renders that text out of
 //! the message and writes one case arm per reported pattern through the
 //! upstream `insertCaseClauseAtEnd` placement (upstream Dart SDK source,
-//! pkg/analyzer_plugin/lib/src/utilities/change_builder/change_builder_dart.dart).
+//! `pkg/analyzer_plugin/lib/src/utilities/change_builder/change_builder_dart.dart`).
 //!
 //! Three upstream legs are deliberately out: the multi-pattern list
 //! (dartq's witness is a single pattern, so every fix writes one arm),
@@ -21,10 +21,15 @@
 //! does not carry; a pattern the correction cannot spell never reaches
 //! the slot, so the arm is only reachable upstream). `missing_enum_
 //! constant_in_switch` has no dartq emission; its upstream producer
-//! (`AddMissingEnumCaseClauses`, fix_internal.dart) is a different
+//! (`AddMissingEnumCaseClauses`, `fix_internal.dart`) is a different
 //! registration and stays out.
 
-use super::*;
+#![allow(clippy::semicolon_if_nothing_returned)]
+use super::{
+    BUILTIN_SEMANTIC_SOURCE, Diagnostic, FixRole, Keyword, LineIndex, PlannerFuse, RuleFix,
+    TokenKind, TokenTable, anchored_edit, byte_offset_to_utf16, kind_of, line_indent_end, line_of,
+    skip_group, token_starting_at,
+};
 
 /// The switch-construct face a non-exhaustive code reports on —
 /// `statement` writes `case <pattern>:` arms, `expression` writes

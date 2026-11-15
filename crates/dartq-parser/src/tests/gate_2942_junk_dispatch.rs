@@ -24,7 +24,7 @@
 //! (identifier_context_impl.dart:487-510) reports on BOTH arms: the
 //! keep-set branch's `insertSyntheticIdentifier(token, this)` passes no
 //! `message`, so `context.recoveryTemplate` — `expectedIdentifier`,
-//! `PseudoSharedCode.missingIdentifier` — fires (parser_impl.dart:
+//! `PseudoSharedCode.missingIdentifier` — fires (`parser_impl.dart`:
 //! 4016-4019; the `:491` "no error reported" TODO is stale). The arm's
 //! earlier probed-silence note cited faces (`late ;`, `int ;`, `int }`)
 //! that do not reach it — `late`/`int` heads are keyword-or-identifier
@@ -41,8 +41,11 @@
 //! `missing_identifier`, no TLF shadow); member-level `int ;`/`int 5;`
 //! carry the keep/consume reports; named controls unchanged.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, setup};
-use crate::parser::Parser;
 
 /// Whether a ZERO-length identifier event fired in `context` at
 /// `target`'s offset inside `needle` (same shape as the #2941 gate).

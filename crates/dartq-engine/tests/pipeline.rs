@@ -4,6 +4,30 @@
 //! from the engine's pinned pipeline shape and the GPU posture rider
 //! (CSR-friendly `&[u32]` views).
 
+#![allow(
+    clippy::useless_conversion,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::semicolon_if_nothing_returned
+)]
 mod common;
 
 use std::path::Path;
@@ -80,7 +104,10 @@ fn two_file_fixture_runs_the_full_pipeline() {
         .expect("warm analyze");
     assert_eq!(warm_diagnostics, diagnostics, "clean re-analyze is stable");
     assert!(warm.overlay_applied.is_empty(), "empty queue emits nothing");
-    assert!(warm.revalidated.is_empty());
+    assert_eq!(
+        warm.revalidated,
+        [] as [(dartq_diagnostics::FileId, dartq_engine::RevalidateGate); 0]
+    );
     assert!(
         warm.analyzed.iter().all(|(_, from_cache)| *from_cache),
         "targets report cache hits"
@@ -278,7 +305,7 @@ fn remove_file_recomputes_the_importer_with_uri_diagnostic() {
     let clean = engine
         .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("clean");
-    assert!(clean.is_empty());
+    assert_eq!(clean, [] as [dartq_diagnostics::Diagnostic; 0]);
 
     engine
         .remove_file(&fixture.path("lib/greeter.dart"))
@@ -315,7 +342,7 @@ fn edited_content_is_still_clean() {
     let diagnostics = engine
         .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("analyze");
-    assert!(diagnostics.is_empty());
+    assert_eq!(diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]

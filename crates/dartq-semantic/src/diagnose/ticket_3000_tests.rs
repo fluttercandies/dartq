@@ -30,6 +30,7 @@
 //! Oracle provenance: `dart analyze` 3.13.1 — every expectation below
 //! was probed against the real binary before the fix.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, report_ops_bare, rows};
 
 /// Operator rows only — the report's `undefined_operator` diagnostics in
@@ -115,7 +116,7 @@ fn dynamic_increment_is_silent() {
 }
 
 /// `n + 1` on `Null` swaps to `invalid_use_of_null_value` at the operand
-/// — never `undefined_operator` (nullable_dereference_verifier's
+/// — never `undefined_operator` (`nullable_dereference_verifier`'s
 /// `NullType` arm).
 #[test]
 fn null_receiver_reports_invalid_use_of_null() {
@@ -148,7 +149,7 @@ fn null_increment_reports_invalid_use_of_null() {
 
 /// `v() + 1` on a `void` result: the operand's `void` face never reaches
 /// `undefined_operator` (the void-result read reports its own family —
-/// `use_of_void_result` upstream, `isPotentiallyNullable`'s VoidType arm
+/// `use_of_void_result` upstream, `isPotentiallyNullable`'s `VoidType` arm
 /// keeping the operand out of the operator-miss consult).
 #[test]
 fn void_result_binary_reports_no_undefined_operator() {
@@ -201,7 +202,7 @@ fn record_equality_is_silent() {
 
 /// A shape extension declaring `+` resolves the record application —
 /// `_lookupExtension` runs on shape receivers too
-/// (type_property_resolver.dart:227).
+/// (`type_property_resolver.dart:227`).
 #[test]
 fn record_extension_operator_is_silent() {
     let report = report_ops(

@@ -12,6 +12,7 @@
 //! [`LibraryIndex::supertypes_of`] reads the run directory instead, so
 //! it keeps its one-binary-search shape.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::capture::{SuperClause, capture};
 use crate::{LibraryBuilder, LibraryIndex, SubtypeEdge, TargetRef};
 use dartq_language::{FeatureSet, LanguageVersion};

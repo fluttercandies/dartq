@@ -8,6 +8,10 @@
 //! (the `(final external int i)` pair) are pinned WITHOUT dedup so count
 //! regressions surface.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, latest_features, scan_ok, version_features};
 use crate::ParserFeatures;
 use crate::parser::Parser;
@@ -18,7 +22,7 @@ use crate::parser::Parser;
 type Row = (&'static str, u32, u32, u32, &'static str);
 
 /// Parses `source` under `features` and returns the parser rows as
-/// `(code, start, end, text)` sorted by position (gate_2791 harness shape).
+/// `(code, start, end, text)` sorted by position (`gate_2791` harness shape).
 fn faces_with(features: ParserFeatures, source: &'static str) -> Vec<(String, u32, u32, String)> {
     let (table, text) = scan_ok(source);
     let mut parser = Parser::new(
@@ -77,10 +81,10 @@ const AUG_BEFORE_STATIC: &str = "The modifier 'augment' should be before the mod
 /// and reports exactly the oracle rows — the keyword never survives into the
 /// member/name lane — with the augment/external pair as a
 /// `conflicting_modifiers` face in both directions (upstream
-/// `reportConflictingModifiers`, modifier_context.dart:431/:523).
+/// `reportConflictingModifiers`, `modifier_context.dart:431/:523`).
 #[test]
 fn member_errors_modifier_run_rows() {
-    let source = r#"class Class {
+    let source = r"class Class {
   augment augment method() {}
   augment external method();
   external augment method();
@@ -172,7 +176,7 @@ fn member_errors_modifier_run_rows() {
   augment augment static late int field;
   static augment late int field;
 }
-"#;
+";
     // `duplicated_modifier` at the second `augment` of every doubled run
     // (corpus lines 2..90 even) and `modifier_out_of_order` at the
     // `augment` of every `static augment` run (:55..91) — the oracle emits
@@ -310,7 +314,7 @@ fn formal_parameter_external_rows() {
 /// P3a: `.new` in metadata continuations rewrites to the unnamed-constructor
 /// identifier with no report (upstream `_tryRewriteNewToIdentifier` over the
 /// `MetadataContinuation`/`MetadataContinuationAfterTypeArguments` contexts,
-/// identifier_context_impl.dart:1112; oracle
+/// `identifier_context_impl.dart:1112`; oracle
 /// `language/metadata/constructor_new_test` — zero rows).
 #[test]
 fn metadata_new_continuation_is_silent() {
@@ -334,7 +338,7 @@ fn primary_constructor_new_head_is_silent() {
 }
 
 /// P3b: built-in keywords name methods and calls silently (corpus
-/// keyword_named_top_level_methods 239-247).
+/// `keyword_named_top_level_methods` 239-247).
 #[test]
 fn builtin_named_method_is_clean() {
     assert_rows(
@@ -372,7 +376,7 @@ fn rethrow_named_method_rows() {
 
 /// P3b: reserved `return` as the method name plus the
 /// parsePrimary unexpected-`return` recovery at the inner call (corpus
-/// 256-259: 257|5 name, 259|10 unexpected_token).
+/// 256-259: 257|5 name, 259|10 `unexpected_token`).
 #[test]
 fn return_named_method_rows() {
     assert_rows(

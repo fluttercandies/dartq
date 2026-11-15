@@ -17,11 +17,12 @@
 //! `StringId::NONE` to the validity walk for a non-named return type
 //! (an implicit return latches `Ty::Unknown`), and `StringTable::resolve`
 //! rejects a never-issued id by design. Upstream keeps the Dart
-//! signature's `dynamic` return (ffi_verifier.dart `_checkFfiNative`),
+//! signature's `dynamic` return (`ffi_verifier.dart` `_checkFfiNative`),
 //! `_isValidFfiNativeFunctionType` says no, and the omitted-type arm
 //! reports `native_function_missing_type` — the engine now routes the
 //! shape through its own `Dynamic` verdict to that row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{report_ops_bare, rows};
 

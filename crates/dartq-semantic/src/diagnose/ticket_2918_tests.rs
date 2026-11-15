@@ -29,6 +29,7 @@
 //! upstream anchors `type.dart` `instantiateTypeFormalsToBounds` /
 //! `DartType.getDisplayString` (Dart SDK 3.13).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -58,13 +59,13 @@ fn at(source: &str, needle: &str) -> u32 {
 /// row — and the downstream assignment displays it.
 #[test]
 fn bounded_bare_creation_displays_the_bound() {
-    let source = r#"
+    let source = r"
 class C<S extends num> {}
 main() {
   var x = C();
   C<int> y = x;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         invalid_assignment_rows(&report),
@@ -83,13 +84,13 @@ main() {
 /// displays `C<num, String>` — both slots fill by their I2B bounds.
 #[test]
 fn two_param_bare_creation_displays_both_bounds() {
-    let source = r#"
+    let source = r"
 class C<S extends num, T extends String> {}
 main() {
   var x = C();
   C<int, String> y = x;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         invalid_assignment_rows(&report),
@@ -109,13 +110,13 @@ main() {
 /// a mismatch.
 #[test]
 fn compatible_bare_creation_stays_silent() {
-    let source = r#"
+    let source = r"
 class C<S extends num> {}
 main() {
   var x = C();
   C<num> y = x;
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         invalid_assignment_rows(&report).is_empty(),
@@ -130,13 +131,13 @@ main() {
 /// `dynamic` residual is the oracle's own instantiation.
 #[test]
 fn unconstrained_bare_creation_displays_dynamic() {
-    let source = r#"
+    let source = r"
 class C<S> {}
 main() {
   var x = C();
   C<Never> y = x;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         invalid_assignment_rows(&report),
@@ -161,7 +162,7 @@ main() {
 /// no written group AND no solve answered.
 #[test]
 fn solved_creation_keeps_its_inferred_display() {
-    let source = r#"
+    let source = r"
 class C<S> {
   S x = throw 0;
   C(this.x);
@@ -170,7 +171,7 @@ main() {
   var x = C(0);
   C<String> y = x;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = invalid_assignment_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", report.diagnostics);

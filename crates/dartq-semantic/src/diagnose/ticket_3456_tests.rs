@@ -17,6 +17,7 @@
 //! `test_propertyAccess_setter`) and the `SuperInExtensionTest` /
 //! `SuperInExtensionTypeTest` silences.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops};
 
 /// `super.foo(0)` inside `mixin M implements A` (a concrete `A.foo` on an
@@ -161,7 +162,7 @@ fn super_inside_extension_emits_no_member_row() {
     );
 }
 
-/// `super` inside an extension-type body: same InvalidType posture —
+/// `super` inside an extension-type body: same `InvalidType` posture —
 /// `SuperInExtensionTypeTest.test_methodInvocation`/`test_propertyAccess`
 /// keep the member face silent.
 #[test]

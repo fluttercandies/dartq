@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    FixInput, Keyword, TokenKind, TokenTable, angle_group_end, angle_group_start, append_bang,
+    bang_wrapped, binds_loose, bool_literal, byte_offset_to_utf16, cut_line, depth_of, depth0_find,
+    drop_lines_range, drop_span_statement, hit_tokens, is_identifier_char, is_null_token, kind_of,
+    line_indent_end, matching_open, member_block_start, operand_end, operand_start,
+    parameter_typed, remove_keyword, remove_lexeme, same_tokens, slice16, span_over, statement_end,
+    ternary_split, token_at, token_end, token_text, utf16_count, utf16_end, utf16_offset_to_byte,
+    word_at, word_shape, wordish,
+};
 
 pub(crate) fn add_member_annotation(
     input: &FixInput<'_>,
@@ -109,7 +117,7 @@ fn parameter_type_run(slice: &str) -> Option<usize> {
         + bytes[at..]
             .iter()
             .position(|b| !b.is_ascii_alphanumeric() && *b != b'_' && *b != b'$')
-            .map_or(bytes.len() - at, |i| i);
+            .unwrap_or(bytes.len() - at);
     if end == at {
         return None;
     }
@@ -809,7 +817,7 @@ pub(crate) fn remove_ignore_comment(input: &FixInput<'_>) -> Option<(u32, u32, S
         // follows stays.
         let mut cut_end = comment_end;
         let bytes = text.as_bytes();
-        while matches!(bytes.get(cut_end), Some(b' ') | Some(b'\t')) {
+        while matches!(bytes.get(cut_end), Some(b' ' | b'\t')) {
             cut_end += 1;
         }
         let start16 = utf16_count(&text[..comment_start]);
@@ -852,7 +860,7 @@ fn enclosing_comment(text: &str, window: (usize, usize), hit: usize) -> Option<(
     let mut at = from;
     while at < to {
         match bytes.get(at) {
-            Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') => at += 1,
+            Some(b' ' | b'\t' | b'\r' | b'\n') => at += 1,
             Some(b'/') if bytes.get(at + 1) == Some(&b'/') => {
                 let close = text[at..to].find('\n').map_or(to, |i| at + i);
                 if at <= hit && hit < close {
@@ -1449,7 +1457,7 @@ pub(crate) fn if_null_bools(input: &FixInput<'_>) -> Option<(u32, u32, String)> 
     } else {
         "true"
     };
-    let mut rebuilt = format!("{} ?? {value}", token_text(tokens, text, nullable)?,);
+    let mut rebuilt = format!("{} ?? {value}", token_text(tokens, text, nullable)?);
     // Outer parentheses when the comparison's parent binds tighter than
     // `??`: an operator-flanked span keeps its parens.
     let before = text
@@ -1695,8 +1703,7 @@ pub(crate) fn binary_precedence(kind: TokenKind) -> Option<u8> {
         | TokenKind::LtEq
         | TokenKind::Gt
         | TokenKind::GtEq
-        | TokenKind::Keyword(Keyword::Is)
-        | TokenKind::Keyword(Keyword::As) => 8,
+        | TokenKind::Keyword(Keyword::Is | Keyword::As) => 8,
         TokenKind::Bar => 9,
         TokenKind::Caret => 10,
         TokenKind::Ampersand => 11,
@@ -1726,7 +1733,7 @@ pub(crate) fn binds_at_or_below(
             | TokenKind::OpenCurly
             | TokenKind::StringInterpolationExpression => depth += 1,
             TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                depth = depth.checked_sub(1).unwrap_or(0);
+                depth = depth.saturating_sub(1);
             }
             _ if depth == 0 && binary_precedence(kind).is_some_and(|p| p <= max) => return true,
             _ => {}
@@ -1798,7 +1805,7 @@ pub(crate) fn bool_comparison(input: &FixInput<'_>) -> Option<(u32, u32, String)
             index -= 1;
             match kind_of(tokens, index)? {
                 TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                    depth += 1
+                    depth += 1;
                 }
                 TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
                     if depth == 0 {
@@ -2209,10 +2216,9 @@ pub(crate) fn eight_digit_hex(input: &FixInput<'_>) -> Option<(u32, u32, String)
     let slice = slice16(input.text, &input.range)?;
     let prefix = if let Some(rest) = slice.strip_prefix("0x") {
         ("0x", rest)
-    } else if let Some(rest) = slice.strip_prefix("0X") {
-        ("0X", rest)
     } else {
-        return None;
+        let rest = slice.strip_prefix("0X")?;
+        ("0X", rest)
     };
     let digits_raw = prefix.1;
     let stripped: String = digits_raw.chars().filter(|c| *c != '_').collect();
@@ -2466,7 +2472,7 @@ pub(crate) fn function_type_syntax(input: &FixInput<'_>) -> Option<(u32, u32, St
         String::new()
     };
     let parameters = token_text(tokens, text, open..body_end + 1)?;
-    let question = if body_end != last { "?" } else { "" };
+    let question = if body_end == last { "" } else { "?" };
     let name = tokens.lexeme(text, name_idx).to_owned();
     let head = format!(
         "{}{}{}Function{type_params}{parameters}{question} ",

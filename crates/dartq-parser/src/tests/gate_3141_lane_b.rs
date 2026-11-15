@@ -5,10 +5,11 @@
 //! pattern closer adoption pins the `moveSynthetic` relocation: an
 //! unclosed pattern bracket's scanner-synthetic closer re-anchors the
 //! unmatched-begin row to the token the pattern resumes behind
-//! (official `parseListPatternSuffix`, pkg/_fe_analyzer_shared/lib/src/
+//! (official `parseListPatternSuffix`, pkg/_`fe_analyzer_shared/lib/src`/
 //! parser/parser_impl.dart:12051-12053, with
 //! token_stream_rewriter.dart:105-134 `_setOffset(endGroup, next.offset)`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use super::collector::{Collector, latest_features};

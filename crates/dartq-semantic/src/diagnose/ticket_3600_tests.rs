@@ -8,11 +8,11 @@ use super::test_rig::{code_names, report_ops, rows};
 #[test]
 fn generic_tearoff_stored_call_reports() {
     let report = report_ops(
-        r#"
+        r"
 void f<T>(T a) {}
 var g = f<int>;
 var x = g('Hello');
-"#,
+",
     );
     assert!(
         code_names(&report).contains(&"argument_type_not_assignable"),
@@ -47,13 +47,13 @@ void main() {
 #[test]
 fn generic_tearoff_stored_call_satisfying_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 T id<T>(T t) => t;
 void main() {
   var f = id<int>;
   f(0);
 }
-"#,
+",
     );
     assert!(
         !code_names(&report).contains(&"argument_type_not_assignable"),
@@ -94,7 +94,7 @@ void main() {
 #[test]
 fn generic_method_tearoff_stored_call_satisfying_stays_silent() {
     let report = report_ops(
-        r#"
+        r"
 class A {
   T m<T>(T t) => t;
 }
@@ -103,7 +103,7 @@ void main() {
   var x = a.m<int>;
   x(0);
 }
-"#,
+",
     );
     assert!(
         !code_names(&report).contains(&"argument_type_not_assignable"),

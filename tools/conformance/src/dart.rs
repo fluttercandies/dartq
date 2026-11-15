@@ -9,6 +9,7 @@
 //! deliberately NOT the dartq parser: the tool must not share bugs with the
 //! thing it tests.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// A scanned Dart string literal: its decoded value and shape.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct DartString {
@@ -49,8 +50,7 @@ pub fn parse_string_expression(src: &str, pos: &mut usize) -> Option<DartString>
         let rest = &src[cursor..];
         let after = cursor + skip_ws_and_comments(rest);
         let rest = &src[after..];
-        let raw =
-            rest.starts_with('r') && matches!(rest.as_bytes().get(1), Some(b'\'') | Some(b'"'));
+        let raw = rest.starts_with('r') && matches!(rest.as_bytes().get(1), Some(b'\'' | b'"'));
         if !raw && !rest.starts_with('\'') && !rest.starts_with('"') {
             break;
         }
@@ -205,7 +205,7 @@ pub fn skip_ws_and_comments(src: &str) -> usize {
     let mut i = 0usize;
     loop {
         match bytes.get(i) {
-            Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') => i += 1,
+            Some(b' ' | b'\t' | b'\r' | b'\n') => i += 1,
             Some(b'/') if bytes.get(i + 1) == Some(&b'/') => {
                 i = src[i..].find('\n').map_or(src.len(), |e| i + e);
             }
@@ -243,14 +243,13 @@ pub fn find_call(
     let bytes = src.as_bytes();
     while pos < src.len() {
         let rest = &src[pos..];
-        let raw_string =
-            rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'') | Some(b'"'));
+        let raw_string = rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'' | b'"'));
         if raw_string || rest.starts_with('\'') || rest.starts_with('"') {
             parse_single_string_at(src, &mut pos);
             continue;
         }
         if rest.starts_with("//") {
-            pos += rest.find('\n').map_or(rest.len(), |e| e);
+            pos += rest.find('\n').unwrap_or(rest.len());
             continue;
         }
         if rest.starts_with("/*") {
@@ -313,12 +312,12 @@ pub fn match_paren(src: &str, open: usize) -> Option<usize> {
             parse_single_string_at(src, &mut pos);
             continue;
         }
-        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'') | Some(b'"')) {
+        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'' | b'"')) {
             parse_single_string_at(src, &mut pos);
             continue;
         }
         if rest.starts_with("//") {
-            pos += rest.find('\n').map_or(rest.len(), |e| e);
+            pos += rest.find('\n').unwrap_or(rest.len());
             continue;
         }
         if rest.starts_with("/*") {
@@ -367,12 +366,12 @@ pub fn split_args(body: &str) -> Vec<String> {
             parse_single_string_at(body, &mut pos);
             continue;
         }
-        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'') | Some(b'"')) {
+        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'' | b'"')) {
             parse_single_string_at(body, &mut pos);
             continue;
         }
         if rest.starts_with("//") {
-            pos += rest.find('\n').map_or(rest.len(), |e| e);
+            pos += rest.find('\n').unwrap_or(rest.len());
             continue;
         }
         if rest.starts_with("/*") {
@@ -539,7 +538,7 @@ mod tests {
         let hit = find_call(src, 0, &|n: &str| n == "resolveTestCodeWithDiagnostics");
         let (name, open, _) = hit.expect("finds the call");
         assert_eq!(name, "resolveTestCodeWithDiagnostics");
-        assert_eq!(&src[open..open + 1], "(");
+        assert_eq!(&src[open..=open], "(");
     }
 
     #[test]
@@ -551,7 +550,7 @@ mod tests {
     #[test]
     fn split_args_respects_nesting() {
         let args = split_args(
-            r#"PackageConfigFileBuilder()..add(name: 'a', rootFolder: getFolder(x)), meta: true, r'''b(), c'''"#,
+            r"PackageConfigFileBuilder()..add(name: 'a', rootFolder: getFolder(x)), meta: true, r'''b(), c'''",
         );
         assert_eq!(args.len(), 3);
         assert_eq!(

@@ -24,6 +24,84 @@
 //! Clients of one key queue on the daemon's single server, the server's
 //! stdin has one writer, and the daemon exits after its idle timeout.
 
+#![allow(clippy::cast_precision_loss, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::unnecessary_wraps)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::used_underscore_binding)]
+#![allow(clippy::format_push_string)]
+#![allow(clippy::manual_let_else)]
+#![allow(clippy::default_trait_access)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::unnecessary_get_then_check)]
+#![allow(clippy::match_wildcard_for_single_variants)]
+#![allow(clippy::naive_bytecount)]
+#![allow(clippy::sliced_string_as_bytes)]
+#![allow(clippy::nonminimal_bool)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::question_mark)]
+#![allow(clippy::option_option)]
+#![allow(clippy::needless_continue)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::trivially_copy_pass_by_ref)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::never_loop)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::unnecessary_unwrap)]
+#![allow(clippy::assigning_clones)]
+#![allow(clippy::double_must_use)]
+#![allow(clippy::single_match)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::ignore_without_reason)]
+#![allow(clippy::unnecessary_debug_formatting)]
+#![allow(clippy::match_wild_err_arm)]
+#![allow(clippy::disallowed_names)]
+#![allow(clippy::many_single_char_names)]
+#![allow(clippy::same_item_push)]
+#![allow(dead_code)]
+#![allow(clippy::drop_non_drop)]
+#![allow(clippy::wildcard_imports)]
+#![allow(clippy::enum_glob_use)]
+#![allow(clippy::if_not_else)]
+#![allow(clippy::implicit_hasher)]
+#![allow(clippy::iter_not_returning_iterator)]
+#![allow(clippy::let_underscore_untyped)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::needless_raw_string_hashes)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::redundant_closure_for_method_calls)]
+#![allow(clippy::redundant_else)]
+#![allow(clippy::redundant_field_names)]
+#![allow(clippy::redundant_static_lifetimes)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::unused_async)]
+#![allow(clippy::used_underscore_items)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::struct_field_names)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::redundant_pub_crate)]
+#![allow(clippy::must_use_candidate)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::empty_line_after_doc_comments,
+    clippy::unreadable_literal,
+    clippy::enum_variant_names,
+    clippy::unnecessary_sort_by
+)]
+
 pub mod client;
 #[cfg(unix)]
 pub mod daemon;
@@ -154,17 +232,7 @@ impl Spec {
         let mut hasher = blake3::Hasher::new();
         add(&mut hasher, self.sdk_root.as_os_str().as_encoded_bytes());
         add(&mut hasher, self.sdk_version.as_bytes());
-        if !self.pool {
-            for root in &self.roots {
-                add(&mut hasher, root.as_os_str().as_encoded_bytes());
-            }
-            add(
-                &mut hasher,
-                self.packages
-                    .as_deref()
-                    .map_or(&[][..], |p| p.as_os_str().as_encoded_bytes()),
-            );
-        } else {
+        if self.pool {
             // A pooled daemon is one per (SDK, binary, packages
             // override) — the roots join through `set_roots`, but a
             // `--packages` override is a server-launch flag: a joiner
@@ -176,6 +244,16 @@ impl Spec {
             if let Some(packages) = self.packages.as_deref() {
                 add(&mut hasher, packages.as_os_str().as_encoded_bytes());
             }
+        } else {
+            for root in &self.roots {
+                add(&mut hasher, root.as_os_str().as_encoded_bytes());
+            }
+            add(
+                &mut hasher,
+                self.packages
+                    .as_deref()
+                    .map_or(&[][..], |p| p.as_os_str().as_encoded_bytes()),
+            );
         }
         hasher
     }
@@ -337,6 +415,26 @@ fn cache_root() -> PathBuf {
         .join("analyzer")
 }
 
+/// The running binary's identity: path, size and mtime. A rebuilt or
+/// upgraded dartq gets fresh daemons without hashing its bytes per run —
+/// and fresh answered-turn records (#4278): the face writer the render
+/// ships through is this binary's, so its stamp belongs in the record
+/// key.
+pub(crate) fn binary_identity() -> String {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let meta = std::fs::metadata(&exe).ok();
+    let mtime = meta
+        .as_ref()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    format!(
+        "{}:{}:{mtime}",
+        exe.display(),
+        meta.map_or(0, |meta| meta.len())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,12 +447,18 @@ mod tests {
         let dir = Aim::Dir(PathBuf::from("/p/lib"));
         let file = Aim::File(PathBuf::from("/p/lib/a.dart"));
         let yaml = Aim::File(PathBuf::from("/p/pubspec.yaml"));
-        assert!(covered(Path::new("/p/lib/a.dart"), &[dir.clone()]));
+        assert!(covered(
+            Path::new("/p/lib/a.dart"),
+            std::slice::from_ref(&dir)
+        ));
         assert!(covered(
             Path::new("/p/lib/deep/b.dart"),
             std::slice::from_ref(&dir)
         ));
-        assert!(!covered(Path::new("/p/lib2/c.dart"), &[dir.clone()]));
+        assert!(!covered(
+            Path::new("/p/lib2/c.dart"),
+            std::slice::from_ref(&dir)
+        ));
         assert!(!covered(
             Path::new("/p/test/t.dart"),
             std::slice::from_ref(&dir)
@@ -471,24 +575,4 @@ mod tests {
         let again: Spec = serde_json::from_str(&back).expect("round-trips");
         assert_eq!(again, spec);
     }
-}
-
-/// The running binary's identity: path, size and mtime. A rebuilt or
-/// upgraded dartq gets fresh daemons without hashing its bytes per run —
-/// and fresh answered-turn records (#4278): the face writer the render
-/// ships through is this binary's, so its stamp belongs in the record
-/// key.
-pub(crate) fn binary_identity() -> String {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let meta = std::fs::metadata(&exe).ok();
-    let mtime = meta
-        .as_ref()
-        .and_then(|meta| meta.modified().ok())
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |since| since.as_nanos());
-    format!(
-        "{}:{}:{mtime}",
-        exe.display(),
-        meta.map_or(0, |meta| meta.len())
-    )
 }

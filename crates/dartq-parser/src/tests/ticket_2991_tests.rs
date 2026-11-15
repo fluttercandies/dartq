@@ -15,6 +15,10 @@
 //! Oracle: `dart analyze` 3.13.7 — every row below verified against the
 //! oracle output on the same source.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::parser::Parser;
 
@@ -84,7 +88,7 @@ fn receiver_function_typed_formals_with_type_parameters() {
     );
 }
 
-/// `(`-suffixed receiver faces (upstream OPEN_PAREN arm :2223-2240): both
+/// `(`-suffixed receiver faces (upstream `OPEN_PAREN` arm :2223-2240): both
 /// `this` and `super` receivers parse clean — pre-fix `super.a(` matched
 /// the probe but the re-walk missed the head → `expected_token ')'` +
 /// `missing_function_parameters`.
@@ -123,7 +127,7 @@ fn receiver_function_typed_formal_missing_period() {
 }
 
 /// The name-less `(`-suffix face behind a receiver head (upstream
-/// OPEN_PAREN arm + `ensureIdentifier(token, nameContext)` :2349): the `(` is
+/// `OPEN_PAREN` arm + `ensureIdentifier(token, nameContext)` :2349): the `(` is
 /// not an identifier, so the field-initializer ensure reports
 /// `missing_identifier` at it (pre-fix consumed `(` as the name silently).
 #[test]

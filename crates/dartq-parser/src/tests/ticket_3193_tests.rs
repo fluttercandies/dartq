@@ -13,6 +13,7 @@
 //! entry node graph) but defers the report until after the expression
 //! re-read has fixed the entry end (`initializer_entry_span`, members.rs).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -64,7 +65,7 @@ fn chained_this_call_rejected_over_whole_entry() {
 }
 
 /// `A() : super()!;` — the postfix `!` leaves no representable initializer
-/// (issue_41597): the row moves from the bare `super` head to the whole
+/// (`issue_41597)`: the row moves from the bare `super` head to the whole
 /// entry `super()!` (16..24).
 #[test]
 fn super_call_bang_rejected_over_whole_entry() {

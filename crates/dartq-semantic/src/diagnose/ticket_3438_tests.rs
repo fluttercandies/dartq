@@ -14,6 +14,7 @@
 //! `nullable_type_ambiguous_test`, `ambiguities_A14_t01`,
 //! `explicit_instantiation_syntax_test_30`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, RigImport, report_ops, report_ops_imports};
 
 /// `(offset, length)` of `needle`'s first occurrence inside the FIXTURE
@@ -143,7 +144,7 @@ void f(Object? a) {\n\
     assert_eq!(dead_rows(source), vec![at(source, "true")]);
 }
 
-/// A generic instantiation (`C<int, int>` — a TypeLiteral) is
+/// A generic instantiation (`C<int, int>` — a `TypeLiteral`) is
 /// non-nullable, so `?? 1` is dead
 /// (`explicit_instantiation_syntax_test_30` arm).
 #[test]

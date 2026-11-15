@@ -726,7 +726,7 @@ fn cascade_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
         let selector = c.head_token(row);
         let prev = selector.checked_sub(1).map(|token| c.lexeme(token));
         let next = (selector + 1 < last).then(|| c.lexeme(selector + 1));
-        if matches!(prev, Some("..") | Some("?..")) && next == Some("(") {
+        if matches!(prev, Some(".." | "?..")) && next == Some("(") {
             c.report(utf16_token_span(c, selector), &[]);
         }
     }

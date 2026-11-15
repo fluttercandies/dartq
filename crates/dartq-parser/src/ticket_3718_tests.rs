@@ -18,6 +18,7 @@
 //! `parse_getter_or_formal_parameters` (members.rs) and
 //! `ensure_function_body_block` (statements.rs).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;
@@ -26,7 +27,7 @@ use dartq_language::{Feature, FeatureSet};
 use dartq_scanner::ScanConfig;
 
 /// Parses `source` at `set` and returns the scanner+parser rows as
-/// `(code, start, end)` — UTF-16 offsets, matching the ticket_3674 harness.
+/// `(code, start, end)` — UTF-16 offsets, matching the `ticket_3674` harness.
 fn rows_at(source: &'static str, set: FeatureSet) -> BTreeSet<(String, u32, u32)> {
     let config = ScanConfig::from_feature_set(set);
     let features = crate::ParserFeatures::from_feature_set(set);

@@ -11,6 +11,7 @@ categories = ["development-tools"]
 keywords = ["dart", "analyzer", "incremental", "analysis"]
 
 [dependencies]
+hex = { workspace = true }
 blake3 = { workspace = true }
 dartq-diagnostics = { workspace = true }
 dartq-index = { workspace = true }

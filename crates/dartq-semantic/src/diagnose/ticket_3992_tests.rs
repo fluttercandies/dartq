@@ -30,6 +30,7 @@
 //! close's `Expr::Call` — the one fold the potentially-constant scan
 //! admits.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

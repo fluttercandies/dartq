@@ -13,6 +13,7 @@
 //! and an opaque promotion the `ReadType` join cannot spell still proves
 //! non-null through the staged `PromotedRead` marker.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 

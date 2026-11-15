@@ -1,5 +1,6 @@
 //! Recovery strategies, diagnostic pinning, the @dart window, CRLF, BOM-as-content, dual-offset consistency.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::{assert_codes, assert_kinds, codes, scan_src};
 use crate::{Keyword, TokenKind as K};
 use dartq_source::byte_offset_to_utf16;
@@ -8,7 +9,7 @@ use dartq_source::byte_offset_to_utf16;
 fn nested_block_comments() {
     let r = scan_src("a /* /* nested */ still */ b");
     assert_kinds(&r, &[K::Identifier, K::Identifier]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     // Nesting depth > 2.
     assert_kinds(&scan_src("/* 1 /* 2 /* 3 */ 2 */ 1 */ x"), &[K::Identifier]);
 }
@@ -28,7 +29,7 @@ fn unterminated_block_comment() {
 fn line_comments_skipped() {
     let r = scan_src("a // rest of line\nb // another");
     assert_kinds(&r, &[K::Identifier, K::Identifier]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     // `///` and `/**` doc comments also produce no tokens (official precedingComments shape).
     assert_kinds(
         &scan_src("/// doc\nvoid f() {}"),
@@ -74,7 +75,7 @@ fn crlf_and_lone_cr() {
     for sep in ["\r\n", "\n", "\r"] {
         let r = scan_src(&format!("a{sep}b"));
         assert_kinds(&r, &[K::Identifier, K::Identifier]);
-        assert!(r.diagnostics.is_empty());
+        assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     }
     // CR ends a line comment.
     let r = scan_src("a // c\rb");
@@ -374,9 +375,9 @@ fn unclosed_interpolation_at_eof() {
 fn stray_close_brace_no_scanner_diag() {
     // Extra/mismatched close tokens: the scanner does not report (parser's job, official appendEndGroupInternal).
     let r = scan_src("foo())");
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     let r = scan_src("a } b");
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     assert_kinds(&r, &[K::Identifier, K::CloseCurly, K::Identifier]);
 }
 
@@ -443,10 +444,10 @@ fn paren_bracket_without_match_silent() {
     // `{a);}\n` and `main() { a]; }\n` → no scanner expected_token at all;
     // the later `}` closes `{` normally.
     let r = scan_src("{a);}");
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     assert_eq!(r.tokens.matching_end(0), Some(4));
     let r = scan_src("main() { a]; }");
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]
@@ -562,7 +563,7 @@ fn deep_match_insert_stays_when_not_strictly_cheaper() {
 fn gt_closes_lt_silently() {
     // Generic closing does not error; `>>` records endGroup only for the outermost `<` (official appendGtGt).
     let r = scan_src("List<List<int>> x");
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     let t = &r.tokens;
     // 0 List, 1 <, 2 List, 3 <, 4 int, 5 >>, 6 x
     assert_eq!(t.matching_end(1), Some(5));
@@ -574,7 +575,7 @@ fn gt_closes_lt_silently() {
 fn single_gt_closes_inner_lt() {
     // A single `>` closes one level: the `>` of `Map<String, int>` is recorded for the `<`.
     let r = scan_src("Map<String, int> m");
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     assert_eq!(r.tokens.matching_end(1), Some(5));
 }
 
@@ -582,7 +583,7 @@ fn single_gt_closes_inner_lt() {
 fn discard_open_lt_on_semicolon_brace() {
     // `;` / `{` / `[` / `${` / `=` silently discard an unclosed `<` (official discardOpenLt).
     let r = scan_src("if (a < b) {}");
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     // By the time `{` appears, the `<` has been silently popped → the `{` begin closes normally.
     let t = &r.tokens;
     let open_curly = t
@@ -748,11 +749,11 @@ fn replacement_char_is_skipped_silently() {
     // never merged into an identifier.
     let r = scan_src("a\u{FFFD}b");
     assert_kinds(&r, &[K::Identifier, K::Identifier]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     // Consecutive U+FFFD: still silent, no token merging.
     let r = scan_src("\u{FFFD}\u{FFFD}x");
     assert_kinds(&r, &[K::Identifier]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]
@@ -868,10 +869,10 @@ fn empty_block_comment_is_not_unterminated() {
     // used to re-bump and swallow one content character, mis-scanning `/**/`).
     let r = scan_src("/**/x");
     assert_kinds(&r, &[K::Identifier]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     let r = scan_src("/***/x");
     assert_kinds(&r, &[K::Identifier]);
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]
@@ -879,7 +880,7 @@ fn this_discards_open_lt() {
     // `this` discards an open `<` group (official appendKeywordToken: type
     // parameters cannot contain 'this') → the later `>` closes nothing.
     let r = scan_src("x < y ? this : z > w");
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     let t = &r.tokens;
     let lt = t
         .as_slice()
@@ -889,7 +890,7 @@ fn this_discards_open_lt() {
     assert_eq!(t.matching_end(lt), None);
     // Same inside interpolation: `'$this'` (keyword arm of the SII path).
     let r = scan_src("'${a < b ? this : c}'");
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
     let t = &r.tokens;
     let lt = t
         .as_slice()

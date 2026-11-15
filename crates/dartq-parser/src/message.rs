@@ -11,6 +11,7 @@
 //! the official templates (`_fe_analyzer_shared/messages.yaml`), matching the
 //! (code, file) oracle differential of
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::listener::ExperimentalFlag;
 use dartq_diagnostics::CodeInfo;
 
@@ -167,7 +168,7 @@ pub(crate) mod msg {
     /// (error_converter.dart:89-96), so the shared "Expected '<x>' before
     /// this." text is never dart-analyze-observable — the rendered text is
     /// the same `Expected to find '<x>'.` face (oracle
-    /// typing_string_interpolation_2.dart comma rows).
+    /// `typing_string_interpolation_2.dart` comma rows).
     pub(crate) fn expected_but_got(expected: &str) -> Message {
         Message::new(EXPECTED_TOKEN, format!("Expected to find '{expected}'."))
     }
@@ -541,7 +542,7 @@ pub(crate) mod msg {
         )
     }
 
-    /// `partOfName` (AstBuilder `endPartOf`, ast_builder.dart:2823-2826):
+    /// `partOfName` (`AstBuilder` `endPartOf`, ast_builder.dart:2823-2826):
     /// the name-form `part of` face, reported only when the enhanced-parts
     /// feature is enabled.
     pub(crate) fn part_of_name() -> Message {
@@ -1658,11 +1659,12 @@ pub(crate) mod msg {
     /// extension type :2453, prefix :2461, type :2469, type parameter :2477,
     /// typedef :2485), all phrased "The built-in identifier '{name}' can't
     /// be used as a ... name." The converter drops the shared parser's
-    /// message in favor of the ErrorVerifier's per-visit face
-    /// (`_checkForBuiltInIdentifierAsName`, error_verifier.dart:3760), so
+    /// message in favor of the `ErrorVerifier`'s per-visit face
+    /// (`_checkForBuiltInIdentifierAsName`, `error_verifier.dart:3760`), so
     /// each declaration kind names its own position
     /// (`keyword_named_typedefs.dart`: "The built-in identifier 'abstract'
     /// can't be used as a typedef name.").
+    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn built_in_identifier_as_name(kind: BuiltInNameKind, lexeme: &str) -> Message {
         let what = match kind {
             BuiltInNameKind::Extension => "an extension name",

@@ -14,6 +14,7 @@
 //! `int x;` reports at the first read, `int? x;` and `int x = f();`
 //! never do).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

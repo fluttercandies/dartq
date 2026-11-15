@@ -6,6 +6,7 @@
 //! outputs), with the decision points mirrored from the upstream parser
 //! (`upstream Dart SDK source, pkg/_fe_analyzer_shared, parser_impl.dart`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{scan_ok, setup};
 use crate::ParserFeatures;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -90,11 +91,11 @@ fn uninitialized_field_faces_use_analyzer_codes() {
 /// `expected_identifier_but_get_keyword` face (the official
 /// `ensureIdentifierPotentiallyRecovered` recovered variant — parseTypedef
 /// passes `isIdentifierRecovered = true` for any non-identifier head heading
-/// the `(`/`=` group, parser_impl.dart:1494/:1583) plus the analyzer's
+/// the `(`/`=` group, `parser_impl.dart:1494/:1583`) plus the analyzer's
 /// per-context `built_in_identifier_in_declaration` template (the converter
 /// drops the shared parser message in favor of
 /// `ErrorVerifier._checkForBuiltInIdentifierAsName`,
-/// error_converter.dart:291; oracle keyword_named_typedefs.dart 1|14, 2|9:
+/// `error_converter.dart:291`; oracle `keyword_named_typedefs.dart` 1|14, 2|9:
 /// "'abstract'" fires both). Pseudo keywords are legal names and stay
 /// completely silent (oracle lines 7-10: `async`/`await` are row-free).
 #[test]
@@ -268,23 +269,26 @@ fn typedef_record_return_type_parses_as_typedef() {
         "record-typedef head must parse clean"
     );
     // Positional record return + empty formals.
-    assert!(
+    assert_eq!(
         rows_with(
             "typedef (int, String) R2();\n",
             super::collector::latest_features()
-        )
-        .is_empty()
+        ),
+        [] as [(std::string::String, u32, u32); 0]
     );
     // Named-field record return.
-    assert!(
+    assert_eq!(
         rows_with(
             "typedef (int, {String s}) baz();\n",
             super::collector::latest_features()
-        )
-        .is_empty()
+        ),
+        [] as [(std::string::String, u32, u32); 0]
     );
     // Empty record `()` return type stays a typedef too.
-    assert!(rows_with("typedef () foo();\n", super::collector::latest_features()).is_empty());
+    assert_eq!(
+        rows_with("typedef () foo();\n", super::collector::latest_features()),
+        [] as [(std::string::String, u32, u32); 0]
+    );
     // Sibling: single-field record without trailing comma keeps its own row
     // (parseRecordType's `recordTypeOnePositionalNoTrailingComma`,
     // parser_impl.dart:1849-1855) — the typedef head is not the owner. (dartq
@@ -304,7 +308,10 @@ fn typedef_record_return_type_parses_as_typedef() {
     // Sibling: `typedef` followed by a non-record `(` shape still takes the
     // member path unchanged (`typedef` usable as a plain identifier).
     // (assert via a clean non-record function pair)
-    assert!(rows_with("typedef void R4();\n", super::collector::latest_features()).is_empty());
+    assert_eq!(
+        rows_with("typedef void R4();\n", super::collector::latest_features()),
+        [] as [(std::string::String, u32, u32); 0]
+    );
 }
 
 // —— C6b: class-member tail recovery + adopted-closer faces —————————————
@@ -337,7 +344,10 @@ fn class_member_tail_routes_progress_to_parse_fields() {
         );
     }
     // Clean field stays row-free.
-    assert!(rows_with("class C { var x; }\n", super::collector::latest_features()).is_empty());
+    assert_eq!(
+        rows_with("class C { var x; }\n", super::collector::latest_features()),
+        [] as [(std::string::String, u32, u32); 0]
+    );
 }
 
 /// The `(`-unclosed member shape: `ensureCloseParen`'s `moveSynthetic` arm
@@ -357,7 +367,10 @@ fn adopted_paren_closer_never_resurfaces_as_member() {
         vec![("expected_token".to_string(), 23, 24)],
     );
     // A well-formed twin stays silent.
-    assert!(rows_with("class C { m() {} }\n", super::collector::latest_features()).is_empty());
+    assert_eq!(
+        rows_with("class C { m() {} }\n", super::collector::latest_features()),
+        [] as [(std::string::String, u32, u32); 0]
+    );
 }
 
 // —— FAM8: primary-constructor feature posture ———————————————————————————
@@ -459,7 +472,7 @@ fn new_headed_member_anchors_mmp_on_the_new_keyword() {
 }
 
 /// The existing `(`/`.`-headed mixin/extension faces already split on the
-/// posture (parser_impl.dart:3799/:3813); pin one shape so the gate stays
+/// posture (`parser_impl.dart:3799/:3813`); pin one shape so the gate stays
 /// symmetric across the two arms.
 #[test]
 fn paren_headed_mixin_keeps_the_posture_split() {
@@ -509,7 +522,7 @@ fn missing_primary_constructor_parameters_anchors_on_the_name() {
 
 /// The empty representation list anchors `expectedRepresentationField` on
 /// the token after the `(` — the `)` itself
-/// (error_verifier.dart:5371, `formalParameterList.leftParenthesis.next`),
+/// (`error_verifier.dart:5371`, `formalParameterList.leftParenthesis.next`),
 /// never the body `{`. Oracle:
 /// `targeted/blindspot_extension_types.dart` 16
 /// (`extension type EmptyRepresentation() {}`).
@@ -754,7 +767,7 @@ fn object_pattern_assignment_enters_pattern_path() {
 /// (`util.dart:140-234`), which the new-style-typedef discriminator reads as
 /// `=` (`parser_impl.dart:1497`). The prior port treated the whole `...Eq`
 /// tail as a `>`-closer unit count and forced `end_raw_compound`/`backed_up`
-/// wrong, so the head scanned as a generic `id<...>` type (NoType never
+/// wrong, so the head scanned as a generic `id<...>` type (`NoType` never
 /// fired) and the follower read `end+1` (the real `T` RHS head) instead of
 /// the `=` remainder — falling to old-style parse and emitting
 /// `missing_typedef_parameters`/`expected_token(';')`/`missing_function_body`

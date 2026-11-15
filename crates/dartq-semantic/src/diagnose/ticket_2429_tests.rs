@@ -22,6 +22,7 @@
 //! exactly), `deadprefix` (`implements idl.Missing` keeps the override
 //! report beside the type-row error).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

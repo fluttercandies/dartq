@@ -20,6 +20,8 @@
 //! Oracle rows below were captured against `dart analyze --format machine`
 //! 3.13.7 with `analyzer.enable-experiment: [augmentations]` on.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::FileReport;
 use super::test_rig::report_ops_experiments_with;
 use dartq_language::Feature;
@@ -53,7 +55,7 @@ fn unused_parameter_rows(source: &str) -> Vec<(u32, u32, String)> {
 /// its own.
 ///
 /// Oracle (3.13.7):
-///   WARNING|STATIC_WARNING|UNUSED_ELEMENT|…|3|8|4|The declaration '_foo' isn't referenced.
+///   `WARNING|STATIC_WARNING|UNUSED_ELEMENT|…|3|8|4|The` declaration '_foo' isn't referenced.
 ///   (line 6 `augment void _foo()` produces no row)
 #[test]
 fn augment_method_fragment_never_reports_unused_element() {
@@ -109,7 +111,7 @@ fn augment_enum_constructor_fragment_never_reports_unused_element() {
 /// augment fragment used to stage a duplicate at its own name offset.
 ///
 /// Oracle (3.13.7):
-///   WARNING|STATIC_WARNING|UNUSED_ELEMENT|…|2|7|2|The declaration '_C' isn't referenced.
+///   `WARNING|STATIC_WARNING|UNUSED_ELEMENT|…|2|7|2|The` declaration '_C' isn't referenced.
 ///   (line 3 `augment class _C` produces no row)
 #[test]
 fn augment_class_fragment_never_reports_unused_element() {
@@ -129,7 +131,7 @@ fn augment_class_fragment_never_reports_unused_element() {
 /// fragment produces no row, the intro's verdict stands alone.
 ///
 /// Oracle (3.13.7):
-///   WARNING|STATIC_WARNING|UNUSED_ELEMENT|…|1|6|7|The declaration '_helper' isn't referenced.
+///   `WARNING|STATIC_WARNING|UNUSED_ELEMENT|…|1|6|7|The` declaration '_helper' isn't referenced.
 #[test]
 fn augment_top_level_function_fragment_never_reports_unused_element() {
     let rows = unused_rows(
@@ -160,8 +162,8 @@ fn augment_top_level_variable_fragment_never_reports_unused_element() {
 /// the augment's own.
 ///
 /// Oracle (3.13.7):
-///   WARNING|STATIC_WARNING|UNUSED_ELEMENT|…|4|5|4|The declaration 'C._foo' isn't referenced.
-///   WARNING|STATIC_WARNING|UNUSED_ELEMENT_PARAMETER|…|4|16|1|A value for optional parameter 'y' isn't ever given.
+///   `WARNING|STATIC_WARNING|UNUSED_ELEMENT|…|4|5|4|The` declaration 'C._foo' isn't referenced.
+///   `WARNING|STATIC_WARNING|UNUSED_ELEMENT_PARAMETER|…|4|16|1|A` value for optional parameter 'y' isn't ever given.
 ///   (line 7 `augment C._foo({int? y})` produces no row for `_foo` or `y`)
 #[test]
 fn augment_constructor_formals_never_report_unused_element_parameter() {
@@ -204,7 +206,7 @@ fn augment_constructor_formals_never_report_unused_element_parameter() {
 /// its own site.
 ///
 /// Oracle (3.13.7):
-///   WARNING|STATIC_WARNING|UNUSED_ELEMENT|…|7|8|4|The declaration '_bar' isn't referenced.
+///   `WARNING|STATIC_WARNING|UNUSED_ELEMENT|…|7|8|4|The` declaration '_bar' isn't referenced.
 #[test]
 fn new_member_inside_augment_class_still_reports_unused_element() {
     let rows = unused_rows(

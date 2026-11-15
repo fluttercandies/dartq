@@ -25,6 +25,9 @@
 //! bare callable-value heads: `nf()`, `(nf)()`, and the inner result of
 //! `a()()`, which is already reference-less when the outer send pops it.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -35,7 +38,7 @@ use dartq_scanner::{ScanConfig, TokenTable};
 
 /// Scans and parses `source` with `ops` mounted when given; returns the
 /// taken facts.
-fn analyze<'t>(source: &'static str, ops: Option<&'t dyn TypeOps>) -> Vec<FlowFact> {
+fn analyze(source: &'static str, ops: Option<&dyn TypeOps>) -> Vec<FlowFact> {
     let result = dartq_scanner::scan(
         source,
         ScanConfig {
@@ -84,15 +87,10 @@ fn dead_of(source: &str, facts: &[FlowFact]) -> Vec<String> {
 /// offset `at` (an `nf;`/`a;` inside a branch, located by `source.find`
 /// from the caller).
 fn read_ty_at(facts: &[FlowFact], at: usize) -> Option<Ty> {
-    facts
-        .iter()
-        .filter_map(|fact| match fact {
-            FlowFact::ReadType { span, ty, .. } => {
-                (span.range.offset as usize == at).then_some(*ty)
-            }
-            _ => None,
-        })
-        .next()
+    facts.iter().find_map(|fact| match fact {
+        FlowFact::ReadType { span, ty, .. } => (span.range.offset as usize == at).then_some(*ty),
+        _ => None,
+    })
 }
 
 /// Every `ConditionType` row's covered text.
@@ -350,6 +348,7 @@ fn type_argument_application_keeps_the_reference() {
 struct UnresolvedHeadOps;
 
 impl UnresolvedHeadOps {
+    #[allow(clippy::unused_self)]
     fn is_invalid(&self, ty: Ty, names: &[Box<str>]) -> bool {
         match ty.base {
             Base::Name(id) => names

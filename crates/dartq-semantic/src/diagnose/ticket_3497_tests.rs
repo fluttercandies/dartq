@@ -32,6 +32,7 @@
 //! extent, later arguments keep their own parameter slots, and shapes the
 //! oracle accepts stay silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// The bounds rows of one fixture as `(utf16 offset, message)` pairs, in

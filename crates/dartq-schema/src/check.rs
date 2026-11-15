@@ -10,6 +10,7 @@
 //! short-id table (`symbols` — its values are the file paths substituted
 //! out of the rows), and the delta cursor echo (`since`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

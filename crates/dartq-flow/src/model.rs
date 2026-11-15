@@ -10,6 +10,7 @@
 //! bookkeeping). Promoted-type and tested-type chains are persistent
 //! cons-cells in a shared pool, so chain sharing across states is free.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_source::saturate_slot_u32;
 use rustc_hash::FxHashSet;
 
@@ -415,7 +416,7 @@ impl State {
     /// `None` for writes that are not the official's real-write events
     /// (declaration initializers, the declared for-in head — upstream's
     /// `declare`/`_initialize` carry no demotion reason).
-    #[expect(clippy::too_many_arguments)] // one slot per fact dimension of the official write event
+    #[expect(clippy::too_many_arguments, clippy::too_many_lines)] // one slot per fact dimension of the official write event
     pub(crate) fn write(
         self,
         ops: &dyn TypeOps,
@@ -680,6 +681,7 @@ impl State {
     /// both with their rows. `arena`/`names` are the recorder's argument
     /// arena and interned-name lexeme table the typed seam reads (#2204
     /// phase D).
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn finish_type_test(
         self,
         ops: &dyn TypeOps,
@@ -731,6 +733,7 @@ impl State {
     /// permanently gone). `tested` joins the types-of-interest chain,
     /// `promoted` the promotion chain — each optional side a
     /// `(type, written-argument tree)` pair.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn finish_prop_type_test(
         self,
         ops: &dyn TypeOps,

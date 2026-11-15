@@ -32,6 +32,9 @@
 //! real return is not staged; that head's non-nullability describes the
 //! CALLABLE, so the equality fold never reads it and no branch dies.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

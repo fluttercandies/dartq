@@ -1,6 +1,7 @@
 //! Pattern events: alternative patterns for cases, if-case, and pattern
 //! variable declarations.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::ev::{Ev, PatternShape};
 use crate::interp::{Expr, Frame, Interp, PatternKind, PatternState, Resolved, VarMeta};
 use crate::ty::{Base, Classification, Ty};
@@ -8,7 +9,8 @@ use dartq_parser::TokenSpan;
 
 impl Interp<'_> {
     /// Handles one pattern-layer event.
-    pub(crate) fn pattern_step(&mut self, ev: &Ev, _events: &[Ev], _i: usize, _match_of: &[u32]) {
+    #[allow(clippy::too_many_lines, clippy::single_match_else)]
+    pub(crate) fn pattern_step(&mut self, ev: &Ev, events: &[Ev], i: usize, _match_of: &[u32]) {
         // The collect pre-pass tracks writes/declares only. The pattern
         // state machine (matched/unmatched splits, guard snapshots) is a
         // flow-walk concern, and a collect-run pattern context leaks
@@ -33,7 +35,7 @@ impl Interp<'_> {
         }
         match ev {
             Ev::ObjectPattern { name, args } => {
-                self.matched_object_pattern(*name, *args, object_fields_irrefutable(_events, _i));
+                self.matched_object_pattern(*name, *args, object_fields_irrefutable(events, i));
             }
             Ev::BinaryOrPatternBegin { operator } => {
                 self.or_frame_begin(*operator);
@@ -296,7 +298,9 @@ impl Interp<'_> {
                 // nullability-disjoint.
                 if !disjoint && self.classify(constant.ty) == Classification::NullOrEquivalent {
                     let (non_null, non_null_args) = self.promote_to_non_null(matched, matched_args);
-                    let mut if_not_null = if non_null != matched {
+                    let mut if_not_null = if non_null == matched {
+                        self.current.clone()
+                    } else {
                         self.current.clone().finish_type_test(
                             self.ops,
                             &mut self.lists,
@@ -306,8 +310,6 @@ impl Interp<'_> {
                             self.args,
                             self.names,
                         )
-                    } else {
-                        self.current.clone()
                     };
                     if self.classify(matched) == Classification::NullOrEquivalent {
                         if_not_null = if_not_null.set_unreachable(&mut self.reach);
@@ -553,7 +555,7 @@ impl Interp<'_> {
                     self.inferred_locals
                         .get(&token.range.offset)
                         .copied()
-                        .map_or((declared, declared_args), |(ty, args)| (ty, args))
+                        .unwrap_or((declared, declared_args))
                 } else {
                     (declared, declared_args)
                 };
@@ -866,12 +868,9 @@ impl Interp<'_> {
     /// join of two distinct faces is no single promotion).
     fn or_pattern_end(&mut self) {
         self.or_operand_depth = None;
-        let (var, lty, largs) = match self.or_pattern_latch.take() {
-            Some(latch) => latch,
-            None => {
-                self.or_right_face = None;
-                return;
-            }
+        let Some((var, lty, largs)) = self.or_pattern_latch.take() else {
+            self.or_right_face = None;
+            return;
         };
         let Some(pattern) = self.pattern.as_ref() else {
             self.or_right_face = None;
@@ -899,6 +898,7 @@ impl Interp<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn matched_object_pattern(
         &mut self,
         name: u32,
@@ -1616,7 +1616,7 @@ impl Interp<'_> {
     /// cross-base question promotes through. The official pattern face
     /// reaches the same gate the is-test face does
     /// (`promoteForPattern` → `tryPromoteForTypeCheck`,
-    /// flow_analysis.dart:7748), so its type-parameter arm chains here
+    /// `flow_analysis.dart:7748`), so its type-parameter arm chains here
     /// too: a pattern test against a type-variable scrutinee
     /// (`case int _` over `T extends num`) promotes the variable to the
     /// intersection `T & int` ([`Interp::type_parameter_promotion`]).
@@ -1859,8 +1859,13 @@ fn object_fields_irrefutable(events: &[Ev], at: usize) -> bool {
     for ev in events[..at].iter().rev() {
         match ev {
             // Parenthesized wrappers are grouping-transparent: their
-            // flagged pair cancels in the backward walk.
-            Ev::PatternEnd { paren: true } | Ev::PatternBegin { paren: true, .. } => {}
+            // flagged pair cancels in the backward walk. `NoType`,
+            // `DeclaredVarPattern`, and `Wildcard` carry no field shape.
+            Ev::PatternEnd { paren: true }
+            | Ev::PatternBegin { paren: true, .. }
+            | Ev::NoType
+            | Ev::DeclaredVarPattern { .. }
+            | Ev::Wildcard { .. } => {}
             Ev::PatternEnd { paren: false } => depth += 1,
             Ev::PatternBegin { paren: false, .. } => {
                 if depth == 0 {
@@ -1868,7 +1873,6 @@ fn object_fields_irrefutable(events: &[Ev], at: usize) -> bool {
                 }
                 depth -= 1;
             }
-            Ev::NoType | Ev::DeclaredVarPattern { .. } | Ev::Wildcard { .. } => {}
             _ => return false,
         }
     }

@@ -28,6 +28,7 @@
 //! - Non-`void` operands keep the no-op; the span dedup still answers one
 //!   row per consumed node.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{report_ops, rows};
 
 /// The oracle's `useOfVoidResult` message spelling (messages.yaml:19638).

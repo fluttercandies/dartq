@@ -3,6 +3,7 @@
 //! `DirectiveContext` ordering checks, and the out-of-order-clause import
 //! recovery (official `parseImportRecovery`, `parser_impl.dart:995`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok, setup};
 use crate::listener::{ParserListener, Token};
 use crate::message::Message;
@@ -427,7 +428,10 @@ fn deferred_with_prefix_is_silent() {
     // The still-valid control: `deferred as p` parses entirely in the
     // primary `parseImportPrefixOpt` (:938) — recovery never runs and no
     // deferred face fires.
-    assert!(error_codes("import 'x.dart' deferred as p;").is_empty());
+    assert_eq!(
+        error_codes("import 'x.dart' deferred as p;"),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
@@ -548,7 +552,10 @@ fn library_name_missing() {
 fn repeated_part_directives_are_legal() {
     // checkPart admits Part → Part (directive_context.dart:91); a
     // declaration between them is still the after-declaration error.
-    assert!(error_codes("part 'a.dart'; part 'b.dart';").is_empty());
+    assert_eq!(
+        error_codes("part 'a.dart'; part 'b.dart';"),
+        [] as [std::string::String; 0]
+    );
     assert_eq!(
         error_codes("part 'a.dart'; int x = 1; part 'b.dart';"),
         ["directive_after_declaration"]

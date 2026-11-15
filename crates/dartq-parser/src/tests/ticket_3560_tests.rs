@@ -21,6 +21,7 @@
 //! * `null-aware-elements` (3.8) — `handleNullAwareElement` :5119 /
 //!   `handleLiteralMapEntry` :4771 (at the `?`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;

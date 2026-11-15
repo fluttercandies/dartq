@@ -19,6 +19,7 @@
 //! declared side of the override check compared a type the oracle never
 //! computed.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 // —— Gap 1 (T-E): the declaring field exists for every primary-ctor

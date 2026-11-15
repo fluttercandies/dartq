@@ -15,6 +15,7 @@
 //! around one fixture pins the substitution from both sides: the equal
 //! argument reports `always 'true'`, the mismatching one stays silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{
     CORE_PRELUDE, RigImport, code_names, report_ops, report_ops_imports, rows,
 };
@@ -341,7 +342,7 @@ fn ticket_3861_nested_written_dynamic_argument_decides_covariance() {
 #[test]
 #[ignore = "held: the sibling-complete corpus shape reads `unnecessary_type_check` rows 1 short of the oracle's pair — the `f15 is F15<int>` arm reports but the `m15 is F15<T>` sibling-shaped arm does not (same receiver-substitution seam as the 3847 family); re-verified 2026-11-05 vs oracle 3.13.7: still fails — 1 row where 2 are expected (plus 2 unused_local_variable extras the corpus pins); owner the creation-receiver instantiation face"]
 fn ticket_3838_sibling_complete_test_method_matches_oracle() {
-    let prologue = r#"
+    let prologue = r"
 typedef F15<T> = List<T> Function(int y, [core.List<core.int> x]) Function(int x);
 
 List<int> Function(int y, [core.List<core.int> x]) f15(int x) =>
@@ -370,7 +371,7 @@ class U<T> {
     ];
     x15 = m15;
     l15 = m15;
-"#;
+";
     let report = report_ops_imports(
         &format!("{prologue}\n  }}\n}}\n"),
         &[
@@ -398,9 +399,7 @@ class U<T> {
         rows(&report)
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|&code| code == "unnecessary_type_check"),
+        code_names(&report).contains(&"unnecessary_type_check"),
         "the rig exercised the family at all: {:?}",
         rows(&report)
     );
@@ -488,7 +487,7 @@ fn ticket_3874_lem_int_literal_converts_to_double_context() {
 }
 
 /// Reflexivity answers the identical pair before any decomposition: the
-/// census face was `FutureOr<T> <: FutureOr<T>`, where the Left FutureOr
+/// census face was `FutureOr<T> <: FutureOr<T>`, where the Left `FutureOr`
 /// leg asked `T <: FutureOr<T>` and the parameter's bound refused a pair
 /// the oracle never asks. The null-aware spread of the same-typed list
 /// rides the same fixture.

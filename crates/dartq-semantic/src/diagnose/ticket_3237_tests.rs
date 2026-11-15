@@ -43,6 +43,7 @@
 //!
 //! Registered through `diagnose/tests.rs`'s `#[path]` block.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// Asserts a `receiver_of_type_never` row fires for `fixture`.

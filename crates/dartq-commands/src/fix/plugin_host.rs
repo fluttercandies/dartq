@@ -1,8 +1,12 @@
-use super::*;
+use super::{
+    AnalysisOptions, BTreeMap, Capability, LineIndex, PackageConfig, PackageConfigEntry, Path,
+    PathBuf, PluginFix, PluginHostError, PluginRuntime, PubNative, SpawnSpec, Yaml,
+    discover_plugins, from_plugin,
+};
 
 /// One entry of the governing options file's `plugins:` section: the
 /// declared package name plus the source the value pins. Upstream
-/// `_parsePluginSource` (analysis_options_parse_model.dart:1639) resolves
+/// `_parsePluginSource` (`analysis_options_parse_model.dart:1639`) resolves
 /// the entry's source kind in a fixed order — a scalar is a version
 /// constraint, a mapping prefers `version`/`hosted`, then `git`, then
 /// `path`, first match wins — and only `path` carries a filesystem location
@@ -69,6 +73,7 @@ pub(crate) fn declared_plugin_path(value: &Yaml, options_dir: &Path) -> Option<P
 /// read-and-parse, the minimum needed to establish absence. A broken
 /// declaration reports through the engine's options face and never takes
 /// the launch down.
+#[must_use]
 pub fn declared_plugins(workspace_root: &Path) -> Option<(PathBuf, Vec<String>)> {
     let (file, declared) = declared_plugin_sources(workspace_root)?;
     Some((file, declared.into_iter().map(|decl| decl.name).collect()))
@@ -81,6 +86,7 @@ pub fn declared_plugins(workspace_root: &Path) -> Option<(PathBuf, Vec<String>)>
 /// ([`declared_plugins`]) is what the pub-native discovery face consumes;
 /// the richer face is where the `path:` entries augment the config the
 /// discovery resolves through.
+#[must_use]
 pub fn declared_plugin_sources(workspace_root: &Path) -> Option<(PathBuf, Vec<DeclaredPlugin>)> {
     let file = AnalysisOptions::find_for_dir(workspace_root)?;
     let text = std::fs::read_to_string(&file).ok()?;
@@ -127,6 +133,7 @@ pub fn declared_plugin_sources(workspace_root: &Path) -> Option<(PathBuf, Vec<De
 /// derived-manifest convention (`lib/main.dart`) then applies like any
 /// pub-native hit. Only called when `path:` declarations exist — the
 /// plugin-free workspace never reaches it.
+#[must_use]
 pub fn plugin_package_config(
     pub_config: &PackageConfig,
     declared: &[DeclaredPlugin],

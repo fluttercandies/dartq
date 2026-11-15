@@ -15,7 +15,7 @@
 //!
 //! The suppression exists because OUR member walk under-resolves the
 //! extension/import members an inference-bound receiver can carry
-//! (manifest_item.dart's `items.write` family): for a container whose
+//! (`manifest_item.dart`'s `items.write` family): for a container whose
 //! member table is genuinely out of reach the `undefined_*` rows stay
 //! silent. The pre-#3396 insert suppressed unconditionally, which also
 //! swallowed the real `undefined_method` row a same-file class produces
@@ -27,6 +27,7 @@
 //! --format=machine` — `UNDEFINED_METHOD … 'noSuchEver' isn't defined for
 //! the type 'Ann'`, `… 'nope' isn't defined for the type 'A'`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 use crate::diagnose::FileReport;
 

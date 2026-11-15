@@ -36,6 +36,7 @@
 //! `type_inference_engine.dart` member lookup precedence (a member selector's
 //! name is never a lexical reference), and `constant.dart` (the const
 //! evaluation fault set).
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
 
 use super::*;
 use crate::diagnose::test_rig::{

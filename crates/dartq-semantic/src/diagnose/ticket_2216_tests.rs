@@ -15,6 +15,7 @@
 //!   unused-member face; an instance member spares only on an
 //!   element-attributed application.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

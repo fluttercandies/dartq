@@ -15,6 +15,7 @@
 //! operand types no constant and must stay silent (staging a guess would
 //! over-report).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 

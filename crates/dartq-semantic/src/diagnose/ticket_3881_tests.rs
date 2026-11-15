@@ -24,6 +24,7 @@
 //! `UNDEFINED_METHOD … 'Iterable'`; `BODY_MIGHT … 'I<int>'` +
 //! `UNDEFINED_METHOD … 'I'`; both controls answer `'Object'`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 use crate::diagnose::FileReport;
 

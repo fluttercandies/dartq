@@ -21,6 +21,7 @@
 //! the face every downstream substitution reads, and a faithful header is
 //! the only way it answers `Some`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::library::ElementIndex;
@@ -135,8 +136,7 @@ fn dynamic_function_clause_argument_parses_faithful() {
             );
             assert!(
                 fn_shape.positional.is_empty() && fn_shape.named.is_empty(),
-                "the `()` literal carries no formals, got {:?}",
-                fn_shape,
+                "the `()` literal carries no formals, got {fn_shape:?}",
             );
         },
     );

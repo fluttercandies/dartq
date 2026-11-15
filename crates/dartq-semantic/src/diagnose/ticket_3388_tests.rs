@@ -31,7 +31,7 @@
 //!   `A<int, String> x = new A('s', 1)` publishes the to-bounds
 //!   `A<dynamic, dynamic>` where upstream pins the context solution
 //!   before any constraint is consulted
-//!   (pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer_operations.dart
+//!   (pkg/_`fe_analyzer_shared/lib/src/type_inference/type_analyzer_operations.dart`
 //!   `inferTypeParameterFromAll`: a covariant parameter returns its
 //!   previously — downward — inferred type, and the argument checks
 //!   report the conflict separately);
@@ -49,6 +49,7 @@
 //! carries the fixture behind it on one line. All fixtures are ASCII, so
 //! the byte and UTF-16 offsets coincide.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -77,7 +78,7 @@ fn at(source: &str, needle: &str) -> u32 {
 /// reader's.
 #[test]
 fn written_group_publishes_the_created_row_type() {
-    let source = r#"
+    let source = r"
 class Pair<K, V> {
   K k = throw 0;
   V v = throw 0;
@@ -87,7 +88,7 @@ void f() {
   var p = new Pair<int, String>(1, 'a');
   Pair<String, String> q = p;
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_of(&report, "argument_type_not_assignable").is_empty(),
@@ -112,7 +113,7 @@ void f() {
 /// written `T`), never an argument row.
 #[test]
 fn written_group_substitutes_the_creation_formals() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class Box<T> {
@@ -122,7 +123,7 @@ class Box<T> {
 void f() {
   Box<A> b = new Box<B>(B());
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_of(&report, "argument_type_not_assignable").is_empty(),
@@ -150,14 +151,14 @@ void f() {
 /// the residual list in the module docs.
 #[test]
 fn context_seed_reports_the_argument() {
-    let source = r#"
+    let source = r"
 class Holder<T> {
   Holder(T t);
 }
 void f() {
   Holder<int> h = Holder('s');
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "argument_type_not_assignable");
     assert_eq!(rows.len(), 1, "{rows:#?}");
@@ -174,7 +175,7 @@ void f() {
 /// `invalid_assignment`. The negative control of face 3.
 #[test]
 fn context_seed_agrees_stays_silent() {
-    let source = r#"
+    let source = r"
 class A {}
 class Holder<T> {
   Holder(T t);
@@ -182,7 +183,7 @@ class Holder<T> {
 void f() {
   Holder<A> h = Holder(A());
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_of(&report, "argument_type_not_assignable").is_empty(),
@@ -202,7 +203,7 @@ void f() {
 /// `C` assignment is clean.
 #[test]
 fn non_generic_head_gains_no_arguments() {
-    let source = r#"
+    let source = r"
 class C {
   C();
 }
@@ -210,7 +211,7 @@ void f() {
   var x = C();
   C c = x;
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_of(&report, "argument_type_not_assignable").is_empty(),

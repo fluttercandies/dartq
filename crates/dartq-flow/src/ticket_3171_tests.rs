@@ -2,7 +2,7 @@
 //! `interp_stmt.rs` and the switch-member keyword rows, asserted as the
 //! exact source text the row covers against the oracle 3.13.7 law.
 //!
-//! Upstream face pinned here (pkg/analyzer/lib/src/error/dead_code_verifier.dart):
+//! Upstream face pinned here (`pkg/analyzer/lib/src/error/dead_code_verifier.dart)`:
 //!
 //! - `checkUnreachableNode(node)` polls the STATEMENT node itself, so a dead
 //!   statement anchors its own first token and the covering `flowEnd` closes
@@ -17,6 +17,9 @@
 //! `DeadCodeOnCatchSubtype`) is a semantic-crate face with no flow fact to
 //! pin; its law is recorded at `finish_try_statement` in
 //! `dartq-semantic/src/diagnose/scopes_bodies.rs`.
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;

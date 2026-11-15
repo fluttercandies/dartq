@@ -13,6 +13,7 @@
 //! materialized as `Object?` by the collector, exactly the type a written
 //! `Object?` annotation spells — the pins pair those two shapes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops_bare;
 use crate::FileReport;
 

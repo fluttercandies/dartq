@@ -49,6 +49,9 @@
 //! `FACTS_SEMANTIC_VERSION` folds `SIGNATURE_VERSION` into its low half, so
 //! cached facts invalidate automatically; no separate engine-side bump).
 
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::field_reassign_with_default)]
+
 use blake3::Hasher;
 use dartq_source::{StringId, StringTable};
 
@@ -56,7 +59,6 @@ use crate::model::{
     Annotation, ArgListId, ArgPool, Container, ContainerKind, FileElements, Formal, Formals,
     MemberEntry, MemberKind, MicroKind, TopDecl, Ty, display_named,
 };
-use dartq_types::Variance;
 
 /// The signature-composition version: bumped with any change to
 /// what [`FileElements::api_signature`] hashes. v1: the initial composition-F
@@ -338,7 +340,7 @@ impl<'a> Face<'a> {
                 // type identity (`(int, String)` != `(String, int)`).
                 self.field("record");
                 let shape = self.args.record_shape(shape);
-                for ty in shape.positional.iter() {
+                for ty in &shape.positional {
                     self.ty(*ty);
                 }
                 for (name, ty) in display_named(&shape.named, self.strings).iter() {
@@ -363,7 +365,7 @@ impl<'a> Face<'a> {
                 // only in that split would read unchanged.
                 self.usize(shape.required_positional as usize);
                 self.ty(shape.return_ty);
-                for ty in shape.positional.iter() {
+                for ty in &shape.positional {
                     self.ty(*ty);
                 }
                 for (name, ty) in display_named(&shape.named, self.strings).iter() {
@@ -496,7 +498,7 @@ impl<'a> Face<'a> {
             self.name(name);
             self.name(face.container);
             self.uint(face.named.len() as u64);
-            for (label, value) in face.named.iter() {
+            for (label, value) in &face.named {
                 self.name(*label);
                 self.field(self.strings.resolve(*value));
             }
@@ -1264,7 +1266,7 @@ mod tests {
         // A second interning history: another name interned first shifts
         // every StringId — the digests must not notice.
         let shifted_table = StringTable::new();
-        shifted_table.intern("zzz_unrelated");
+        let _ = shifted_table.intern("zzz_unrelated");
         let b = elements_of(source, &shifted_table);
         assert_eq!(
             sorted_digests(&a, &strings),

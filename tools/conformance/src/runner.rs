@@ -8,6 +8,7 @@
 //! must never share roots, because the second materialization deletes the
 //! first one's files while its analyzer is still walking them.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::analyze_json;
 use crate::materialize::{self, LoadedCase};
 use crate::rows::Row;
@@ -264,13 +265,13 @@ fn remove_chunk_dir(chunk_dir: &Path) {
     if !chunk_dir.is_dir() {
         return;
     }
-    if let Err(e) = std::fs::remove_dir_all(chunk_dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn(&format!(
-                "cannot remove chunk dir {}: {e}",
-                chunk_dir.display()
-            ));
-        }
+    if let Err(e) = std::fs::remove_dir_all(chunk_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn(&format!(
+            "cannot remove chunk dir {}: {e}",
+            chunk_dir.display()
+        ));
     }
 }
 
@@ -341,13 +342,12 @@ fn attribute(
 /// direct prefix strip fails the fully resolved forms of both sides are
 /// compared before the row is given up on.
 fn split_under_chunk(path: &Path, chunk_dir: &Path) -> Option<(usize, Vec<String>)> {
-    let rest = match path.strip_prefix(chunk_dir) {
-        Ok(rest) => rest.to_owned(),
-        Err(_) => {
-            let resolved = std::fs::canonicalize(path).ok()?;
-            let resolved_chunk = std::fs::canonicalize(chunk_dir).ok()?;
-            resolved.strip_prefix(resolved_chunk).ok()?.to_owned()
-        }
+    let rest = if let Ok(rest) = path.strip_prefix(chunk_dir) {
+        rest.to_owned()
+    } else {
+        let resolved = std::fs::canonicalize(path).ok()?;
+        let resolved_chunk = std::fs::canonicalize(chunk_dir).ok()?;
+        resolved.strip_prefix(resolved_chunk).ok()?.to_owned()
     };
     let mut comps = rest.components();
     let index = comps.next()?.as_os_str().to_string_lossy().into_owned();

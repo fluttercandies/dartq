@@ -22,6 +22,7 @@
 //! left hands the right operand's own verdict through untouched
 //! (:2525-2532), so `null ?? a` keeps the operand's anchor.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

@@ -13,6 +13,7 @@
 //! annotation (`named_type_resolver.dart:814-818`), so the declaration
 //! shape pinned here is the correct one.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, setup};
 
 fn parse(source: &'static str) -> Collector {

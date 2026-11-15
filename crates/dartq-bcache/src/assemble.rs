@@ -3,14 +3,14 @@
 //! the dir under a recomputed name in any tree.
 //!
 //! The platform build systems behind `flutter build|run` (Gradle, Xcode,
-//! CMake) invoke `flutter assemble …` as a child process with every
+//! `CMake`) invoke `flutter assemble …` as a child process with every
 //! `-dKEY=VALUE` define and the `--output` dir in argv — through the
 //! SDK's absolute `$FLUTTER_ROOT/bin/flutter` path, which no PATH shim
 //! can intercept. The outer shim's process-table observer
 //! ([`crate::observer`]) therefore reads each such invocation's argv
 //! while the build runs and hands it to [`capture_templates`], which
 //! rebuilds the exact `Environment.defines` map and hashed output-dir
-//! string the flutter_tools 3.47.1 `AssembleCommand` assembles and
+//! string the `flutter_tools` 3.47.1 `AssembleCommand` assembles and
 //! computes the `.dart_tool/flutter_build/<name>` dir name that
 //! invocation will use, as one [`AssembleCapture`].
 //!
@@ -30,6 +30,7 @@
 //! Everything here is pure except the pubspec read of the
 //! deferred-components heuristic.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -46,7 +47,7 @@ pub struct AssembleCapture {
     pub defines: BTreeMap<String, String>,
     /// The output-dir string as hashed at capture time (absolute; a
     /// relative `--output` is joined against the capture cwd, as
-    /// flutter_tools joins it against the project directory).
+    /// `flutter_tools` joins it against the project directory).
     pub output_dir: String,
     /// `flutter_build_dir_name(engine_revision, defines, output_dir)` at
     /// capture time — verified by the outer POST against the dir that
@@ -57,7 +58,7 @@ pub struct AssembleCapture {
 /// Where one argv option's value lands.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
-    /// `-d/--define`: a `KEY=VALUE` pair (flutter_tools 3.47.1).
+    /// `-d/--define`: a `KEY=VALUE` pair (`flutter_tools` 3.47.1).
     Define,
     /// `--dart-define`/`-D`/`--DartDefines`: one padded-standard-base64
     /// `k=v` pair.
@@ -98,7 +99,7 @@ fn global_slot(name: &str) -> Option<Slot> {
     }
 }
 
-/// The options the `assemble` command declares (flutter_tools 3.47.1
+/// The options the `assemble` command declares (`flutter_tools` 3.47.1
 /// `AssembleCommand` + the helpers it calls), plus the globals that also
 /// resolve after the command through `package:args`' parent fallback.
 fn command_slot(name: &str) -> Option<Slot> {
@@ -239,9 +240,10 @@ impl AssembleArgs {
                 };
                 match slot_of(name) {
                     Some(Slot::Flag) => {}
-                    Some(slot) => match inline {
-                        Some(value) => self.record_tagged(slot, value)?,
-                        None => {
+                    Some(slot) => {
+                        if let Some(value) = inline {
+                            self.record_tagged(slot, value)?
+                        } else {
                             let value = tokens.get(i + 1).ok_or_else(|| {
                                 ArgModelError::Invalid(format!(
                                     "option `{token}` is missing its value"
@@ -250,7 +252,7 @@ impl AssembleArgs {
                             self.record_tagged(slot, value)?;
                             i += 1;
                         }
-                    },
+                    }
                     None => {
                         if inline.is_none() {
                             i += 1; // an unknown option may consume a value
@@ -288,10 +290,10 @@ impl AssembleArgs {
                         tokens: vec![token.to_owned()],
                     });
                     self.orphan_run_open = true;
-                } else if self.orphan_run_open {
-                    if let Some(run) = self.orphan_runs.last_mut() {
-                        run.tokens.push(token.to_owned());
-                    }
+                } else if self.orphan_run_open
+                    && let Some(run) = self.orphan_runs.last_mut()
+                {
+                    run.tokens.push(token.to_owned());
                 }
             }
             i += 1;
@@ -348,7 +350,7 @@ const MAX_JOIN_VARIANTS: usize = 64;
 /// carries the argv's source: `true` for a whitespace-split line, and
 /// `false` for a kernel-read argv whose tokens are exact and yield the
 /// as-tokenized capture alone. Every capture carries the define map
-/// exactly as the flutter_tools 3.47.1 `AssembleCommand` assembles it
+/// exactly as the `flutter_tools` 3.47.1 `AssembleCommand` assembles it
 /// for the `Environment` factory —
 ///
 /// * every `-dK=V` value, then every `--dart-define` value
@@ -537,7 +539,7 @@ fn decode_dart_defines(raw: &[String]) -> Result<Vec<String>, ArgModelError> {
     Ok(decoded)
 }
 
-/// The assemble gate for `DeferredComponents` (flutter_tools
+/// The assemble gate for `DeferredComponents` (`flutter_tools`
 /// `assemble.dart`): one of the six deferred-components bundle targets
 /// (`android.dart`'s `deferredComponentsTargets`), no target name
 /// containing `debug`, and a pubspec that declares the section.
@@ -785,7 +787,7 @@ mod tests {
     /// then path-fictionalized (SDK root, project root) with every
     /// token shape preserved — the paths are fixture inputs, not
     /// references into any checkout-local tree. The pinned names are
-    /// precomputed offline with the flutter_tools 3.47.1 dir-name hash
+    /// precomputed offline with the `flutter_tools` 3.47.1 dir-name hash
     /// (exactly the crate's `flutter_build_dir_name`) over THIS argv,
     /// so the goldens stay non-circular: the full-value join is the
     /// name the real build materialized (its dir-name hash is how the

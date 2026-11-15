@@ -27,6 +27,7 @@
 //! augment body and vice versa (the #3418 face the scope merge must stay
 //! consistent with).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops_augment, report_ops_augment_intro_experiments, rows};
 
 /// ① The introduction's member repeated by the augment reports
@@ -118,7 +119,7 @@ fn a_static_repeating_an_instance_member_still_reports() {
 /// that is the oracle's count, not a bug: upstream's merged
 /// `_InstanceElementContext` claims `x = 1` (getter+setter → pair), then
 /// `x = 2` collides → one report, then `x = 3` collides → one report
-/// (member_duplicate_definition_verifier.dart walks every fragment of the
+/// (`member_duplicate_definition_verifier.dart` walks every fragment of the
 /// element). The two rows come from two producers on our side:
 ///
 /// - `x = 2` is the keep-first survivor in the aug unit's

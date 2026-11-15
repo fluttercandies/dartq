@@ -378,10 +378,9 @@ impl AstListener {
     /// happen (the node is already open; skipping it would desynchronize
     /// the builder's open stack).
     fn end_last(&mut self, kind: NodeKind) {
-        let end = match self.expect_paired("end_last before any node", self.b.last_end_token()) {
-            Some(end) => end,
-            None => 0,
-        };
+        let end = self
+            .expect_paired("end_last before any node", self.b.last_end_token())
+            .unwrap_or_default();
         self.b.end(kind, end);
     }
 
@@ -3551,7 +3550,7 @@ mod tests {
         assert!(
             matches!(
                 parent_kind,
-                Some(NodeKind::ForIn) | Some(NodeKind::ForControlFlow)
+                Some(NodeKind::ForIn | NodeKind::ForControlFlow)
             ),
             "loop variable nests in the for container: {parent_kind:?}"
         );
@@ -4093,7 +4092,7 @@ mod tests {
         // at 20, `double` at 34, `1` at 54.
         let mut spans: Vec<u32> = fields
             .iter()
-            .map(|&(_, ref range)| {
+            .map(|(_, range)| {
                 assert_eq!(range.start, range.end, "zero-width marker");
                 parsed
                     .tokens

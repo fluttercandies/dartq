@@ -19,6 +19,7 @@
 //! the dual-import `void run(ast.AstNode? node)` narrowed call — and on
 //! the foreign projection).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::model::{ArgListId, Ty};

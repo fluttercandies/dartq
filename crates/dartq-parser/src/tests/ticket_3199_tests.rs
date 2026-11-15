@@ -31,6 +31,7 @@
 //! depth. These pins run on the DEFAULT test-thread stack: no
 //! `RUST_MIN_STACK` anywhere in the run.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::parser::{MAX_DIAGNOSTICS, Parser};
 
@@ -90,8 +91,7 @@ fn written_out_chain_50k_folds_flat_on_default_stack() {
     assert_eq!(
         c.errors.len(),
         MAX_DIAGNOSTICS,
-        "the cap bounds the flood: {} - 1 written-out rows + the terminal",
-        MAX_DIAGNOSTICS
+        "the cap bounds the flood: {MAX_DIAGNOSTICS} - 1 written-out rows + the terminal"
     );
     assert_eq!(
         codes.last().map(String::as_str),

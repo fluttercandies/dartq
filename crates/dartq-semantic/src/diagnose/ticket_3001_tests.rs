@@ -18,6 +18,7 @@
 //! declarations stand the name world's primitives in for the fixture, so
 //! the heads resolve and `decide_subtype` sees the `int <: num` edge.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

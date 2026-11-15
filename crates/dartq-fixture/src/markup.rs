@@ -29,6 +29,7 @@
 //! a UTF-16 code unit count, so the upstream `codeBuffer.length` offsets
 //! are UTF-16 too; this scanner counts them as it emits.)
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use core::ops::Range;
 
 /// One stripped range: the UTF-16 span in the unmarked code plus the marked
@@ -258,7 +259,7 @@ mod tests {
     }
 
     /// `[!!p.isEmpty!]` — the shorthand wrapping content that itself
-    /// starts with `!` (the prefer_is_not_empty shape).
+    /// starts with `!` (the `prefer_is_not_empty` shape).
     #[test]
     fn shorthand_range_with_leading_bang_content() {
         let (_, ranges) = strip("var x = [!!p.isEmpty!];\n").expect("strips");

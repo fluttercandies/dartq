@@ -62,14 +62,14 @@ fn check(c: &mut Check<'_>) {
     ) else {
         return;
     };
-    if !subtype_of_core_type(c, &container, exact_core_silent) {
+    if !subtype_of_core_type(c, container, exact_core_silent) {
         return;
     }
     // The Object-member gate (:99-101): the invoked `toString` must be
     // the dart:core declaration — an indexed declaration anywhere on
     // the receiver's chain is an override and stays silent.
     let member = analysis.strings().intern("toString");
-    let container_id = analysis.strings().intern(&container);
+    let container_id = analysis.strings().intern(container);
     if analysis
         .inherited_member(container_id, member, false)
         .is_some()
@@ -111,9 +111,9 @@ fn receiver_container<'a>(
     match prev.map(|token| c.lexeme(token)) {
         // The cascade-section dot is its own spelling; the upstream
         // cascade face reads a leaked thisType dartq does not carry.
-        Some("..") | Some("?..") => return None,
+        Some(".." | "?..") => return None,
         // A member receiver: the piece run before the selector.
-        Some(".") | Some("?.") => {}
+        Some("." | "?.") => {}
         // No dot before the name: the implicit-this face (:129-131).
         _ => return this_container(c).map(|name| (name, true)),
     }

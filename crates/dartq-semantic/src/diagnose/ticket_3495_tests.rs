@@ -27,6 +27,7 @@
 //! that pair (`'{0}' doesn't conform to the bound '{2}' of the type
 //! parameter '{1}'.`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 /// The `type_argument_not_matching_bounds` messages of `report`, in source

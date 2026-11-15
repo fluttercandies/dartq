@@ -26,6 +26,7 @@
 //! binder shadowing any same-named outer parameter) and spell
 //! `InvalidType` for an unresolvable leaf.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

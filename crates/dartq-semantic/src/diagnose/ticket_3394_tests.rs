@@ -30,6 +30,7 @@
 //! ([`Engine::check_explicit_creation_arguments`]) now runs the
 //! per-argument verdict the callee-linked spellings already ran.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops};
 use super::*;
 

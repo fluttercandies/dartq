@@ -5,6 +5,7 @@
 //! `severity|code|file|line:col` is the position-level unit used to report
 //! message-only diffs separately.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// One canonical diagnostic row, positioned relative to a case's package
 /// root (`file` = e.g. `lib/test.dart`).
 #[derive(Debug, PartialEq, Eq, Clone)]

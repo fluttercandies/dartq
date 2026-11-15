@@ -13,12 +13,13 @@
 //! (a subclass of a sealed type need not be sealed), so the leg changes
 //! verdicts the head alone cannot: `T extends St` (sealed) promoted to
 //! `Mid` closes a switch the bare `Mid` head leaves open. Oracle rows
-//! (dart analyze 3.13.7): the post-switch statement reports dead_code in
+//! (dart analyze 3.13.7): the post-switch statement reports `dead_code` in
 //! P1/C2 and stays live in C1/C3; P2 pins the named SDK-bound residual
 //! (`num`'s core sealedness is outside this lattice, oracle-dead). The
 //! `non_exhaustive_switch_statement` error beside the oracle's rows is
 //! the semantic face, not a flow fact.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

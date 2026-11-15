@@ -10,6 +10,7 @@
 //! business). The CLI/RPC equivalence is pinned by both faces sharing
 //! this implementation.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fs;
@@ -1131,7 +1132,7 @@ mod tests {
 
         let (version, _, warnings) = scan_file("// @dart = 2.12\nvar x = 1;\n", file);
         assert_eq!(version, LanguageVersion::new(2, 12), "override adopted");
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [dartq_diagnostics::Diagnostic; 0]);
 
         let (version, _, warnings) = scan_file("// @dart = 9.9\n", file);
         assert_eq!(version, DEFAULT_LANGUAGE_VERSION, "above-latest dropped");
@@ -1157,7 +1158,7 @@ mod tests {
             LanguageVersion::new(3, 13),
             "oracle latest accepted"
         );
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [dartq_diagnostics::Diagnostic; 0]);
 
         let (version, ..) = scan_file("// @dart = 2.12\n// @dart = 3.1\n", file);
         assert_eq!(version, LanguageVersion::new(3, 1), "last match wins");
@@ -1203,7 +1204,7 @@ mod tests {
         assert!(errors.is_empty(), "the floor itself is allowed");
 
         let (_, _, errors) = scan_file("// @dart = 2.14\nvar x = 1;\n", file);
-        assert!(errors.is_empty());
+        assert_eq!(errors, [] as [dartq_diagnostics::Diagnostic; 0]);
     }
 
     /// The above-latest warning emits the oracle-matching machine line: the

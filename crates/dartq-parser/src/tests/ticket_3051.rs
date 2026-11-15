@@ -25,6 +25,7 @@
 //!   .isIdentifier` — a reserved keyword (`class`) takes the URI form and
 //!   reports `expectedString` at the keyword.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 
 /// `(code, start, end)` parser rows for `source` under latest features.
@@ -356,7 +357,7 @@ fn part_of_tails() {
 }
 
 /// Import tails: bare `import` (string at EOF 7, `;` on the keyword
-/// 0..6); `as` with no prefix name (missing_identifier at EOF 14, `;` on
+/// 0..6); `as` with no prefix name (`missing_identifier` at EOF 14, `;` on
 /// `as` 11..13); a bare `deferred` carries into the recovery loop and
 /// reports both `missing_prefix_in_deferred_import` and the `;` on the
 /// keyword (11..19).
@@ -411,8 +412,20 @@ fn combinator_tails() {
 /// arm — the real-closer path reports nothing).
 #[test]
 fn clean_directives_stay_silent() {
-    assert!(rows_with("import 'a' if (x == 'b') 'c' if (y) 'd';\n").is_empty());
-    assert!(rows_with("export 'a' show b hide c;\n").is_empty());
-    assert!(rows_with("library foo.bar;\n").is_empty());
-    assert!(rows_with("part of foo.bar;\n").is_empty());
+    assert_eq!(
+        rows_with("import 'a' if (x == 'b') 'c' if (y) 'd';\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
+    assert_eq!(
+        rows_with("export 'a' show b hide c;\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
+    assert_eq!(
+        rows_with("library foo.bar;\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
+    assert_eq!(
+        rows_with("part of foo.bar;\n"),
+        [] as [(std::string::String, u32, u32); 0]
+    );
 }

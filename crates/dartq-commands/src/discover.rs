@@ -5,6 +5,7 @@
 //! descended into — see [`discover`]'s contract for the full oracle parity
 //! notes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;

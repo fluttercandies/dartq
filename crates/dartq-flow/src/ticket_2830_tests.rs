@@ -9,6 +9,7 @@
 //! `?..{` fingerprint in `begin_cascade`, the drop in `begin_block`), so
 //! the re-parsed `return` cannot kill the enclosing path.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

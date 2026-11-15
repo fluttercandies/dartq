@@ -14,6 +14,7 @@
 //! `undefinedChain - 0` silence — the unresolved-receiver arm), and a
 //! known-typed `<<` operand reports the argument face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -205,7 +206,7 @@ fn chained_super_formals_climb_to_the_root_field_type() {
 /// named lookup key. Oracle-verified on fvm 3.13.1 (#2408): the
 /// declaration itself is silent and `E(maybe)` reports
 /// `argument_type_not_assignable` (`Txt?` vs the associated `Txt` slot).
-/// The earlier pin's "unassociated → InvalidType suppression" reading
+/// The earlier pin's "unassociated → `InvalidType` suppression" reading
 /// was mistaken — `nope` associates positionally, never falls to
 /// `InvalidType`, and the without-associated face never fires.
 #[test]

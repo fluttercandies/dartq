@@ -22,6 +22,7 @@
 //! Version-pinned data like `crate::code`'s generated table: sorted by
 //! name, membership and flag read by one binary search.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// One lint code's documentation fact: the rule name and whether the
 /// upstream code is `hasPublishedDocs: true`. The included file is the
 /// generated row slice (single expression, the `include!` shape).

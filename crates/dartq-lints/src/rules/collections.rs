@@ -11,6 +11,7 @@
 //! A cascaded section send's owner is therefore the cascade itself, and the
 //! first section is the piece run before the marker.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
@@ -451,7 +452,7 @@ pub(crate) mod prefer_collection_literals {
     /// spellings resolve only through an unprefixed `dart:collection`
     /// import — an import-less unit leaves the head unresolved, and the
     /// official's instance-creation arm never arms on an unresolved head
-    /// (no static type; the MethodInvocation arm answers `toSet` only).
+    /// (no static type; the `MethodInvocation` arm answers `toSet` only).
     /// Every `Linked*` creation consults
     /// [`context_reports`] first — the written context face of the
     /// official's `approximateContextType` (declaration type-before,
@@ -1078,8 +1079,8 @@ pub(crate) mod prefer_collection_literals {
                     NodeKind::TopLevelMethod
                         | NodeKind::Method
                         | NodeKind::LocalFunctionDeclaration
-                ) || !crate::rules::declarations::member_declaration_name(c, row)
-                    .is_some_and(|name_row| c.lexeme(c.head_token(name_row)) == callee_name)
+                ) || crate::rules::declarations::member_declaration_name(c, row)
+                    .is_none_or(|name_row| c.lexeme(c.head_token(name_row)) != callee_name)
                 {
                     continue;
                 }
@@ -2010,13 +2011,13 @@ pub(crate) mod collection_methods_unrelated_type {
         }
         let dotted = matches!(
             selector.checked_sub(1).map(|token| c.lexeme(token)),
-            Some(".") | Some("?.")
+            Some("." | "?.")
         );
         if !dotted && !cascade {
             // The implicit-this face (`_getTargetType`'s walk): the
             // enclosing class-like's supertype clauses.
             if let Some(expected) = enclosing_container(c)
-                .and_then(|container| substituted_expected(c, name, &container))
+                .and_then(|container| substituted_expected(c, name, container))
                 && let Some((arg_type, expected)) = expected_verdict(c, &expected, &arg_rows)
             {
                 c.report(arg_span.clone(), &[&arg_type, &expected]);
@@ -2039,7 +2040,7 @@ pub(crate) mod collection_methods_unrelated_type {
                     if let [only] = trimmed
                         && c.kind(*only) == NodeKind::ThisExpression
                         && let Some(expected) = enclosing_container(c)
-                            .and_then(|container| substituted_expected(c, name, &container))
+                            .and_then(|container| substituted_expected(c, name, container))
                         && let Some((arg_type, expected)) =
                             expected_verdict(c, &expected, &arg_rows)
                     {
@@ -2540,7 +2541,7 @@ pub(crate) mod collection_methods_unrelated_type {
     /// bound, a `dynamic` bound, or a written `?` all stay potentially
     /// nullable.
     fn type_parameter_admits_null(c: &Check<'_>, name: &str) -> Option<bool> {
-        for &ancestor in c.path.iter() {
+        for &ancestor in c.path {
             let mut candidates = c.collect_direct(ancestor);
             if let Some(owner) = c.unit.ast.parent(ancestor) {
                 candidates.extend(c.collect_direct(owner));
@@ -3098,8 +3099,7 @@ pub(crate) mod prefer_foreach {
         };
         let selector_head = kids[head..args_pos]
             .iter()
-            .filter(|&&row| c.kind(row) == NodeKind::ParenthesizedExpression)
-            .next_back()
+            .rfind(|&&row| c.kind(row) == NodeKind::ParenthesizedExpression)
             .map_or_else(
                 || c.head_token(kids[head]),
                 |&paren| c.unit.ast.token_range(paren).end,
@@ -3880,7 +3880,7 @@ mod tests {
         );
     }
 
-    /// The inferred-initializer receiver gate (the ledgered dartq_only
+    /// The inferred-initializer receiver gate (the ledgered `dartq_only`
     /// face: a user `toList` on a non-Iterable over-reported). An untyped
     /// binding decides through its initializer: a user-class creation (the
     /// official's non-Iterable static type — the spread is a compile error
@@ -3968,7 +3968,7 @@ mod tests {
         );
     }
 
-    /// The body-ROOT gate (the ledgered dartq_only face: the closure-
+    /// The body-ROOT gate (the ledgered `dartq_only` face: the closure-
     /// parameter identity presumed for an is-test nested deeper). The
     /// official reads the body expression itself (`expression is
     /// IsExpression` after `unParenthesized`), so a binary arm, a
@@ -5814,7 +5814,7 @@ pub(crate) mod use_null_aware_elements {
             assert!(run("List<int> f(int? x) { return [if (x == null) x else 2]; }").is_empty());
         }
 
-        /// The then-element must BE the target (:70-134 — SimpleIdentifier /
+        /// The then-element must BE the target (:70-134 — `SimpleIdentifier` /
         /// SpreadElement(identifier) / PostfixExpression(identifier!)) — a
         /// name merely appearing inside a larger expression never matches.
         #[test]

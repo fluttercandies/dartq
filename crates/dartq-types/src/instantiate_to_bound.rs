@@ -35,7 +35,7 @@
 //! (unbounded reads `dynamic`, default_types_builder.dart:136-140), build
 //! the reference graph among the parameters, rewrite every strongly
 //! connected component's own bounds through the substitution that maps the
-//! component's members to `dynamic` or `Never` (default_types_builder.dart:
+//! component's members to `dynamic` or `Never` (`default_types_builder.dart`:
 //! 144-162), then substitute each parameter's resolved bound through every
 //! bound in declaration order so no parameter leaf survives
 //! (default_types_builder.dart:164-180).
@@ -112,6 +112,7 @@
 //! under-report direction — the answer degrades toward `dynamic`, never
 //! toward a fabricated `Never`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use rustc_hash::FxHashSet;
 
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
@@ -128,7 +129,7 @@ pub struct BoundsInstantiation {
     /// One type per input parameter, in input order.
     pub defaults: Vec<TypeId>,
     /// `true` when some parameter's bound reaches a cycle — the official
-    /// `partials.isNotEmpty → hasError[0] = true` (type_system.dart:
+    /// `partials.isNotEmpty → hasError[0] = true` (`type_system.dart`:
     /// 785-788): cycle members and their dependents were completed only by
     /// the default face's component rewrite and grounding sweep, or by the
     /// to-bounds face's `Phi`. The caller reports the malbounded-ness
@@ -473,6 +474,7 @@ pub fn instantiate_type_formals_to_bounds_fixpoint(
 /// Recursion is bounded by `DEPTH_LIMIT` like the other type-operation
 /// walks; a tripped budget leaves the subtree unsubstituted — under-report,
 /// not a fabricated `Never`.
+#[expect(clippy::too_many_lines, reason = "the upper-lower substitution walk")]
 fn replace_upper_lower(
     table: &TypeTable,
     ty: TypeId,
@@ -501,8 +503,7 @@ fn replace_upper_lower(
             };
             map.iter()
                 .find(|(p, _)| *p == parameter)
-                .map(|&(_, mapped)| mapped)
-                .unwrap_or(ty)
+                .map_or(ty, |&(_, mapped)| mapped)
         }
         TypeKind::Interface { decl, args } => {
             let mut rewritten: Option<Vec<TypeId>> = None;
@@ -684,6 +685,10 @@ fn replace_upper_lower(
 /// is indifferent to — each component's substitution is scoped to its own
 /// members' bounds.
 fn strong_components(dependents: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the SCC walk carries graph state"
+    )]
     fn visit(
         vertex: usize,
         dependents: &[Vec<usize>],
@@ -751,7 +756,7 @@ fn strong_components(dependents: &[Vec<usize>]) -> Vec<Vec<usize>> {
 /// are none — the `-->m` edges of the default face and the progress test of
 /// the to-bounds face. Function types bind their own declared parameters
 /// (type_system.dart:566-575); the official alias arm
-/// (type_system.dart:574) has no counterpart — dartq types carry no alias
+/// (`type_system.dart:574`) has no counterpart — dartq types carry no alias
 /// kinds.
 #[expect(
     clippy::implicit_hasher,

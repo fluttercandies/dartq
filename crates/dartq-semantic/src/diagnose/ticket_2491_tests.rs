@@ -19,6 +19,7 @@
 //! model). Send-position arity keeps its anchors: the adjacent-head
 //! controls still report.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

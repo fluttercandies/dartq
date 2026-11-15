@@ -5,6 +5,7 @@
 //!
 //! Oracle provenance (`dart analyze` 3.13.1): silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 #[test]
@@ -109,9 +110,7 @@ fn cascade_argument_promoted_local_keeps_promotion() {
          }\n",
     );
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "unchecked_use_of_nullable_value"),
+        !code_names(&report).contains(&"unchecked_use_of_nullable_value"),
         "{:?}",
         rows(&report)
     );

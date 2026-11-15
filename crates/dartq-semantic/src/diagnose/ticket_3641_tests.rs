@@ -7,7 +7,7 @@
 //!
 //! Upstream dispatches every record field's sub-pattern with that field's
 //! own slot type as `matchedValueType` (`analyzeRecordPattern`, upstream
-//! Dart SDK source, pkg/_fe_analyzer_shared/lib/src/type_inference/
+//! Dart SDK source, pkg/_`fe_analyzer_shared/lib/src/type_inference`/
 //! type_analyzer.dart:1841-1855), so `checkPatternNeverMatchesValueType`
 //! (pkg/analyzer/lib/src/generated/resolver.dart:624-653) judges a field
 //! against its column, never the whole record.
@@ -15,6 +15,7 @@
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs`
 //! is a live-lane file out of this ticket's write scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 

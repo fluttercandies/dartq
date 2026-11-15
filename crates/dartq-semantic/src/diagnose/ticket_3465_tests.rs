@@ -25,6 +25,7 @@
 //! * the `]`-closer extension never swallows a `;` after a NULL-AWARE
 //!   index (`n?[i]` reports `i]`, not `i];`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{report_ops, report_ops_bare};
 
 /// The `dead_code` rows of `report` as `(offset, length)`, source order.

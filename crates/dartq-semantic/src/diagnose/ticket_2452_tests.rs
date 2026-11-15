@@ -15,6 +15,8 @@
 //! - `typedef L = io.File;` with `io.File` resolvable — the chain grounds
 //!   through the prefix's namespace and stays silent (the iso probe).
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

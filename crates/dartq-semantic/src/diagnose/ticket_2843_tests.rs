@@ -18,6 +18,9 @@
 //! lookup, `_reportedGetterError` suppression), and the representation
 //! formal's `Object?` default (the implicit-`final` declaring formal).
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(unused_imports)]
+
 use super::*;
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, fold_unit_with_ops, merge_source_ordered};
@@ -186,7 +189,7 @@ fn assert_one_unchecked(report: &FileReport, offset: usize, len: u32, message: &
 
 /// A relational pattern over a nullable matched value reports at the
 /// operator token, its length the lexeme's width (the oracle's
-/// test_uncheckedOperatorInvocation_relationalPattern: `if (x case > 0)`
+/// `test_uncheckedOperatorInvocation_relationalPattern`: `if (x case > 0)`
 /// anchors at `>`).
 #[test]
 fn relational_over_nullable_scrutinee_reports_at_operator() {
@@ -201,7 +204,7 @@ fn relational_over_nullable_scrutinee_reports_at_operator() {
 }
 
 /// Every comparison operator reports; a two-character lexeme takes its own
-/// width (the co19 type_inference_A21_t05 shape over an `A?` alias).
+/// width (the co19 `type_inference_A21_t05` shape over an `A?` alias).
 #[test]
 fn relational_operator_family_reports_with_lexeme_widths() {
     let src = "typedef A = int;\n\
@@ -259,7 +262,7 @@ fn equality_operators_stay_silent() {
 }
 
 /// An applicable extension operator resolves the read silent (the oracle's
-/// test_uncheckedOperatorInvocation_relationalPattern_hasExtension: the
+/// `test_uncheckedOperatorInvocation_relationalPattern_hasExtension`: the
 /// `operator >` on `int?` face wins the nullable bucket).
 #[test]
 fn extension_operator_on_nullable_face_resolves() {
@@ -286,7 +289,7 @@ fn non_nullable_and_nested_shapes_stay_silent() {
 
 /// A typedef-aliased nullable head reads each field over a
 /// potentially-nullable receiver and reports at the pattern's type name
-/// (the oracle's test_typeAlias_nullable: `case A(foo: 0)` anchors at `A`).
+/// (the oracle's `test_typeAlias_nullable`: `case A(foo: 0)` anchors at `A`).
 /// The found-nothing row never pairs with `undefined_getter`.
 #[test]
 fn nullable_typedef_head_reports_at_type_name() {
@@ -308,7 +311,7 @@ fn nullable_typedef_head_reports_at_type_name() {
 }
 
 /// A type parameter through its nullable bound reads the same face (the
-/// co19 nullable_object_pattern_error_test's `T extends int?` shape).
+/// co19 `nullable_object_pattern_error_test`'s `T extends int?` shape).
 #[test]
 fn nullable_bound_type_parameter_head_reports() {
     let src =
@@ -363,7 +366,7 @@ fn non_nullable_head_keeps_undefined_getter_face() {
 
 /// An extension type's untyped representation formal reads `Object?` in the
 /// this-block body, so a member read over it reports the shared unchecked
-/// code at the member name (the co19 static_processing_A12_t07 four-row
+/// code at the member name (the co19 `static_processing_A12_t07` four-row
 /// shape: `x`, `[x]`, `{x}`, `{required x}`).
 #[test]
 fn this_block_untyped_rep_formal_reads_object_question() {
@@ -396,7 +399,7 @@ fn this_block_untyped_rep_formal_reads_object_question() {
 
 /// The representation getter carries the same `Object?` face outside the
 /// this-block: an instance read through it reports at the next member (the
-/// extension_type_error_test `et3.i.arglebargle` shape).
+/// `extension_type_error_test` `et3.i.arglebargle` shape).
 #[test]
 fn representation_getter_face_rides_object_question() {
     let src = "extension type ET3(i);\n\nvoid main() {\n  var et3 = ET3(1);\n\

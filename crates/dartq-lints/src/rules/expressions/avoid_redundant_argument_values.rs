@@ -491,7 +491,7 @@ fn params_of(c: &Check<'_>, params_row: u32) -> Vec<u32> {
                         c.kind(row),
                         NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter
                     )
-                }))
+                }));
             }
             _ => {}
         }

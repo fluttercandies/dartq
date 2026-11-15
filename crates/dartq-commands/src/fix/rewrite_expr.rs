@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    FixInput, Keyword, TokenKind, TokenTable, angle_group_end, angle_group_start, cut_line,
+    depth0_find, drop_lines_range, hit_tokens, is_identifier_char, is_null_token, kind_of,
+    matching_begin, paren_removable, remove_keyword_across_comments, slice16, span_over, token_end,
+    token_starting_at, trivia_run, utf16_count, utf16_end, utf16_offset_to_byte, word_at,
+};
 
 // ---------------------------------------------------------------------------
 // Semantic source: the F6 written-surface family
@@ -94,10 +99,9 @@ pub(crate) fn is_null_to_eq_null(input: &FixInput<'_>) -> Option<(u32, u32, Stri
     let trimmed = slice.trim_end();
     let (head, eq) = if let Some(head) = trimmed.strip_suffix("is! Null") {
         (head, "!=")
-    } else if let Some(head) = trimmed.strip_suffix("is Null") {
-        (head, "==")
     } else {
-        return None;
+        let head = trimmed.strip_suffix("is Null")?;
+        (head, "==")
     };
     let head = head.trim_end();
     if head.is_empty() {
@@ -457,10 +461,9 @@ pub(crate) fn drop_combinator_name(input: &FixInput<'_>) -> Option<(u32, u32, St
         cursor = cursor.checked_sub(1)?;
         match kind_of(tokens, cursor)? {
             TokenKind::Keyword(Keyword::Import | Keyword::Export) => break,
-            TokenKind::Keyword(Keyword::Show | Keyword::Hide)
+            TokenKind::Keyword(Keyword::Show | Keyword::Hide | _)
             | TokenKind::Identifier
             | TokenKind::Comma
-            | TokenKind::Keyword(_)
             | TokenKind::String => {}
             TokenKind::CloseParen => cursor = matching_begin(tokens, cursor)?,
             _ => return None,

@@ -20,6 +20,8 @@
 //! absorber reports `dead_code` (not `unreachable_switch_default`), empty
 //! bodies contribute the head row only.
 
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

@@ -13,8 +13,12 @@
 //! `extraneous_modifier` face, never a field formal), a parenthesized
 //! expression, a call's argument list, a `for`/`if-case` head, and a
 //! primary-constructor head (best_practices_verifier.dart:101/:818-824).
+#![allow(
+    clippy::empty_line_after_doc_comments,
+    clippy::semicolon_if_nothing_returned
+)]
 
-use super::test_rig::{CORE_PRELUDE, report_ops};
+use super::test_rig::report_ops;
 use super::*;
 
 fn uf_rows(report: &FileReport) -> usize {

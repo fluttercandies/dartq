@@ -20,6 +20,7 @@
 //! instantiation nobody decided and stages rows the oracle never reports,
 //! so the under-report face is pinned as hard as the positive one.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 
@@ -39,14 +40,14 @@ fn rows_of(report: &FileReport, code: &str) -> Vec<(u32, u32, String)> {
 /// result, never the callee's absent return.
 #[test]
 fn written_instantiation_reaches_the_send_result() {
-    let source = r#"
+    let source = r"
 class G<T> {
   G.value(int n);
 }
 void f() {
   G<String> g = G<int>.value(1);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -64,14 +65,14 @@ void f() {
 /// `Pair<int, String>`.
 #[test]
 fn multi_argument_instantiation_reaches_the_send_result() {
-    let source = r#"
+    let source = r"
 class Pair<K, V> {
   Pair.value(int n);
 }
 void f(String s) {
   s = Pair<int, String>.value(1);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -87,14 +88,14 @@ void f(String s) {
 /// assignment it always did.
 #[test]
 fn non_generic_ctor_send_still_names_the_head() {
-    let source = r#"
+    let source = r"
 class D {
   D.named(int n);
 }
 void f(String s) {
   s = D.named(1);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -109,14 +110,14 @@ void f(String s) {
 /// arm's positive answer stages nothing.
 #[test]
 fn agreeing_written_instantiation_stays_silent() {
-    let source = r#"
+    let source = r"
 class G<T> {
   G.value(int n);
 }
 void f(G<int> g) {
   g = G<int>.value(1);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_of(&report, "invalid_assignment").is_empty(),
@@ -134,14 +135,14 @@ void f(G<int> g) {
 /// it, so the face now reports.)
 #[test]
 fn argument_solved_instantiation_reports_the_mismatch() {
-    let source = r#"
+    let source = r"
 class G<T> {
   G.value(T t);
 }
 void f(String s) {
   s = G.value(1);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);

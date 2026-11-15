@@ -8,19 +8,22 @@
 //!   `literalBool`'s recorded type — the `matchedType` the write
 //!   promotes through, `_initialize` → `PromotionModel.write` →
 //!   `_tryPromoteToTypeOfInterest`, upstream Dart SDK source,
-//!   pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:
+//!   pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart`:
 //!   7546-7595, 3837-3903, 3982-4098): `bool <: Object` makes `Object`
 //!   the write's promotion step over the `Object?` declared face.
 //!   Without it the opaque unknown written type failed every
 //!   `written <: candidate` question and the read kept `Object?`.
 //! * The initializer's `promoteToTypeOfInterest` is the official's
-//!   `!isImplicitlyTyped && !isFinal` (flow_analysis.dart:7583), not a
+//!   `!isImplicitlyTyped && !isFinal` (`flow_analysis.dart:7583`), not a
 //!   blanket `true`: a `final`/`const` local's initializer never
 //!   promotes (`final Object? o = true` stays `Object?` upstream), and
 //!   an implicitly typed declarator's slot is already the inferred type.
 //!   `rhs.literal` also rides in, so a collection-literal initializer
 //!   takes the same written-face bridge the plain-assign write has
 //!   (`Object? o = <num>[]` promotes `o` to `Object`).
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
@@ -84,10 +87,10 @@ impl TypeOps for BoolToObjectOps {
 /// given, is seeded with `intern`'s first two ids (`bool`, `Object`)
 /// and mounted as the replay's back-end (None = the name-level default).
 /// Returns the interned ids and the taken facts.
-fn analyze<'t>(
+fn analyze(
     source: &'static str,
     intern: &[&str],
-    ops: Option<&'t BoolToObjectOps>,
+    ops: Option<&BoolToObjectOps>,
 ) -> (Vec<u32>, Vec<FlowFact>) {
     let result = dartq_scanner::scan(
         source,
@@ -124,6 +127,7 @@ fn analyze<'t>(
 }
 
 /// `(snippet, ty)` of every `ReadType`/`PromotedRead` row.
+#[allow(clippy::type_complexity)]
 fn reads<'a>(
     source: &'a str,
     facts: &[FlowFact],
@@ -182,7 +186,7 @@ fn bool_literal_initializer_promotes_to_declared_non_null() {
 
 /// A plain `=` write of `true` promotes the same way — the official
 /// write's `promoteToTypeOfInterest` is unconditional for assignments
-/// (`flow.write`, flow_analysis.dart:4802+): `Object? o; o = true` still
+/// (`flow.write`, `flow_analysis.dart:4802+)`: `Object? o; o = true` still
 /// promotes `o` to `Object`.
 #[test]
 fn bool_literal_assignment_promotes_to_declared_non_null() {
@@ -205,7 +209,7 @@ fn bool_literal_assignment_promotes_to_declared_non_null() {
 }
 
 /// The `isFinal` arm of the official gate (`promoteToTypeOfInterest:
-/// !isImplicitlyTyped && !isFinal`, flow_analysis.dart:7583): a `final`
+/// !isImplicitlyTyped && !isFinal`, `flow_analysis.dart:7583)`: a `final`
 /// local's initializer never promotes — `final Object? o = true` stays
 /// `Object?`, and the `x = o` read keeps the nullable declared face.
 /// Without the gate the bool literal's real type would over-promote
@@ -281,7 +285,7 @@ fn collection_literal_initializer_promotes_to_declared_non_null() {
 }
 
 /// An implicitly typed declarator never takes the type-of-interest arm
-/// (`isImplicitlyTyped`, flow_analysis.dart:7583): `var o = true`'s
+/// (`isImplicitlyTyped`, `flow_analysis.dart:7583)`: `var o = true`'s
 /// declared slot is the inferred type itself — the write records no
 /// promotion row (the slot the fold reads was the adoption's answer,
 /// not a promotion). Under the bare pipeline the unknown slot stays the

@@ -3,6 +3,7 @@
 //! (methods with block bodies, getters with literal values). Built directly
 //! on the lexer so string literals and comments never confuse the structure.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::dart::{
     ident_at, ident_end, is_ident_start, match_paren, next_char, skip_ws_and_comments, split_args,
 };
@@ -44,12 +45,12 @@ pub fn scan_declarations(src: &str) -> Vec<Declaration> {
             skip_string(src, &mut pos);
             continue;
         }
-        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'') | Some(b'"')) {
+        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'' | b'"')) {
             skip_string(src, &mut pos);
             continue;
         }
         if rest.starts_with("//") {
-            pos += rest.find('\n').map_or(rest.len(), |e| e);
+            pos += rest.find('\n').unwrap_or(rest.len());
             continue;
         }
         if rest.starts_with("/*") {
@@ -74,13 +75,13 @@ pub fn scan_declarations(src: &str) -> Vec<Declaration> {
                     }
                     _ => None,
                 };
-                if let Some(after) = after {
-                    if let Some((decl, end)) = scan_declaration(src, after, word == "mixin") {
-                        out.push(decl);
-                        pos = end;
-                        depth = 0;
-                        continue;
-                    }
+                if let Some(after) = after
+                    && let Some((decl, end)) = scan_declaration(src, after, word == "mixin")
+                {
+                    out.push(decl);
+                    pos = end;
+                    depth = 0;
+                    continue;
                 }
                 pos = ident_end(src, pos);
                 continue;
@@ -140,7 +141,7 @@ fn scan_declaration(src: &str, pos: usize, is_mixin: bool) -> ScanResult {
                         name,
                         superclass,
                         mixins,
-                        implements: implements,
+                        implements,
                         members: Vec::new(),
                     },
                     p + 1,
@@ -223,12 +224,12 @@ pub fn scan_members(body: &str, base: usize) -> Vec<Member> {
             skip_string(body, &mut pos);
             continue;
         }
-        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'') | Some(b'"')) {
+        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'' | b'"')) {
             skip_string(body, &mut pos);
             continue;
         }
         if rest.starts_with("//") {
-            pos += rest.find('\n').map_or(body.len(), |e| e);
+            pos += rest.find('\n').unwrap_or(body.len());
             continue;
         }
         if rest.starts_with("/*") {
@@ -470,12 +471,12 @@ fn return_expr(body: &str) -> Option<(usize, usize)> {
             skip_string(body, &mut pos);
             continue;
         }
-        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'') | Some(b'"')) {
+        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'' | b'"')) {
             skip_string(body, &mut pos);
             continue;
         }
         if rest.starts_with("//") {
-            pos += rest.find('\n').map_or(rest.len(), |e| e);
+            pos += rest.find('\n').unwrap_or(rest.len());
             continue;
         }
         if rest.starts_with("/*") {
@@ -514,7 +515,10 @@ fn member_name(prologue: &[String]) -> String {
     if words.last() == Some(&"get") || words.last() == Some(&"set") {
         words.pop();
     }
-    words.last().map(|w| w.to_string()).unwrap_or_default()
+    words
+        .last()
+        .map(std::string::ToString::to_string)
+        .unwrap_or_default()
 }
 
 /// Matches a `{` at `open`, string/comment aware; returns the `}` offset.
@@ -528,12 +532,12 @@ pub fn match_brace(src: &str, open: usize) -> Option<usize> {
             skip_string(src, &mut pos);
             continue;
         }
-        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'') | Some(b'"')) {
+        if rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'' | b'"')) {
             skip_string(src, &mut pos);
             continue;
         }
         if rest.starts_with("//") {
-            pos += rest.find('\n').map_or(rest.len(), |e| e);
+            pos += rest.find('\n').unwrap_or(rest.len());
             continue;
         }
         if rest.starts_with("/*") {
@@ -578,7 +582,7 @@ fn parse_single_string_len(src: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
-    const FILE: &str = r#"
+    const FILE: &str = r"
 import 'x.dart';
 
 @reflectiveTest
@@ -615,7 +619,7 @@ var y = 2;
 }
 
 class Alias = Foo with Bar;
-"#;
+";
 
     #[test]
     fn scans_classes_mixins_and_members() {
@@ -647,7 +651,7 @@ class Alias = Foo with Bar;
 
         let set_up = &class.members[1];
         let (bs, be) = set_up.body.expect("setUp has a body");
-        assert!(bs > be.min(0) || be <= FILE.len(), "offsets in range");
+        assert!(bs > 0 || be <= FILE.len(), "offsets in range");
         let set_up_body = &FILE[bs..be];
         assert!(
             set_up_body.contains("writeTestPackageConfigWithMeta"),
@@ -675,7 +679,7 @@ class Alias = Foo with Bar;
 
     #[test]
     fn strings_do_not_confuse_structure() {
-        let src = r#"
+        let src = r"
 class A {
   void test_x() {
     var s = '''
@@ -684,7 +688,7 @@ class Fake { void fake() {} }
     var t = '} // fake brace';
   }
 }
-"#;
+";
         let decls = scan_declarations(src);
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].members.len(), 1);
@@ -705,7 +709,7 @@ class Fake { void fake() {} }
         for member in &class.members {
             if let Some((bs, be)) = member.body {
                 assert!(
-                    FILE[bs..be].contains(&FILE[bs..bs + 1].to_string()),
+                    FILE[bs..be].contains(&FILE[bs..=bs].to_string()),
                     "offsets slice the file text"
                 );
                 assert!(be <= FILE.len());
@@ -720,7 +724,7 @@ class Fake { void fake() {} }
         assert!(FILE[bs..be].contains("resolveTestCodeWithDiagnostics"));
     }
 
-    const PARAMS_FILE: &str = r#"
+    const PARAMS_FILE: &str = r"
 class A {
   void _helper({required String packageName, required String pathInLib, String content = ''}) {
     newFile('$root/$packageName/lib/$pathInLib', content);
@@ -736,7 +740,7 @@ class A {
 
   String get abstractOnly;
 }
-"#;
+";
 
     #[test]
     fn params_block_getters_and_abstract_getters() {

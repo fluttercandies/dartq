@@ -25,6 +25,8 @@
 //! (`~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze`); each pin names
 //! the corpus row it encodes.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// The rows of `code` in `report` as `@offset` spans, fixture-relative
@@ -176,8 +178,8 @@ fn relational_operand_nonconst() {
     }
 }
 
-/// `test_variables_scope` (if_element / if_statement / switch_expression /
-/// switch_statement): `case [int a, == a]` reports BOTH codes at `a`.
+/// `test_variables_scope` (`if_element` / `if_statement` / `switch_expression` /
+/// `switch_statement)`: `case [int a, == a]` reports BOTH codes at `a`.
 #[test]
 fn relational_operand_self_reference() {
     let report = report_ops(

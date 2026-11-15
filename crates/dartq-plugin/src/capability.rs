@@ -6,6 +6,7 @@
 //! newer plugin can advertise capabilities an older core does not know about
 //!.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde_json::Value;
 
 /// A capability a plugin can expose. The wire names are lowercase strings.

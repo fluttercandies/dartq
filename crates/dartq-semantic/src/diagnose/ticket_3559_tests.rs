@@ -22,6 +22,8 @@
 //! version-gated upstream — it fires at 3.13 identically — so it belongs
 //! to the label resolver's own emit site, not this pass).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::report_ops_bare;
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, fold_unit_with_ops, merge_source_ordered};
@@ -37,7 +39,7 @@ use dartq_source::{FileTable, StringTable};
 use std::path::Path;
 
 /// The (offset, length) rows of `code` in `report`, in emit order.
-fn code_rows<'a>(report: &'a FileReport, code: &str) -> Vec<(u32, u32)> {
+fn code_rows(report: &FileReport, code: &str) -> Vec<(u32, u32)> {
     report
         .diagnostics
         .iter()

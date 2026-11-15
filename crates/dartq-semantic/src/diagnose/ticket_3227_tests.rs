@@ -21,6 +21,7 @@
 //! `#[path]` keeps the module inside the `diagnose` subtree so
 //! `crate::diagnose::*` resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::test_rig::rows;
 use crate::diagnose::{FileReport, StrictModes, fold_unit_with_ops, merge_source_ordered};

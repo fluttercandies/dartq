@@ -1,20 +1,21 @@
 //! #3698 pins — the `wrong_type_parameter_variance_position` member-face
 //! anchors (`_checkForWrongVariancePosition`, upstream Dart SDK source
 //! `pkg/analyzer/lib/src/generated/error_verifier.dart:7565-7658`):
-//! * the return-type check anchors at the return TypeAnnotation node
+//! * the return-type check anchors at the return `TypeAnnotation` node
 //!   (`T` in `T method1()`, `Cov<T>` in `Cov<T> method3()`), not the
 //!   member name;
 //! * each formal's contravariant-position check anchors at its own
-//!   FormalParameter node (`Contra<T> x`, `required Contra<T> x`), not
+//!   `FormalParameter` node (`Contra<T> x`, `required Contra<T> x`), not
 //!   the member name;
 //! * a method's own type-parameter bound check anchors at the
-//!   `X extends B` TypeParameter node and fires in the `inout` position
+//!   `X extends B` `TypeParameter` node and fires in the `inout` position
 //!   (`Invariant.combine`, error_verifier.dart:7608-7624) — the arm was
 //!   missing entirely;
 //! * the field arms keep the variable-name anchor (upstream
 //!   `fields.variables.first.name`), now including the getter's return
 //!   type (`T get c` anchors at `T`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::super::test_rig::report_ops_experiments_with;
 use dartq_language::Feature;
 
@@ -29,7 +30,7 @@ fn position_rows(source: &str) -> Vec<String> {
         .collect()
 }
 
-/// `test_method_returnType` (variance_in_method_error_test): the row
+/// `test_method_returnType` (`variance_in_method_error_test)`: the row
 /// anchors at the `T` return annotation — before the fix it sat at the
 /// `method1` name token.
 #[test]
@@ -45,7 +46,7 @@ fn method_return_row_anchors_at_the_return_type() {
 }
 
 /// `test_method_parameterType`: each formal anchors at its own
-/// FormalParameter node — `Contra<T> x` is 11 units starting at `C`.
+/// `FormalParameter` node — `Contra<T> x` is 11 units starting at `C`.
 #[test]
 fn method_formal_row_anchors_at_the_formal() {
     let source = "typedef Contra<T> = void Function(T);\n\
@@ -60,7 +61,7 @@ fn method_formal_row_anchors_at_the_formal() {
 }
 
 /// `test_method_typeParameterBound`: the `X extends B` arm (missing
-/// outright before the fix) anchors at the TypeParameter node — `X`
+/// outright before the fix) anchors at the `TypeParameter` node — `X`
 /// through the bound's end — and reports the `inout` position
 /// (`Variance.invariant.combine`, error_verifier.dart:7614-7624).
 #[test]
@@ -91,7 +92,7 @@ fn method_bound_row_fires_for_out_parameter() {
 }
 
 /// `test_method_namedParameterType` (`{required Contra<T> x}`): the
-/// FormalParameter node includes the `required` keyword — the row spans
+/// `FormalParameter` node includes the `required` keyword — the row spans
 /// `required Contra<T> x` (20 units), not just `Contra<T> x`.
 #[test]
 fn named_formal_row_includes_the_required_keyword() {
@@ -124,8 +125,8 @@ fn two_named_formals_anchor_independently() {
     );
 }
 
-/// `test_setter_parameterType` (variance_out_field_error_test): a
-/// setter's formal anchors at its FormalParameter node — `T value` is 7
+/// `test_setter_parameterType` (`variance_out_field_error_test)`: a
+/// setter's formal anchors at its `FormalParameter` node — `T value` is 7
 /// units starting at `T`; the `void` return reads unrelated and rows
 /// nothing.
 #[test]
@@ -140,7 +141,7 @@ fn setter_formal_row_anchors_at_the_formal() {
     );
 }
 
-/// `test_getter_returnType` (variance_in_field_error_test): a getter's
+/// `test_getter_returnType` (`variance_in_field_error_test)`: a getter's
 /// return-type row anchors at the `T` annotation before `get`, not the
 /// `c` name token.
 #[test]
@@ -183,7 +184,7 @@ fn method_within_the_keyword_rows_nothing() {
 
 /// Negative control: the experiment gate — a keyword parameter without
 /// the variance grant emits no `_position` rows at all (the keyword
-/// parses but the face stays gated, error_verifier.dart:7567
+/// parses but the face stays gated, `error_verifier.dart:7567`
 /// `isLegacyCovariant` posture).
 #[test]
 fn keyword_parameter_without_the_experiment_stays_silent() {

@@ -19,6 +19,7 @@
 //! 3. the conditional-expression cascade target — the `.m()` send folded
 //!    under a `?:` arm consumes its void target.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 

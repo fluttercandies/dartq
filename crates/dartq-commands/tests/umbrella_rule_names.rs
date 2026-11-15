@@ -103,12 +103,12 @@ fn member_spelling_under_umbrella_matches_upstream() {
 #[test]
 fn exact_member_name_still_resolves() {
     let (set, unknown) = EnableSet::resolve(["analyzer_public_api_bad_type"]);
-    assert!(unknown.is_empty());
+    assert_eq!(unknown, [] as [&str; 0]);
     assert_eq!(enabled_names(&set), ["analyzer_public_api_bad_type"]);
 
     // The umbrella name is consumed by the fan-out, not reported unknown.
     let (set, unknown) = EnableSet::resolve(["analyzer_public_api"]);
-    assert!(unknown.is_empty());
+    assert_eq!(unknown, [] as [&str; 0]);
     assert_eq!(enabled_names(&set), PUBLIC_API_MEMBERS);
 }
 

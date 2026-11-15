@@ -25,6 +25,7 @@
 //!   covering `) {}` never folding in. Statement and collection forms
 //!   share the face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

@@ -33,6 +33,7 @@
 //! keys (the interned `StringId`s resolve straight through
 //! [`dartq_engine::Engine::strings`]).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::Write;
 use std::path::Path;
 
@@ -348,7 +349,7 @@ pub fn run_export(
             if tier == crate::Verbosity::Full {
                 let mut rows: Vec<&dartq_index::RefRow> = occurrences
                     .get(&file)
-                    .map_or_else(Vec::new, |rows| rows.clone());
+                    .map_or_else(Vec::new, std::clone::Clone::clone);
                 // The stored order is target-major; the document order is
                 // use-site order (offset, end, kind, target) — the reading
                 // an AI consumer scans top-down. Sort the raw rows before
@@ -658,17 +659,14 @@ mod tests {
             let header: serde_json::Value = serde_json::from_str(lines[0]).expect("header parses");
             assert_eq!(header["documents"], 3);
             assert_eq!(header["declarations"], 6);
-            match tier {
-                crate::Verbosity::Full => {
-                    assert_eq!(totals.occurrences, 4, "2 in b, 2 in c");
-                    assert_eq!(totals.supertypes, 1, "Sub extends Foo");
-                    assert_eq!(header["occurrences"], 4);
-                    assert_eq!(header["supertypes"], 1);
-                }
-                _ => {
-                    assert!(header.get("occurrences").is_none());
-                    assert!(header.get("supertypes").is_none());
-                }
+            if tier == crate::Verbosity::Full {
+                assert_eq!(totals.occurrences, 4, "2 in b, 2 in c");
+                assert_eq!(totals.supertypes, 1, "Sub extends Foo");
+                assert_eq!(header["occurrences"], 4);
+                assert_eq!(header["supertypes"], 1);
+            } else {
+                assert!(header.get("occurrences").is_none());
+                assert!(header.get("supertypes").is_none());
             }
             // Documents ascend by canonical path: a < b < c under lib/.
             let doc_paths: Vec<String> = lines[1..]

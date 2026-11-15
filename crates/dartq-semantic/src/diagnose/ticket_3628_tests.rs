@@ -1,4 +1,4 @@
-//! #3628 pins — TOP_MERGE over a container's full direct-supertype
+//! #3628 pins — `TOP_MERGE` over a container's full direct-supertype
 //! closure (extends + implements + with), plus merged member result
 //! typing.
 //!
@@ -23,6 +23,7 @@
 //! `merged_member_entry`) so an inherited `member()` answer is the
 //! merged signature, not the first-found face (Face B).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// Interfaces face, `extends ... implements` (the
@@ -227,7 +228,7 @@ class D0 extends A<dynamic> {
     );
 }
 
-/// Control: `D7 extends A<dynamic> implements B<dynamic>` — TOP_MERGE of
+/// Control: `D7 extends A<dynamic> implements B<dynamic>` — `TOP_MERGE` of
 /// identical `dynamic` instantiations keeps `dynamic`, so `x: dynamic`
 /// and the oracle stays silent on `x.foo`/`takesObject(x)`. Guards the
 /// merge against over-reporting.

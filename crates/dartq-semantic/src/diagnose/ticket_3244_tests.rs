@@ -2,7 +2,7 @@
 //! the `unnecessary_type_check` verdict.
 //!
 //! Upstream reads the operand's static type (`leftNode.typeOrThrow`,
-//! best_practices_verifier.dart:1011) and asks
+//! `best_practices_verifier.dart:1011`) and asks
 //! `_typeSystem.isSubtypeOf(leftType, rightType)` (:1044). A constructor
 //! tear-off is not a generic function value: `C.new` on `class C<T>` is the
 //! official generic tear-off `C Function<T>()`, while an INSTANTIATED
@@ -25,6 +25,7 @@
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs`
 //! is a live-lane file out of this ticket's write scope).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
 

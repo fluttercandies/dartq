@@ -13,7 +13,7 @@
 //! check sits inside the `typeArgumentList != null` branch
 //! (invocation_inferrer.dart:236-261), and the extension override's
 //! `_checkTypeArgumentsMatchingBounds` answers the same way
-//! (extension_member_resolver.dart:320).
+//! (`extension_member_resolver.dart:320`).
 //!
 //! Oracle 3.13.7, measured direction by direction over the inferred
 //! shapes (context type, argument-driven, generic-function propagation,
@@ -30,6 +30,7 @@
 //! and the same entry carrying a real span still reports (the gate keys
 //! on the span, never on the entry's origin).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops};
 use crate::collector::collect;
 use crate::diagnose::{Engine, StrictModes};
@@ -195,7 +196,7 @@ fn written_span_entry_still_reports() {
 
 /// `A<String> x = A();` — the creation's instantiation is inferred, and
 /// the oracle's single bounds row anchors the DECLARATION's `String`
-/// (type_arguments_verifier.dart's `checkNamedType` face). The inferred
+/// (`type_arguments_verifier.dart`'s `checkNamedType` face). The inferred
 /// invocation contributes nothing: exactly one row, at the declaration.
 #[test]
 fn context_inferred_creation_keeps_only_the_declaration_row() {

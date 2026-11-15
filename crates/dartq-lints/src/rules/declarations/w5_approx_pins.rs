@@ -236,7 +236,7 @@ fn breaking_version_corpus() {
     assert!(!is_breaking_version(""));
 }
 
-/// Empty optional segments fail closed: upstream pub_semver 2.2.1
+/// Empty optional segments fail closed: upstream `pub_semver` 2.2.1
 /// requires at least one identifier character in each optional
 /// segment, so `Version.parse` rejects `1.0.0-` / `1.0.0+` and the
 /// official gate never registers — neither may read as a bare

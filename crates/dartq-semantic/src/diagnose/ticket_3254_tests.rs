@@ -28,6 +28,7 @@
 //! keeps the module inside the `diagnose` subtree so
 //! `crate::diagnose::test_rig` resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{report_ops_bare, rows};
 
@@ -202,7 +203,7 @@ class D extends C { void m<A, B extends A>(A a, B b) {} }
 /// unifies to a bound on the first parameter (`dynamic` — `A` is
 /// unbounded), which no `num` equals in either direction. The renamed
 /// bound leaf must resolve to the unified parameter (not read as an
-/// unresolvable head, whose InvalidType leniency would answer
+/// unresolvable head, whose `InvalidType` leniency would answer
 /// "compatible" in both directions and swallow the row).
 #[test]
 fn parameter_bound_against_concrete_bound_broken() {

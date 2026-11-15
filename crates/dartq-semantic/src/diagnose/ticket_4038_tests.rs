@@ -23,6 +23,7 @@
 //! `x is List<int>` / `z is List<int>` / `g2 is List<int>` are silent,
 //! and so are ours.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 

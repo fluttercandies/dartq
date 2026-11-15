@@ -18,6 +18,7 @@
 //!   the whole returned expression, never the row's head token (a callee
 //!   name, an untyped collection literal's `]`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, code_names, report_ops};
 use crate::diagnose::types::FileReport;
 
@@ -34,7 +35,7 @@ fn return_spans(report: &FileReport) -> Vec<(u32, u32)> {
 }
 
 /// The text a `(offset, length)` span covers inside `fixture`.
-fn span_text<'a>(fixture: &'a str, span: (u32, u32)) -> &'a str {
+fn span_text(fixture: &str, span: (u32, u32)) -> &str {
     let start = span.0 as usize;
     let end = start + span.1 as usize;
     &fixture[start..end]

@@ -39,6 +39,8 @@
 //! receivers, top-level write tracking) are later increments, not
 //! guarantees.
 
+#![allow(clippy::assert_is_empty)]
+
 use dartq_flow::FlowFact;
 use dartq_parser::ParserFeatures;
 use dartq_resolution::{
@@ -318,7 +320,7 @@ impl<'a> Analysis<'a> {
     /// whose file the element index never carries (`<dart:*>` — the engine
     /// graph's SDK posture; a bare name resolved through the implicit
     /// dart:core import lands here). The upstream element-identity checks
-    /// (`isDartCorePrint`, noop_primitive_operations.dart:60) read this
+    /// (`isDartCorePrint`, `noop_primitive_operations.dart:60`) read this
     /// face: a binding into the SDK is the core symbol, a workspace
     /// binding shadows it.
     #[must_use]
@@ -417,7 +419,7 @@ impl<'a> Analysis<'a> {
     /// name in the prefix's merged import table — combinator filtered,
     /// independent of same-named names in the unit's own scope (upstream
     /// Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-    /// named_type_resolver.dart's prefixed-type branch: the head goes
+    /// `named_type_resolver.dart`'s prefixed-type branch: the head goes
     /// through the import's `PrefixScope`, scope.dart:352-357, not the
     /// library scope). The bare path ([`Analysis::resolve_constructor`])
     /// cannot serve these heads: the prefixed head's type-use row carries
@@ -455,7 +457,7 @@ impl<'a> Analysis<'a> {
     /// under-report `None`.
     ///
     /// A receiver whose static type is the `Type` metaclass is the
-    /// TypeLiteral face of a container spelling (`List.empty()`'s `List`,
+    /// `TypeLiteral` face of a container spelling (`List.empty()`'s `List`,
     /// `p.C`), not a lookup anchor: the metaclass carries no core
     /// container's members, so the walk starts from the container the
     /// site's own reference rows name — the getter-vs-tear-off split of
@@ -610,7 +612,7 @@ impl<'a> Analysis<'a> {
     /// [`Analysis::inherited_member`] walk, self-hits included — was
     /// written `covariant`. The `unnecessary_overrides` parameter gate
     /// reads it (upstream Dart SDK source, pkg/linter/lib/src/rules/
-    /// unnecessary_overrides.dart `_isCovariant`: a covariant parameter
+    /// `unnecessary_overrides.dart` `_isCovariant`: a covariant parameter
     /// narrows the inherited signature, so a super-forwarding body is not
     /// trivially removable).
     ///
@@ -680,7 +682,7 @@ impl<'a> Analysis<'a> {
     /// supertype question the spread rule asks as
     /// `target.staticType.implementsInterface('Iterable', 'dart.core')`
     /// (upstream Dart SDK source, pkg/linter/lib/src/rules/
-    /// unnecessary_to_list_in_spreads.dart; the walk:
+    /// `unnecessary_to_list_in_spreads.dart`; the walk:
     /// `library::implements_interface`, the declared supertype graph —
     /// `extends`/`with`/`implements`, a mixin's `on` constraints — walked
     /// transitively, cross-file through the declaring containers'
@@ -747,7 +749,7 @@ impl<'a> Analysis<'a> {
     /// checking whether dropping an explicit `this.` (or another
     /// receiver-less spelling) would re-resolve the name consults this
     /// face for the part its own declaration tables cannot see (upstream
-    /// Dart SDK source, pkg/linter/lib/src/rules/unnecessary_this.dart
+    /// Dart SDK source, `pkg/linter/lib/src/rules/unnecessary_this.dart`
     /// `_canReferenceElementWithoutThisPrefix`, the `resolveNameInScope`
     /// library-scope half).
     ///
@@ -766,7 +768,7 @@ impl<'a> Analysis<'a> {
     /// spelled `annotation`. The name-level cut of the JS-interop
     /// classification the runtime-check rules read (the class element's
     /// own `@JS` metadata; upstream Dart SDK source, pkg/linter/lib/src/
-    /// rules/invalid_runtime_check_with_js_interop_types.dart
+    /// `rules/invalid_runtime_check_with_js_interop_types.dart`
     /// `_jsTypeForStaticInterop`): only the resolved container's own
     /// annotation rows answer, the supertype chain is not walked.
     ///
@@ -795,7 +797,7 @@ impl<'a> Analysis<'a> {
     /// The enclosing library's compilation units — the defining unit first,
     /// then each part in part-directive order, exactly the registration
     /// order the graph's unit face holds (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/analysis/library_analyzer.dart
+    /// `pkg/analyzer/lib/src/dart/analysis/library_analyzer.dart`
     /// `_resolveDirectives` parses the defining unit before its parts and
     /// publishes the walk as `_libraryFiles`; the oracle's
     /// `RuleContext.allUnits`). A pure read over the graph: no copy, a
@@ -846,7 +848,7 @@ impl<'a> Analysis<'a> {
     /// an alias target the model cannot unwrap, an ambiguous import). The
     /// chain mirrors the official resolution
     /// (upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-    /// comment_reference_resolver.dart): the bare face walks the scope
+    /// `comment_reference_resolver.dart)`: the bare face walks the scope
     /// (file locals, import namespace, prefixes — setters probed under
     /// their `name=` spelling), then the enclosing container's declared
     /// members and enum constants, then the inherited chain
@@ -1152,7 +1154,7 @@ impl<'a> Analysis<'a> {
 
     /// Whether the name is one of the `Object` implicit-interface members.
     /// The inheritance manager's chains root every `InterfaceElement` at
-    /// `Object` (upstream comment_reference_resolver.dart
+    /// `Object` (upstream `comment_reference_resolver.dart`
     /// `_resolveInstanceMember` ends in `inheritance.getMember`), so a hit
     /// on these four names is confident resolution whenever the container
     /// face resolved. A stateless spelling compare — the check runs only on
@@ -1178,12 +1180,12 @@ impl<'a> Analysis<'a> {
         seen.insert(self.lib.index());
         while let Some(lib) = queue.pop() {
             for file in self.graph.unit_files(lib) {
-                if let Some(elements) = self.index.get(*file) {
-                    if elements.extension_faces().iter().any(|face| {
+                if let Some(elements) = self.index.get(*file)
+                    && elements.extension_faces().iter().any(|face| {
                         face.members.contains_key(&name) || face.members.contains_key(&setter)
-                    }) {
-                        return true;
-                    }
+                    })
+                {
+                    return true;
                 }
             }
             let reach =
@@ -1603,7 +1605,7 @@ mod tests {
         assert_eq!(analysis.type_of(token_of(source, "x)")), None);
     }
 
-    /// A typed formal's conditional-position read publishes its ReadType
+    /// A typed formal's conditional-position read publishes its `ReadType`
     /// row (#1056 — the row `type_of` answers), and the row's type folds
     /// through a type alias to the aliased interface type (upstream Dart
     /// SDK source, pkg/analyzer/lib/src/dart/element/element.dart — a
@@ -2295,7 +2297,7 @@ mod tests {
     /// `implements_core_interface` answers the declared supertype graph: a
     /// chain reaching the interface spelling answers `true` (a definite
     /// `true` outranks everything), a chain whose only miss is a dead edge
-    /// (an undefined/non-class spelling — the oracle's InvalidType
+    /// (an undefined/non-class spelling — the oracle's `InvalidType`
     /// contributes nothing to the interface) answers `false`, an edge that
     /// resolves but sits outside the indexed set leaves the answer open,
     /// and the core face answers the SDK spellings directly — while a user
@@ -2626,7 +2628,7 @@ mod tests {
     /// expression it is, so its bare read carries the read row the face
     /// keys on — the same model the official pattern walk reaches an
     /// if-statement's case clause by (upstream Dart SDK source,
-    /// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart
+    /// pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart`
     /// `ifCaseStatement_afterExpression` + `_getMatchedValueType`).
     #[test]
     fn matched_value_type_answers_an_if_case_condition() {

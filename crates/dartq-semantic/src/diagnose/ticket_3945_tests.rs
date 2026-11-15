@@ -33,6 +33,7 @@
 //! Oracle provenance: `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze
 //! --format=machine`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 use crate::diagnose::FileReport;
 
@@ -201,12 +202,12 @@ fn generic_literal_under_a_matched_context_checks_the_body() {
 /// `drain_published_read_types` (listener.rs) can only ever answer from
 /// EARLIER executables.
 ///
-/// The two consults that starve are in engine_core.rs:
+/// The two consults that starve are in `engine_core.rs`:
 /// `fold_binary`'s `promoted_operand_ty` (the `read_type_at` closure in
 /// the fold) and `fold_conditional`'s `arm_ty`. Answering them after the
 /// fact requires re-deciding the composite's type at teardown — a pure
 /// binary/conditional type recompute entry (the fold itself mutates the
-/// row stack and cannot be re-run). Owner: engine_core.rs (Lane BE
+/// row stack and cannot be re-run). Owner: `engine_core.rs` (Lane BE
 /// #3564) for the recompute entry, with the listener-side pending-consult
 /// queue here.
 #[test]

@@ -69,7 +69,7 @@ pub(crate) struct ScanDiag {
 /// compares code, offset, length, message) so distinct error tokens
 /// translating to the same row surface once — the nested-interpolation EOF
 /// cascade emits one unterminated-string error token per suspended body over
-/// the same eof pin (oracle nested_unclosed 1:12 + 1:13: two rows over three
+/// the same eof pin (oracle `nested_unclosed` 1:12 + 1:13: two rows over three
 /// tokens). Identical rows share their byte span, so they are adjacent after
 /// the sort and a byte-level `dedup_by` over `(code, span, pin, message)` is
 /// the whole rule (byte equality ⇒ converted-row equality: the conversion is
@@ -143,7 +143,7 @@ pub(crate) fn finish(mut diags: Vec<ScanDiag>, source: &str, file: FileId) -> Ve
 /// input-coupled slice arithmetic in the scanner, so an over-long target —
 /// reachable only through a scanner bug — degrades the range to the end of
 /// the text instead of slicing past it. Exactly one past the end is legal:
-/// the official synthetic token at eof (missing_identifier after a `$` at
+/// the official synthetic token at eof (`missing_identifier` after a `$` at
 /// eof, upstream Dart SDK source,
 /// `pkg/analyzer/lib/src/dart/scanner/translate_error_token.dart`) reports
 /// `length: 1` at the eof boundary — one virtual UTF-16 unit past the text.

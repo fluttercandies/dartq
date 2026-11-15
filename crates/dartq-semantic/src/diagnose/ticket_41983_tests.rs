@@ -14,6 +14,7 @@
 //! Every `dart analyze` 3.13.7 machine row quoted below is the oracle's
 //! answer over a single-file package of the same fixture.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops};
 

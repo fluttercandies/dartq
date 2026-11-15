@@ -209,7 +209,7 @@ fn overrides_load_directories_and_report_missing_paths() {
         &[plugin_dir.clone(), plugin_dir.join("dartq_plugin.json")],
     );
     assert_eq!(report.plugins.len(), 1);
-    assert!(report.skipped.is_empty());
+    assert_eq!(report.skipped, [] as [dartq_plugin::DiscoveryIssue; 0]);
 
     // An override the caller named explicitly must report, not skip silently;
     // the convention scan still finds the fixture on its own.

@@ -23,6 +23,7 @@
 //! * setter arity (`AstBuilder` `_ensureSetterFormalParameter`,
 //!   `ast_builder.dart:6457`) and `var`+type in formals (`varAndType`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, setup};
 
 /// Sorted diagnostic-code multiset of one whole-unit parse.
@@ -317,7 +318,7 @@ fn typedef_type_arguments_only() {
 
 /// A built-in keyword in type-parameter position takes the per-context
 /// built-in face and is consumed as the name — the oracle row for
-/// `typedef F<Function> = int;` (issue_45703 line 5) is
+/// `typedef F<Function> = int;` (`issue_45703` line 5) is
 /// `built_in_identifier_in_declaration` with the type-parameter template
 /// only; the keyword face at 4:9 in the same oracle file belongs to the
 /// typedef NAME on line 4 (`typedef Function = int;`).

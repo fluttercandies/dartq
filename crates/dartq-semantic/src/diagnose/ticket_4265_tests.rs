@@ -18,10 +18,11 @@
 //!   `named_type_is_type("FutureOr")` scope gate (written unimported
 //!   `FutureOr` resolves to `InvalidType` upstream), collapsing to
 //!   `Object?` and reporting `body_might_complete_normally_nullable`
-//!   'FutureOr<Object?>'. Closure-context rows now carry a
+//!   '`FutureOr`<Object?>'. Closure-context rows now carry a
 //!   `synthetic_ctx` flag that bypasses the scope gate — written
-//!   unimported `FutureOr` (ticket_3132 pin) still reports.
+//!   unimported `FutureOr` (`ticket_3132` pin) still reports.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// (1) The ternary-inferred local: `final probe = cond ? a : b` binds
@@ -125,7 +126,7 @@ fn synthetic_futureor_closure_context_stays_silent() {
     assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
 }
 
-/// (2) The written-unimported-FutureOr pin (ticket_3132): the existing
+/// (2) The written-unimported-FutureOr pin (`ticket_3132)`: the existing
 /// `ticket_3132_tests::async_unimported_futureor_reports_nullable_object`
 /// covers the declared path — this test verifies the synthetic bypass
 /// does not leak: a CLOSURE context carrying a written `FutureOr`

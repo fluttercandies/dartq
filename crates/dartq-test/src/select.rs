@@ -9,6 +9,7 @@
 //! annotation name it cannot resolve) is [`Selection::Unknown`], and the
 //! caller lets the runner decide.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, ScanConfig, TokenKind, TokenTable};
 use dartq_source::FileTable;
 use std::path::Path;
@@ -617,7 +618,8 @@ mod tests {
         ] {
             assert_eq!(select(&src(form), &slow), Selection::Dropped, "{form}");
         }
-        for form in ["@Tags(['fast'])"] {
+        {
+            let form = "@Tags(['fast'])";
             assert_eq!(select(&src(form), &slow), Selection::Loaded, "{form}");
         }
         // An empty list is one `Index` token to the scanner, not a group:

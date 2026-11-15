@@ -13,7 +13,7 @@
 //!   element identity, any written nullability
 //!   (pkg/analyzer/lib/src/dart/element/type.dart:767-769). A record/paren
 //!   `on` head still resolves (`computeType` accepts the record type,
-//!   parser_impl.dart:10723) and therefore takes the subtype arm, where a
+//!   `parser_impl.dart:10723`) and therefore takes the subtype arm, where a
 //!   record shape proves nothing against a named head; an `on` head no type
 //!   parse accepts resolves to `InvalidType`, which the 0c rule proves from
 //!   either side (the oracle's `'InvalidType' is a subtype of 'String'`
@@ -25,6 +25,7 @@
 //! `on A<num> {} on A<int> {}` fires and `on A<int> {} on A<num> {}` is
 //! silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 
 /// The dead-catch rows of the fixture as `(code, offset, message)`,
@@ -100,8 +101,7 @@ fn ticket_3238_identical_args_fire_and_render_written_arguments() {
             fixture.rfind("on List<String>").unwrap(),
             "Dead code: This on-catch block won't be executed because 'List<String>' is a subtype of 'List<String>' and hence will have been caught already.".to_string(),
         )],
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
 }
 
@@ -118,8 +118,7 @@ fn ticket_3238_bare_catch_makes_the_tail_dead() {
             fixture.find("on Foo").unwrap(),
             "Dead code: Catch clauses after a 'catch (e)' or an 'on Object catch (e)' are never reached.".to_string(),
         )],
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
     let report = report_ops(fixture);
     let row = report
@@ -207,8 +206,7 @@ fn ticket_3238_record_head_after_catch_all_joins_the_dead_span() {
             fixture.find("on (int").unwrap(),
             "Dead code: Catch clauses after a 'catch (e)' or an 'on Object catch (e)' are never reached.".to_string(),
         )],
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
 }
 
@@ -229,8 +227,7 @@ fn ticket_3238_unparsable_head_is_the_invalid_face() {
             fixture.find("on<T>").unwrap(),
             "Dead code: This on-catch block won't be executed because 'InvalidType' is a subtype of 'String' and hence will have been caught already.".to_string(),
         )],
-        "{:#?}",
-        rows
+        "{rows:#?}"
     );
 }
 

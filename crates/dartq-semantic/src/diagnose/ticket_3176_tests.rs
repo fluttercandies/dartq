@@ -17,6 +17,7 @@
 //! the anonymous-invocation callee
 //! (function_expression_invocation_resolver.dart:56).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// The message the oracle spells for every face — parameterless
@@ -42,7 +43,7 @@ fn assert_void_at(report: &super::FileReport, offset: usize) {
 /// A `void`-returning call on the assignment right operand reports
 /// `use_of_void_result` at the callee's name token — the resolver's
 /// `_checkForUseOfVoidResult(right)` gate runs only when the target's
-/// `writeType is! VoidType` (assignment_expression_resolver.dart:136):
+/// `writeType is! VoidType` (`assignment_expression_resolver.dart:136)`:
 /// `x = v()` into a non-`void` `x` reports, a `void`-typed target absorbs.
 #[test]
 fn ticket_3176_assignment_rhs_void_call() {
@@ -60,10 +61,10 @@ fn ticket_3176_assignment_rhs_void_call() {
 
 /// A `void`-typed read on the assignment right operand anchors at the
 /// read's own expression span (the non-`MethodInvocation` arm,
-/// error_detection_helpers.dart:254 `.at(expression)`). `var v = f()`
+/// `error_detection_helpers.dart:254` `.at(expression)`). `var v = f()`
 /// reports nothing: the local's inferred `void` type is the write type,
 /// and `checkForAssignableExpressionAtType`'s `expectedStaticType is!
-/// VoidType` gate (variable_declaration_resolver.dart:104) skips the void
+/// VoidType` gate (`variable_declaration_resolver.dart:104`) skips the void
 /// use. The 3.13.7 oracle answers one row, `v` inside `x = v` (4:7,
 /// length 1).
 #[test]
@@ -95,7 +96,7 @@ fn ticket_3176_decl_initializer_void_call() {
 }
 
 /// `var a = v()` infers `a: void` — the upstream
-/// `writeType is! VoidType` gate (assignment_expression_resolver.dart:136)
+/// `writeType is! VoidType` gate (`assignment_expression_resolver.dart:136`)
 /// swallows the use-of-void check on an inferred-`void` slot, so `var a`
 /// reports only `unused_local_variable`, never `use_of_void_result`.
 #[test]
@@ -103,9 +104,7 @@ fn ticket_3176_var_decl_inferred_void_stays_silent() {
     let fixture = "void v() {}\nvoid main() {\n  var a = v();\n}";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "use_of_void_result"),
+        !code_names(&report).contains(&"use_of_void_result"),
         "{:?}",
         rows(&report)
     );
@@ -122,7 +121,7 @@ fn ticket_3176_argument_void_call() {
     assert_void_at(&report, offset);
 }
 
-/// The for-in iterable (`for (x in v())` — error_verifier.dart:4442
+/// The for-in iterable (`for (x in v())` — `error_verifier.dart:4442`
 /// `checkForUseOfVoidResult(node.iterable)` early-returns after reporting):
 /// a `void` iterable reports `use_of_void_result`, never
 /// `for_in_of_invalid_type`.
@@ -135,7 +134,7 @@ fn ticket_3176_for_in_iterable_void() {
 }
 
 /// The switch-statement scrutinee (`switch (v())` —
-/// error_verifier.dart:2038 `checkForUseOfVoidResult(node.expression)`).
+/// `error_verifier.dart:2038` `checkForUseOfVoidResult(node.expression)`).
 #[test]
 fn ticket_3176_switch_statement_scrutinee_void() {
     let fixture = "void v() {}\nvoid main() {\n  switch (v()) {\n    case 1:\n      break;\n  }\n}";
@@ -155,7 +154,7 @@ fn ticket_3176_if_null_left_void() {
     assert_void_at(&report, offset);
 }
 
-/// The `is` operand (`v() is int` — error_verifier.dart:1436
+/// The `is` operand (`v() is int` — `error_verifier.dart:1436`
 /// `checkForUseOfVoidResult(node.expression)`): the type-test consumes the
 /// operand's value.
 #[test]
@@ -166,7 +165,7 @@ fn ticket_3176_is_operand_void() {
     assert_void_at(&report, offset);
 }
 
-/// The interpolation element (`"${v()}"` — error_verifier.dart:1429
+/// The interpolation element (`"${v()}"` — `error_verifier.dart:1429`
 /// `checkForUseOfVoidResult(node.expression)`): the element's value is
 /// consumed into the string.
 #[test]
@@ -177,7 +176,7 @@ fn ticket_3176_interpolation_element_void() {
     assert_void_at(&report, offset);
 }
 
-/// `await v()` (error_verifier.dart:459
+/// `await v()` (`error_verifier.dart:459`
 /// `checkForUseOfVoidResult(node.expression)`): the await consumes the
 /// operand's value.
 #[test]
@@ -188,7 +187,7 @@ fn ticket_3176_await_operand_void() {
     assert_void_at(&report, offset);
 }
 
-/// `throw v()` (error_verifier.dart:2052
+/// `throw v()` (`error_verifier.dart:2052`
 /// `checkForUseOfVoidResult(node.expression)`): the thrown value is
 /// consumed — `use_of_void_result` reports beside `throw_of_invalid_type`.
 #[test]
@@ -196,11 +195,7 @@ fn ticket_3176_throw_operand_void() {
     let fixture = "void v() {}\nvoid main() {\n  throw v();\n}";
     let report = report_ops(fixture);
     let names = code_names(&report);
-    assert!(
-        names.iter().any(|name| *name == "use_of_void_result"),
-        "{:?}",
-        rows(&report)
-    );
+    assert!(names.contains(&"use_of_void_result"), "{:?}", rows(&report));
     let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     let void_row = report
         .diagnostics
@@ -216,18 +211,14 @@ fn ticket_3176_throw_operand_void() {
 }
 
 /// `yield v()` inside a `sync*`/`async*` generator
-/// (yield_statement_resolver.dart:181/:198 — both arms run
+/// (`yield_statement_resolver.dart:181/:198` — both arms run
 /// `_checkForUseOfVoidResult(node.expression)`).
 #[test]
 fn ticket_3176_yield_operand_void() {
     let fixture = "void v() {}\nIterable<int> main() sync* {\n  yield v();\n}";
     let report = report_ops(fixture);
     let names = code_names(&report);
-    assert!(
-        names.iter().any(|name| *name == "use_of_void_result"),
-        "{:?}",
-        rows(&report)
-    );
+    assert!(names.contains(&"use_of_void_result"), "{:?}", rows(&report));
     let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     let void_row = report
         .diagnostics
@@ -251,11 +242,7 @@ fn ticket_3176_prefix_minus_void() {
     let fixture = "void v() {}\nvoid main() {\n  -v();\n}";
     let report = report_ops(fixture);
     let names = code_names(&report);
-    assert!(
-        names.iter().any(|name| *name == "use_of_void_result"),
-        "{:?}",
-        rows(&report)
-    );
+    assert!(names.contains(&"use_of_void_result"), "{:?}", rows(&report));
     let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     let void_row = report
         .diagnostics
@@ -272,7 +259,7 @@ fn ticket_3176_prefix_minus_void() {
 
 /// An untyped list literal's `void` element (`[v()]`) stays silent: the
 /// literal infers `List<void>`, and `_verifyElement` runs the void use
-/// only into a non-`void` element type (literal_element_verifier.dart:94
+/// only into a non-`void` element type (`literal_element_verifier.dart:94`
 /// `elementType is! VoidType && checkForUseOfVoidResult(element)`). The
 /// 3.13.7 oracle reports only `unused_local_variable` on `l`; a written
 /// non-`void` element slot's row is pinned by
@@ -282,16 +269,14 @@ fn ticket_3176_list_element_void() {
     let fixture = "void v() {}\nvoid main() {\n  var l = [v()];\n}";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "use_of_void_result"),
+        !code_names(&report).contains(&"use_of_void_result"),
         "{:?}",
         rows(&report)
     );
 }
 
 /// A map-entry `void` value reports only into a non-`void` value type
-/// (literal_element_verifier.dart:170 `mapValueType is! VoidType &&
+/// (`literal_element_verifier.dart:170` `mapValueType is! VoidType &&
 /// checkForUseOfVoidResult(entry.value)`): the untyped `{1: v()}` infers
 /// `Map<int, void>` and stays silent, while `<int, Object>{1: v()}`
 /// reports at the callee name. The 3.13.7 oracle: only
@@ -301,9 +286,7 @@ fn ticket_3176_list_element_void() {
 fn ticket_3176_map_value_void() {
     let untyped = report_ops("void v() {}\nvoid main() {\n  var m = {1: v()};\n}");
     assert!(
-        !code_names(&untyped)
-            .iter()
-            .any(|name| *name == "use_of_void_result"),
+        !code_names(&untyped).contains(&"use_of_void_result"),
         "{:?}",
         rows(&untyped)
     );

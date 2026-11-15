@@ -24,6 +24,7 @@
 //!   `#[ignore]` and flips green the moment the delegate routes through
 //!   the helper.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::types::FileReport;
@@ -291,7 +292,7 @@ void f(int? x) {
 /// An extension-type receiver WITH interfaces reports the dead spread
 /// today (the plain shape face answers true) and must keep reporting once
 /// the delegate routes through the helper (`interfaces.isNotEmpty` →
-/// true) — the ExtensionType arm's non-regression witness.
+/// true) — the `ExtensionType` arm's non-regression witness.
 #[test]
 fn extension_type_with_interfaces_receiver_reports_the_dead_spread() {
     let fixture = "\

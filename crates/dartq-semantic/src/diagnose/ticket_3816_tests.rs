@@ -5,14 +5,14 @@
 //! The ticket's named mechanism — a `Receiver::Super`/"super is never
 //! null" exemption leaking out of the unnecessary-null-aware decision —
 //! does not exist on this path at HEAD. The only super exemption
-//! (`coalesce_operand_never_null`, scopes_bodies.rs) is already confined
+//! (`coalesce_operand_never_null`, `scopes_bodies.rs`) is already confined
 //! to the `??`/`??=` dead-operand verdict, exactly the end-state the
 //! ticket prescribes, so these pins stand alone as the oracle contract:
 //!
 //! 1. `this[0]` / `this[0] = v` inside `extension E on A?` report
 //!    `The method '[]' can't be unconditionally invoked` at the opening
 //!    bracket with length 1 — the nullable implicit `this`'s `isNullable`
-//!    tail precedes the member lookup (type_property_resolver.dart).
+//!    tail precedes the member lookup (`type_property_resolver.dart`).
 //!    Green at HEAD through `resolve_receiver_row`'s `Receiver::This` arm
 //!    + `nullable_this_receiver`.
 //! 2. `x.first()` over `List<T?>` (`T extends Function`) reports the
@@ -22,18 +22,19 @@
 //!    `List`/`Iterable` carry no `first` member and the frozen member
 //!    verdict on a resolvable (non-`dart:`) container reads the index
 //!    alone, so `member_defined`'s `Walk::Found` accessor-callee
-//!    `Intent::Invoke` check (row_resolution.rs:12342) never runs and the
+//!    `Intent::Invoke` check (`row_resolution.rs:12342`) never runs and the
 //!    class-family miss tail emits `undefined_method` instead — the same
 //!    gap the SDK-stub `Missing`+`Defined` arm (:8469) opens for
 //!    `dart:`-stub anchors. Pin kept red as the divergence latch; the fix
 //!    lives in `check_instance_member`/`member_defined`
-//!    (row_resolution.rs) — see the #3816 report.
+//!    (`row_resolution.rs`) — see the #3816 report.
 //!
 //! Oracle provenance: `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze
 //! --format=machine` on the three minimal fixtures —
 //! `UNCHECKED_USE_OF_NULLABLE_VALUE …|4|9|1|The method '[]' …`,
 //! `…|2|3|7|The function can't be unconditionally invoked …`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops, rows};
 

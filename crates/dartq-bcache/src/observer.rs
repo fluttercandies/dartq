@@ -2,7 +2,7 @@
 //! delivery channel of the assemble face.
 //!
 //! The platform build systems behind `flutter build|run` — Gradle
-//! (`BaseFlutterTaskHelper.kt`), Xcode (`xcode_backend.dart`), CMake
+//! (`BaseFlutterTaskHelper.kt`), Xcode (`xcode_backend.dart`), `CMake`
 //! (`tool_backend.dart`) — invoke `$FLUTTER_ROOT/bin/flutter assemble …`
 //! through the SDK's absolute path, bypassing PATH, so no shim ever sees
 //! those invocations as commands. The outer shim closes the gap from
@@ -64,6 +64,7 @@
 //! thread is spawned, and every assemble-face dir degrades to
 //! not-replayable.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::sync::mpsc::RecvTimeoutError;
@@ -284,7 +285,7 @@ fn collect(
 
 /// Whether `argv` belongs to a flutter tool process: a `flutter` binary
 /// token (the wrapper script gradle/Xcode/CMake invoke, however spelled)
-/// or a flutter_tools snapshot/source token (the dart process the
+/// or a `flutter_tools` snapshot/source token (the dart process the
 /// wrapper execs).
 fn is_flutter_process(argv: &[String]) -> bool {
     argv.iter().any(|token| {
@@ -401,7 +402,7 @@ fn read_argv(pid: libc::pid_t) -> Option<Vec<String>> {
                 mib.as_mut_ptr(),
                 3,
                 std::ptr::null_mut(),
-                &mut size,
+                &raw mut size,
                 std::ptr::null_mut(),
                 0,
             )
@@ -419,7 +420,7 @@ fn read_argv(pid: libc::pid_t) -> Option<Vec<String>> {
                 mib.as_mut_ptr(),
                 3,
                 blob.as_mut_ptr().cast(),
-                &mut filled,
+                &raw mut filled,
                 std::ptr::null_mut(),
                 0,
             )
@@ -681,7 +682,7 @@ mod tests {
             "--dart-define-from-file=env.json",
         ]);
         let mut seen = FxHashSet::default();
-        assert!(poll(&[unmodeled.clone()], tmp.path(), &mut seen).is_empty());
+        assert!(poll(std::slice::from_ref(&unmodeled), tmp.path(), &mut seen).is_empty());
         assert!(poll(&[unmodeled], tmp.path(), &mut seen).is_empty());
     }
 

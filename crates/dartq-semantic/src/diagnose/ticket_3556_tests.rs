@@ -25,6 +25,7 @@
 //!   augmentation_positional_formal_parameter_name @ `p3` (names 'p2')
 //! ```
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::FileReport;
 use crate::diagnose::test_rig::{
     RigImport, code_names, report_ops, report_ops_augment, report_ops_imports, rows,

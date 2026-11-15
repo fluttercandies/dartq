@@ -51,6 +51,7 @@
 //!   the pushed config carries re-levelings only, and `// ignore:` handling
 //!   for plugin codes is the engine output face's concern.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
@@ -738,8 +739,7 @@ fn to_diagnostic(
     let kind = batch
         .codes
         .get(&row.code.to_ascii_lowercase())
-        .map(|meta| meta.kind)
-        .unwrap_or(RuleKind::Warning);
+        .map_or(RuleKind::Warning, |meta| meta.kind);
     let code = intern_code(&row.code, kind, interned);
     Diagnostic::new(
         severity,
@@ -1147,6 +1147,6 @@ mod tests {
         assert_eq!(cycle.crashes[0].severity, Severity::Error);
         // A second cycle emits nothing — once per run.
         let cycle = set.cycle(&[], &files, Some(file), &context);
-        assert!(cycle.crashes.is_empty());
+        assert_eq!(cycle.crashes, [] as [dartq_diagnostics::Diagnostic; 0]);
     }
 }

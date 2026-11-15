@@ -23,6 +23,7 @@
 //!
 //! Oracle provenance: `dart analyze` 3.13.7.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops_wildcards, rows};
 
 /// `duplicate_definition` rows only, in emission order.

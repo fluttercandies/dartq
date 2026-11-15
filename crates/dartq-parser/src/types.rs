@@ -20,6 +20,7 @@
 //! during skip analysis yield "no type" instead of the official aggressive
 //! in-declaration recovery.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 pub use crate::type_args::TypeParamOrArg;
 use dartq_scanner::{Keyword, TokenKind};
 
@@ -652,22 +653,21 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             }
             return TypeInfo::NoType;
         }
-        if required {
-            if kw == Keyword::Var
-                && matches!(
-                    self.cursor.look_kind(1),
-                    TokenKind::Lt | TokenKind::Comma | TokenKind::Gt
-                )
-            {
-                let type_param = self.compute_type_param_or_arg_at(1, in_declaration);
-                let skip_end = type_param.skip(self.peek_id());
-                let mut complex = self.complex_from_here(type_param);
-                complex.end = skip_end;
-                complex.end_raw_compound = complex.type_args.ends_on_raw_compound();
-                complex.compute_rest(self, complex.end, required);
-                complex.recovered = true;
-                return TypeInfo::Complex(complex);
-            }
+        if required
+            && kw == Keyword::Var
+            && matches!(
+                self.cursor.look_kind(1),
+                TokenKind::Lt | TokenKind::Comma | TokenKind::Gt
+            )
+        {
+            let type_param = self.compute_type_param_or_arg_at(1, in_declaration);
+            let skip_end = type_param.skip(self.peek_id());
+            let mut complex = self.complex_from_here(type_param);
+            complex.end = skip_end;
+            complex.end_raw_compound = complex.type_args.ends_on_raw_compound();
+            complex.compute_rest(self, complex.end, required);
+            complex.recovered = true;
+            return TypeInfo::Complex(complex);
         }
         TypeInfo::NoType
     }
@@ -800,7 +800,7 @@ mod tests {
     /// A silent parse that committed `count` generalized function types:
     /// `count` `begin_function_type` events, the no-return-type
     /// `handle_no_type`, `count` `end_function_type` events — the
-    /// `ComplexTypeInfo.parseType` two-pass shape (type_info_impl.dart:616).
+    /// `ComplexTypeInfo.parseType` two-pass shape (`type_info_impl.dart:616`).
     fn assert_silent_gft(source: &'static str, count: usize) {
         let c = parse(source);
         assert!(c.errors.is_empty(), "rows for {source:?}: {:?}", c.errors);

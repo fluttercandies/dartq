@@ -31,6 +31,7 @@
 //!   `ast_builder.dart:3825-3841`).
 //! * collection for-elements consume the `(` (`parseForLoopPartsStart`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok, setup};
 
 /// Sorted diagnostic-code multiset of one whole-unit parse.

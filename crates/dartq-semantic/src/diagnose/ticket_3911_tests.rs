@@ -28,6 +28,7 @@
 //! ACQUITTED: with the three arms fixed, the merged answer reaches `x`
 //! unaided.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{code_names, report_ops, report_ops_experiments_with, rows};
 use dartq_language::Feature;
@@ -43,7 +44,7 @@ fn argument_message(report: &FileReport) -> Option<String> {
 
 /// `Left Top` through the override face: `dynamic m()` is a VALID override
 /// of `FutureOr<Object?> m()` (`dynamic <: FutureOr<Object?>` holds via
-/// `Object? <: FutureOr<Object?>`, the FutureOr disjunction's
+/// `Object? <: FutureOr<Object?>`, the `FutureOr` disjunction's
 /// `T0 <: S1` leg against a top target) — and the reverse direction holds
 /// through `Right Top` (`FutureOr<Object?> <: dynamic`, `dynamic` is top).
 /// Neither pair may report `invalid_override`. Before the fix the forward
@@ -150,7 +151,7 @@ class DND3 extends A<FutureOr<void> Function()> implements B<Object? Function()>
 #[test]
 fn invariant_head_rejects_both_widening_directions() {
     let report = report_ops_experiments_with(
-        r#"class C {}
+        r"class C {}
 
 class Inv<inout T> {
   T? value;
@@ -158,7 +159,7 @@ class Inv<inout T> {
 }
 Inv<C?> h(Inv<C> a) => a;
 Inv<C> k(Inv<C?> a) => a;
-"#,
+",
         &[],
         None,
         &[Feature::Variance],
@@ -192,7 +193,7 @@ Inv<C> k(Inv<C?> a) => a;
 #[test]
 fn contravariant_head_reverses_the_accepted_pair() {
     let report = report_ops_experiments_with(
-        r#"class C {}
+        r"class C {}
 
 class Contra<in T> {
   T? value;
@@ -200,7 +201,7 @@ class Contra<in T> {
 }
 Contra<C?> g(Contra<C> a) => a;
 Contra<C> f(Contra<C?> a) => a;
-"#,
+",
         &[],
         None,
         &[Feature::Variance],

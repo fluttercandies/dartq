@@ -24,6 +24,7 @@
 //! the type 'Object'`; `invalid_assignment 'Iterable<Null>'`; `body_might_
 //! complete_normally … 'Ann'`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 use crate::diagnose::FileReport;
 

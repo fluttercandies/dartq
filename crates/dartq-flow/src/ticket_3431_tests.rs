@@ -6,7 +6,7 @@
 //! when the else arm was unspellable), discarding the then arm's face at
 //! `Ev::CondColon`. The official types `c ? a : b` by
 //! `typeOperations.leastUpperBound`
-//! (pkg/analyzer/lib/src/generated/static_type_analyzer.dart:87), so a
+//! (`pkg/analyzer/lib/src/generated/static_type_analyzer.dart:87`), so a
 //! conditional whose arms joined anywhere but the else face mis-typed
 //! every consumer: inferred locals adopted the else arm, write promotion
 //! promoted toward it, and the staged-type seams read it. The join now
@@ -23,6 +23,7 @@
 //! [`crate::ticket_3397_tests`]) answers the joins the name-level
 //! spelling alone cannot.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -117,10 +118,10 @@ impl TypeOps for HierarchyOps {
 
 /// Scans and parses `source` with `ops` mounted; returns the interned ids
 /// (positions matching `intern`) and the taken facts.
-fn analyze<'t>(
+fn analyze(
     source: &'static str,
     intern: &[&str],
-    ops: Option<&'t HierarchyOps>,
+    ops: Option<&HierarchyOps>,
 ) -> (Vec<u32>, Vec<FlowFact>) {
     let result = dartq_scanner::scan(
         source,
@@ -171,7 +172,7 @@ fn ty_of_last_read(source: &str, facts: &[FlowFact], name: &str) -> Option<Ty> {
             }
             _ => None,
         })
-        .last()
+        .next_back()
 }
 
 /// The `dead_code` row texts of `source`, in source order.

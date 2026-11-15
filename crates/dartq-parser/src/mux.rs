@@ -28,6 +28,7 @@
 //! listener gains an override outside that set, the matching forward must
 //! be added here — the fan-out equality tests pin the corpus paths.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::listener::{
     ConstructorReferenceContext, DeclarationKind, ExperimentalFlag, FormalParameterKind,
     IdentifierContext, MemberKind, ParserListener, Token,

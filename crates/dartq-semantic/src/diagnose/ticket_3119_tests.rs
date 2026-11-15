@@ -25,6 +25,7 @@
 //!   bool_expression_verifier.dart's `checkForNonBoolNegationExpression`
 //!   arm).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -172,7 +173,7 @@ fn yield_as_identifier_is_no_yield_each() {
 /// face beside its `use_of_void_result`: `void` is potentially nullable,
 /// so upstream `ForResolver` runs `nullableDereferenceVerifier.expression(
 /// uncheckedUseOfNullableValueAsIterator, iterable)` on it. Corpus case
-/// UseOfVoidResultTest/test_forIn_iterable_typeVoid_error is this exact
+/// `UseOfVoidResultTest/test_forIn_iterable_typeVoid_error` is this exact
 /// fixture: both rows at the iterable. (The pin once locked an
 /// under-report while the statement-operand face could not see the
 /// `void` row; the face now stages it.)
@@ -212,8 +213,8 @@ fn spread_void_operand_reports_the_unchecked_use() {
 }
 
 /// A `void`-typed `yield*` operand reports the unchecked-use face the
-/// same way (corpus case UseOfVoidResultTest/
-/// test_yieldStatement_star_syncStar_error).
+/// same way (corpus case `UseOfVoidResultTest`/
+/// `test_yieldStatement_star_syncStar_error`).
 #[test]
 fn yield_each_void_operand_reports_the_unchecked_use() {
     let report = report(

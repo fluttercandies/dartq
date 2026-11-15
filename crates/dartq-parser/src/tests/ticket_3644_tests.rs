@@ -3,7 +3,7 @@
 //! the entry's value pattern ends).
 //!
 //! Upstream recovery (upstream Dart SDK source,
-//! pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart
+//! pkg/_`fe_analyzer_shared/lib/src/parser/parser_impl.dart`
 //! `parseLiteralListSetMapOrFunction` :8740-8745) probes the `<...>` group
 //! with `inDeclaration: true`, so `< 0` — no type-shaped content — forms a
 //! RECOVERED type-argument group: `parseArguments` reports `expectedType`
@@ -20,6 +20,7 @@
 //! which swallowed the operand and dragged every anchor one token right
 //! (the refutable row landed on the closing `}`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 
 fn rows_of(source: &'static str) -> Vec<(String, u32, u32)> {

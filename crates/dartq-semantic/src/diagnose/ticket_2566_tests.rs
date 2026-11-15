@@ -1,6 +1,7 @@
 //! The #2566 pins: UNDEFINED_* member-resolution sweep — fill in as roots close. The rig
 //! declares no imports, so every pin spells custom types only.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -81,7 +82,7 @@ fn messages(report: &FileReport) -> Vec<String> {
 /// own `with` faces to the interface — `class C extends Object with A`
 /// where `mixin class A = Object with M` exposes M's members exactly like
 /// a directly-written `with M` (the named-application rule; the oracle
-/// resolves the chain, tests/language/mixin5_test.dart's shape). Before
+/// resolves the chain, `tests/language/mixin5_test.dart`'s shape). Before
 /// the fix the mixin hop's miss-path queued only `on`/`implements` faces,
 /// so the walk answered Missing and the verdict over-reported
 /// `undefined_method`.
@@ -113,7 +114,7 @@ void f() {
 /// The same rule one level deeper: a named application whose `with` face
 /// is itself a named application (`class C<T> = S with B<...>` over
 /// `mixin class B = Object with A<...>` over `mixin class A = Object
-/// with M<...>` — mixin5_test's exact shape). The face-list climb expands
+/// with M<...>` — `mixin5_test`'s exact shape). The face-list climb expands
 /// each applied mixin's own `with` faces transitively.
 #[test]
 fn nested_mixin_application_chain_resolves_deep_members() {
@@ -205,7 +206,7 @@ class C<T> extends Object with A<T, Set<T>> {
 /// The `extends` face of the same rule: a class whose SUPERCLASS is a
 /// named application (`class F extends B<String>` over `class B<V> =
 /// Object with A<V>` over `mixin class A<U> = Object with M<U>` —
-/// tests/language/mixin2_test.dart). The climb reaches B's `with` face A
+/// `tests/language/mixin2_test.dart`). The climb reaches B's `with` face A
 /// through the regular mixin hop, and A's own `with` face M now joins the
 /// pending levels.
 #[test]

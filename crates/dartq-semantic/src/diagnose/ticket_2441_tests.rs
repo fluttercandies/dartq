@@ -27,6 +27,7 @@
 //! positive shape; `corpus.txt` carries the real-corpus `ast?` message
 //! the pre-fix pass reported at `simply_bounded.dart:102:11`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

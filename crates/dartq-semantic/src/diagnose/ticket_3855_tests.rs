@@ -37,6 +37,7 @@
 //!   displays the bounds face, not the written one: the pending tuple carries
 //!   the head name only. The oracle reports `'Circle<Sub>'`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{RigImport, report_ops, report_ops_imports};
 

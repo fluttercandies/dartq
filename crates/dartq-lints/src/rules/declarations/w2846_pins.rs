@@ -1,27 +1,33 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::needless_range_loop,
+    clippy::unnecessary_debug_formatting,
+    clippy::many_single_char_names
+)]
 use crate::testsupport::{Fixture, one_rule};
 
-/// The #2846 pins: a bare-identifier collection element's `Send` leaf
-/// tiles through its unconsumed follower token — the element comma when
-/// the next element follows directly (`parse_send_from_identifier`'s
-/// documented span contract). The shared `slice::comma_segments`
-/// boundary kept `comma.end <= piece.end`, so that follower comma read
-/// as covered interior and `[j, 1]` folded into one segment rooted at
-/// `1` — every per-element face over the shared segmentation
-/// under-reported. The fix keeps strict-interior coverage
-/// (`comma.end < piece.end`) plus the sits-on separator guard — the
-/// same boundary `declarations.rs`'s `collection_elements` walks —
-/// because upstream terminates an element's span at its own last token
-/// (`upstream Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart`
-/// :3117, `AstNodeImpl.end => endToken.end`).
-///
-/// `await_only_futures` is the stable consumer (its collection-display
-/// face reads one display per segment, `await_only_futures.dart`'s
-/// inferred-type argument): a folded segment reports only its last
-/// row's face, so the display is the segmentation itself.
+// The #2846 pins: a bare-identifier collection element's `Send` leaf
+// tiles through its unconsumed follower token — the element comma when
+// the next element follows directly (`parse_send_from_identifier`'s
+// documented span contract). The shared `slice::comma_segments`
+// boundary kept `comma.end <= piece.end`, so that follower comma read
+// as covered interior and `[j, 1]` folded into one segment rooted at
+// `1` — every per-element face over the shared segmentation
+// under-reported. The fix keeps strict-interior coverage
+// (`comma.end < piece.end`) plus the sits-on separator guard — the
+// same boundary `declarations.rs`'s `collection_elements` walks —
+// because upstream terminates an element's span at its own last token
+// (`upstream Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart`
+// :3117, `AstNodeImpl.end => endToken.end`).
+//
+// `await_only_futures` is the stable consumer (its collection-display
+// face reads one display per segment, `await_only_futures.dart`'s
+// inferred-type argument): a folded segment reports only its last
+// row's face, so the display is the segmentation itself.
 
-/// `[j, 1]` is two elements: `String j` and `int` mix to `List<dynamic>`
-/// — the comma the `j` send swallows still separates. The folded read
-/// answered `List<int>` (the merged segment's `1` root).
+// `[j, 1]` is two elements: `String j` and `int` mix to `List<dynamic>`
+// — the comma the `j` send swallows still separates. The folded read
+// answered `List<int>` (the merged segment's `1` root).
 #[test]
 fn bare_identifier_element_comma_still_separates() {
     let f = Fixture::parse("void f() async {\n  String j = '';\n  await [j, 1];\n}\n");
@@ -73,14 +79,14 @@ fn same_type_elements_still_spell() {
     );
 }
 
-/// The control-flow and spread shapes' unchanged faces: each segment's
-/// root is the `Spread`/`ForControlFlow`/`IfControlFlow` marker, which
-/// `await_only_futures`'s display face does not read (`side_display`'s
-/// `_` arm answers `None` — the documented best-effort display
-/// under-read), so only the `1` side contributes `int`. The comma
-/// boundary itself is exercised — the element markers seal exactly on
-/// the follower comma (the same `end_incl` contract the `Send` leaf
-/// rides), so these keep the boundary honest as regression pins.
+// The control-flow and spread shapes' unchanged faces: each segment's
+// root is the `Spread`/`ForControlFlow`/`IfControlFlow` marker, which
+// `await_only_futures`'s display face does not read (`side_display`'s
+// `_` arm answers `None` — the documented best-effort display
+// under-read), so only the `1` side contributes `int`. The comma
+// boundary itself is exercised — the element markers seal exactly on
+// the follower comma (the same `end_incl` contract the `Send` leaf
+// rides), so these keep the boundary honest as regression pins.
 
 /// `[...z, 1]`: the spread operand's own send swallows the same
 /// follower comma — the element still separates; the display reads the

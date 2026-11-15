@@ -37,6 +37,7 @@
 //! oracle-verified expectation so the owning lane only has to drop the
 //! attribute.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 
 const TYPE_CHECK: &str = "unnecessary_type_check";

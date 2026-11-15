@@ -42,6 +42,7 @@
 //! leaves quiet — plus the genuine errors that must keep reporting with the
 //! oracle's exact wording.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops, rows};
 
 /// The messages of every `conflicting_generic_interfaces` row, in report

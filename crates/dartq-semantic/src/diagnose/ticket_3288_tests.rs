@@ -3,7 +3,7 @@
 //! The face's dominant residual root is upstream of this file (the flow
 //! layer's facts carry a token span, while the oracle's `flowEnd` derives
 //! the reported length from the flow-ending NODE, `length = node.end -
-//! offset`, dead_code_verifier.dart:321). What the emit layer owns is the
+//! offset`, `dead_code_verifier.dart:321`). What the emit layer owns is the
 //! tail shaping and the dead-region containment, and both are pinned here:
 //!
 //! * the `for` header's `)` never rides a dead run's tail — the `ForParts`
@@ -17,6 +17,8 @@
 //!   verifier keeps `_deadCatchClauseRanges` and returns before latching a
 //!   nested dead node (:449-455), so a dead clause's `if (false) {}` yields
 //!   no second row.
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
 
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};

@@ -35,6 +35,7 @@
 //! Probed both ways: the same source analyzed through `report_ops` is
 //! silent, exactly as the oracle is.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops as report;
 
 /// The `unused_element` rows of `report`, as (offset, message) pairs — the

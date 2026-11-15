@@ -13,6 +13,7 @@
 //! contract — method table, handshake sequence, payload shapes — is specified
 //! in the crate documentation.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

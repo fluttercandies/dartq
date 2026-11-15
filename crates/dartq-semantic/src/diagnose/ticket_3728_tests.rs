@@ -17,6 +17,7 @@
 //! the same switch with a `_`/`Object?` catch-all stays silent; a sealed
 //! root missing a case reports; a sealed root fully covered stays silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// The `non_exhaustive_switch_expression` messages of `report`, in source
@@ -115,9 +116,7 @@ fn sealed_scrutinee_fully_covered_stays_silent() {
 fn unresolvable_scrutinee_still_suppresses() {
     let report = report_ops("int f(Missing m) => switch (m) { Object _ => 1, _ => 2 };\n");
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "non_exhaustive_switch_expression"),
+        !code_names(&report).contains(&"non_exhaustive_switch_expression"),
         "{:?}",
         code_names(&report)
     );

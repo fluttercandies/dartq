@@ -2,20 +2,21 @@
 //! `receiver.{ ... }`, `receiver.=> e`, `receiver.(p) { ... }` and their
 //! `?.`/`..`/`?..` faces, behind
 //! [`crate::ParserFeatures::anonymous_methods_enabled`] (upstream Dart SDK
-//! source, pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart,
+//! source, pkg/_`fe_analyzer_shared/lib/src/parser/parser_impl.dart`,
 //! `:7292-7295` selector dispatch, `:7524-7547` `_beginsAnonymousMethod`
 //! lookahead, `:7550-7590` `_parseAnonymousMethod` body, `:7770-7801`
 //! cascade dispatch). With the experiment off the member dispatch falls
 //! through to the ordinary selector path — the upstream
 //! `reportExperimentNotEnabled` call is an unimplemented stub that never
 //! fires, so the off posture is the plain noise rows pinned below
-//! (oracle-pinned by the DeadCode experiment corpus rows). The
+//! (oracle-pinned by the `DeadCode` experiment corpus rows). The
 //! missing-body recovery arm
 //! (`:7581-7589`) is unreachable through the public gate — the lookahead
 //! and the body check read the same follower unless a recovery synthetic is
 //! spliced between them — so every clean-parse pin doubles as its
 //! does-not-fire-spuriously proof.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::ParserFeatures;
 use dartq_language::{Feature, FeatureSet};
@@ -37,7 +38,7 @@ fn rows_with(source: &'static str, features: ParserFeatures) -> Vec<(String, u32
     parser.listener.errors.clone()
 }
 
-/// `receiver.=> e` (upstream expression/plain_test): the implicit-params
+/// `receiver.=> e` (upstream `expression/plain_test)`: the implicit-params
 /// arrow member parses clean with the experiment on.
 #[test]
 fn selector_arrow_member_parses_clean() {
@@ -45,7 +46,7 @@ fn selector_arrow_member_parses_clean() {
     assert!(rows.is_empty(), "flag-on `.=>` must parse clean: {rows:?}");
 }
 
-/// `receiver.{ ... }` (upstream block/plain_test): the implicit-params
+/// `receiver.{ ... }` (upstream `block/plain_test)`: the implicit-params
 /// block member parses clean with the experiment on.
 #[test]
 fn selector_block_member_parses_clean() {
@@ -60,7 +61,7 @@ fn selector_block_member_parses_clean() {
 }
 
 /// `receiver.(int x) => e` — an explicitly parameterized arrow member; the
-/// wrong-parameter-type face is semantic (ast_builder), never parser rows.
+/// wrong-parameter-type face is semantic (`ast_builder`), never parser rows.
 #[test]
 fn selector_explicit_params_arrow_parses_clean() {
     let rows = rows_with(
@@ -113,8 +114,8 @@ fn null_aware_selector_members_parse_clean() {
 }
 
 /// `receiver..{ ... }` / `receiver?..{ ... }` / `receiver..(p) { ... }`:
-/// the cascade initial-section faces (upstream block/cascaded_test,
-/// null_aware_cascaded_test).
+/// the cascade initial-section faces (upstream `block/cascaded_test`,
+/// `null_aware_cascaded_test`).
 #[test]
 fn cascade_initial_section_members_parse_clean() {
     let rows = rows_with(
@@ -128,7 +129,7 @@ fn cascade_initial_section_members_parse_clean() {
 }
 
 /// `receiver..=> e` and `receiver?..=> e`: the cascade arrow faces
-/// (upstream expression/cascaded_test).
+/// (upstream `expression/cascaded_test`).
 #[test]
 fn cascade_arrow_members_parse_clean() {
     let rows = rows_with(
@@ -141,7 +142,7 @@ fn cascade_arrow_members_parse_clean() {
     );
 }
 
-/// `(receiver.=> e).=> f` (upstream plain_test v2): an anonymous member
+/// `(receiver.=> e).=> f` (upstream `plain_test` v2): an anonymous member
 /// nested in a parenthesized receiver, then another anonymous member.
 #[test]
 fn parenthesized_receiver_then_selector_member_parses_clean() {
@@ -155,7 +156,7 @@ fn parenthesized_receiver_then_selector_member_parses_clean() {
     );
 }
 
-/// `receiver.=> foo.=> bar` (upstream cascaded_test v6 shape): a chained
+/// `receiver.=> foo.=> bar` (upstream `cascaded_test` v6 shape): a chained
 /// selector-level anonymous member — the second gate reads the member
 /// after the first arrow body's expression.
 #[test]
@@ -170,7 +171,7 @@ fn chained_selector_members_parse_clean() {
     );
 }
 
-/// `receiver.=> foo..=> bar` (upstream cascaded_test v7): a selector-level
+/// `receiver.=> foo..=> bar` (upstream `cascaded_test` v7): a selector-level
 /// member followed by a cascade-level member in the same expression.
 #[test]
 fn selector_then_cascade_members_parse_clean() {
@@ -185,7 +186,7 @@ fn selector_then_cascade_members_parse_clean() {
 }
 
 /// Flag off: `.` + `=>` falls through to the ordinary selector path — the
-/// operand takes parse_primary's identifier recovery, the single
+/// operand takes `parse_primary`'s identifier recovery, the single
 /// `missing_identifier` row the oracle emits for the same input.
 #[test]
 fn flag_off_selector_arrow_is_ordinary_noise() {
@@ -197,7 +198,7 @@ fn flag_off_selector_arrow_is_ordinary_noise() {
 }
 
 /// Flag off: `.` + `{` — the `{` operand takes the arm's own
-/// missing_identifier anchor (OpenCurly is a complete-expression operand),
+/// `missing_identifier` anchor (`OpenCurly` is a complete-expression operand),
 /// then parses as a set/map literal (the oracle's ordinary path too).
 #[test]
 fn flag_off_selector_block_is_ordinary_noise() {
@@ -209,7 +210,7 @@ fn flag_off_selector_block_is_ordinary_noise() {
 }
 
 /// Flag off: `.` + `(p) => p` — the `(` operand anchors the arm's
-/// missing_identifier row, then the group reads as a function literal (the
+/// `missing_identifier` row, then the group reads as a function literal (the
 /// oracle's ordinary path too).
 #[test]
 fn flag_off_selector_params_is_ordinary_noise() {

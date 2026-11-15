@@ -9,6 +9,7 @@
 //! only while an analysis runs, so an idle resident server costs no
 //! sampling at all.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::process::Command;
 
 /// `(pid, ppid, rss KiB)` for every process, from one `ps` snapshot.

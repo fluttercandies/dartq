@@ -1,5 +1,9 @@
 //! Recovery primitive tests.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, latest_features, scan_ok, setup};
 
 #[test]
@@ -107,8 +111,8 @@ fn parse_collected(source: &'static str, table: &dartq_scanner::TokenTable) -> (
     let at_eof = {
         let mut p = crate::Parser::new(source, table, latest_features(), &mut listener);
         p.parse_unit();
-        let eof = p.cursor.at_eof();
-        eof
+
+        p.cursor.at_eof()
     };
     (listener, at_eof)
 }
@@ -326,7 +330,7 @@ fn expression_continuation_rewrites_new_as_identifier() {
 /// Logs the constructor-reference selector events next to the recovery
 /// rows: the enum-constant empty-name face rides `handleIdentifier` on the
 /// synthesized identifier (official `ensureIdentifier`,
-/// parser_impl.dart:4083).
+/// `parser_impl.dart:4083`).
 #[derive(Default)]
 struct SelectorListener {
     errors: Vec<(String, u32, u32)>,
@@ -719,7 +723,7 @@ fn unit_error_spans(source: &'static str) -> Vec<(String, u32, u32)> {
 /// the group scan's `skipType` covers the head and its `?` (official
 /// computeType(required) `simpleNullableType`, type_info.dart:305-330), so
 /// the `<...>` group is a real type-argument group and the `?` never falls
-/// to the expression layer. Frozen census faces (nnbd static_errors
+/// to the expression layer. Frozen census faces (nnbd `static_errors`
 /// family, one shared preamble line failing 198+ cases):
 /// `List<Function?> funcList = [];` in a body used to cascade
 /// `missing_identifier` at the `>` plus `missing_identifier` +
@@ -750,11 +754,11 @@ fn pin_type_arg_bare_function_question_is_a_type() {
     }
 }
 
-/// Name-less `(`-suffix formals (official OPEN_PAREN arm +
-/// formalParameterDeclaration keep-set ensure, parser_impl.dart:2233/:2349):
+/// Name-less `(`-suffix formals (official `OPEN_PAREN` arm +
+/// formalParameterDeclaration keep-set ensure, `parser_impl.dart:2233/:2349)`:
 /// one `missing_identifier` anchored on the `(` that opens the formal's
 /// parameter list, the suffix consumed, no further rows. Frozen census rows
-/// (FragmentOffsetTest formalParameterFragment_missingName{,2}):
+/// (`FragmentOffsetTest` `formalParameterFragment_missingName{,2})`:
 /// `void f(void (int x)) {}` → 2:13, `void f((int x)) {}` → 2:8.
 #[test]
 fn pin_formal_missing_name_before_params_anchors_on_the_open_paren() {
@@ -782,10 +786,10 @@ fn pin_formal_missing_name_before_params_anchors_on_the_open_paren() {
     );
 }
 
-/// Function-typed field formals (official OPEN_PAREN arm over the receiver
-/// walk, parser_impl.dart:2211/:2233): `this.field(int value)` consumes the
+/// Function-typed field formals (official `OPEN_PAREN` arm over the receiver
+/// walk, `parser_impl.dart:2211/:2233)`: `this.field(int value)` consumes the
 /// parameter list as the function-type suffix and stays silent — census
-/// face NonErrorResolverTest fieldFormalParameter_functionTyped_named,
+/// face `NonErrorResolverTest` `fieldFormalParameter_functionTyped_named`,
 /// previously `expected_token '}'` at the `(`.
 #[test]
 fn pin_function_typed_field_formal_parses_silently() {

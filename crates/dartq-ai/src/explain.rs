@@ -100,6 +100,7 @@
 //! query face use. Each producer maps its own enum; the spellings are the
 //! shared contract, not shared code.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde::{Deserialize, Serialize};
 
 use dartq_index::{DeclKind, DeclRow, RefKind, RefRow, SuperClause, TargetRef, TestGraph};
@@ -481,10 +482,10 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
     // breaks a label tie deterministically.
     let rank_of = |hit: &SymbolDeclHit<'_>| {
         let surface = decls_of(hit.file);
-        let name = if hit.decl.container != DeclRow::NONE {
-            surface[hit.decl.container as usize].name
-        } else {
+        let name = if hit.decl.container == DeclRow::NONE {
             hit.decl.name
+        } else {
+            surface[hit.decl.container as usize].name
         };
         (
             is_test_of(hit.file),
@@ -508,10 +509,10 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
     // widening), is in scope.
     let container_of = |hit: &SymbolDeclHit<'_>| -> StringId {
         let surface = decls_of(hit.file);
-        if hit.decl.container != DeclRow::NONE {
-            surface[hit.decl.container as usize].name
-        } else {
+        if hit.decl.container == DeclRow::NONE {
             StringId::NONE
+        } else {
+            surface[hit.decl.container as usize].name
         }
     };
     let in_scope = |hit: &SymbolDeclHit<'_>, row: &RefRow| {

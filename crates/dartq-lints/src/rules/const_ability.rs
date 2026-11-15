@@ -49,6 +49,7 @@
 //! parent link. The module's pins parse through the production bridge
 //! ([`crate::testsupport::Fixture::parse`]) for exactly that reason.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_ast::{NodeKind, PayloadField, mod_flags};
 use dartq_semantic::Analysis;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1155,13 +1156,13 @@ fn parse_callee<'s>(unit: &Unit<'s>, send: u32) -> Option<Callee<'s>> {
         Some(&row) if unit.ast.kind(row) == NodeKind::DotAccess => selector_name(unit, row),
         _ => None,
     };
-    let args = match run.get(tail_pos.checked_sub(1)?).copied() {
-        Some(row) => match unit.ast.kind(row) {
+    let args = {
+        let row = run.get(tail_pos.checked_sub(1)?).copied()?;
+        match unit.ast.kind(row) {
             NodeKind::Arguments => Some(row),
             NodeKind::NoArguments => None,
             _ => return None,
-        },
-        None => return None,
+        }
     };
     Some(Callee {
         name,
@@ -1326,50 +1327,49 @@ fn member_const_face(
     let Some(type_row) = index.types.get(type_name).copied() else {
         return false;
     };
-    match unit.ast.kind(type_row) {
-        NodeKind::EnumDeclaration => enum_value_names(unit, type_row).contains(&selector),
-        _ => {
-            let members = class_members(unit, type_row);
-            // No generative constructor declared — the implicit default
-            // answers `new` (a factory does not suppress it): the
-            // `final c = CInference.new;` tear-off face.
-            if selector == "new"
-                && !members
-                    .iter()
-                    .any(|&member| unit.ast.kind(member) == NodeKind::Constructor)
-            {
-                return true;
-            }
-            members.into_iter().any(|member| {
-                match unit.ast.kind(member) {
-                    NodeKind::Fields => {
-                        mod_flags(unit.ast, member) & STATIC_BIT != 0
-                            && static_const_names(unit, member).contains(&selector)
-                    }
-                    // A constructor tear-off: `C.new` / `C.named` — the
-                    // `new` selector and the class's own name spell the
-                    // unnamed constructor; otherwise the second identifier is
-                    // the named selector (the `const_ctor_face` header read,
-                    // minus the `const` requirement — a tear-off is constant
-                    // even over a non-const constructor).
-                    NodeKind::Constructor => {
-                        ctor_member_selector(unit, member).is_some_and(|s| s == selector)
-                            || (selector == "new"
-                                && ctor_member_selector(unit, member)
-                                    .is_none_or(|s| s == type_name || s == "new"))
-                    }
-                    // A static-method tear-off: `static T m(…)` — the head
-                    // names the method; `get`/`set` accessors are not
-                    // tear-off-able as `C.m` (a `static` getter reads as a
-                    // static property — still non-const upstream).
-                    NodeKind::Method => {
-                        mod_flags(unit.ast, member) & STATIC_BIT != 0
-                            && lexeme(unit, head_token(unit, member)) == selector
-                    }
-                    _ => false,
-                }
-            })
+    if unit.ast.kind(type_row) == NodeKind::EnumDeclaration {
+        enum_value_names(unit, type_row).contains(&selector)
+    } else {
+        let members = class_members(unit, type_row);
+        // No generative constructor declared — the implicit default
+        // answers `new` (a factory does not suppress it): the
+        // `final c = CInference.new;` tear-off face.
+        if selector == "new"
+            && !members
+                .iter()
+                .any(|&member| unit.ast.kind(member) == NodeKind::Constructor)
+        {
+            return true;
         }
+        members.into_iter().any(|member| {
+            match unit.ast.kind(member) {
+                NodeKind::Fields => {
+                    mod_flags(unit.ast, member) & STATIC_BIT != 0
+                        && static_const_names(unit, member).contains(&selector)
+                }
+                // A constructor tear-off: `C.new` / `C.named` — the
+                // `new` selector and the class's own name spell the
+                // unnamed constructor; otherwise the second identifier is
+                // the named selector (the `const_ctor_face` header read,
+                // minus the `const` requirement — a tear-off is constant
+                // even over a non-const constructor).
+                NodeKind::Constructor => {
+                    ctor_member_selector(unit, member).is_some_and(|s| s == selector)
+                        || (selector == "new"
+                            && ctor_member_selector(unit, member)
+                                .is_none_or(|s| s == type_name || s == "new"))
+                }
+                // A static-method tear-off: `static T m(…)` — the head
+                // names the method; `get`/`set` accessors are not
+                // tear-off-able as `C.m` (a `static` getter reads as a
+                // static property — still non-const upstream).
+                NodeKind::Method => {
+                    mod_flags(unit.ast, member) & STATIC_BIT != 0
+                        && lexeme(unit, head_token(unit, member)) == selector
+                }
+                _ => false,
+            }
+        })
     }
 }
 
@@ -1448,10 +1448,10 @@ fn declaration_name<'s>(unit: &Unit<'s>, row: u32) -> Option<&'s str> {
     // The extension type's name never tiles as an `Identifier` child —
     // `begin_extension_type_declaration` patches it into the row's `Name`
     // word.
-    if unit.ast.kind(row) == NodeKind::ExtensionTypeDeclaration {
-        if let Some(name) = unit.ast.field(row, PayloadField::Name) {
-            return Some(lexeme(unit, name));
-        }
+    if unit.ast.kind(row) == NodeKind::ExtensionTypeDeclaration
+        && let Some(name) = unit.ast.field(row, PayloadField::Name)
+    {
+        return Some(lexeme(unit, name));
     }
     let is_name = |kid: u32| {
         unit.ast.kind(kid) == NodeKind::Identifier
@@ -1837,7 +1837,7 @@ mod w3_const_pins {
     /// The unnamed face is selector-correct: a class whose only const
     /// constructor is NAMED (`._`) never makes the unnamed creation
     /// const-able — the unnamed constructor resolves elsewhere (absent or
-    /// a factory, the upstream test_no_lint_factorySome face) — while the
+    /// a factory, the upstream `test_no_lint_factorySome` face) — while the
     /// unnamed const constructor answers its own face.
     #[test]
     fn const_ctor_face_is_selector_correct() {
@@ -1981,7 +1981,7 @@ mod w3_const_pins {
 
     /// The tear-off faces: `C.new` over a class with no generative
     /// constructor answers the implicit default (the
-    /// prefer_const_declarations corpus face); over `const F._()` it
+    /// `prefer_const_declarations` corpus face); over `const F._()` it
     /// answers false — the generative constructor suppresses the
     /// implicit `new`.
     #[test]

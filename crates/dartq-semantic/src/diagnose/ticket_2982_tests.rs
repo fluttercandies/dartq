@@ -19,6 +19,7 @@
 //! the iterable) and `NotNullAwareNullSpreadTest`'s `nullTyped` rows
 //! (`invalid_use_of_null_value` beside `not_null_aware_null_spread`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, rows};
 
 /// `Null x; for (var y in x)` — the iterable read's `Ty::Null` face swaps

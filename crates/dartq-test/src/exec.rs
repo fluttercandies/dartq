@@ -18,6 +18,7 @@
 //! Every event is kept verbatim in its suite's block; dartq re-renders the
 //! blocks with the reporter the user asked for.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use rustc_hash::FxHashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -25,7 +26,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Default per-run timeout. Suites that hang are killed.
-const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60); // 30 min
+const RUN_TIMEOUT: Duration = Duration::from_mins(30); // 30 min
 
 /// Spawn configuration.
 #[derive(Debug, Clone)]
@@ -215,7 +216,7 @@ fn batched(
         let mut end = start;
         let mut bytes = 0;
         while end < files.len()
-            && (end == start || bytes + files[end].as_os_str().len() + 1 <= ARGV_BUDGET)
+            && (end == start || bytes + files[end].as_os_str().len() < ARGV_BUDGET)
         {
             bytes += files[end].as_os_str().len() + 1;
             end += 1;
@@ -276,7 +277,7 @@ fn run_command(mut cmd: Command, cfg: &ExecConfig) -> Result<Execution, ExecErro
     });
     let mut peak_rss = 0u64;
     let mut peak_tester_rss = 0u64;
-    let mut sampled = Instant::now() - RSS_SAMPLE;
+    let mut sampled = Instant::now().checked_sub(RSS_SAMPLE).unwrap();
     loop {
         if child.try_wait().map_err(ExecError::Wait)?.is_some() {
             break;
@@ -488,10 +489,10 @@ fn parse_stream(
                             .and_then(crate::event::Json::as_bool)
                             .unwrap_or(false);
                     }
-                    if let Some(sink) = sink {
-                        if let Some(block) = blocks[index].take() {
-                            let _ = sink.send(Streamed::Settled(Settled { block, spawned }));
-                        }
+                    if let Some(sink) = sink
+                        && let Some(block) = blocks[index].take()
+                    {
+                        let _ = sink.send(Streamed::Settled(Settled { block, spawned }));
                     }
                 }
                 continue;
@@ -514,10 +515,10 @@ fn parse_stream(
                 }));
             }
             _ => {
-                if let Some(test) = raw.u64_at(&["test", "id"]) {
-                    if let Some(suite) = raw.u64_at(&["test", "suiteID"]) {
-                        suite_of_test.insert(test, suite);
-                    }
+                if let Some(test) = raw.u64_at(&["test", "id"])
+                    && let Some(suite) = raw.u64_at(&["test", "suiteID"])
+                {
+                    suite_of_test.insert(test, suite);
                 }
                 let suite = crate::event::suite_of(&raw).or_else(|| {
                     raw.u64_at(&["testID"])

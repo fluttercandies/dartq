@@ -18,6 +18,7 @@
 //! unmodelable rows the client prints as `note:` advisories), so the
 //! client's fatal-infos/fatal-warnings arithmetic is unchanged.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};

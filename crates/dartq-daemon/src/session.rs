@@ -214,6 +214,7 @@
 //! accelerator invariant makes an unwritten generation a future miss, never
 //! an error.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::hash_map::Entry;
 use std::fs;
 use std::io;
@@ -1804,17 +1805,7 @@ impl Session {
     /// the turn proceeds on whatever loaded (the pre-#2591 startup
     /// sweep's failure posture).
     fn refresh_workspace_state(&mut self) {
-        if !self.discovered {
-            self.discovered = true;
-            for index in 0..self.context_ids.len() {
-                if let Err(error) = self
-                    .engine_mut(self.context_ids[index])
-                    .discover_workspace()
-                {
-                    eprintln!("dartq-daemon: workspace discovery failed: {error}");
-                }
-            }
-        } else {
+        if self.discovered {
             let cap = self.live_path_cap;
             // The answer cache's freshness leg (#4240): a pass that
             // reloaded or removed anything changed the engine content a
@@ -1843,7 +1834,7 @@ impl Session {
                     }
                     Err(error) => {
                         moved = true;
-                        eprintln!("dartq-daemon: workspace refresh failed: {error}")
+                        eprintln!("dartq-daemon: workspace refresh failed: {error}");
                     }
                 }
             }
@@ -1851,6 +1842,16 @@ impl Session {
                 self.invalidate_answers();
                 // Reloaded or removed content reopens the settle (#4268).
                 self.settled.clear();
+            }
+        } else {
+            self.discovered = true;
+            for index in 0..self.context_ids.len() {
+                if let Err(error) = self
+                    .engine_mut(self.context_ids[index])
+                    .discover_workspace()
+                {
+                    eprintln!("dartq-daemon: workspace discovery failed: {error}");
+                }
             }
         }
         // The serve face's `dartq.yaml` advisory (#4106): ticked on this
@@ -2021,7 +2022,7 @@ impl Session {
     /// (their analysis then runs on the new universe, ahead of this
     /// turn's answers), the still-staged write applies on top of the
     /// fresh engine's discovered disk state, and the publish baseline
-    /// clears so the next base read republishes the whole view (FileIds
+    /// clears so the next base read republishes the whole view (`FileIds`
     /// are per-engine; a stale baseline could alias another file).
     /// Warm-start, memory budget, and content-store arming mirror the
     /// assembly's `open` posture; the trace sink cannot travel (one
@@ -2652,7 +2653,7 @@ impl Session {
         method: &str,
         params: serde_json::Value,
     ) -> Option<Response> {
-        let root = self.workspace_root.to_path_buf();
+        let root = self.workspace_root.clone();
         // The handover leaves a fresh, still-sharing manager in place so
         // a later worker respawn (the dead-dispatch retirement below)
         // re-hands over the same live counter.
@@ -2728,7 +2729,7 @@ impl Session {
             id: RequestId::Str(crate::debug::SHUTDOWN_JOB_ID.into()),
             method: crate::debug::DEBUG_SHUTDOWN.to_owned(),
             params: serde_json::Value::Null,
-            root: self.workspace_root.to_path_buf(),
+            root: self.workspace_root.clone(),
         };
         if dispatch.send(job).is_some() {
             return None; // queue full or worker gone — nothing to wait for
@@ -2766,7 +2767,7 @@ impl Session {
     pub(crate) fn debug_completions(&self) -> Option<&crossbeam_channel::Receiver<Response>> {
         self.debug_dispatch
             .as_ref()
-            .map(|dispatch| dispatch.completions())
+            .map(super::debug::DebugDispatch::completions)
     }
 
     /// How many `dartq/test/run` children are still running: while any
@@ -3990,7 +3991,7 @@ impl Session {
                     // full turn.
                     dartq_commands::analyze::Target::Dir(_) => return None,
                     dartq_commands::analyze::Target::File(path)
-                        if !path.extension().is_some_and(|ext| ext == "dart") => {}
+                        if path.extension().is_none_or(|ext| ext != "dart") => {}
                     dartq_commands::analyze::Target::File(path) => {
                         let file = files.try_file_id(path)?;
                         engine.library_of(file)?;
@@ -4220,7 +4221,7 @@ impl Session {
     /// unsaved text — the staged table is the session's open/dirty-documents
     /// face, the same bytes `wear` pushes into the engine for an agent view.
     /// Upstream sends the same thing: the server's whole `_overlayState`
-    /// (`AnalysisUpdateContentParams`, plugin_manager.dart) so plugin rules
+    /// (`AnalysisUpdateContentParams`, `plugin_manager.dart`) so plugin rules
     /// parse the client's edited view, never stale disk bytes — the base
     /// view's engine still analyzes disk, which is exactly why the plugin
     /// push needs the staged text.
@@ -4956,7 +4957,7 @@ impl Session {
                 .engine(self.default_context)
                 .file_table()
                 .path(file)
-                .map(|path| path.to_path_buf())
+                .map(std::path::Path::to_path_buf)
             else {
                 continue;
             };
@@ -5992,7 +5993,7 @@ mod tests {
         let turn = session.service();
 
         assert_eq!(turn.publishes.len(), 1, "the write's clear push");
-        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert_eq!(turn.publishes[0].diagnostics, [] as [wire::Diagnostic; 0]);
         assert_eq!(
             turn.answers.iter().map(|(id, _)| id).collect::<Vec<_>>(),
             [&RequestId::Num(2), &RequestId::Num(3)]
@@ -6143,7 +6144,7 @@ mod tests {
             "the write's clear push survives the cancel: {:?}",
             turn.publishes
         );
-        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert_eq!(turn.publishes[0].diagnostics, [] as [wire::Diagnostic; 0]);
 
         // A follow-up analysis over the unchanged set publishes nothing —
         // the push face is pure diff — but still answers the clean view.
@@ -6337,7 +6338,7 @@ mod tests {
             "the clear push: {:?}",
             turn.publishes
         );
-        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert_eq!(turn.publishes[0].diagnostics, [] as [wire::Diagnostic; 0]);
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
@@ -7111,7 +7112,7 @@ mod tests {
             "one batch, one push — as if a single clean edit arrived: {:?}",
             turn.publishes
         );
-        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert_eq!(turn.publishes[0].diagnostics, [] as [wire::Diagnostic; 0]);
 
         // The survivor is the LAST text: an earlier broken one winning
         // would surface syntax diagnostics here.
@@ -7162,7 +7163,7 @@ mod tests {
             .expect("sync admits");
         let turn = session.service();
         assert_eq!(turn.publishes.len(), 1, "the clear push");
-        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert_eq!(turn.publishes[0].diagnostics, [] as [wire::Diagnostic; 0]);
 
         // A file deleted since the event: the overlay drops it, the file's
         // diagnostics vanish, and — the baseline already being empty — no
@@ -7284,7 +7285,7 @@ mod tests {
             "the clearing push for the diagnosed file: {:?}",
             turn.publishes
         );
-        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert_eq!(turn.publishes[0].diagnostics, [] as [wire::Diagnostic; 0]);
         assert!(
             !session.changed.contains_key(&extra),
             "the removed path left the delta cursor"
@@ -7851,7 +7852,10 @@ mod tests {
 
         // Nothing staged: the feed is empty (the plugin-free shape's cost is
         // the agents-table emptiness check).
-        assert!(session.plugin_overlays().is_empty());
+        assert_eq!(
+            session.plugin_overlays(),
+            [] as [(std::string::String, std::string::String); 0]
+        );
 
         // Agent A stages `main` with a BOM — the pushed text is the canonical
         // decode, byte-identical to what `wear` hands the engine — and
@@ -7896,7 +7900,10 @@ mod tests {
         // is the source, not a snapshot.
         session.clear_overlay("A");
         session.clear_overlay("B");
-        assert!(session.plugin_overlays().is_empty());
+        assert_eq!(
+            session.plugin_overlays(),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// The weave carries the staged text to the plugin cycle (#1819's wire
@@ -8135,7 +8142,7 @@ mod tests {
     /// inside the analysis root (`sym`'s `label|name` labels likewise),
     /// while the changed table keys on the session's absolute paths — the
     /// lookup key re-joins a relative tail against the workspace root
-    /// (commands::delta_key). The bare relative spelling missed the table
+    /// (`commands::delta_key`). The bare relative spelling missed the table
     /// and silently dropped every in-root row from the delta answer.
     #[test]
     fn the_delta_filters_rejoin_located_rows_against_the_workspace_root() {
@@ -8168,7 +8175,7 @@ mod tests {
             answer.as_ref().expect("the impact answer is ok").as_value()["sym"]
                 .as_array()
                 .expect("the changed-symbol rows")
-                .to_vec()
+                .clone()
         };
         // since=0: the edited file's changed-symbol row survives the
         // filter, its label the located spelling — the re-join resolved
@@ -8321,7 +8328,7 @@ mod tests {
     /// serves the next request.
     #[test]
     fn a_panicking_answer_worker_yields_error_rows_and_the_session_serves_the_next_request() {
-        let (workspace, mut session) = fixture("answer-worker-join-unit");
+        let (_workspace, mut session) = fixture("answer-worker-join-unit");
         session.sweep().expect("sweep");
         let _ = session.service();
 
@@ -8356,8 +8363,7 @@ mod tests {
         for id in &ids {
             assert!(
                 answered_ids.contains(&&RequestId::Num(*id)),
-                "request id {id} is lost: {:?}",
-                answered_ids
+                "request id {id} is lost: {answered_ids:?}"
             );
         }
         let mut ok_answers = 0usize;
@@ -8646,7 +8652,7 @@ mod tests {
             "one clearing push for the removed file: {:?}",
             turn.publishes
         );
-        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert_eq!(turn.publishes[0].diagnostics, [] as [wire::Diagnostic; 0]);
         assert!(session.staged.is_empty());
 
         // The baseline dropped with the removal: later drains stay quiet.
@@ -8704,7 +8710,7 @@ mod tests {
             "the removal's clearing push: {:?}",
             turn.publishes
         );
-        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert_eq!(turn.publishes[0].diagnostics, [] as [wire::Diagnostic; 0]);
         assert!(session.staged.is_empty(), "the merged set applied");
         let engine = session.engine(session.default_context);
         let main_file = engine
@@ -10610,7 +10616,7 @@ mod tests {
             "the merge's clear push: {:?}",
             turn.publishes
         );
-        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert_eq!(turn.publishes[0].diagnostics, [] as [wire::Diagnostic; 0]);
         assert!(session.cursor > before, "the merge bumped the cursor");
         assert_eq!(
             session.changed.get(&main),
@@ -10679,7 +10685,7 @@ mod tests {
 
     /// The `context` param's wire contract at the parse edge: the
     /// engine-view faces carry it; the disk-view faces reject it (the
-    /// agent_id rule, extended).
+    /// `agent_id` rule, extended).
     #[test]
     fn context_param_parses_on_engine_faces_and_rejects_on_disk_faces() {
         let request = crate::commands::parse(
@@ -11351,7 +11357,7 @@ mod tests {
         std::hash::Hasher::write(&mut digest, &served[0]);
         let digest = std::hash::Hasher::finish(&digest);
         let mut hits = walls[1..].to_vec();
-        hits.sort_by(|a, b| a.total_cmp(b));
+        hits.sort_by(f64::total_cmp);
         println!(
             "serve receipt: {} bytes/turn, 12 turns (1 miss + 11 hits): miss {:.3} ms, hit median {:.3} ms, hit max {:.3} ms",
             served[0].len(),

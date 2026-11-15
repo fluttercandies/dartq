@@ -27,6 +27,7 @@
 //!   oracle records `LUB(NonNull(T1), T2)`
 //!   (assignment_expression_resolver.dart `_resolveTypes`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, report_ops, report_ops_with};
 use super::*;
 
@@ -135,7 +136,7 @@ fn closure_context_return_stays_silent() {
 /// The still-reports path: a written parameter the context cannot retype
 /// (`(String x) => 5` against `int Function()`) keeps the rejection, and
 /// the message renders the context-typed literal (`int Function(String)`,
-/// the cap's shape) — the oracle's resolved FunctionExpression type.
+/// the cap's shape) — the oracle's resolved `FunctionExpression` type.
 #[test]
 fn closure_written_parameter_mismatch_reports() {
     let folded = report_ops(

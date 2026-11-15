@@ -1,5 +1,6 @@
 //! In-crate test suites: one file per parser area plus the golden smoke.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 pub(crate) mod collector;
 
 mod declarations;

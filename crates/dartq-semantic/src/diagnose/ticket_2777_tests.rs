@@ -12,6 +12,7 @@
 //! asserted). Official source: best_practices_verifier.dart
 //! `_checkForOtherInvalidAccess` (:1824-1948).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::library::ElementIndex;

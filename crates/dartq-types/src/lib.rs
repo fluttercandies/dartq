@@ -88,6 +88,7 @@
 //! The table is single-threaded (interior `RefCell`); the M2 arena story
 //! revisits parallelism.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 mod error;
 mod exhaustive;
 mod generic_function;

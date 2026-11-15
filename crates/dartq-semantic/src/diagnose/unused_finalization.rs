@@ -1,8 +1,12 @@
+#![allow(clippy::disallowed_types)]
+#![allow(unused_mut)]
+#![allow(unused_variables)]
+
 use super::*;
 
 /// The diagnostic codes whose presence anywhere in the unit skips the
 /// whole import-warning pass (upstream Dart SDK source,
-/// library_analyzer.dart `_hasDiagnosticReportedThatPreventsImportWarnings`
+/// `library_analyzer.dart` `_hasDiagnosticReportedThatPreventsImportWarnings`
 /// — the exact set, machine spellings lowered to the engine's code names).
 /// The upstream list's `constWithNonType` and `newWithNonType` entries both
 /// carry the machine name `creation_with_non_type` (diagnostic.g.dart
@@ -65,10 +69,10 @@ impl<'a> Engine<'a> {
             // `implements` entries being disallowed silences the whole
             // `with` loop (upstream `_checkClassInheritance`,
             // error_verifier.dart:2338-2340).
-            if let Some(range) = enclosing_range {
-                if self.enclosing_has_disallowed_supertype(range) {
-                    continue;
-                }
+            if let Some(range) = enclosing_range
+                && self.enclosing_has_disallowed_supertype(range)
+            {
+                continue;
             }
             for span in spans {
                 // The span is UTF-16; the slice reads source bytes (#2594). It
@@ -83,7 +87,7 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 let text = &self.source[start..end];
-                let head_end = text.find(['<', '?']).map(|i| start + i).unwrap_or(end);
+                let head_end = text.find(['<', '?']).map_or(end, |i| start + i);
                 let head = self.intern(&self.source[start..head_end]);
                 // A dotted spelling (`p.C`) resolves the leaf through the
                 // prefix's own table — the bare-scope walk would answer the
@@ -250,7 +254,7 @@ impl<'a> Engine<'a> {
 
     /// Whether the enclosing container's `extends` head or `implements`
     /// entries resolve to disallowed SDK types — the CUM-2 suppression
-    /// (`_checkClassInheritance`'s short-circuit, error_verifier.dart:
+    /// (`_checkClassInheritance`'s short-circuit, `error_verifier.dart`:
     /// 2338-2340: `!_checkForExtendsDisallowedClass &&
     /// !_checkForImplementsClauseErrorCodes` gates the whole
     /// `_checkForAllMixinErrorCodes` loop).
@@ -274,13 +278,13 @@ impl<'a> Engine<'a> {
             return false;
         };
         // `extends` head disallowed → suppress all `with` entries.
-        if let Some(superclass) = container.superclass {
-            if self.disallowed_subtype_head(superclass).is_some() {
-                return true;
-            }
+        if let Some(superclass) = container.superclass
+            && self.disallowed_subtype_head(superclass).is_some()
+        {
+            return true;
         }
         // `implements` entries disallowed → suppress all `with` entries.
-        for interface in container.implements_clause.iter() {
+        for interface in &container.implements_clause {
             if self.disallowed_subtype_head(*interface).is_some() {
                 return true;
             }
@@ -335,15 +339,15 @@ impl<'a> Engine<'a> {
             }
             // Check 2: `extends` non-Object →
             // `mixin_class_declaration_extends_not_object` at the superclass.
-            if let Some(superclass) = container.superclass {
-                if self.strings.resolve(superclass) != "Object" {
-                    self.emit(
-                        SemanticCode::MixinClassDeclarationExtendsNotObject,
-                        site_range,
-                        &name_text,
-                        "",
-                    );
-                }
+            if let Some(superclass) = container.superclass
+                && self.strings.resolve(superclass) != "Object"
+            {
+                self.emit(
+                    SemanticCode::MixinClassDeclarationExtendsNotObject,
+                    site_range,
+                    &name_text,
+                    "",
+                );
             }
             // Check 3: `with` clause on a non-application or with 2+
             // entries. Upstream reads `element.isMixinApplication` — a
@@ -885,10 +889,10 @@ impl<'a> Engine<'a> {
                         // substituted receiver resolves the member, so the
                         // access stays resolved like an `Unknown` receiver.
                         || {
-                            let foreign = !self.is_scope_param(container)
-                                && self.type_resolution(container).0 == TypeResolution::Missing;
-                            if foreign {}
-                            foreign
+
+
+                            !self.is_scope_param(container)
+                                && self.type_resolution(container).0 == TypeResolution::Missing
                         }
                 }
                 Receiver::Super { container, .. } => self.member_found(container, read.name, true),
@@ -1177,7 +1181,7 @@ impl<'a> Engine<'a> {
         while at < limit {
             match self.byte_at(at) {
                 Some(b'(') => return true,
-                Some(b';') | Some(b'\n') => return false,
+                Some(b';' | b'\n') => return false,
                 _ => at += 1,
             }
         }
@@ -1344,7 +1348,8 @@ impl<'a> Engine<'a> {
             // The enclosing `on` type must be the face's own head or a
             // subtype of it (`ClassElement` reaching an `InterfaceElement`
             // face); an unresolvable head keeps the pool credit.
-            let foreign = match face_head {
+
+            match face_head {
                 Some(face_head) if face_head != head.as_str() => {
                     let sub = Ty::named(self.intern(&head));
                     let sup = Ty::named(self.intern(face_head));
@@ -1352,9 +1357,7 @@ impl<'a> Engine<'a> {
                         && !self.name_subtype(sub, sup)
                 }
                 _ => false,
-            };
-
-            foreign
+            }
         };
         for unit_ref in &self.refs {
             if matches!(unit_ref.target, RefTarget::Opaque)
@@ -1413,10 +1416,9 @@ impl<'a> Engine<'a> {
                 .iter()
                 .copied()
                 .filter(|&(offset, _)| {
-                    !self
-                        .member_reads
+                    self.member_reads
                         .binary_search_by(|read| read.offset.cmp(&offset))
-                        .is_ok()
+                        .is_err()
                 })
                 .collect();
             reads.append(&mut extra);
@@ -1804,25 +1806,17 @@ impl<'a> Engine<'a> {
                     cursor += 1;
                     spaced = true;
                 }
-                if spaced {
-                    if let Some(op) = self.binary_operator_at(cursor) {
-                        let name = self.intern(&self.source[start..end]);
-                        let head = if fn_heads.contains(&name) {
-                            Some(function_head)
-                        } else if type_heads.contains(&name) {
-                            Some(type_head)
-                        } else {
-                            None
-                        };
-                        if let Some(head) = head {
-                            self.credit_face_member(
-                                &faces,
-                                &declarers,
-                                op,
-                                head,
-                                &mut index_read_used,
-                            );
-                        }
+                if spaced && let Some(op) = self.binary_operator_at(cursor) {
+                    let name = self.intern(&self.source[start..end]);
+                    let head = if fn_heads.contains(&name) {
+                        Some(function_head)
+                    } else if type_heads.contains(&name) {
+                        Some(type_head)
+                    } else {
+                        None
+                    };
+                    if let Some(head) = head {
+                        self.credit_face_member(&faces, &declarers, op, head, &mut index_read_used);
                     }
                 }
                 scan = end;
@@ -1854,7 +1848,7 @@ impl<'a> Engine<'a> {
                 let member_text = self.strings.resolve(*member);
                 let applied = fn_heads.iter().any(|&head| {
                     !self.member_found(head, *member, false)
-                        && self.source_member_access(self.strings.resolve(head), &member_text)
+                        && self.source_member_access(self.strings.resolve(head), member_text)
                 });
                 if applied {
                     self.credit_face_member(
@@ -2451,7 +2445,7 @@ impl<'a> Engine<'a> {
     /// group is balanced and its closing `>` is followed by `(`, `.`,
     /// `==`, `!=`, `)`, `]`, `}`, `;`, `:`, `,` or the end of input
     /// (`computeMethodTypeArguments` / `_mayFollowTypeArgs`, upstream Dart
-    /// SDK source, pkg/_fe_analyzer_shared/lib/src/parser/type_info.dart);
+    /// SDK source, pkg/_`fe_analyzer_shared/lib/src/parser/type_info.dart`);
     /// every other glued angle is `operator<` on the name or `operator>`
     /// on the group's last name. The spaced form is
     /// [`Self::adjacent_operator_at`]'s.
@@ -2835,7 +2829,7 @@ impl<'a> Engine<'a> {
                 let name_len = self.strings.resolve(unit_ref.name).len() as u32;
                 let bytes = self.source.as_bytes();
                 let mut at = self.byte_of(decl_offset + name_len);
-                while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+                while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
                     at += 1;
                 }
                 match bytes.get(at) {
@@ -2878,7 +2872,7 @@ impl<'a> Engine<'a> {
                     }
                     Some(b'=') => {
                         let mut init = at + 1;
-                        while bytes.get(init).is_some_and(|b| b.is_ascii_whitespace()) {
+                        while bytes.get(init).is_some_and(u8::is_ascii_whitespace) {
                             init += 1;
                         }
                         if bytes.get(init) == Some(&b'(') {
@@ -3070,7 +3064,7 @@ impl<'a> Engine<'a> {
         // run. A `_f` read in `m(int _f)` — a local resolution — never
         // reaches `field_read_rows` at all, so its `(0, A)` credit came
         // from the declaration alone.
-        for (&offset, &container) in self.field_read_rows.clone().iter() {
+        for (&offset, &container) in &self.field_read_rows.clone() {
             let is_decl = self
                 .decl_sites
                 .iter()
@@ -3175,7 +3169,7 @@ impl<'a> Engine<'a> {
         // The bare discarded rows: a `field_read_rows`-backed bare read
         // the statement dropped credits the pushed container — the same
         // (file, owner) the pass-2 read gate joined.
-        for (&offset, &container) in self.field_read_rows.clone().iter() {
+        for (&offset, &container) in &self.field_read_rows.clone() {
             if !self.statement_discarded_rows.contains(&offset) {
                 continue;
             }
@@ -3203,7 +3197,7 @@ impl<'a> Engine<'a> {
         // field's. `local_decl_at_read` proves the local resolution:
         // every `field_read_rows` offset that also has a local-decl
         // entry strips its (file, container) owner credit.
-        for (&offset, &container) in self.field_read_rows.clone().iter() {
+        for (&offset, &container) in &self.field_read_rows.clone() {
             if !self.local_decl_at_read.contains_key(&offset) {
                 continue;
             }
@@ -3284,7 +3278,7 @@ impl<'a> Engine<'a> {
         // write but the getter never ran, so it dead-ends the name's read
         // pool the same way a discarded statement does.
         let mut shadowed_offsets: FxHashMap<StringId, Vec<u32>> = FxHashMap::default();
-        for (&offset, _) in self.field_read_rows.iter() {
+        for &offset in self.field_read_rows.keys() {
             if self.local_decl_at_read.contains_key(&offset)
                 && let Some(name) = self
                     .refs
@@ -3325,7 +3319,7 @@ impl<'a> Engine<'a> {
             let owners_empty = self
                 .member_read_owners
                 .get(&name)
-                .is_none_or(|owners| owners.is_empty());
+                .is_none_or(std::collections::HashSet::is_empty);
             if owners_empty && total > 0 && dead == total {
                 self.read_names.remove(&name);
             }
@@ -3531,7 +3525,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The applicable-face resolution the head-spelled arms replay
-    /// (upstream Dart SDK source, extension_member_resolver.dart — the
+    /// (upstream Dart SDK source, `extension_member_resolver.dart` — the
     /// most-specific choice): among the faces declaring `member` whose
     /// non-generic named `on` head the receiver `head` reaches — the head
     /// itself or a named supertype of it — the face whose `on` head is a
@@ -3775,7 +3769,7 @@ impl<'a> Engine<'a> {
     /// to a closure body, `+=`-family reads too — every compound and
     /// null-aware form keeps the read credit, matching the upstream
     /// write-credits-only-the-setter posture).
-    fn pure_write_at(&self, offset: u32, end: u32) -> bool {
+    fn pure_write_at(&self, _offset: u32, end: u32) -> bool {
         let bytes = self.source.as_bytes();
         let stop = self.byte_of(end).min(bytes.len());
         let mut k = stop;
@@ -3802,7 +3796,7 @@ impl<'a> Engine<'a> {
         let bytes = self.source.as_bytes();
         let ident_byte = |b: u8| matches!(b, b'_' | b'$' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z');
         let mut from = 0usize;
-        while let Some(rel) = self.source[from..].find(&container_text) {
+        while let Some(rel) = self.source[from..].find(container_text) {
             let hit = from + rel;
             let bounded = (hit == 0 || !ident_byte(bytes[hit - 1]))
                 && bytes
@@ -4446,7 +4440,7 @@ impl<'a> Engine<'a> {
             let Some((container, container_file)) = target else {
                 continue;
             };
-            for &ctor in container.constructors.iter() {
+            for &ctor in &container.constructors {
                 if !self.is_private_name(ctor) {
                     alias_used_ctors.insert((container_file, leaf, ctor));
                 }
@@ -4774,7 +4768,7 @@ impl<'a> Engine<'a> {
                         && self
                             .member_read_owners
                             .get(&bare)
-                            .is_none_or(|owners| owners.is_empty());
+                            .is_none_or(std::collections::HashSet::is_empty);
                     if self.member_was_read(container, &bare)
                         || enum_values_read
                         || unresolved_read
@@ -5122,7 +5116,7 @@ impl<'a> Engine<'a> {
                 && self
                     .member_read_owners
                     .get(&bare)
-                    .is_none_or(|owners| owners.is_empty());
+                    .is_none_or(std::collections::HashSet::is_empty);
             if !self.is_private_name(field.name)
                 || self.member_was_read(field.container, &bare)
                 || unresolved_read
@@ -5466,7 +5460,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The forward-reference credit (`referenced_before_declaration`,
-    /// referenced_before_declaration_test.dart's hideInBlock family): a
+    /// `referenced_before_declaration_test.dart`'s hideInBlock family): a
     /// bare read of `v` before `var v` in the same block chain binds the
     /// LOCAL in the oracle — the resolver's block scopes see the whole
     /// block's declarations, so the read reports
@@ -5901,7 +5895,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The unused-local verifier's pre-feature wildcard fallback
-    /// (`_isNamedWildcard`'s else branch, unused_local_elements_verifier.dart
+    /// (`_isNamedWildcard`'s else branch, `unused_local_elements_verifier.dart`
     /// :836-844): below 3.7 an ALL-UNDERSCORES name spares the
     /// local-variable and catch-exception arms (neither carries the
     /// explicit `_wildCardVariablesEnabled` conjunct the local-function
@@ -6054,7 +6048,7 @@ impl<'a> Engine<'a> {
     /// constructor falls through to the interface arm — a public enum's
     /// `factory E.named()` is exported (`isGenerative` gates only the
     /// generative face, unused_local_elements_verifier.dart:1010-1014,
-    /// upstream Dart SDK source — the constructor_body constFactory corpus,
+    /// upstream Dart SDK source — the `constructor_body` constFactory corpus,
     /// where the error'd factory body never turns into an unused row).
     /// `_overridesUsedElement`
     /// (unused_local_elements_verifier.dart:1016-1022): a member is used
@@ -6146,7 +6140,7 @@ impl<'a> Engine<'a> {
             .pending_super_formals
             .iter()
             .filter(|(entry_owner, ..)| *entry_owner == owner)
-            .cloned()
+            .copied()
             .collect();
         for (_, super_index, named, name, _, container) in entries {
             // The same resolved super-constructor face `check_super_formal`
@@ -6354,7 +6348,7 @@ impl<'a> Engine<'a> {
         // The target must declare formals — an invocation of a constructor
         // the superclass lacks resolves no corresponding parameter upstream
         // (`undefined_constructor_in_initializer` owns that face).
-        if !resolve_container(
+        if resolve_container(
             self.graph,
             self.namespaces,
             self.index,
@@ -6362,7 +6356,7 @@ impl<'a> Engine<'a> {
             self.file,
             decl,
         )
-        .is_some_and(|(super_container, _)| super_container.ctor_formals.get(&key).is_some())
+        .is_none_or(|(super_container, _)| super_container.ctor_formals.get(&key).is_none())
         {
             return;
         }
@@ -6902,10 +6896,10 @@ impl<'a> Engine<'a> {
                 | dartq_scanner::TokenKind::OpenSquare
                 | dartq_scanner::TokenKind::OpenCurly => depth += 1,
                 dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
-                    depth -= 1
+                    depth -= 1;
                 }
                 dartq_scanner::TokenKind::CloseCurly if !interp_closers.contains(&end) => {
-                    depth -= 1
+                    depth -= 1;
                 }
                 dartq_scanner::TokenKind::Colon | dartq_scanner::TokenKind::Semicolon
                     if depth == 0 =>
@@ -7009,7 +7003,7 @@ impl<'a> Engine<'a> {
                 };
                 match t.kind {
                     dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
-                        depth += 1
+                        depth += 1;
                     }
                     dartq_scanner::TokenKind::OpenCurly => {
                         if depth == 0 {
@@ -7060,8 +7054,7 @@ impl<'a> Engine<'a> {
             };
             let key = selector
                 .filter(|s| *s != "new")
-                .map(|s| self.intern(s))
-                .unwrap_or(class);
+                .map_or(class, |s| self.intern(s));
             if class != container || key != ctor_spelling {
                 continue;
             }
@@ -7089,7 +7082,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The overridden instance members behind one member declaration
-    /// (`_overriddenElements`, inheritance_manager3.dart `getOverridden`):
+    /// (`_overriddenElements`, `inheritance_manager3.dart` `getOverridden`):
     /// the nearest same-named non-static member of each direct super face —
     /// the `extends` face, each `with` mixin, each `implements` interface, a
     /// mixin's `on` constraints — deduplicated by the entry identity the
@@ -7295,7 +7288,7 @@ impl<'a> Engine<'a> {
                         x.members.get(&site.name).and_then(|m| m.formals.as_deref())
                     }
                 })
-                .map(Formals::clone)
+                .cloned()
                 // An unnamed extension keeps no container entry — its
                 // member tables live on the nameless application face
                 // (`close_container` moves them out of the container open).
@@ -7314,7 +7307,7 @@ impl<'a> Engine<'a> {
                                 })
                                 .and_then(|face| face.members.get(&site.name))
                                 .and_then(|m| m.formals.as_deref())
-                                .map(Formals::clone)
+                                .cloned()
                         })
                     } else {
                         None
@@ -7786,7 +7779,7 @@ impl<'a> Engine<'a> {
                     bare_decls.entry(name).or_default().insert(file);
                 }
                 Lookup::Ambiguous(entries) => {
-                    for entry in entries.iter() {
+                    for entry in &entries {
                         if let NamespaceEntry::Decl(file) = entry {
                             bare_decls.entry(name).or_default().insert(*file);
                         }
@@ -7854,27 +7847,27 @@ impl<'a> Engine<'a> {
             if self.graph.uri(target) == "dart:core" {
                 continue;
             }
-            let is_used = match prefix {
-                Some(prefix) => match prefix_evidence.get(&prefix) {
+            let is_used = if let Some(prefix) = prefix {
+                match prefix_evidence.get(&prefix) {
                     Some((attributed, bare)) => {
                         *bare
-                            || attributed.iter().any(|&name| {
-                                edge.combinators.allows(name)
-                                    && self.graph.exported(target, name).is_some()
-                            })
-                            // The implicit-extension credit is prefix-blind
-                            // upstream: `notifyExtensionUsed` walks the
-                            // tracking map per prefix scope too (scope.dart
-                            // :204-321) — an extension reached through a
-                            // prefixed import applies implicitly with or
-                            // without a bare prefix use (`accessibility_
-                            // A01_t02`'s `"".id1` over `as p`, the
-                            // wildcard-prefix corpus `wildcard_variables/
-                            // import/import_test`), so the applied face's
-                            // members spare this edge exactly as the
-                            // unprefixed arm's do.
-                            || self.import_credits_extension_member(edge, target, &credit)
-                            || self.literal_extension_credit(edge, target, &literal_apps)
+                        || attributed.iter().any(|&name| {
+                            edge.combinators.allows(name)
+                                && self.graph.exported(target, name).is_some()
+                        })
+                        // The implicit-extension credit is prefix-blind
+                        // upstream: `notifyExtensionUsed` walks the
+                        // tracking map per prefix scope too (scope.dart
+                        // :204-321) — an extension reached through a
+                        // prefixed import applies implicitly with or
+                        // without a bare prefix use (`accessibility_
+                        // A01_t02`'s `"".id1` over `as p`, the
+                        // wildcard-prefix corpus `wildcard_variables/
+                        // import/import_test`), so the applied face's
+                        // members spare this edge exactly as the
+                        // unprefixed arm's do.
+                        || self.import_credits_extension_member(edge, target, &credit)
+                        || self.literal_extension_credit(edge, target, &literal_apps)
                     }
                     // No evidence record for the spelling — keep the raw
                     // posture (the under-report direction).
@@ -7883,40 +7876,39 @@ impl<'a> Engine<'a> {
                             || self.import_used.contains(&prefix)
                             || self.literal_extension_credit(edge, target, &literal_apps)
                     }
-                },
-                None => {
-                    // The element-attributed hit: the resolved declaration's
-                    // file must sit in this edge's target library — a bare
-                    // `File` resolving to `lib1.dart`'s element never
-                    // credits `dart:io`'s edge (upstream's `PrefixScope`/
-                    // `ImportScope` records the lookup on the resolving
-                    // edge alone, scope.dart:638-655).
-                    let hit = used.iter().find(|&&n| {
-                        edge.combinators.allows(n)
-                            && !local_names.contains(&n)
-                            && self.graph.exported(target, n).is_some()
-                            && bare_decls.get(&n).is_some_and(|files| {
-                                // The resolved declaration's file must be
-                                // the file this edge's target library
-                                // declares the spelling in — a bare `File`
-                                // resolving to `lib1.dart`'s element never
-                                // credits `dart:io`'s edge. `graph.local`
-                                // reads the target's own declaration slot
-                                // (`LocalSlot::Decl(file)`) — `library_of_
-                                // file`'s units map cannot see aux files
-                                // that never registered a unit.
-                                matches!(
-                                    self.graph.local(target, n),
-                                    dartq_resolution::LocalLookup::Found(
-                                        decl_file
-                                    ) if files.contains(&decl_file)
-                                )
-                            })
-                    });
-                    let credited = self.import_credits_extension_member(edge, target, &credit)
-                        || self.literal_extension_credit(edge, target, &literal_apps);
-                    hit.is_some() || credited
                 }
+            } else {
+                // The element-attributed hit: the resolved declaration's
+                // file must sit in this edge's target library — a bare
+                // `File` resolving to `lib1.dart`'s element never
+                // credits `dart:io`'s edge (upstream's `PrefixScope`/
+                // `ImportScope` records the lookup on the resolving
+                // edge alone, scope.dart:638-655).
+                let hit = used.iter().find(|&&n| {
+                    edge.combinators.allows(n)
+                        && !local_names.contains(&n)
+                        && self.graph.exported(target, n).is_some()
+                        && bare_decls.get(&n).is_some_and(|files| {
+                            // The resolved declaration's file must be
+                            // the file this edge's target library
+                            // declares the spelling in — a bare `File`
+                            // resolving to `lib1.dart`'s element never
+                            // credits `dart:io`'s edge. `graph.local`
+                            // reads the target's own declaration slot
+                            // (`LocalSlot::Decl(file)`) — `library_of_
+                            // file`'s units map cannot see aux files
+                            // that never registered a unit.
+                            matches!(
+                                self.graph.local(target, n),
+                                dartq_resolution::LocalLookup::Found(
+                                    decl_file
+                                ) if files.contains(&decl_file)
+                            )
+                        })
+                });
+                let credited = self.import_credits_extension_member(edge, target, &credit)
+                    || self.literal_extension_credit(edge, target, &literal_apps);
+                hit.is_some() || credited
             };
             if !is_used {
                 self.stage_usage(SemanticCode::UnusedImport, uri_range, &uri_text);
@@ -7952,8 +7944,8 @@ impl<'a> Engine<'a> {
     /// (`element_usage_detector.dart:769-775` for imports, `:256` for
     /// exports): each written `dart:` directive whose target carries an
     /// SDK-level `@Deprecated` reports once at the whole-directive anchor
-    /// (the upstream `usageRange: node.sourceRange` — the ImportDirective
-    /// or ExportDirective, not the URI literal). The same-package rule
+    /// (the upstream `usageRange: node.sourceRange` — the `ImportDirective`
+    /// or `ExportDirective`, not the URI literal). The same-package rule
     /// never applies — the `dart:` namespace has no package of its own —
     /// but the URI must resolve: untabulated names (`web_sql`) report
     /// nothing, matching the upstream resolved-library gate.
@@ -8373,7 +8365,7 @@ impl<'a> Engine<'a> {
     /// wildcard kind (local variable, local function, prefix, type
     /// parameter, formal parameter — the call sites are already
     /// kind-restricted): the same shape the duplicate-definition
-    /// verifier's `isWildcard` applies (duplicate_definition_verifier.dart
+    /// verifier's `isWildcard` applies (`duplicate_definition_verifier.dart`
     /// :398-402). The unused-local verifier's own pre-feature fallback
     /// (all-underscores names spare the local-variable and
     /// catch-exception arms only, `_isNamedWildcard`'s else branch,
@@ -9451,7 +9443,7 @@ impl<'a> Engine<'a> {
                     crate::annotation::is_meta_spelling(
                         self.strings.resolve(*a),
                         spelling,
-                        &self.strings,
+                        self.strings,
                         self.graph,
                         self.lib,
                     )
@@ -10118,7 +10110,7 @@ mod pins {
         assert_eq!(unused_local_rows(source), vec![], "{source:?}");
     }
 
-    /// #2189-b (drift versioned_schema.dart's clean-file proof): a local
+    /// #2189-b (drift `versioned_schema.dart`'s clean-file proof): a local
     /// read in receiver position of a member WRITE is a use — the
     /// official `_visitNameExpression` credits the receiver through its
     /// lexical resolution regardless of the member access.
@@ -10165,7 +10157,7 @@ mod pins {
 
     /// A bare for-in loop target is a WRITE per iteration — the official
     /// `ForEachPartsWithIdentifier` assignment (`_isReadIdentifier`'s
-    /// `inGetterContext` fails, unused_local_elements_verifier.dart
+    /// `inGetterContext` fails, `unused_local_elements_verifier.dart`
     /// :429-453) — so the loop's mention never spares the declaration and
     /// the write-only life reports.
     #[test]
@@ -10232,7 +10224,7 @@ mod pins {
         assert_eq!(unused_local_rows(source), vec![], "{source:?}");
     }
 
-    /// #2189-c (archive bzip2_encoder/zlib rows): a trailing same-line
+    /// #2189-c (archive `bzip2_encoder/zlib` rows): a trailing same-line
     /// `// ignore: unused_local_variable` suppresses the row anchored on
     /// that line (`IgnoreInfo.forDart` — a comment with code before it
     /// applies to its own line).
@@ -10708,7 +10700,7 @@ mod pins {
 
     /// #2745: a cyclic same-file superclass chain (mutual `extends`)
     /// must not spin the `ur_member_site` climb — the member row
-    /// resolves on the chain with no UseResult face anywhere, so the
+    /// resolves on the chain with no `UseResult` face anywhere, so the
     /// walk terminates (revisit = chain-broken terminus) and reports
     /// nothing.
     #[test]
@@ -10741,8 +10733,8 @@ mod pins {
 
     // —— the per-library wildcard gate (#2888 1a) ————————————————————————
 
-    /// The pre-3.7 local-function `_` (DeadCodeTest
-    /// test_localFunction_wildcard_preWildcards#0): with the
+    /// The pre-3.7 local-function `_` (`DeadCodeTest`
+    /// `test_localFunction_wildcard_preWildcards#0)`: with the
     /// wildcard-variables feature off, a lone `_` is an ordinary name —
     /// the unused local function reports (`_visitLocalFunctionElement`'s
     /// `_wildCardVariablesEnabled && _isNamedWildcard` cut demands the
@@ -10765,10 +10757,10 @@ mod pins {
     }
 
     /// The ≥3.7 twin: the same `_()` local function is a wildcard (name
-    /// `_`, kind LocalFunction, feature on — extensions.dart:81's one
+    /// `_`, kind `LocalFunction`, feature on — extensions.dart:81's one
     /// gate for all five kinds), so the unused-element face stays silent.
     /// The whole-declaration `dead_code` row still reports (the
-    /// DeadCodeVerifier's own `_` face, dead_code_verifier.dart:72-82) —
+    /// `DeadCodeVerifier`'s own `_` face, dead_code_verifier.dart:72-82) —
     /// the pin is that nothing else reports beside it.
     #[test]
     fn local_function_wildcard_feature_enabled_stays_silent() {
@@ -10828,7 +10820,7 @@ mod pins {
 
     // —— the forward-reference credit (#2888 1b) ——————————————————————————
 
-    /// ReferencedBeforeDeclarationTest test_hideInBlock_local: `print(v)`
+    /// `ReferencedBeforeDeclarationTest` `test_hideInBlock_local`: `print(v)`
     /// before `var v = 2` binds the LOCAL in the oracle (the read reports
     /// `referenced_before_declaration` and marks the element referenced),
     /// so the local never reports unused. dartq's read bound the
@@ -10845,7 +10837,7 @@ mod pins {
         assert_eq!(unused_local_rows(source), vec![], "{source:?}");
     }
 
-    /// test_hideInBlock_local_subBlock: the read sits in a nested block,
+    /// `test_hideInBlock_local_subBlock`: the read sits in a nested block,
     /// the declaration in the enclosing block afterwards — the
     /// declaration's block still encloses the read, so the credit holds.
     /// The inline control is the sibling-block boundary: a read in a
@@ -10876,7 +10868,7 @@ mod pins {
         assert_eq!(unused_local_rows(control), vec![(at, 1)], "{control:?}");
     }
 
-    /// test_hideInBlock_function: the read also credits a LOCAL FUNCTION
+    /// `test_hideInBlock_function`: the read also credits a LOCAL FUNCTION
     /// declared after it (`v() {}` — the element the oracle's rbd binds),
     /// so no `unused_element` row reports for it.
     #[test]
@@ -11453,7 +11445,7 @@ mod pins {
     }
 
     /// #2898-e: the constructor's super-initialization corresponding face
-    /// (`_isUsedElement`'s ConstructorElement block): `_B`'s optional
+    /// (`_isUsedElement`'s `ConstructorElement` block): `_B`'s optional
     /// `super.b` corresponds to `A.b` — a REQUIRED named parameter — so it
     /// spares (`overrideRequired_noDiagnostic` corpus shape; the implicit
     /// `super()` resolves the unnamed super constructor). Without the face
@@ -11554,7 +11546,7 @@ mod pins {
     }
 
     /// #2911-a, the nameless recovery face (the census `unused_element`
-    /// over-fire family, fragment_offset `_missingName` corpus): a class
+    /// over-fire family, `fragment_offset` `_missingName` corpus): a class
     /// whose name the parser never produced reports `missing_identifier`
     /// and NOTHING else — the element answers `isPrivate` through its
     /// fragment and `FragmentImpl.isPrivate` maps a null name to PUBLIC
@@ -11590,12 +11582,12 @@ mod pins {
         assert_eq!(unused_element_rows(source), vec![], "{source:?}");
     }
 
-    /// #2911-d, the errored-declaration face (constructor_body
+    /// #2911-d, the errored-declaration face (`constructor_body`
     /// `test_enum_secondaryConstructor_constFactory_blockBody` corpus): a
     /// const factory with a block body carries the `constFactory` error,
     /// and the constructor still never reports unused — `_isPubliclyAccessible`'s
-    /// EnumElement arm gates only GENERATIVE constructors
-    /// (`element.isGenerative`, unused_local_elements_verifier.dart:
+    /// `EnumElement` arm gates only GENERATIVE constructors
+    /// (`element.isGenerative`, `unused_local_elements_verifier.dart`:
     /// 1010-1014, upstream Dart SDK source); the factory falls through to
     /// the interface arm and a public enum's factory is exported. Before
     /// the gate fix this fired `The declaration 'E.named' isn't

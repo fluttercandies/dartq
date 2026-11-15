@@ -6,6 +6,7 @@
 //! daemon protocol (`dartq-daemon::run`) over the session socket, one
 //! client at a time.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -694,7 +695,7 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
             Err(error) => {
                 served = false;
                 accept_failures += 1;
-                if accept_failures == 1 || accept_failures % 20 == 0 {
+                if accept_failures == 1 || accept_failures.is_multiple_of(20) {
                     eprintln!(
                         "dartq: session serve: accept failed ({accept_failures} consecutive): {error}"
                     );
@@ -795,7 +796,7 @@ fn wait_listener(listener: &UnixListener, tick: Duration) {
     // SAFETY: a poll over one owned fd; the return value (ready count,
     // 0 on timeout, -1 on a signal) needs no branch — every outcome
     // returns to the loop top.
-    unsafe { libc::poll(&mut poll, 1, millis) };
+    unsafe { libc::poll(&raw mut poll, 1, millis) };
 }
 
 /// The shared pressure monitor lives in `dartq_toolchain::ledger`
@@ -911,7 +912,7 @@ fn size_after_load(lease: &mut dartq_toolchain::ledger::Lease, peak_key: &str, t
 
 /// How long a session daemon waits at the job gate before it gives up.
 #[cfg(unix)]
-const SESSION_MEMORY_WAIT: Duration = Duration::from_secs(30 * 60);
+const SESSION_MEMORY_WAIT: Duration = Duration::from_mins(30);
 
 /// The session daemon's lease: its recorded peak (else the largest live
 /// session daemon's, else the ledger default) over its own tree, analyzer
@@ -1062,7 +1063,7 @@ fn bind_takeover(layout: &Layout) -> io::Result<UnixListener> {
 
 /// The liveness rewrite: state.json plus the registry record. `held`
 /// is the live debug-session count (#2632) — the reaper reading either
-/// copy scales its SIGTERM grace by it instead of SIGKILLing a daemon
+/// copy scales its SIGTERM grace by it instead of `SIGKILLing` a daemon
 /// mid-detach. `used_ms` is the last client answer's wall time — the
 /// memory-pressure eviction's LRU fact.
 #[cfg(unix)]
@@ -1272,7 +1273,7 @@ pub(crate) mod tests {
         // and state down mid-roundtrip.
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = test_fixture("events");
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
@@ -1337,7 +1338,7 @@ pub(crate) mod tests {
         // parallel signal test would rewrite it (see SIGNAL_SERIALIZATION).
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = test_fixture("loop");
         // #2661: an earlier daemon's orphan manifest sits in the trail
         // — this daemon holds nothing, so its shutdown must release
@@ -1607,7 +1608,7 @@ pub(crate) mod tests {
         }
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = test_fixture("sized");
         let (dir, sdk) = (root.clone(), root.join("sdk"));
         let server = std::thread::spawn(move || {
@@ -1683,7 +1684,7 @@ pub(crate) mod tests {
         assert_eq!(silent_for(0, 0), Duration::ZERO);
         assert_eq!(
             silent_for(16 * 60, 0),
-            Duration::from_secs(16 * 60),
+            Duration::from_mins(16),
             "no session: plain silence counts"
         );
         assert_eq!(
@@ -1713,7 +1714,7 @@ pub(crate) mod tests {
         // reason-asserting serve pins out of its window.
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = test_fixture("signal-held");
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
@@ -1788,7 +1789,7 @@ pub(crate) mod tests {
         // full-suite failure: "state while held").
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = test_fixture("beat-held");
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
@@ -1817,16 +1818,14 @@ pub(crate) mod tests {
         // thread, which must therefore be independent of client service.
         let held = UnixStream::connect(&layout.socket).expect("client connects");
         let entry_hb = loop {
-            match SessionState::read(&layout) {
-                Some(state) => break state.heartbeat_ms,
-                None => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the initial heartbeat never landed"
-                    );
-                    std::thread::sleep(Duration::from_millis(50));
-                }
+            if let Some(state) = SessionState::read(&layout) {
+                break state.heartbeat_ms;
             }
+            assert!(
+                Instant::now() < deadline,
+                "the initial heartbeat never landed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
         };
         let beat_by = Instant::now() + 2 * HEARTBEAT;
         loop {
@@ -1855,7 +1854,7 @@ pub(crate) mod tests {
         // SIGNAL_SERIALIZATION).
         let _serial = SIGNAL_SERIALIZATION
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A root deep enough that `<root>/.dart_tool/dartq/session.sock`
         // blows the 104-byte sun_path: one long directory name under /tmp.
         let segment = "w".repeat(72);
@@ -2085,7 +2084,7 @@ pub(crate) mod tests {
         }
         let serve = parse(&["serve", "--dir", "/w", "--sdk", "/s"]).expect("parse");
         assert!(
-            matches!(&serve.command, SessionCommand::Serve(args) if args.dir == PathBuf::from("/w") && args.sdk == PathBuf::from("/s"))
+            matches!(&serve.command, SessionCommand::Serve(args) if args.dir == *"/w" && args.sdk == *"/s")
         );
         assert!(parse(&["serve"]).is_err(), "serve requires its flags");
         assert!(parse(&["bogus"]).is_err());
@@ -2280,7 +2279,7 @@ pub(crate) mod tests {
     }
 
     /// #2661: every serve-loop exit path funnels through `cleanup` —
-    /// idle, signal, and accept_failed alike — so its unlink is the
+    /// idle, signal, and `accept_failed` alike — so its unlink is the
     /// one fact that keeps a daemon from leaving its socket behind.
     #[test]
     fn cleanup_unlinks_the_socket_state_and_pointer() {

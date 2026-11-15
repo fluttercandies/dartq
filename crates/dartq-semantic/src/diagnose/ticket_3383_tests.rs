@@ -21,6 +21,7 @@
 //! typedef arm, and `testing_param_bound_of` gives `T`'s expanded bound —
 //! the function signature whose binder's own bound the walk reads back.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::types_for;
 use crate::resolved_ops::LibraryTypes;
 use dartq_source::FileId;
@@ -41,7 +42,7 @@ fn param_bound(
 }
 
 /// Interns the named interface (`num`, `int`) of `types`'s registry —
-/// the expected bound TypeId a pin compares against.
+/// the expected bound `TypeId` a pin compares against.
 fn named_ty(types: &LibraryTypes, strings: &dartq_source::StringTable, name: &str) -> TypeId {
     let decl = types
         .testing_decl_of(strings.intern(name))
@@ -61,10 +62,10 @@ fn named_ty(types: &LibraryTypes, strings: &dartq_source::StringTable, name: &st
 /// the former `None`.
 #[test]
 fn ticket_3383_typedef_binder_bound_reaches_facts_substituted() {
-    let source = r#"
+    let source = r"
 typedef F<X> = void Function<Y extends X>();
 class A<T extends F<num>> {}
-"#;
+";
     let (types, strings, file) = types_for(source);
     let bound = param_bound(&types, &strings, file, "T");
     // The bound is the expanded function signature.
@@ -91,10 +92,10 @@ class A<T extends F<num>> {}
 /// on the nested signature's fresh binder.
 #[test]
 fn ticket_3383_nested_interface_arg_binder_bound_reaches_facts() {
-    let source = r#"
+    let source = r"
 typedef F<X> = List<void Function<Y extends X>()>;
 class A<T extends F<num>> {}
-"#;
+";
     let (types, strings, file) = types_for(source);
     let bound = param_bound(&types, &strings, file, "T");
     assert!(
@@ -120,10 +121,10 @@ class A<T extends F<num>> {}
 /// unbounded read, never an invented constraint).
 #[test]
 fn ticket_3383_unbounded_binder_keeps_none() {
-    let source = r#"
+    let source = r"
 typedef F<X> = void Function<Y>();
 class A<T extends F<num>> {}
-"#;
+";
     let (types, strings, file) = types_for(source);
     let bound = param_bound(&types, &strings, file, "T");
     let binders = types.testing_fn_binder_bounds(bound);
@@ -140,11 +141,11 @@ class A<T extends F<num>> {}
 /// the bound through the shared template.
 #[test]
 fn ticket_3383_two_uses_keep_per_use_bounds() {
-    let source = r#"
+    let source = r"
 typedef F<X> = void Function<Y extends X>();
 class A<T extends F<num>> {}
 class B<U extends F<int>> {}
-"#;
+";
     let (types, strings, file) = types_for(source);
     let num = named_ty(&types, &strings, "num");
     let int = named_ty(&types, &strings, "int");

@@ -18,6 +18,7 @@
 //! generic-constructor arm answers `G<int>` for a send that a solved call
 //! site decided — and keeps `Unknown` for one it did not.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 

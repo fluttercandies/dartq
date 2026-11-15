@@ -306,7 +306,7 @@ fn run_scale(libs: usize, probes: usize) {
             legacy_build,
             est_bytes as u128 * 100_000 / (libs as u128 * 1_000_000_000),
         );
-        println!("lookup latency (legacy p50 / combinator p50): {lp50} / {p50} ns",);
+        println!("lookup latency (legacy p50 / combinator p50): {lp50} / {p50} ns");
     }
 }
 

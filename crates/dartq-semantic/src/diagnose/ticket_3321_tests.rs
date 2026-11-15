@@ -14,6 +14,7 @@
 //! Behavioral oracle: dart 3.13.7 `deprecated_member_use_test.dart`
 //! (`DeprecatedMemberUse_PackageConfigWorkspaceTest`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::library::ElementIndex;
 use crate::model::MicroKind;
@@ -216,7 +217,7 @@ fn dmu_engine_graph_prefixed_core_tag() {
 // —— the silent negatives the fix must not break ————————————————
 
 /// Same package: both reporters bail before reading the tag
-/// (`isInSamePackage`, deprecated_member_use_verifier.dart:46).
+/// (`isInSamePackage`, `deprecated_member_use_verifier.dart:46`).
 #[test]
 fn dmu_engine_graph_same_package_silent() {
     let report = core_member_use_report(

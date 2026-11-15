@@ -29,6 +29,7 @@
 //!   head — before a stranded token can enter `parse_statement` and mint
 //!   the expression/semicolon rows the official jumps never emit.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features};
 use crate::Parser;
 use dartq_scanner::{ScanConfig, scan};

@@ -20,6 +20,7 @@
 //! the UNCHECKED twin beside every `USE_OF_VOID_RESULT`), and
 //! `string/multiline_newline_test.dart` (`const c4 = c1 ? 1 : 2`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 
@@ -50,8 +51,7 @@ fn assert_unchecked(report: &FileReport, offset: usize, len: u32, message: &str)
     assert_eq!(
         unchecked(report),
         vec![format!(
-            "unchecked_use_of_nullable_value @{}:{} {}",
-            offset, len, message
+            "unchecked_use_of_nullable_value @{offset}:{len} {message}"
         )],
     );
 }

@@ -50,6 +50,7 @@
 //! (any line starting with `//-`) never appear in ported content — the
 //! converter rejects a case whose Dart source contains one.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use core::ops::Range;
 
 use dartq_language::LanguageVersion;

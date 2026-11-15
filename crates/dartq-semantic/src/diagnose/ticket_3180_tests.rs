@@ -4,12 +4,13 @@
 //! instantiate-to-bounds form (`Circle<MetricUnits>`), never the raw
 //! `Circle` head the same-file bounds snapshot cannot spell. The
 //! type-production seam is `instantiated_head_ty`'s foreign fill
-//! (creation_args.rs): when `itb_default_args` misses the snapshot
+//! (`creation_args.rs)`: when `itb_default_args` misses the snapshot
 //! registry the container's declared `type_param_bounds` — projected
 //! across the file boundary through `boundary.ty(owner, …)` — supplies the
 //! defaults, and `bind_var_type` applies the same I2B the declared-type
 //! arms already bind. Every expectation is a verbatim oracle 3.13.7 row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, report_ops_imports};
 
 /// A `patterns_lib`-style foreign library: generic `Shape`/`Unit` heads

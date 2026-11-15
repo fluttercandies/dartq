@@ -6,6 +6,7 @@
 //! `_checkForUnnecessaryNullAware` :7668-7752 and the `_NullAwareKind`
 //! table :8804-8850). Every expectation is a verbatim oracle 3.13.7 row.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::super::test_rig::report_ops_bare;
 
 /// The `invalid_null_aware_operator` rows of `report_ops_bare`, as

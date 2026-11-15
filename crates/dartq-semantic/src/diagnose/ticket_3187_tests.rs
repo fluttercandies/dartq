@@ -3,7 +3,7 @@
 //! `C<T>.sel<T>()` / `Alias<T>.sel<T>()`: the selector's own type
 //! arguments keep the send a `MethodInvocation`, and upstream
 //! `_resolveReceiverTypeLiteral`
-//! (pkg/analyzer/lib/src/dart/resolver/method_invocation_resolver.dart:
+//! (`pkg/analyzer/lib/src/dart/resolver/method_invocation_resolver.dart`:
 //! 1212-1268) resolves `sel` against the `Type` INSTANCE — the class's or
 //! the alias's statics never answer, only the `Object` face resolves, and a
 //! clean miss is `undefined_method` naming `Type`. dartq resolved the
@@ -17,6 +17,7 @@
 //! - `C<T>.sel`   → `class_instantiation_access_to_member`
 //! - `C<T>.new()` → resolves; `C<T>().sel<T>()` → instance face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

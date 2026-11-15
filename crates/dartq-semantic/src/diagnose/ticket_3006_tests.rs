@@ -23,6 +23,7 @@
 //! alone); the formals' supplies subtract granularly instead
 //! (`verifySuperFormalParameters`, :7244-7258).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -133,7 +134,7 @@ fn semicolon_factory_expects_defaults() {
 /// `external` heads stay silent on every arm — `external C([int x]);`
 /// takes its defaults in the embedding, never from Dart
 /// (`defaultValuesAreExpected`'s `isExternal` exclusion,
-/// error_verifier.dart:8337).
+/// `error_verifier.dart:8337`).
 #[test]
 fn external_constructor_stays_silent() {
     let fixture = concat!(

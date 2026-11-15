@@ -19,6 +19,7 @@
 //! and the parameter name, because the `could_not_infer` detail builder still
 //! reads `CreationInferenceRow::bound` rather than its `infer_bound` twin.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 
@@ -53,12 +54,12 @@ fn names_parameter(message: &str, parameter: &str) -> bool {
 /// `Instantiate-to-bound/class/static/class_l2_t01` 66:3.
 #[test]
 fn ticket_3801_bare_parameter_bound_answers_no_row() {
-    let src = r#"
+    let src = r"
 class A<X1 extends X2, X2 extends A<X1, X2>> {}
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "A();");
     let infer = messages_at(&report, "could_not_infer", offset, 1);
@@ -83,13 +84,13 @@ main() {
 /// (`Instantiate-to-bound/class/static/class_l2_t08`), in both faces.
 #[test]
 fn ticket_3801_unsolved_sibling_is_silent_and_the_solved_one_reports() {
-    let src = r#"
+    let src = r"
 class B<X extends B<X>> {}
 class A<X1 extends X2, X2 extends B<X2>> {}
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "A();");
     assert_eq!(
@@ -118,13 +119,13 @@ main() {
 /// which spells the unsolved `X2` slot as `dynamic`.
 #[test]
 fn ticket_3801_alias_leaves_the_unbounded_parameter_unsolved() {
-    let src = r#"
+    let src = r"
 class B<X extends B<X, Y>, Y> {}
 typedef A<X1 extends B<X1, X2>, X2> = B<X1, X2>;
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "A();");
     let infer = messages_at(&report, "could_not_infer", offset, 1);
@@ -151,12 +152,12 @@ main() {
 /// all for this fixture.
 #[test]
 fn ticket_3801_all_parameters_unsolved_stays_silent() {
-    let src = r#"
+    let src = r"
 class A<X1 extends X2, X2> {}
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(src);
     assert!(
         report

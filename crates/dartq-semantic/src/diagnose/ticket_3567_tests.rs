@@ -6,7 +6,7 @@
 //! verdict must compare that signature against the written target
 //! (upstream reads `node.expression.typeOrThrow` — the tear-off's
 //! instantiated `FunctionType` — and asks `isSubtypeOf`,
-//! best_practices_verifier.dart's `_checkAllTypeChecks`).
+//! `best_practices_verifier.dart`'s `_checkAllTypeChecks`).
 //!
 //! Root 2 — lossy is-target production: the written target (`F<int>`
 //! alias, an explicit `R Function(params)` literal) must keep its written
@@ -19,6 +19,7 @@
 //! shape, every silent twin is the oracle's own silence on an informative
 //! (non-subtype) pair — a fabricated row is worse than a silent verdict.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;
@@ -136,7 +137,7 @@ fn all_names(report: &FileReport) -> Vec<&'static str> {
 /// `f2 is F2a<int>` over a top-level `core.List<core.int> f2(int y,
 /// {List<Function> x})` — the tear-off's static type is the declared
 /// signature and the alias instantiates to the same leaves: always true
-/// (function_type0_test.dart:240's shape; the member twin of the same
+/// (`function_type0_test.dart:240`'s shape; the member twin of the same
 /// signature already fires).
 #[test]
 fn top_level_tearoff_core_leaf_alias_fires() {
@@ -174,7 +175,7 @@ fn top_level_tearoff_wrong_return_alias_stays_silent() {
 
 /// `m2 is F2b<T>` inside `U<T>` — the instance tear-off's signature
 /// carries the class parameter and the alias instantiates its own `T`
-/// with the same class parameter (function_type59_test.dart:324's shape).
+/// with the same class parameter (`function_type59_test.dart:324`'s shape).
 #[test]
 fn member_tearoff_class_t_alias_fires() {
     let report = prefix_report(concat!(
@@ -217,7 +218,7 @@ fn member_tearoff_wrong_instantiation_stays_silent() {
 /// alias `void Function<A>(core.List<core.int> x)` — the tear-off of a
 /// generic function carries the generic signature; the alias's unused
 /// `T` and matching inner `A` make the pair always true
-/// (function_type59_test.dart:385's shape).
+/// (`function_type59_test.dart:385`'s shape).
 #[test]
 fn generic_tearoff_generic_alias_fires() {
     let report = prefix_report(concat!(
@@ -270,7 +271,7 @@ fn literal_report(target: &str, return_annotation: &str) -> FileReport {
 }
 
 /// `m6 is int Function([core.List<core.int> x]) Function()` — the inner
-/// optional-positional `core.` leaf (function_type0_test.dart:351's
+/// optional-positional `core.` leaf (`function_type0_test.dart:351`'s
 /// shape).
 #[test]
 fn literal_target_inner_core_optional_fires() {
@@ -285,7 +286,7 @@ fn literal_target_inner_core_optional_fires() {
     );
 }
 
-/// The unprefixed control (function_type0_test.dart:697's shape — a
+/// The unprefixed control (`function_type0_test.dart:697`'s shape — a
 /// zero-own-formal method whose declared return is a function type with
 /// no prefixed leaf): the verdict already answers it today; the pins
 /// below must not regress it.
@@ -316,7 +317,7 @@ fn literal_target_inner_optional_mismatch_stays_silent() {
 
 /// `m12 is core.List<core.int> Function([Function]) Function()` — the
 /// core-prefixed inner RETURN beside an optional positional
-/// (function_type0_test.dart:547's shape).
+/// (`function_type0_test.dart:547`'s shape).
 #[test]
 fn literal_target_core_return_fires() {
     let report = literal_report(
@@ -331,7 +332,7 @@ fn literal_target_core_return_fires() {
 }
 
 /// `m13 is core.List<core.int> Function({core.List<core.int> x})
-/// Function()` — the named core leaf (function_type0_test.dart:572's
+/// Function()` — the named core leaf (`function_type0_test.dart:572`'s
 /// shape).
 #[test]
 fn literal_target_named_core_fires() {
@@ -363,7 +364,7 @@ fn literal_target_named_name_mismatch_stays_silent() {
 
 /// `m15 is List<T> Function(int, [core.List<core.int> x]) Function()` —
 /// the class-parameter return beside the core optional
-/// (function_type0_test.dart:647's shape).
+/// (`function_type0_test.dart:647`'s shape).
 #[test]
 fn literal_target_class_t_return_fires() {
     let report = literal_report(
@@ -379,7 +380,7 @@ fn literal_target_class_t_return_fires() {
 
 /// `m23 is void Function<A>(core.List<core.int> x) Function()` — the
 /// generic inner signature beside the core positional
-/// (function_type0_test.dart:915's shape).
+/// (`function_type0_test.dart:915`'s shape).
 #[test]
 fn literal_target_generic_inner_core_fires() {
     let report = literal_report(

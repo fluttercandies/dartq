@@ -5,6 +5,7 @@
 //! `kind`(1) + `flags`(1) + padding = 16B. Lexemes are not stored — the caller
 //! slices them via `&source[t.byte_range()]` ([`Token::byte_range`]).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::keyword::Keyword;
 
 /// Lexical token categories (naming aligned with the official `TokenType`;
@@ -425,19 +426,16 @@ impl TokenTable {
     /// missing sentinel (never-scanned table) debug-asserts and appends the
     /// inserted tokens without a re-seat instead of panicking.
     pub fn append_inserted(&mut self, inserted: impl IntoIterator<Item = Token>) {
-        match self.tokens.pop() {
-            Some(eof) => {
-                debug_assert_eq!(eof.kind, TokenKind::Eof, "Eof must be the last token");
-                self.tokens.extend(inserted);
-                self.tokens.push(eof);
-            }
-            None => {
-                debug_assert!(
-                    false,
-                    "append_inserted expects a scanned table ending at Eof"
-                );
-                self.tokens.extend(inserted);
-            }
+        if let Some(eof) = self.tokens.pop() {
+            debug_assert_eq!(eof.kind, TokenKind::Eof, "Eof must be the last token");
+            self.tokens.extend(inserted);
+            self.tokens.push(eof);
+        } else {
+            debug_assert!(
+                false,
+                "append_inserted expects a scanned table ending at Eof"
+            );
+            self.tokens.extend(inserted);
         }
     }
 }

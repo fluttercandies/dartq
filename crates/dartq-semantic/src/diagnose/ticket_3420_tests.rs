@@ -29,6 +29,7 @@
 //! [`Engine::instantiate_accessor_static`]:
 //!     super::Engine::instantiate_accessor_static
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 
@@ -48,7 +49,7 @@ fn rows_of(report: &FileReport, code: &str) -> Vec<(u32, u32, String)> {
 /// suppressed.
 #[test]
 fn created_chain_slot_read_carries_the_written_instantiation() {
-    let source = r#"
+    let source = r"
 class Box<T> {
   Box(this.slot);
   final T? slot;
@@ -57,7 +58,7 @@ void takesInt(int x) {}
 void f() {
   takesInt(Box<int>(1).slot);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "argument_type_not_assignable");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -73,7 +74,7 @@ void f() {
 /// slot reads `int?` and reaches the same argument row.
 #[test]
 fn named_creation_chain_slot_read_carries_the_instantiation() {
-    let source = r#"
+    let source = r"
 class Box<T> {
   Box.make(int n) : slot = null;
   final T? slot;
@@ -82,7 +83,7 @@ void takesInt(int x) {}
 void f() {
   takesInt(Box<int>.make(1).slot);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "argument_type_not_assignable");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -98,7 +99,7 @@ void f() {
 /// raw `T?` leak (or a `dynamic` fill) would name neither.
 #[test]
 fn written_instantiation_substitutes_the_receiver_argument() {
-    let source = r#"
+    let source = r"
 class Box<T> {
   Box(this.slot);
   final T? slot;
@@ -107,7 +108,7 @@ void takesInt(int x) {}
 void f() {
   takesInt(Box<String>('x').slot);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "argument_type_not_assignable");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -122,7 +123,7 @@ void f() {
 /// types without staging anything.
 #[test]
 fn agreeing_nullable_sink_stays_silent() {
-    let source = r#"
+    let source = r"
 class Box<T> {
   Box(this.slot);
   final T? slot;
@@ -131,7 +132,7 @@ void takesNullable(int? x) {}
 void f() {
   takesNullable(Box<int>(1).slot);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_of(&report, "argument_type_not_assignable").is_empty(),
@@ -144,7 +145,7 @@ void f() {
 /// created chain answers the instantiated return.
 #[test]
 fn created_chain_getter_read_carries_the_instantiation() {
-    let source = r#"
+    let source = r"
 class Box<T> {
   Box(this.slot);
   final T? slot;
@@ -154,7 +155,7 @@ void takesInt(int x) {}
 void f() {
   takesInt(Box<int>(1).maybe);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "argument_type_not_assignable");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -170,7 +171,7 @@ void f() {
 /// the new face never widens a non-parameterized read.
 #[test]
 fn non_generic_created_chain_keeps_its_declared_face() {
-    let source = r#"
+    let source = r"
 class IntBox {
   IntBox(this.slot);
   final int slot;
@@ -179,7 +180,7 @@ void takesInt(int x) {}
 void f() {
   takesInt(IntBox(1).slot);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_of(&report, "argument_type_not_assignable").is_empty(),
@@ -195,7 +196,7 @@ void f() {
 /// read types as `dynamic` or stays `Unknown`.
 #[test]
 fn dynamic_instantiation_stages_no_row() {
-    let source = r#"
+    let source = r"
 class Box<T> {
   Box(this.slot);
   final T? slot;
@@ -204,7 +205,7 @@ void takesInt(int x) {}
 void f() {
   takesInt(Box<dynamic>(1).slot);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_of(&report, "argument_type_not_assignable").is_empty(),

@@ -1,4 +1,4 @@
-//! #3202 — the `args` RefCell re-entrancy panic in `subst_ty`'s function
+//! #3202 — the `args` `RefCell` re-entrancy panic in `subst_ty`'s function
 //! leg (and its `closure_subst_param_ty` twin).
 //!
 //! The frame pair, confirmed on the release binary
@@ -24,6 +24,7 @@
 //! types): the crash path is the generic assignability, not the
 //! extension-type face itself.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::FileReport;
 use crate::diagnose::test_rig::report_ops;
 
@@ -83,7 +84,7 @@ fn instantiated_tear_off_compound_return_mismatch_reports() {
     );
 }
 
-/// The `closure_subst_param_ty` twin (scopes_bodies): a closure literal
+/// The `closure_subst_param_ty` twin (`scopes_bodies)`: a closure literal
 /// under an OLD-STYLE generic typedef context (`typedef List<X>
 /// Function(int) F<X>();` — the spelling `fold_alias_ty` misses, so
 /// `closure_typedef_function_ty` instantiates the RHS itself) runs the

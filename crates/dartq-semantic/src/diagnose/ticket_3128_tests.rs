@@ -20,6 +20,7 @@
 //! operator==(B o) => true; }` over `bool operator==(Object o)` emits
 //! `invalid_override` at `==(B`, message `'B.=='`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 
 /// The absolute fixture offset of `needle` (the rig's prelude included).

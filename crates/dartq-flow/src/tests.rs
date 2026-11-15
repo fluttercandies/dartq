@@ -3,6 +3,9 @@
 //! each citing its source file. Assertions cover the crate's fact face:
 //! dead code and definite-unassigned reads.
 
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::cast_possible_truncation)]
+
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, TokenTable};
@@ -687,6 +690,7 @@ fn never_typed_subexpression_exit_kills_the_rest() {
 /// subexpression's type to Never, so the parser pipeline cannot produce
 /// this buffer yet.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn dead_cast_tail_owns_the_initializer_row() {
     // `void main() { var a = f() as int; }` — offsets: `var` at 14, `f()`
     // at 22-24, `as` at 26, `;` at 32, `}` at 34. The recorded grammar
@@ -4614,7 +4618,7 @@ fn if_null_types_as_lub_of_lhs_non_null_and_rhs() {
     );
 }
 
-/// The `??` skip-path promotion feeds the write's types-of-interest pass::
+/// The `??` skip-path promotion feeds the write's types-of-interest `pass::`
 /// `int? x = g(); x = x ?? y;` with `int y` leaves `x` promoted to `int`
 /// (the written type is the `??` result's non-null form). The RHS itself
 /// evaluates on the LHS-null path — unpromoted (official
@@ -4668,9 +4672,9 @@ fn if_null_write_repromotes_via_types_of_interest() {
 /// `x ??= e` (official `ifNullExpression_*` wiring on the null-aware
 /// assignment path, assignment_expression_resolver.dart:665-707): the
 /// write's type is `LUB(NonNull(readType), rhsType)`. At name level an
-/// unresolvable RHS reads the unknown face — the official's InvalidType —
-/// whose `LUB(NonNull(T1), InvalidType)` is InvalidType itself
-/// (least_upper_bound.dart:55, `InvalidType <: X` for every X at
+/// unresolvable RHS reads the unknown face — the official's `InvalidType` —
+/// whose `LUB(NonNull(T1), InvalidType)` is `InvalidType` itself
+/// (`least_upper_bound.dart:55`, `InvalidType <: X` for every X at
 /// subtype.dart:274): the write neither promotes (the mutual-subtype
 /// `isValidPromotionStep` check fails) nor demotes (the `covers` recovery
 /// keeps any standing promotion).
@@ -5003,8 +5007,8 @@ fn read_type_rows_carry_the_flow_type_at_reads() {
 
 /// The collection-if element split carries the promotion into the
 /// then-element only (official `handle_ifElement_conditionEnd`,
-/// type_analyzer.dart:1161, replayed at `ThenControlFlow` — the split
-/// opens on the condition's own event, interp_expr.rs): the then-element's
+/// `type_analyzer.dart:1161`, replayed at `ThenControlFlow` — the split
+/// opens on the condition's own event, `interp_expr.rs)`: the then-element's
 /// read is promoted, the else-element's read is not (`!=`'s false arm
 /// carries no factored remainder — official `_equalityCheck`,
 /// flow_analysis.dart:4046-4076), and each element read's read-type row
@@ -5033,11 +5037,10 @@ fn collection_if_splits_promotion_across_elements() {
         })
         .collect();
     let ty_at = |offset: u32| {
-        read_types
-            .iter()
-            .find(|(at, _)| *at == offset)
-            .map(|(_, ty)| *ty)
-            .unwrap_or_else(|| panic!("no read-type row at {offset}: {read_types:?}"))
+        read_types.iter().find(|(at, _)| *at == offset).map_or_else(
+            || panic!("no read-type row at {offset}: {read_types:?}"),
+            |(_, ty)| *ty,
+        )
     };
     // The condition read sits before the split; the then read is promoted
     // non-null; the else read is back at the declared nullable type.
@@ -5937,7 +5940,7 @@ fn catch_sweep_reaches_slots_interned_inside_the_try_body() {
 
 // —— matched-case promotion (case-body promotion of the switched variable)
 
-/// (`snippet`, promoted-type name) pairs of the ReadType rows, in fact
+/// (`snippet`, promoted-type name) pairs of the `ReadType` rows, in fact
 /// order — the matched-case promotion face's assertion view. Non-named
 /// flow types (declared `dynamic`/untyped reads) render as an empty name.
 fn read_type_names(source: &str) -> Vec<(String, String)> {
@@ -6417,7 +6420,7 @@ fn non_promoted_property_read_reports_the_swept_evidence() {
 
 /// The increment face does NOT demote: `x++` writes the operator's result
 /// type (the official `postIncDec` hands flow
-/// `SharedTypeView(operatorReturnType)`, postfix_expression_resolver.dart
+/// `SharedTypeView(operatorReturnType)`, `postfix_expression_resolver.dart`
 /// :174-186, and `_write` demotes against that type — a result still under
 /// the standing promotion keeps it, flow_analysis.dart:6319/:7881-7905).
 /// On a promoted `int` the `int`-returning `+` keeps the promotion, so the
@@ -6480,8 +6483,8 @@ fn non_promotion_rows_dedup_and_stay_bounded() {
     // The quirk: a second no-demotion write erases the link, and reads
     // after it carry no row.
     let after = "void f() { int? x; if (x is int) { x = null; x; x = null; x; } }";
-    let (_flow, _facts, rows) = why_rows(after);
-    assert_eq!(rows.len(), 1, "{_facts:?}");
+    let (_flow, facts, rows) = why_rows(after);
+    assert_eq!(rows.len(), 1, "{facts:?}");
 }
 
 /// The entry rows are compact copyable payloads — a `u32`-keyed arena of
@@ -6671,10 +6674,10 @@ fn object_pattern_promotes_scrutinee_for_case_body_reads() {
     let body_none = source.find("option.noneProp").unwrap();
     let post = source.rfind("option; }").unwrap();
     let row = |offset: u32| {
-        rows.iter()
-            .find(|(o, _)| *o == offset as u32)
-            .map(|(_, name)| name.as_str())
-            .unwrap_or_else(|| panic!("no read row at {offset}: {rows:?}"))
+        rows.iter().find(|(o, _)| *o == offset).map_or_else(
+            || panic!("no read row at {offset}: {rows:?}"),
+            |(_, name)| name.as_str(),
+        )
     };
     assert_eq!(row(scrutinee as u32), "Option", "{rows:?}");
     assert_eq!(row(body_some as u32), "Some", "{rows:?}");
@@ -6685,11 +6688,11 @@ fn object_pattern_promotes_scrutinee_for_case_body_reads() {
 /// Refutable pattern shapes join their failure arm into the if-case's
 /// unmatched chain: the statement after `if (v case (int a, int b))` stays
 /// live (official `_unmatched` accumulates every can-fail shape's else arm —
-/// flow_analysis.dart's pattern dispatch). Without the join the chain sits
+/// `flow_analysis.dart`'s pattern dispatch). Without the join the chain sits
 /// at its initial unreachable state and the fall-through reads dead.
 #[test]
 fn if_case_record_pattern_leaves_fall_through_live() {
-    let source = r#"String f(Object v) {
+    let source = r"String f(Object v) {
   if (v case (int a, int b)) {
     return 'pair';
   }
@@ -6712,7 +6715,7 @@ String h(Object v) {
     return 'n';
   }
   return 'o';
-}"#;
+}";
     assert!(dead_snippets(source).is_empty());
 }
 
@@ -6724,7 +6727,7 @@ String h(Object v) {
 /// spurious else dead row after a for-in object pattern).
 #[test]
 fn for_in_pattern_head_does_not_dead_the_next_if_else() {
-    let source = r#"void f(Helper? helper, Iterable<(int, int)> pairs) {
+    let source = r"void f(Helper? helper, Iterable<(int, int)> pairs) {
   for (final (a, b) in pairs) {
     a + b;
   }
@@ -6733,7 +6736,7 @@ fn for_in_pattern_head_does_not_dead_the_next_if_else() {
   } else {
     'missing'.length;
   }
-}"#;
+}";
     assert_eq!(dead_snippets(source), Vec::<String>::new());
 }
 
@@ -6742,14 +6745,14 @@ fn for_in_pattern_head_does_not_dead_the_next_if_else() {
 /// unmatched chain must not become the next plain if's else branch.
 #[test]
 fn pattern_declaration_does_not_dead_the_next_if_else() {
-    let source = r#"void f(int? n) {
+    let source = r"void f(int? n) {
   var (a, b) = (1, 2);
   if (n == 3) {
     n + 1;
   } else {
     'other'.length;
   }
-}"#;
+}";
     assert_eq!(dead_snippets(source), Vec::<String>::new());
 }
 
@@ -6757,7 +6760,7 @@ fn pattern_declaration_does_not_dead_the_next_if_else() {
 /// (official `patternAssignment_end`) — no leak into the following if.
 #[test]
 fn pattern_assignment_does_not_dead_the_next_if_else() {
-    let source = r#"void f(int? n) {
+    let source = r"void f(int? n) {
   int a, b;
   (a, b) = (1, 2);
   if (n == 3) {
@@ -6765,7 +6768,7 @@ fn pattern_assignment_does_not_dead_the_next_if_else() {
   } else {
     'other'.length;
   }
-}"#;
+}";
     assert_eq!(dead_snippets(source), Vec::<String>::new());
 }
 
@@ -6776,13 +6779,13 @@ fn pattern_assignment_does_not_dead_the_next_if_else() {
 /// (dio `options.dart:629`, the `copyWith` argument list).
 #[test]
 fn value_context_null_comparison_does_not_narrow() {
-    let source = r#"int? g() => 1;
+    let source = r"int? g() => 1;
 void f(int? a) {
   final b = a != null;
   int c = a ?? g();
   print(c);
   print(b);
-}"#;
+}";
     assert_eq!(dead_snippets(source), Vec::<String>::new());
 }
 
@@ -6790,12 +6793,12 @@ void f(int? a) {
 /// condition context still splits (control below).
 #[test]
 fn value_context_is_check_does_not_narrow() {
-    let source = r#"void f(int? a) {
+    let source = r"void f(int? a) {
   final b = a is int;
   int c = a ?? 3;
   print(c);
   print(b);
-}"#;
+}";
     assert_eq!(dead_snippets(source), Vec::<String>::new());
 }
 
@@ -6803,15 +6806,15 @@ fn value_context_is_check_does_not_narrow() {
 /// control for the value-context pins).
 #[test]
 fn condition_context_null_comparison_still_promotes() {
-    let source = r#"void f(int? a) {
+    let source = r"void f(int? a) {
   if (a != null) {
     print(a + 1);
   }
-}"#;
+}";
     assert_eq!(dead_snippets(source), Vec::<String>::new());
 }
 
-/// A Never exit inside a then arm dies with its region: the IfEnd join
+/// A Never exit inside a then arm dies with its region: the `IfEnd` join
 /// revives the flow and retires the exit's anchoring latch, so a later
 /// flow-killing statement (`throw 'end';`) does not self-anchor on the
 /// stale exit (riverpod `async_value.dart:603`). Hand-driven: the exit
@@ -6931,13 +6934,13 @@ fn never_exit_still_anchors_the_next_statement() {
 #[test]
 fn creation_rhs_types_the_write() {
     use crate::ty::{Base, Ty};
-    let source = r#"void f() {
+    let source = r"void f() {
   Object? a; a = Object()..toString(); a;
   Object? b; b = new Object(); b;
   Object? c; c = const Object(); c;
   Object? d; d = Object<int>.from('x'); d;
   Object? e; e = Object<int>(); e;
-}"#;
+}";
     let promoted: Vec<Ty> = promoted_tys(source);
     let non_null_named = promoted
         .iter()
@@ -6958,7 +6961,7 @@ fn creation_rhs_types_the_write() {
 /// never ran — the whole-buffer `anywhere` stayed write-free.
 #[test]
 fn late_var_written_around_closure_reads_not_unassigned() {
-    let source = r#"void f(Stream s) {
+    let source = r"void f(Stream s) {
   late StreamSubscription sub;
   sub = s.listen((d) {
     sub.pause();
@@ -6966,7 +6969,7 @@ fn late_var_written_around_closure_reads_not_unassigned() {
     sub.cancel();
   });
   sub.hashCode;
-}"#;
+}";
     // Every read of `sub` emits a row (`!assigned` holds through the
     // conservative join), but none may carry the definite bit — that bit
     // alone drives `definitely_unassigned_late_local_variable`.
@@ -6987,7 +6990,7 @@ fn late_var_written_around_closure_reads_not_unassigned() {
 
 /// #2185 pin (prefixed `is` narrowing): `handle_type` fires on the
 /// qualified chain's FIRST token (`io` of `io.Directory` — official
-/// `handleType(typeRefOrPrefix)`, type_info_impl.dart:691), so the
+/// `handleType(typeRefOrPrefix)`, `type_info_impl.dart:691`), so the
 /// recorded type name must be the chain's LAST identifier, the element
 /// the spelling resolves to. Interning the prefix collapsed every `io.*`
 /// spelling onto `Name(io)`, and `factor(io-typed e, io)` bottomed —
@@ -6995,25 +6998,25 @@ fn late_var_written_around_closure_reads_not_unassigned() {
 /// oracle reports none (the dartq-only dead-code direction).
 #[test]
 fn prefixed_is_test_else_arm_stays_reachable() {
-    let source = r#"FSE m(io.FSE e) {
+    let source = r"FSE m(io.FSE e) {
   if (e is io.PNFE) {
     return P(e.p, e.m);
   } else {
     return F(e.p, e.m);
   }
-}"#;
+}";
     assert_eq!(dead_snippets(source), Vec::<String>::new());
     // And the resolved tail name keeps the SAME spelled type factoring
     // against itself: a variable declared `io.PNFE` promotes on
     // `e is io.PNFE`, so a repeat test bottoms the second arm's true
     // branch exactly like the unprefixed shape.
-    let source = r#"void f(io.PNFE e) {
+    let source = r"void f(io.PNFE e) {
   if (e is io.PNFE) {
     g(e);
   } else if (e is io.PNFE) {
     g(e);
   }
-}"#;
+}";
     assert_eq!(dead_snippets(source).len(), 1, "second arm must be dead");
 }
 
@@ -7026,24 +7029,24 @@ fn prefixed_is_test_else_arm_stays_reachable() {
 /// deaded the second `??` arm).
 #[test]
 fn field_initializer_does_not_write_like_named_parameter() {
-    let source = r#"class C {
+    let source = r"class C {
   C(int? f, int? g)
       : f = f ?? 0,
         _g = g ?? calc(g ?? 1);
   final int f;
   final int _g;
-}"#;
+}";
     assert_eq!(dead_snippets(source), Vec::<String>::new());
     // And the parameter still promotes on its own is-test afterwards —
     // the suppression is the write, not the variable.
-    let source = r#"class C {
+    let source = r"class C {
   C(int? v) : _v = v ?? 0 {
     if (v is int) {
       g(v);
     }
   }
   final int _v;
-}"#;
+}";
     let facts = facts_of(source);
     assert!(
         facts
@@ -7059,12 +7062,12 @@ fn field_initializer_does_not_write_like_named_parameter() {
 /// promotes `x` to the resolved type, not the shared `io` prefix.
 #[test]
 fn prefixed_constructor_write_promotes_tail_type() {
-    let source = r#"void f() {
+    let source = r"void f() {
   var x = io.File();
   if (x is io.File) {
     g(x);
   }
-}"#;
+}";
     let facts = facts_of(source);
     let promoted: Vec<String> = facts
         .iter()
@@ -7085,13 +7088,13 @@ fn prefixed_constructor_write_promotes_tail_type() {
 /// row could only come from a tested-set leak the source never spells).
 #[test]
 fn constructor_initialized_final_receiver_never_promotes() {
-    let source = r#"Stream f(Stream s) {
+    let source = r"Stream f(Stream s) {
   final c = StreamController.broadcast(sync: true);
   c.onListen = () {
     s.listen((d) {});
   };
   return c.stream;
-}"#;
+}";
     let facts = facts_of(source);
     assert!(
         facts.iter().all(|fact| !matches!(
@@ -7136,7 +7139,7 @@ fn cross_base_raw_tested_against_written_declaration_promotes() {
     // The same-base raw test still refuses (`List<dynamic>` is no subtype
     // of `List<int>`): `x` carries no promotion at all.
     let list_reads: Vec<u32> = source
-        .match_indices("x")
+        .match_indices('x')
         .map(|(offset, _)| offset as u32)
         .collect();
     assert!(
@@ -7152,6 +7155,7 @@ fn cross_base_raw_tested_against_written_declaration_promotes() {
 
 /// The `(offset, ty, args)` triples of a source's promoted reads, for the
 /// pins that key on where a promotion stands and what tree it carries.
+#[allow(clippy::type_complexity)]
 fn promoted_read_rows(
     source: &str,
 ) -> (
@@ -7385,7 +7389,7 @@ fn field_initializer_closure_guarded_read_promotes() {
 
 /// The promotion gates dead code inside the initializer closure: after
 /// the early-return guard the second `str == null` test is known-false,
-/// so its then-branch is dead — the oracle rows DEAD_CODE there (and in
+/// so its then-branch is dead — the oracle rows `DEAD_CODE` there (and in
 /// the plain-function control). Before the fix the closure emitted no
 /// row: the branch condition read rode the unresolved property face.
 #[test]
@@ -7400,7 +7404,7 @@ fn initializer_closure_promotion_gates_dead_code() {
 
 /// The guarded read as a call argument carries the non-null face — the
 /// staged-assignability consumer's row (the #2241 probe's `take(str)`
-/// false ARGUMENT_TYPE_NOT_ASSIGNABLE rode the missing fact).
+/// false `ARGUMENT_TYPE_NOT_ASSIGNABLE` rode the missing fact).
 #[test]
 fn initializer_closure_guarded_argument_read_carries_non_null_face() {
     let source = concat!(
@@ -7689,14 +7693,14 @@ fn staged_declared_rhs_yields_to_the_folds_promoted_read() {
     // the if-join leaves the promotion live for the argument check
     // (analyzer `context_locator.dart:276` family). The staged declared
     // face must not demote the write back to `int?`.
-    let source = r#"void g(int x) {}
+    let source = r"void g(int x) {}
 void f(int? a, int? b) {
   if (b == null) return;
   if (a == null) {
     a = b;
   }
   g(a);
-}"#;
+}";
     // Two passes with the staged face mounted (offsets are
     // deterministic for the same source): the first finds the write
     // target's token offset, the second stages `int?` there exactly like
@@ -7749,7 +7753,7 @@ fn assignment_with_promoted_rhs_promotes_the_target_through_the_join() {
     // The unstaged fold (bare flow harness): the promoted RHS read type
     // is the write type, and the if-join keeps the target promoted for
     // the read after the `if` — the oracle's clean `g(a)` (probe u3).
-    let source = r#"
+    let source = r"
 void g(int x) {}
 void f(int? a, int? b) {
   if (b == null) return;
@@ -7758,7 +7762,7 @@ void f(int? a, int? b) {
   }
   g(a);
 }
-"#;
+";
     let (_, facts) = analyze(source);
     let g_arg = (source.find("g(a)").unwrap() + 2) as u32;
     let promoted: Vec<crate::ty::Ty> = facts
@@ -7880,7 +7884,7 @@ fn for_in_declared_element_reads_the_element_type() {
 }
 
 /// A write-captured local is never promotable (the official `writeCaptured`
-/// bail gating `tryPromoteForTypeCheck`, flow_analysis.dart:4136): the `is`
+/// bail gating `tryPromoteForTypeCheck`, `flow_analysis.dart:4136)`: the `is`
 /// test still splits reachability, but the variable's own promotion chain
 /// stays empty — the guarded read carries no promoted type.
 #[test]
@@ -7950,7 +7954,7 @@ fn closure_read_captured_parameter_promotes_through_the_is_test() {
     );
 }
 
-/// An unknown-typed `??=` RHS writes the official's InvalidType face: it
+/// An unknown-typed `??=` RHS writes the official's `InvalidType` face: it
 /// never PROMOTES (the valid-step gate's mutual-subtype check refuses the
 /// unknown), but it also never DEMOTES — `InvalidType <: everything`
 /// (subtype.dart:274) keeps a standing promotion through the write.
@@ -7975,7 +7979,7 @@ fn if_null_assign_unknown_rhs_preserves_promotion() {
 
 /// The `??=` unknown arm on an already-promoted variable: `s` promoted,
 /// then `s ??= opaque()` — the write's unknown face satisfies every
-/// standing promotion (`covers`'s InvalidType recovery), so `s` stays
+/// standing promotion (`covers`'s `InvalidType` recovery), so `s` stays
 /// promoted after it.
 #[test]
 fn if_null_assign_unknown_rhs_keeps_the_standing_promotion() {
@@ -8026,7 +8030,7 @@ fn dead_region_read_carries_the_promotion_row() {
 }
 
 /// The assert message evaluates on the condition-FALSE state (official
-/// `assert_afterCondition`, flow_analysis.dart:6478): `assert(t == null,
+/// `assert_afterCondition`, `flow_analysis.dart:6478)`: `assert(t == null,
 /// '${t.f}')`'s message reads `t` under the non-null arm — the null check's
 /// promotion reaches the message's interpolation read.
 #[test]
@@ -8188,13 +8192,10 @@ fn named_arg(lexeme: &str) -> crate::ty::StagedArg {
 /// The promoted-read face at `needle`'s last occurrence, when one stands.
 fn promoted_read_at_last(source: &str, facts: &[FlowFact], needle: &str) -> Option<crate::ty::Ty> {
     let offset = source.rfind(needle).unwrap() as u32;
-    facts
-        .iter()
-        .filter_map(|fact| match fact {
-            FlowFact::PromotedRead { span, ty, .. } if span.range.offset == offset => Some(*ty),
-            _ => None,
-        })
-        .next()
+    facts.iter().find_map(|fact| match fact {
+        FlowFact::PromotedRead { span, ty, .. } if span.range.offset == offset => Some(*ty),
+        _ => None,
+    })
 }
 
 // —— #2360: the `??=` write's staged-RHS discriminator ——————————————————
@@ -8285,8 +8286,8 @@ fn if_null_staged_non_null_getter_promotes_the_receiver() {
 }
 
 /// #2360 pin ⑤ (`e_invalid_listlit_first`/`f_undefined_ident`): an RHS the
-/// resolution leaves invalid or dynamic writes the official's InvalidType
-/// face (`LUB(NonNull(T1), InvalidType)` is InvalidType — the supertype
+/// resolution leaves invalid or dynamic writes the official's `InvalidType`
+/// face (`LUB(NonNull(T1), InvalidType)` is `InvalidType` — the supertype
 /// rule over `InvalidType <: X`, subtype.dart:274), and the official
 /// assumes no promotion for an invalid written type
 /// (flow_analysis.dart:4966-4969): the receiver stays unpromoted and the
@@ -8475,7 +8476,7 @@ fn function_is_test_splits_the_arms() {
 /// type is already the tested type's subtype makes the test a boolean
 /// literal (official `isExpression_end`'s
 /// `_isTypeCheckGuaranteedToSucceedWithSoundNullSafety` arm — upstream Dart
-/// SDK source, pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+/// SDK source, pkg/_`fe_analyzer_shared/lib/src/flow_analysis`/
 /// flow_analysis.dart:7201-7205 — folded to `booleanLiteral(!isNot)`,
 /// :6544-6559): `is` deads the else branch and its body reports the
 /// whole-block dead row (the probe-g5 shape).
@@ -8512,7 +8513,7 @@ fn is_dynamic_and_unknown_operand_never_guarantee() {
 
 /// #2356 pin ① (guaranteed-fail, bottom tested type): a bottom tested type
 /// folds the test to a constant `false` (official `isExpression_end`'s
-/// first arm — upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/
+/// first arm — upstream Dart SDK source, pkg/_`fe_analyzer_shared/lib/src`/
 /// flow_analysis/flow_analysis.dart:7184-7189 — `booleanLiteral(isNot)`):
 /// `is` deads the then branch, whose body reports the whole-block dead row.
 #[test]
@@ -8554,7 +8555,7 @@ fn nullability_disjoint_test_deads_the_then_arm() {
 /// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:5944-5949),
 /// so even an unknowable operand face (an unresolved call) deads the then
 /// arm — the oracle's `f() is Never` then-block row in
-/// language/nnbd/flow_analysis/unreachable_via_never_test.
+/// `language/nnbd/flow_analysis/unreachable_via_never_test`.
 #[test]
 fn unknowable_operand_never_guaranteed_fail() {
     let source = "void f() { if (g() is Never) { h(); } else {} }";
@@ -8580,7 +8581,7 @@ fn local_reference_is_never_deads_the_then_arm() {
 /// disjoint) and the promotion split itself deads the else arm: a bottom
 /// `factor(previous, tested)` marks the unmatched arm unreachable
 /// (official `tryPromoteForTypeCheck`'s `ifFalseIsUnreachable` —
-/// upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/
+/// upstream Dart SDK source, pkg/_`fe_analyzer_shared/lib/src`/
 /// flow_analysis/flow_analysis.dart:4156-4160). Honest swap-back note:
 /// HEAD-green — this deadness is [`Interp::branch_type_test`]'s
 /// pre-existing factor face; the pin constrains the fail fold from
@@ -8614,7 +8615,7 @@ fn promotable_reference_keeps_both_is_test_arms_live() {
 
 /// #2357 pin ⑤ (no guaranteed-succeed fold on references): the official
 /// succeed arm sits behind the reference check (upstream Dart SDK source,
-/// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:
+/// pkg/_`fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart`:
 /// 7190-7205 — reached only when `_getExpressionReference` returned
 /// null), so a reference test never folds to `true` on a mere subtype
 /// fact: `int x; x is num` keeps the else arm live (the promotion split's

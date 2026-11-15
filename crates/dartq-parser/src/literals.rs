@@ -7,6 +7,7 @@
 //! elements). Elements parse full expressions through the #20 engine
 //! (official parity: the collection suffixes call `parseExpression`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind};
 
 use crate::expr_const::is_user_definable_operator;
@@ -1063,6 +1064,7 @@ mod tests {
 
     /// `(count, left (offset, len), right (offset, len))` of every list
     /// literal event.
+    #[allow(clippy::type_complexity)]
     fn list_shapes(
         p: &crate::Parser<'_, '_, '_, LiteralLog>,
     ) -> Vec<(usize, (u32, u32), (u32, u32))> {
@@ -1274,9 +1276,9 @@ mod tests {
     }
 
     /// The triple-shift lexing gate decides the `#>>>` recovery shape
-    /// (triple_shift_symbol corpus): the official `tokenizeGreaterThan`
-    /// (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/scanner/
-    /// abstract_scanner.dart :1493) merges `>>>`/`>>>=` only under the
+    /// (`triple_shift_symbol` corpus): the official `tokenizeGreaterThan`
+    /// (upstream Dart SDK source, pkg/_`fe_analyzer_shared/lib/src/scanner`/
+    /// `abstract_scanner.dart` :1493) merges `>>>`/`>>>=` only under the
     /// triple-shift switch, so at a pre-2.14 settled version the scanner
     /// hands the parser `>>` + `>` and `parseLiteralSymbol` (:9249) takes
     /// the whole `>>` as the symbol operator — the bare `>` then parses as

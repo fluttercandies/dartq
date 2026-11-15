@@ -23,6 +23,7 @@
 //!    signature; a shadowing plain local claims nothing and keeps the
 //!    unknown face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 // —— the quantifier-leaf slot face ——

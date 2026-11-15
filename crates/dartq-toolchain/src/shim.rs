@@ -10,6 +10,7 @@
 //! argv verbatim. Installing is always explicit: nothing here runs
 //! without `dartq shim install dart`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -104,6 +105,11 @@ impl From<io::Error> for DartShimError {
 ///
 /// [`DartShimError::NoHome`] with no home directory,
 /// [`DartShimError::Io`] when the link cannot be created.
+///
+/// # Panics
+///
+/// Panics if the shim path has no parent directory (an internal invariant
+/// violation — the shim always lives in `~/.dartq/bin`).
 pub fn dart_shim_install() -> Result<DartShimReport, DartShimError> {
     let home = std::env::home_dir().ok_or(DartShimError::NoHome)?;
     let exe = std::env::current_exe()?;
@@ -285,7 +291,7 @@ mod tests {
     }
 
     /// The install lifecycle mirrors the flutter shim's: fresh →
-    /// Installed; same executable again → AlreadyPresent; a stale link is
+    /// Installed; same executable again → `AlreadyPresent`; a stale link is
     /// refreshed; a real file is never clobbered; remove takes down the
     /// link only.
     #[test]

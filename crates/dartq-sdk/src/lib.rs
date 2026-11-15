@@ -46,6 +46,7 @@
 //! with [`SdkError`], so a crippled SDK can never masquerade as a valid
 //! analysis baseline.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 mod extension_faces;
 mod flat_libraries;
 mod identity;

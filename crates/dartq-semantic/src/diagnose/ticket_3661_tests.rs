@@ -47,6 +47,7 @@
 //! `Primary-constructors`/`Extension-types` static-collision rows, and
 //! the `member_errors` non-leading `augment` asymmetry (family 10).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{
     assert_silent, report_ops, report_ops_augment, report_ops_augment_intro_experiments, rows,
 };

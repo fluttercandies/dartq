@@ -1,5 +1,6 @@
 //! Content-addressed storage of source bytes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::Path;
 
 use parking_lot::Mutex;

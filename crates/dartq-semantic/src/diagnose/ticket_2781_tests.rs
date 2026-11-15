@@ -14,6 +14,7 @@
 //! READ by a closure stays promotable, the co19 `Utils/async_utils.dart`
 //! `error is Function(Object)` shape).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 
@@ -61,13 +62,13 @@ fn invocation_rows(report: &FileReport) -> Vec<&'static str> {
 /// function form is callable by the resolver's own decision order
 /// (function_expression_invocation_resolver.dart:67-79 — the promoted
 /// static type is a `FunctionTypeImpl`). Fixture fidelity: the co19
-/// original declares `Object error` (Utils/async_utils.dart:169) — the
+/// original declares `Object error` (`Utils/async_utils.dart:169`) — the
 /// promotion step is valid only from a supertype of
 /// `dynamic Function(Object)`.
 #[test]
 fn closure_read_capture_promotes_for_the_invocation() {
     let report = report_ops(
-        r#"
+        r"
 void run(void Function() action) {
   action();
 }
@@ -78,7 +79,7 @@ void f(Object error) {
     }
   });
 }
-"#,
+",
     );
     assert!(
         invocation_rows(&report).is_empty(),
@@ -92,11 +93,11 @@ void f(Object error) {
 #[test]
 fn untested_non_function_parameter_still_reports() {
     let report = report_ops(
-        r#"
+        r"
 void f(int error) {
   error(0);
 }
-"#,
+",
     );
     let rows = invocation_rows(&report);
     assert_eq!(
@@ -116,7 +117,7 @@ void f(int error) {
 #[test]
 fn type_param_function_bound_callee_is_callable() {
     let report = report_ops(
-        r#"
+        r"
 typedef MyFunction = double Function(int _);
 class C<T extends MyFunction> {
   T foo;
@@ -125,7 +126,7 @@ class C<T extends MyFunction> {
     foo(0);
   }
 }
-"#,
+",
     );
     assert!(
         invocation_rows(&report).is_empty(),
@@ -142,14 +143,14 @@ class C<T extends MyFunction> {
 #[test]
 fn nullable_extension_call_member_is_callable() {
     let report = report_ops(
-        r#"
+        r"
 void f(int? a) {
   a();
 }
 extension N on int? {
   int call() => 0;
 }
-"#,
+",
     );
     assert!(
         invocation_rows(&report).is_empty(),
@@ -165,13 +166,13 @@ extension N on int? {
 #[test]
 fn this_invocation_finds_the_enclosing_extension_call() {
     let report = report_ops(
-        r#"
+        r"
 class C {}
 extension E on C {
   int call(int x) => 0;
   int m() => this(2);
 }
-"#,
+",
     );
     assert!(
         invocation_rows(&report).is_empty(),
@@ -187,12 +188,12 @@ extension E on C {
 #[test]
 fn record_typed_callee_reports() {
     let report = report_ops(
-        r#"
+        r"
 void f() {
   (int, String) r = (1, 'a');
   r();
 }
-"#,
+",
     );
     assert_eq!(
         invocation_rows(&report),
@@ -207,12 +208,12 @@ void f() {
 #[test]
 fn plain_interface_callee_without_call_still_reports() {
     let report = report_ops(
-        r#"
+        r"
 class C {}
 void f(C c) {
   c();
 }
-"#,
+",
     );
     assert_eq!(
         invocation_rows(&report),

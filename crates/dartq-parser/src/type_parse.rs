@@ -3,6 +3,7 @@
 //! while consuming, plus the official record-type grammar
 //! (`parseRecordType`, `parser_impl.dart:1747-1907`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind};
 
 use crate::listener::{IdentifierContext, MemberKind, ParserListener};

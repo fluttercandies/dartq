@@ -24,6 +24,7 @@
 //! combinator presence, so the carried state is the same fact without the
 //! second walk. Events and diagnostics are identical.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind};
 
 use crate::listener::{IdentifierContext, ParserListener};
@@ -269,24 +270,19 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             // keyword on every `handleImportPrefix`), so the bookkeeping
             // below covers this arm too — the deferred-after-prefix and
             // duplicate faces anchor here.
-            let recorded_deferred;
-            let recorded_as;
-            if self.peek_kind() == TokenKind::Keyword(Keyword::Deferred)
+
+            let (recorded_deferred, recorded_as) = if self.peek_kind()
+                == TokenKind::Keyword(Keyword::Deferred)
                 && self.cursor.look_kind(1) != TokenKind::Keyword(Keyword::As)
             {
                 let deferred = self.peek_span();
                 self.listener.handle_import_prefix(Some(deferred), None);
                 self.cursor.advance();
-                recorded_deferred = Some(deferred);
-                // The special case hands `asKeyword = null` to the recovery
-                // listener (:1060), resetting the field — the `as` block
-                // below stays silent this iteration.
-                recorded_as = None;
+                (Some(deferred), None)
             } else {
                 let prefix = self.parse_import_prefix_opt();
-                recorded_deferred = prefix.deferred;
-                recorded_as = prefix.as_kw;
-            }
+                (prefix.deferred, prefix.as_kw)
+            };
             // Bookkeeping order mirrors the do-loop: the deferred block
             // (:1041-1056) precedes the `as` block (:1057-1071) in every
             // iteration.

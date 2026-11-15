@@ -32,6 +32,7 @@
 //! bodies, carried by the `||` binder ledger and the assignment ledger of
 //! `listener.rs`'s `PatternNodeState`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops};
 

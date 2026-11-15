@@ -31,6 +31,7 @@
 //! Every face answers at intake without blocking. The newest
 //! [`MAX_FINISHED`] finished runs are kept.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::jsonrpc::codes;
 use rustc_hash::FxHashMap;
 use serde::Deserialize;

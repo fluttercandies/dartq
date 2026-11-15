@@ -29,6 +29,7 @@
 //! `null` constant already covers that space (`Null` is one static type,
 //! `static_type.dart:21`), so the later clause is subsumed.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// A cast pattern whose cast type sits inside the sub-pattern's space
@@ -89,9 +90,7 @@ fn null_constant_subsumes_the_null_type_test() {
     let arrow = subsumed + full[subsumed as usize..].find("=>").unwrap() as u32;
     assert_eq!(unreachable, [arrow], "{:#?}", rows(&report));
     assert!(
-        !names
-            .iter()
-            .any(|name| *name == "non_exhaustive_switch_expression"),
+        !names.contains(&"non_exhaustive_switch_expression"),
         "{:#?}",
         rows(&report)
     );

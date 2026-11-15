@@ -7,7 +7,7 @@
 //! cluster table attributed to the same family: the curried
 //! `ReturnType Function() Function()` composition split across lines
 //! (x682-x684), the `>>`-compound and nested-`Function` parameter masses
-//! (x676-x681), the multi-line parameter list (error_test x144), the
+//! (x676-x681), the multi-line parameter list (`error_test` x144), the
 //! nested GFT parameter (error2 x35), and the typedef head/alias-RHS
 //! bound groups. The oracle emits no parser rows on any of them (the
 //! trio's fail faces are semantic-tier only), so each pin asserts an
@@ -17,6 +17,10 @@
 //! instantiation parse: `f(a<b, c>(d))` is one send with a type-argument
 //! group, never a relational chain.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, setup};
 use crate::parser::Parser;
 
@@ -307,7 +311,7 @@ fn trio_neighborhood_sequence_parses_clean() {
 /// `_mayFollowTypeArgs`, type_info.dart:485-574): one send whose operand
 /// `a` carries a type-argument group, then the invocation of `(d)`. The
 /// oracle resolves the type-argument identifiers against the locals
-/// (`non_type_as_type_argument` at both names, co19 ambiguities_A01_t01
+/// (`non_type_as_type_argument` at both names, co19 `ambiguities_A01_t01`
 /// 58:7/61:7 — semantic tier, outside this crate) — so the parser must
 /// emit the type-reference identifier events for `b` and `c` (the reads
 /// the resolver registers) and NEVER take the relational arm (no binary

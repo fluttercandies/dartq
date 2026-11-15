@@ -12,6 +12,7 @@
 //! upstream markup cases open with an empty first line, the doc examples
 //! do not — the oracle's line numbers depend on it.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::engine::Lint;
 use crate::testsupport::{Fixture, one_rule};
 

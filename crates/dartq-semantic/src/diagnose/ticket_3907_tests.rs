@@ -18,7 +18,7 @@
 //!   `flow_analysis.dart`'s `_write` keeps a subtype write promoted).
 //!   The acceptance pin stays `#[ignore]`d at the flow owner
 //!   (`crates/dartq-flow`'s `Ev::UnaryPrefixAssign`/`UnaryPostfixAssign`
-//!   arm — the row_resolution.rs face needs no change once the write
+//!   arm — the `row_resolution.rs` face needs no change once the write
 //!   types the operator result).
 //! * gap2 member-callee miss arm: `x.first()` over `List<T?>` where
 //!   `T extends Function` — the walk misses on the rig's stub `List` (no
@@ -29,6 +29,7 @@
 //!   arm runs (the existing `ticket_2919`/`ticket_3816` pins are the
 //!   oracle contract; the pins here cover the arm's own edges).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

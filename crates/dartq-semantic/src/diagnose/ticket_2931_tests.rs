@@ -22,6 +22,7 @@
 //! `test_instanceCreation_undeprecatedClass_deprecatedConstructor`
 //! (:1163-1179), `test_dotShorthandConstructorInvocation_…` (:529-566).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::diagnose::test_rig::{RigImport, report_ops_imports};
 use crate::library::ElementIndex;

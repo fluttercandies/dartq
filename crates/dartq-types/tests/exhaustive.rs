@@ -200,7 +200,7 @@ fn enum_switch_all_constants_is_exhaustive() {
             constant_case(w.color, 2, &model),
         ],
     );
-    assert!(report.unreachable.is_empty());
+    assert_eq!(report.unreachable, Vec::<usize>::new());
     assert!(matches!(report.exhaustiveness, Exhaustiveness::Exhaustive));
 }
 
@@ -280,7 +280,7 @@ fn sealed_class_switch_all_subclasses_is_exhaustive() {
             case_of(w.itf(w.square, false), &model),
         ],
     );
-    assert!(report.unreachable.is_empty());
+    assert_eq!(report.unreachable, Vec::<usize>::new());
     assert!(matches!(report.exhaustiveness, Exhaustiveness::Exhaustive));
 }
 

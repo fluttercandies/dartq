@@ -28,6 +28,7 @@
 //!   enclosing class's `thisType` (element.dart:1004), spelling `A<T>`
 //!   for a generic container — under the `constructor` host word.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 
@@ -240,7 +241,7 @@ Future<int> fi() async { return fs(); }
 
 // —— `await` anchor —————————————————————————————————————————————————————
 
-/// The oracle's `.at(expression)` is the AwaitExpression: the row starts
+/// The oracle's `.at(expression)` is the `AwaitExpression`: the row starts
 /// at the `await` keyword and runs through the operand's end
 /// (rtv.dart:155-205), not at the operand's own span.
 #[test]

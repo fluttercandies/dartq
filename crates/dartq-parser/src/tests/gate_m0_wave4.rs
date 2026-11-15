@@ -27,6 +27,7 @@
 //!   identifier, consumed without a report
 //!   (`identifier_context_impl.dart:579-583`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::setup;
 
 /// Parses `source` and asserts the exact in-order (code, start, end)

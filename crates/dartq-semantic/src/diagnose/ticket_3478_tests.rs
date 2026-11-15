@@ -27,6 +27,7 @@
 //! Registered here via `#[path]`; the module stays inside the `diagnose`
 //! subtree so `crate::diagnose::test_rig` resolves.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{report_ops, rows};
 

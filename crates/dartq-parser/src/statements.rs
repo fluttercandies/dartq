@@ -20,6 +20,7 @@
 //! `missing_identifier`, `extraneous_modifier`, ...), never a dedicated
 //! Group A code.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, KeywordStyle, TokenKind};
 
 use crate::cursor::TokenCursor;
@@ -249,7 +250,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// last consumed token for a catchless on clause. So `try junk {}` pins
     /// the body row on `try`, `catch (e) junk {}` on the `)`,
     /// `finally junk {}` on `finally`, `on T junk {}` on `T` (oracle
-    /// try_statement corpus, probed 3.13.1). `anchor = None` keeps the
+    /// `try_statement` corpus, probed 3.13.1). `anchor = None` keeps the
     /// shared follower-walk arm of `ensure_block` for the other faces.
     fn parse_block_anchored(
         &mut self,
@@ -1270,8 +1271,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.cursor.advance();
             self.synthetic(TokenKind::Semicolon, offset);
             self.synthetic(TokenKind::Semicolon, offset);
-            let close = self.synthetic(TokenKind::CloseParen, offset);
-            close
+
+            self.synthetic(TokenKind::CloseParen, offset)
         };
         // The landing report belongs to the C-style `parseForLoopPartsRest`
         // alone ([`Self::parse_for_loop_parts_rest`]'s landed-token gate,

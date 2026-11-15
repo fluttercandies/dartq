@@ -13,6 +13,7 @@
 //! The rule refines the DECLARATION's type: a written `Null` annotation keeps
 //! `Null`, and a non-`Null` initializer keeps its own type.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// The `invalid_assignment` rows of `source`, `code @offset: message` each.

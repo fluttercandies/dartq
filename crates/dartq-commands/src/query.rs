@@ -52,6 +52,7 @@
 //! candidates, `refs` empty); the exact faces' request path and cost are
 //! untouched.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 // The dependencies row type (the frozen `DependencyRow` shape), re-exported
 // so the faces name it in their signatures without a dartq-ai dependency.
 pub use dartq_ai::explain::DependencyRow;
@@ -101,7 +102,7 @@ pub struct SymbolRun<'a> {
 ///
 /// [`AnalyzeError`] on discovery failure or cancellation.
 pub fn symbol<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<'a>, AnalyzeError> {
-    let _ = prelude(engine)?;
+    let () = prelude(engine)?;
     Ok(symbol_after_analysis(engine, name))
 }
 
@@ -120,7 +121,7 @@ pub fn symbol_fuzzy<'a>(
     engine: &'a mut Engine,
     query: &str,
 ) -> Result<SymbolRun<'a>, AnalyzeError> {
-    let _ = prelude(engine)?;
+    let () = prelude(engine)?;
     Ok(symbol_fuzzy_after_analysis(engine, query))
 }
 
@@ -236,7 +237,7 @@ pub fn symbol_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a
 ///
 /// [`AnalyzeError`] on discovery failure or cancellation.
 pub fn callers<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<'a>, AnalyzeError> {
-    let _ = prelude(engine)?;
+    let () = prelude(engine)?;
     Ok(callers_after_analysis(engine, name))
 }
 
@@ -266,7 +267,7 @@ pub fn implementations<'a>(
     engine: &'a mut Engine,
     name: &str,
 ) -> Result<SymbolRun<'a>, AnalyzeError> {
-    let _ = prelude(engine)?;
+    let () = prelude(engine)?;
     Ok(implementations_after_analysis(engine, name))
 }
 
@@ -420,7 +421,7 @@ pub fn implementations_after_analysis<'a>(engine: &'a Engine, name: &str) -> Sym
 ///
 /// [`AnalyzeError`] on discovery failure or cancellation.
 pub fn dependencies<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<'a>, AnalyzeError> {
-    let _ = prelude(engine)?;
+    let () = prelude(engine)?;
     Ok(dependencies_after_analysis(engine, name))
 }
 
@@ -624,7 +625,7 @@ pub fn batch<'run, 'name>(
     engine: &'run mut Engine,
     queries: &'name [BatchQuery],
 ) -> Result<Vec<BatchAnswer<'run, 'name>>, AnalyzeError> {
-    let _ = prelude(engine)?;
+    let () = prelude(engine)?;
     Ok(batch_after_analysis(engine, queries))
 }
 
@@ -1412,7 +1413,10 @@ mod tests {
         let run = dependencies(&mut engine, "Widget").expect("query");
         assert_eq!(run.decls.len(), 1, "the dependency-tier declaration stays");
         assert!(engine_library_of(&run, 0).is_none());
-        assert!(run.dependencies.is_empty());
+        assert_eq!(
+            run.dependencies,
+            [] as [dartq_ai::explain::DependencyRow; 0]
+        );
         let json = to_json(&run, "Widget");
         assert!(json.get("deps").is_none());
         dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query)
@@ -1904,7 +1908,10 @@ mod tests {
         // dependencies array is absent (the schema's additive slots are
         // empty-row omitted), the envelope stays the frozen one.
         let run = dependencies(&mut engine, "Animal").expect("query");
-        assert!(run.dependencies.is_empty());
+        assert_eq!(
+            run.dependencies,
+            [] as [dartq_ai::explain::DependencyRow; 0]
+        );
         let json = to_json(&run, "Animal");
         assert!(json.get("deps").is_none());
         assert!(dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query).is_ok());

@@ -28,6 +28,7 @@
 //! conformance `equalityRhs` family pins the left-operand static type as
 //! the context.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 

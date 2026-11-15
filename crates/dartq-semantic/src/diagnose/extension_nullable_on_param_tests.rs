@@ -5,8 +5,9 @@
 //! it safely (no `unchecked_use_of_nullable_value`, the member credited).
 //! Oracle provenance: `dart analyze` 3.13.1 — the analyzer's own
 //! `extension<T> on T? { mapOrNull }` over `UnlinkedLibraryImportPrefix?`
-//! (summary2/library_builder.dart census shape).
+//! (`summary2/library_builder.dart` census shape).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops};
 
 /// `extension<T> on T?` over a nullable receiver: the member resolves

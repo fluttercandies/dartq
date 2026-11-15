@@ -20,6 +20,7 @@
 //! #2413 red pin (the same verdict the oracle emits for the direct
 //! `bool Function(String)` spelling).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::resolved_ops::{LibraryTypes, ResolvedTypeOps};
@@ -288,7 +289,7 @@ fn parameterized_alias_substitutes_at_the_chase() {
 }
 
 /// The substitution face end-to-end (the flipped #2413 red pin's face, probed
-/// on /tmp/probe2410/p1_main.dart + typedefs.dart): a foreign parameterized
+/// on /`tmp/probe2410/p1_main.dart` + typedefs.dart): a foreign parameterized
 /// alias use folds to the aliased signature at the formal's bind, and
 /// `pred(42)` counts against the instantiated formals —
 /// `argument_type_not_assignable` at the `42`, exactly the oracle's row.

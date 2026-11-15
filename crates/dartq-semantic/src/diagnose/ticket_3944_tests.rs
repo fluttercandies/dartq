@@ -22,6 +22,7 @@
 //! the inverted-pass display keeps the binder list), pinned here against
 //! live `dart analyze --format=machine` output per clause position.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 use dartq_diagnostics::Diagnostic;
@@ -204,17 +205,19 @@ class C extends G<void Function<Z extends H<String>>()> {}
     let rows = bounds_rows(&report);
     let messages: Vec<String> = rows.iter().map(|row| row.message.to_string()).collect();
     assert!(
-        messages.contains(&format!(
-            "'void Function<Z extends H<String>>()' doesn't conform to \
+        messages.contains(
+            &"'void Function<Z extends H<String>>()' doesn't conform to \
              the bound 'num' of the type parameter 'T'."
-        )),
+                .to_string()
+        ),
         "the argument row must keep its quantifier: {messages:#?}"
     );
     assert!(
-        messages.contains(&format!(
-            "'String' doesn't conform to the bound 'num' of the type \
+        messages.contains(
+            &"'String' doesn't conform to the bound 'num' of the type \
              parameter 'T'."
-        )),
+                .to_string()
+        ),
         "the bound annotation below the binder must report: {messages:#?}"
     );
 }
@@ -236,7 +239,7 @@ extension type Et(void Function<S extends int>() rep) {}
     );
 }
 
-/// Routed residual (AP #3932's A03_t05 row): a constructor tear-off's
+/// Routed residual (AP #3932's `A03_t05` row): a constructor tear-off's
 /// receiver carries a written, bound-violating type-argument group
 /// (`MyList<String>.filled` over `typedef MyList<T extends num> =
 /// List<T>`), and the oracle reports the alias-instantiation bounds face

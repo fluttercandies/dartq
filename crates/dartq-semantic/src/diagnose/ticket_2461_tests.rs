@@ -22,6 +22,7 @@
 //! imports, so every pin spells custom types only (`void`/`null` are
 //! keywords and stay legal).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -250,7 +251,7 @@ class Some {
 /// `call`-bearing field — the send's `Seq` (a `Base`) is the yield-star
 /// operand, and the live oracle reports the raw-face row (probed:
 /// "The type 'Seq' implied by the 'yield*' expression must be assignable
-/// to 'IterableLike'." — `impliedReturnType = expressionType`, the
+/// to '`IterableLike`'." — `impliedReturnType = expressionType`, the
 /// send's resolved type, never a sequence wrap).
 #[test]
 fn yield_star_implicit_call_send_resolves() {

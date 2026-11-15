@@ -13,7 +13,7 @@
 //!   (`There isn't a setter named '{0}' in class '{1}'.`);
 //! * a `final` LOCAL or formal reports `assignment_to_final_local`
 //!   (`AssignmentExpressionShared.checkFinalAlreadyAssigned`,
-//!   pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver
+//!   `pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver`
 //!   .dart:395-425): the write is an error unless the variable is
 //!   definitely unassigned there — its first assignment after a bare
 //!   `final int x;` declaration — and a for-in loop's existing-variable
@@ -25,6 +25,7 @@
 //! `assignment_to_const`'s row (this family stays silent rather than
 //! emitting a second wrong code).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::FileReport;
 use crate::diagnose::test_rig::report_ops_bare;
 

@@ -28,6 +28,7 @@
 //! `ReturnOfInvalidTypeTest.test_function_sync_block_int__to_void` for
 //! the void-host verdict text.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, fold_unit, merge_source_ordered};
 use crate::library::ElementIndex;
@@ -91,7 +92,7 @@ fn report(source: &str) -> FileReport {
     report
 }
 
-fn rows_named<'a>(report: &'a FileReport, code: &str) -> Vec<(u32, u32, String)> {
+fn rows_named(report: &FileReport, code: &str) -> Vec<(u32, u32, String)> {
     let mut rows: Vec<(u32, u32, String)> = report
         .diagnostics
         .iter()

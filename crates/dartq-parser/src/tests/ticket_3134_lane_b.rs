@@ -7,7 +7,7 @@
 //!
 //! * `NamedRecordFieldReferenceIdentifierContext.ensureIdentifier`
 //!   (upstream Dart SDK source,
-//!   pkg/_fe_analyzer_shared/lib/src/parser/identifier_context_impl.dart
+//!   pkg/_`fe_analyzer_shared/lib/src/parser/identifier_context_impl.dart`
 //!   :1258-1284): `:`/EOF splice the synthetic name in front (branch 2
 //!   keep), keywords report `expectedIdentifierButGotKeyword` and are
 //!   consumed, and every OTHER junk token is REPLACED by the synthetic —
@@ -21,11 +21,12 @@
 //! * Postfix `++`/`--` (`handleUnaryPostfixAssignmentExpression`,
 //!   ast_builder.dart:5620-5642) reports `illegalAssignmentToNonAssignable`
 //!   anchored on the operator when the operand is not assignable;
-//!   assignable operands are parser-silent (const_patterns_binary 86/87).
+//!   assignable operands are parser-silent (`const_patterns_binary` 86/87).
 //!
 //! Every expected row below is transcribed from the 3.13.1 oracle machine
 //! output (`dart analyze --format=machine`) for the exact source text.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 
 fn rows_with(source: &'static str) -> Vec<(String, u32, u32)> {

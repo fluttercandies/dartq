@@ -17,6 +17,7 @@
 //!     `invocation.rs` (held by a live lane) — those pins document the
 //!     oracle expectation as `// known-defect` until that fix lands.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, assert_silent, report_ops, rows};
 use super::types::FileReport;
 

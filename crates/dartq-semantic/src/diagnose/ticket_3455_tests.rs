@@ -27,6 +27,8 @@
 //! (`const NonType<int>.named()` reports `creation_with_non_type` at
 //! `NonType`).
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{assert_silent, code_names, report_ops};
 
 /// `foo<int>` inside an extension instance member reports

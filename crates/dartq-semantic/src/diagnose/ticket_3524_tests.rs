@@ -30,6 +30,7 @@
 //! (`analyzeAwaitExpression` flattens the operand's `staticType` once,
 //! type_analyzer.dart:542-548).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// The `(code, offset, len)` rows of `fixture`'s `invalid_assignment`

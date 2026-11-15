@@ -39,6 +39,7 @@
 //! the resolved `TypeOps` mounted, diagnostics read off the joined
 //! report.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use crate::resolved_ops::{LibraryTypes, ResolvedTypeOps};
@@ -231,7 +232,7 @@ fn undefined_type_argument_is_test_deads_the_else() {
 
 /// The well-typed operand keeps both branches: `int is Future<Invalid>`
 /// answers the real relation (false — no fold either way; probe
-/// p12_undef_arg_matrix case `a`), so no branch reports dead.
+/// `p12_undef_arg_matrix` case `a`), so no branch reports dead.
 #[test]
 fn well_typed_operand_keeps_the_undefined_argument_test_live() {
     let source = concat!(
@@ -355,10 +356,10 @@ fn identical_null_on_dynamic_keeps_both_branches() {
 /// A `dynamic` receiver against an undefined name deads the test-false
 /// arm (the #2450 dynamic face, the corpus's dominant `x is T` shape):
 /// the spelling's code reports AND the else arm carries the dead row —
-/// 2026-10-22 re-probe (Dart 3.13.1, probe p12_isdead): the both-arms
+/// 2026-10-22 re-probe (Dart 3.13.1, probe `p12_isdead)`: the both-arms
 /// posture originally pinned here was wrong; the reference path's
 /// `factor(dynamic, InvalidType)` is `Never`, so `ifFalseIsUnreachable`
-/// fires (see ticket_2450_tests' (c) section for the mechanism).
+/// fires (see `ticket_2450_tests`' (c) section for the mechanism).
 #[test]
 fn dynamic_receiver_undefined_test_deads_the_else() {
     let source = concat!(
@@ -385,9 +386,7 @@ fn dynamic_receiver_undefined_test_deads_the_else() {
         report.diagnostics
     );
     assert!(
-        code_names(&report)
-            .iter()
-            .any(|name| *name == "type_test_with_undefined_name"),
+        code_names(&report).contains(&"type_test_with_undefined_name"),
         "the undefined spelling reports its own code: {:?}",
         report.diagnostics
     );

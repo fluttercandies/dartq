@@ -12,6 +12,7 @@
 //! member, `this`, and `super` shapes below pin the observable dead face
 //! at the value span.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// Asserts one `dead_null_aware_expression` sits at `offset`, tolerating
@@ -88,9 +89,7 @@ fn local_nullable_target_stays_silent() {
     let fixture = "void f(int? x, int v) {\n  x ??= v;\n}";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|&c| c == "dead_null_aware_expression"),
+        !code_names(&report).contains(&"dead_null_aware_expression"),
         "{:?}",
         rows(&report)
     );

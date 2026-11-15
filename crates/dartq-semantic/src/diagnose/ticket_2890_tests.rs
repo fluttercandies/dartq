@@ -8,6 +8,7 @@
 //! literal (`G<A>;` — a `TypeLiteral`, whose visit runs no bounds face)
 //! stay silent.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -32,14 +33,14 @@ fn at(source: &str, needle: &str) -> u32 {
 /// reports at the written argument.
 #[test]
 fn function_tear_off_bad_type_argument_reports_at_the_argument() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 void f<T extends B>(T x) {}
 main() {
   f<A>;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -56,14 +57,14 @@ main() {
 /// A satisfying tear-off argument stays silent (`B` is its own bound).
 #[test]
 fn function_tear_off_satisfying_argument_stays_silent() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 void f<T extends B>(T x) {}
 main() {
   f<B>;
 }
-"#;
+";
     let report = report_ops(source);
     assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
@@ -75,7 +76,7 @@ main() {
 /// argument.
 #[test]
 fn constructor_reference_bad_type_argument_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends B> {
@@ -84,7 +85,7 @@ class G<E extends B> {
 main() {
   G<A>.named;
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -98,19 +99,19 @@ main() {
     );
 }
 
-/// The dot-less spelling is a TypeLiteral instantiation — the oracle's
-/// verifier visit for TypeLiteral runs no bounds face — so `G<A>;` stays
+/// The dot-less spelling is a `TypeLiteral` instantiation — the oracle's
+/// verifier visit for `TypeLiteral` runs no bounds face — so `G<A>;` stays
 /// silent where `G<A>.named;` reports.
 #[test]
 fn type_literal_instantiation_stays_silent() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends B> {}
 main() {
   G<A>;
 }
-"#;
+";
     let report = report_ops(source);
     assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
@@ -121,7 +122,7 @@ main() {
 /// walk feeds the same latch the plain sends read (#2869 residual).
 #[test]
 fn super_send_bad_type_argument_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class Sup {
@@ -132,7 +133,7 @@ class C extends Sup {
     super.m<A>(A());
   }
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -147,18 +148,18 @@ class C extends Sup {
 }
 
 /// The keyword-form creation `new G<A>()`: the constructor name's type is
-/// a NamedType, and its written arguments check exactly like an
+/// a `NamedType`, and its written arguments check exactly like an
 /// annotation's — the mirror of the landed implicit-creation pin.
 #[test]
 fn keyword_new_creation_bad_type_argument_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends B> {}
 main() {
   new G<A>();
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -176,7 +177,7 @@ main() {
 /// const constructor declared, so the keyword's own face stays silent).
 #[test]
 fn keyword_const_creation_bad_type_argument_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends B> {
@@ -185,7 +186,7 @@ class G<E extends B> {
 main() {
   const G<A>();
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),

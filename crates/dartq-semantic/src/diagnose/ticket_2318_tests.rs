@@ -17,6 +17,7 @@
 //! Oracle provenance: each expectation was probed with `dart analyze`
 //! over the same sources during #2188/#2318 (`/tmp/probe2318` family).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

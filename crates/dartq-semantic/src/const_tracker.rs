@@ -10,6 +10,7 @@
 //! matches verdict stay engine-side (they read the engine's row stack and
 //! report machinery).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::model::Ty;
 use dartq_source::SourceRange;
 
@@ -29,7 +30,7 @@ pub(crate) struct ConstTracker {
     /// means the expression is a composite (`1 == 2`, `'a' 'b'`, `{1, 2}`)
     /// whose own static type the last arm cannot spell — the recovered
     /// eval tail in `class_static_const_tail_ty` answers it instead
-    /// (upstream `visitConstantPattern` reads the DartObject's
+    /// (upstream `visitConstantPattern` reads the `DartObject`'s
     /// `value.type`, never an operand's).
     arms: u32,
 }

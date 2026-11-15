@@ -2,6 +2,7 @@
 //! test per diagnostic code, well-formed silence pins, and the
 //! multi-malformation decision-order pins.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::{assert_codes, assert_kinds, scan_src};
 use crate::TokenKind as K;
 
@@ -163,7 +164,7 @@ fn invalid_code_point() {
     // Six hex digits above the cap; 0x10FFFF itself is valid.
     assert_eq!(one(r"'\u{200000}'"), (vec!["invalid_code_point"], 1, 9));
     let r = scan_src(r"'\u{10FFFF}'");
-    assert!(r.diagnostics.is_empty());
+    assert_eq!(r.diagnostics, [] as [dartq_diagnostics::Diagnostic; 0]);
 }
 
 #[test]

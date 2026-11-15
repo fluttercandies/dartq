@@ -226,12 +226,11 @@ impl<'s, 't> TokenCursor<'s, 't> {
             // resolve; a miss is a logic bug. Degrade to the EOF-pinned shape
             // (kind reads as Eof, so parser loops bail) instead of panicking
             // on the hot path.
-            match self.table.get(index) {
-                Some(t) => (t.kind, t.is_synthetic()),
-                None => {
-                    debug_assert!(false, "id below table len must resolve");
-                    (TokenKind::Eof, true)
-                }
+            if let Some(t) = self.table.get(index) {
+                (t.kind, t.is_synthetic())
+            } else {
+                debug_assert!(false, "id below table len must resolve");
+                (TokenKind::Eof, true)
             }
         } else {
             // An id past the table addresses the side table; a miss there is
@@ -239,12 +238,11 @@ impl<'s, 't> TokenCursor<'s, 't> {
             // caller side of the [`Self::reset`] contract). Degrade to the
             // same EOF-pinned shape (kind reads as Eof, so parser loops
             // bail) instead of panicking on the hot path.
-            match self.inserted.get(index - self.table.len()) {
-                Some(t) => (t.kind, t.synthetic),
-                None => {
-                    debug_assert!(false, "stale token id after reset/detach");
-                    (TokenKind::Eof, true)
-                }
+            if let Some(t) = self.inserted.get(index - self.table.len()) {
+                (t.kind, t.synthetic)
+            } else {
+                debug_assert!(false, "stale token id after reset/detach");
+                (TokenKind::Eof, true)
             }
         }
     }
@@ -256,31 +254,29 @@ impl<'s, 't> TokenCursor<'s, 't> {
         if index < self.table.len() {
             // Same invariant as `resolve`: degrade to a zero-width EOF-pinned
             // span instead of panicking.
-            match self.table.get(index) {
-                Some(t) => SourceRange {
+            if let Some(t) = self.table.get(index) {
+                SourceRange {
                     offset: t.utf16_offset,
                     length: utf16_len_of_token(self.source, t),
-                },
-                None => {
-                    debug_assert!(false, "id below table len must resolve");
-                    SourceRange {
-                        offset: self.table.last().utf16_offset,
-                        length: 0,
-                    }
+                }
+            } else {
+                debug_assert!(false, "id below table len must resolve");
+                SourceRange {
+                    offset: self.table.last().utf16_offset,
+                    length: 0,
                 }
             }
         } else {
             // Same invariant as the table arm: a side-table miss is a stale
             // id — degrade to a zero-width EOF-pinned span instead of
             // panicking.
-            match self.inserted.get(index - self.table.len()) {
-                Some(t) => t.range(),
-                None => {
-                    debug_assert!(false, "stale token id after reset/detach");
-                    SourceRange {
-                        offset: self.table.last().utf16_offset,
-                        length: 0,
-                    }
+            if let Some(t) = self.inserted.get(index - self.table.len()) {
+                t.range()
+            } else {
+                debug_assert!(false, "stale token id after reset/detach");
+                SourceRange {
+                    offset: self.table.last().utf16_offset,
+                    length: 0,
                 }
             }
         }
@@ -296,12 +292,11 @@ impl<'s, 't> TokenCursor<'s, 't> {
             self.table.lexeme(self.source, index)
         } else {
             // Same invariant as `resolve`: a stale id lexes as empty.
-            match self.inserted.get(index - self.table.len()) {
-                Some(t) => t.kind.fixed_lexeme().unwrap_or(""),
-                None => {
-                    debug_assert!(false, "stale token id after reset/detach");
-                    ""
-                }
+            if let Some(t) = self.inserted.get(index - self.table.len()) {
+                t.kind.fixed_lexeme().unwrap_or("")
+            } else {
+                debug_assert!(false, "stale token id after reset/detach");
+                ""
             }
         }
     }
@@ -317,8 +312,8 @@ impl<'s, 't> TokenCursor<'s, 't> {
         if index < self.table.len() {
             // Same invariant as `resolve`: an Eof-shaped view makes every loop
             // head bail, so the degradation stays terminating.
-            match self.table.get(index) {
-                Some(t) => TokenView {
+            if let Some(t) = self.table.get(index) {
+                TokenView {
                     kind: t.kind,
                     span: TokenSpan::new(
                         id,
@@ -328,44 +323,42 @@ impl<'s, 't> TokenCursor<'s, 't> {
                         },
                     ),
                     is_synthetic: t.is_synthetic(),
-                },
-                None => {
-                    debug_assert!(false, "id below table len must resolve");
-                    TokenView {
-                        kind: TokenKind::Eof,
-                        span: TokenSpan::new(
-                            id,
-                            SourceRange {
-                                offset: self.table.last().utf16_offset,
-                                length: 0,
-                            },
-                        ),
-                        is_synthetic: true,
-                    }
+                }
+            } else {
+                debug_assert!(false, "id below table len must resolve");
+                TokenView {
+                    kind: TokenKind::Eof,
+                    span: TokenSpan::new(
+                        id,
+                        SourceRange {
+                            offset: self.table.last().utf16_offset,
+                            length: 0,
+                        },
+                    ),
+                    is_synthetic: true,
                 }
             }
         } else {
             // Same invariant as the table arm: an Eof-shaped view makes
             // every loop head bail, so the degradation stays terminating.
-            match self.inserted.get(index - self.table.len()) {
-                Some(t) => TokenView {
+            if let Some(t) = self.inserted.get(index - self.table.len()) {
+                TokenView {
                     kind: t.kind,
                     span: TokenSpan::new(id, t.range()),
                     is_synthetic: t.synthetic,
-                },
-                None => {
-                    debug_assert!(false, "stale token id after reset/detach");
-                    TokenView {
-                        kind: TokenKind::Eof,
-                        span: TokenSpan::new(
-                            id,
-                            SourceRange {
-                                offset: self.table.last().utf16_offset,
-                                length: 0,
-                            },
-                        ),
-                        is_synthetic: true,
-                    }
+                }
+            } else {
+                debug_assert!(false, "stale token id after reset/detach");
+                TokenView {
+                    kind: TokenKind::Eof,
+                    span: TokenSpan::new(
+                        id,
+                        SourceRange {
+                            offset: self.table.last().utf16_offset,
+                            length: 0,
+                        },
+                    ),
+                    is_synthetic: true,
                 }
             }
         }
@@ -436,7 +429,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// Forward jump for the GFT type-variable pass: moves to a strictly
     /// later real token (queue must be empty). Paired with [`Self::reset`].
     pub(crate) fn jump_to(&mut self, id: TokenId) {
-        debug_assert!(self.head == QUEUE_EMPTY);
+        debug_assert_eq!(self.head, QUEUE_EMPTY);
         let target = id as usize;
         debug_assert!(target > self.pos && target < self.table.len());
         self.pos = target;
@@ -448,7 +441,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// first ([`Self::detach_queue`]) when a previous re-parse may have left
     /// split remainders pending.
     pub(crate) fn rewind_to(&mut self, id: TokenId) {
-        debug_assert!(self.head == QUEUE_EMPTY);
+        debug_assert_eq!(self.head, QUEUE_EMPTY);
         let target = id as usize;
         debug_assert!(target < self.table.len());
         self.pos = target;
@@ -522,7 +515,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// `expected_class_member` on the 0-width synthetic).
     pub(crate) fn hide(&mut self, id: TokenId) {
         debug_assert!(id as usize >= self.pos);
-        self.adopted.push(id as u32);
+        self.adopted.push(id);
         self.skip_adopted();
     }
 

@@ -12,6 +12,7 @@
 //! half-open, so the last token of the official End extent is the token just
 //! below `end_token`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind, TokenTable};
 
 use crate::TokenRef;

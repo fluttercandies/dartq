@@ -35,6 +35,7 @@
 //!   `error_detection_helpers.dart:260-289`) — the
 //!   `InferredTypeTest/test_mapLiterals` family here, green.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 

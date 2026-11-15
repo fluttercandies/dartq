@@ -8,6 +8,7 @@
 //! static field's bare-name read the same way (#2335 — the official read
 //! credit precedes its static early-return).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

@@ -7,6 +7,10 @@
 //! `p?` produced the nullable leaf (wrongly killing a following
 //! `case null:`) and `p!` dropped the null side (wrongly keeping later
 //! cases live).
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 
 use std::path::Path;
 
@@ -23,7 +27,7 @@ const CORE_FACE: &[&str] = &["Object", "bool", "double", "int", "String", "Null"
 /// Runs `source` through the live pipeline (the corpus posture: language
 /// 3.13, a standalone library over the synthetic core face) and returns
 /// the whole fold.
-fn unit_fold<'s>(source: &'s str, strings: &StringTable) -> UnitFold {
+fn unit_fold(source: &str, strings: &StringTable) -> UnitFold {
     let mut files = FileTable::new();
     let file = files.intern(Path::new("main.dart"));
     let set = FeatureSet::for_language_version(LanguageVersion::new(3, 13));
@@ -92,7 +96,7 @@ fn switch_rows(fold: &UnitFold) -> Vec<(&'static str, u32)> {
     fold.report
         .diagnostics
         .iter()
-        .filter_map(|d| match d.code.name.as_ref() {
+        .filter_map(|d| match d.code.name {
             "unreachable_switch_case" => Some(("unreachable_switch_case", d.range.offset)),
             "dead_code" => Some(("dead_code", d.range.offset)),
             _ => None,
@@ -117,7 +121,7 @@ void f(Box? x) {
   }
 }
 ";
-    let mut strings = StringTable::default();
+    let strings = StringTable::default();
     let fold = unit_fold(source, &strings);
     assert!(
         switch_rows(&fold).is_empty(),
@@ -151,7 +155,7 @@ void f(int? x) {
     let case_null = source.find("case null").unwrap() as u32;
     let case_one = source.find("case 1").unwrap() as u32;
     let case_two = source.find("case 2").unwrap() as u32;
-    let mut strings = StringTable::default();
+    let strings = StringTable::default();
     let fold = unit_fold(source, &strings);
     let rows = switch_rows(&fold);
     let offsets: Vec<u32> = rows.iter().map(|(_, off)| *off).collect();
@@ -183,7 +187,7 @@ void f(Object? x) {
   }
 }
 ";
-    let mut strings = StringTable::default();
+    let strings = StringTable::default();
     let fold = unit_fold(source, &strings);
     assert!(
         switch_rows(&fold).is_empty(),
@@ -208,7 +212,7 @@ void f(int? x) {
   }
 }
 ";
-    let mut strings = StringTable::default();
+    let strings = StringTable::default();
     let fold = unit_fold(source, &strings);
     assert!(
         switch_rows(&fold).is_empty(),
@@ -231,7 +235,7 @@ void f(int? x) {
   }
 }
 ";
-    let mut strings = StringTable::default();
+    let strings = StringTable::default();
     let fold = unit_fold(source, &strings);
     assert!(
         switch_rows(&fold).is_empty(),
@@ -257,7 +261,7 @@ void f(int x) {
 ";
     let case_check = source.find("case var y?").unwrap() as u32;
     let case_null = source.find("case null").unwrap() as u32;
-    let mut strings = StringTable::default();
+    let strings = StringTable::default();
     let fold = unit_fold(source, &strings);
     let rows = switch_rows(&fold);
     let offsets: Vec<u32> = rows.iter().map(|(_, off)| *off).collect();
@@ -288,7 +292,7 @@ void f(Box b) {
   }
 }
 ";
-    let mut strings = StringTable::default();
+    let strings = StringTable::default();
     let fold = unit_fold(source, &strings);
     assert!(
         switch_rows(&fold).is_empty(),

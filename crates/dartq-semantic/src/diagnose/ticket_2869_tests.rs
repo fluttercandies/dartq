@@ -8,6 +8,7 @@
 //! unresolvable argument or bound reads `DynamicType`/null upstream —
 //! the erroneous-type suppression, never a mismatch.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -27,12 +28,12 @@ fn at(source: &str, needle: &str) -> u32 {
 }
 
 /// The generic top-level function send
-/// (TypeArgumentNotMatchingBoundsTest/test_methodInvocation_topLevelFunction):
+/// (`TypeArgumentNotMatchingBoundsTest/test_methodInvocation_topLevelFunction)`:
 /// `f<String>()` violates `T extends num` and reports at the written
 /// argument.
 #[test]
 fn generic_function_send_bad_type_argument_reports_at_the_argument() {
-    let source = r#"
+    let source = r"
 class Point<T extends num> {
   Point(T x, T y);
 }
@@ -42,7 +43,7 @@ Point<T> f<T extends num>(T x, T y) {
 main() {
   f<String>('hello', 'world');
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -57,19 +58,19 @@ main() {
 }
 
 /// The unnamed creation
-/// (TypeArgumentNotMatchingBoundsTest/test_new_superTypeOfUpperBound
+/// (`TypeArgumentNotMatchingBoundsTest/test_new_superTypeOfUpperBound`
 /// family): `G<A>()` violates `E extends B` — the creation's explicit
 /// arguments check exactly like a send's.
 #[test]
 fn unnamed_creation_bad_type_argument_reports() {
-    let source = r#"
+    let source = r"
 class A {}
 class B {}
 class G<E extends B> {}
 main() {
   G<A>();
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -83,13 +84,13 @@ main() {
     );
 }
 
-/// The type-alias creation (ConstructorReferenceResolutionTest_TypeArgs/
-/// test_alias_genericWithBound_unnamed_badBound family): the ALIAS's own
+/// The type-alias creation (`ConstructorReferenceResolutionTest_TypeArgs`/
+/// `test_alias_genericWithBound_unnamed_badBound` family): the ALIAS's own
 /// parameter bounds decide (`checkNamedType` reads
 /// `alias.element.typeParameters` on the alias application).
 #[test]
 fn type_alias_creation_checks_the_alias_bounds() {
-    let source = r#"
+    let source = r"
 class A<T> {
   A();
 }
@@ -97,7 +98,7 @@ typedef TA<T extends num> = A<T>;
 main() {
   TA<String>();
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -116,12 +117,12 @@ main() {
 /// the written pairs), so `List<String>` violates `List<int>`.
 #[test]
 fn compound_bound_substitutes_the_written_arguments() {
-    let source = r#"
+    let source = r"
 void f<T, U extends List<T>>(T t, U u) {}
 main() {
   f<int, List<String>>(0, []);
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),
@@ -142,14 +143,14 @@ main() {
 /// `undefined_class` here, never a bounds mismatch.
 #[test]
 fn unresolvable_argument_or_bound_suppresses() {
-    let source = r#"
+    let source = r"
 class C<T extends Missing> {}
 void f<T extends num>(T x) {}
 main() {
   C<String>();
   f<AlsoMissing>(0);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
@@ -161,12 +162,12 @@ main() {
 /// written `dynamic` argument's own span).
 #[test]
 fn dynamic_argument_satisfies_any_bound() {
-    let source = r#"
+    let source = r"
 void f<T extends num>(T x) {}
 main() {
   f<dynamic>(0);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = bounds_rows(&report);
     assert_eq!(rows.len(), 1, "{rows:?}");
@@ -180,8 +181,8 @@ main() {
 }
 
 /// The satisfying generic-function-type argument
-/// (TypeArgumentNotMatchingBoundsTest/
-/// test_methodInvocation_genericFunctionTypeArgument_match): `F` unfolds
+/// (`TypeArgumentNotMatchingBoundsTest`/
+/// `test_methodInvocation_genericFunctionTypeArgument_match)`: `F` unfolds
 /// to `void Function<T extends num>()`, whose parameter bound equals the
 /// target's per `relateTypeParameters` (`fn_sig_subtype`'s positional
 /// unification) — the invocation face stays silent. The declaring
@@ -191,32 +192,32 @@ main() {
 /// (#2897 — the stolen `[(X, num)]` window made this fire against `num`).
 #[test]
 fn generic_function_type_argument_matching_bound_stays_silent() {
-    let source = r#"
+    let source = r"
 typedef F = void Function<T extends num>();
 void f<T extends void Function<X extends num>()>() {}
 void g() {
   f<F>();
 }
-"#;
+";
     let report = report_ops(source);
     assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
 
 /// The explicit extension override with a violating type argument
-/// (TypeArgumentNotMatchingBoundsTest/
-/// test_extensionOverride_hasTypeArguments_call): the written arguments
+/// (`TypeArgumentNotMatchingBoundsTest`/
+/// `test_extensionOverride_hasTypeArguments_call)`: the written arguments
 /// check against the extension's declared bounds exactly like a send's,
 /// the report anchored at the offending argument.
 #[test]
 fn extension_override_bad_type_argument_reports_at_the_argument() {
-    let source = r#"
+    let source = r"
 extension E<T extends num> on int {
   void call() {}
 }
 void f() {
   E<String>(0)();
 }
-"#;
+";
     let report = report_ops(source);
     assert_eq!(
         bounds_rows(&report),

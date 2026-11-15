@@ -18,6 +18,7 @@
 //! both conditional operands — plus the negative: with no context the
 //! creation stays `LinkedHashSet<dynamic>`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 use crate::diagnose::types::FileReport;
 

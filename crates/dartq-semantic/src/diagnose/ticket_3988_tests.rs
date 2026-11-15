@@ -23,6 +23,7 @@
 //! Oracle rows below were captured against `dart analyze --format
 //! machine` 3.13.7.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 use super::*;
 

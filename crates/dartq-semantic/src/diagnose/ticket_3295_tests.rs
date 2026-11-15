@@ -29,6 +29,7 @@
 //! this file was written; the residuals the probe exposed are recorded in
 //! the ticket, not pinned here.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, report_ops_wildcards};
 
 /// The messages of `report`'s rows carrying `code`, in emission order.
@@ -124,7 +125,7 @@ fn index_read_and_write_are_distinct_spellings() {
 
 /// An applicable extension declaring the spelling rescues the member miss:
 /// the implicit-application face resolves user operators
-/// (extension_member_resolver.dart's `getExtension` + the `[]` lookup).
+/// (`extension_member_resolver.dart`'s `getExtension` + the `[]` lookup).
 #[test]
 fn extension_operator_rescues_the_member_miss() {
     let report = report_ops(

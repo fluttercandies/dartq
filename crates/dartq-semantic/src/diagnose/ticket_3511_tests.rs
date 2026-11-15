@@ -22,6 +22,7 @@
 //! `engine_core.rs` (`fn_sig_ty`/`fn_face_sig`), outside this ticket's
 //! file set.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 

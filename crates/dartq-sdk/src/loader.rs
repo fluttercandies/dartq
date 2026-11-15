@@ -5,6 +5,7 @@
 //! `allowed_experiments.json` → optional `_embedder.yaml` (the
 //! full-replacement table of an embedder package) → canonical id.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
@@ -62,7 +63,7 @@ impl SdkSnapshot {
     ) -> Result<SdkSnapshot, SdkError> {
         let named = dart_sdk_root.to_path_buf();
         let dart_sdk_root = crate::locate::dart_sdk_root(dart_sdk_root)
-            .ok_or_else(|| SdkError::NotASdkRoot { path: named })?;
+            .ok_or(SdkError::NotASdkRoot { path: named })?;
         let version_path = dart_sdk_root.join("version");
         let version_text = read_required(&version_path)?;
         let version = version_text.trim();
@@ -146,7 +147,7 @@ impl SdkSnapshot {
             platform_metadata,
             language_metadata,
             embedder,
-            dart_sdk_root: dart_sdk_root.to_path_buf(),
+            dart_sdk_root: dart_sdk_root.clone(),
         })
     }
 }

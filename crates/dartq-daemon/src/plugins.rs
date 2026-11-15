@@ -67,9 +67,10 @@
 //!   engine output face's concern, exactly as it is for the pre-T5 plugin
 //!   findings path.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use dartq_commands::SCHEMA_VERSION;
 use dartq_commands::fix::{DeclaredPlugin, declared_plugin_sources, plugin_package_config};
@@ -1338,6 +1339,7 @@ mod query_server_tests {
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::Duration;
 
     use dartq_diagnostics::{
         CodeInfo, DARTQ_PLUGIN_CRASHED, DiagnosticType, Severity as EngineSeverity, SourceRange,

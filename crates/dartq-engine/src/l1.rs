@@ -2,6 +2,7 @@
 //! identity-keyed library-graph delta → cascade closure
 //!.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::Arc;
 
 use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, Severity};
@@ -61,7 +62,7 @@ pub(crate) struct ApplyOutcome {
     /// satisfies a previously missing target; a removed file un-resolves
     /// one). Their content is untouched — only `target`/`code` columns and
     /// the URI diagnostic tail moved — so they join the structure gate's
-    /// refresh input (a target FileId flip, e.g. the generated-file
+    /// refresh input (a target `FileId` flip, e.g. the generated-file
     /// fallback, moves the folded digest face; a pure code flip digests
     /// equal).
     pub relinked: Vec<FileId>,
@@ -731,9 +732,10 @@ fn recompute_facts(
     changed
         .iter()
         .zip(slots)
-        .filter_map(|((file, _, _), slot)| match slot {
-            Some((facts, cache_hit, capture)) => Some((*file, facts, cache_hit, capture)),
-            None => {
+        .filter_map(|((file, _, _), slot)| {
+            if let Some((facts, cache_hit, capture)) = slot {
+                Some((*file, facts, cache_hit, capture))
+            } else {
                 // The classification pass routed every index to exactly one
                 // bucket and every bucket's fill pass covers its own slots,
                 // so `None` is only-on-bug. Degrade: the file skips this
@@ -1965,7 +1967,7 @@ pub(crate) fn extract_directives(
 /// (the whole literal region, interpolation pieces included — the shapeless
 /// face still anchors there, the oracle reporting
 /// `uriWithInterpolation.at(directive.uri)`, the URI node's
-/// beginToken..endToken, library_analyzer.dart:732/:993/:1031), and the index
+/// beginToken..endToken, `library_analyzer.dart:732/:993/:1031`), and the index
 /// just past the literal region.
 ///
 /// A literal with no string token at all is NOT the interpolation face: the
@@ -2079,7 +2081,7 @@ fn skip_interpolation_chain(tokens: &TokenTable, mut j: usize) -> usize {
 
 /// The whole-literal UTF-16 span from token `start` through token `end - 1`
 /// — the URI node's beginToken..endToken, the anchor every shapeless
-/// (interpolated) face reports at (library_analyzer.dart:732/:993/:1031).
+/// (interpolated) face reports at (`library_analyzer.dart:732/:993/:1031`).
 fn whole_literal_span(text: &str, tokens: &TokenTable, start: usize, end: usize) -> SourceRange {
     let head = tokens.get(start).expect("start token exists");
     let last = end - 1;
@@ -2241,7 +2243,7 @@ fn skip_annotation(tokens: &TokenTable, mut i: usize) -> usize {
 /// Returns the joined spelling and the index just past the `;`.
 ///
 /// The grammar is `qualified: identifier qualifiedRest*` with
-/// `qualifiedRest: '.' identifier` (parser_impl.dart `parseQualified`
+/// `qualifiedRest: '.' identifier` (`parser_impl.dart` `parseQualified`
 /// :2525-2535 / `parseQualifiedRest` :2558-2566), so a segment continues
 /// the name only across a `.`. Both callers — `parseLibraryName`
 /// (:907-925) and `parsePartOf` (:1315-1334) — then end on
@@ -2665,13 +2667,12 @@ fn walk_conditional_uri(
         // branch literal when the declared map hits it. The placeholder
         // `uri` is never read: `selected_uri` consults the interpolated
         // index column first.
-        match uri {
-            Some(uri) => configurations.push(Configuration::new(&name, value.as_deref(), &uri)),
-            None => {
-                interpolated_configurations
-                    .push(u32::try_from(configurations.len()).unwrap_or(u32::MAX));
-                configurations.push(Configuration::new(&name, value.as_deref(), ""));
-            }
+        if let Some(uri) = uri {
+            configurations.push(Configuration::new(&name, value.as_deref(), &uri))
+        } else {
+            interpolated_configurations
+                .push(u32::try_from(configurations.len()).unwrap_or(u32::MAX));
+            configurations.push(Configuration::new(&name, value.as_deref(), ""));
         }
         configuration_spans.push(span);
     }
@@ -4124,7 +4125,7 @@ pub(crate) fn declared_library_name(facts: &UnitFacts) -> Option<&str> {
 ///   layer links a name-matched part into EVERY matching library (upstream
 ///   Dart SDK source, pkg/analyzer/lib/src/dart/element/element.dart
 ///   `PartIncludeWithFile.includedPart` is per-library `isPartOf`, linked
-///   per library by library_analyzer.dart `_buildPartInclude`) — the
+///   per library by `library_analyzer.dart` `_buildPartInclude`) — the
 ///   path-smallest winner only picks the attribution owner, never an
 ///   exclusive membership.
 /// * URI form — the part file's own `part of` URI must resolve back to the
@@ -4587,7 +4588,7 @@ pub(crate) mod tests {
     /// matching library — upstream Dart SDK source,
     /// pkg/analyzer/lib/src/dart/element/element.dart
     /// `PartIncludeWithFile.includedPart`, linked per library by
-    /// library_analyzer.dart `_buildPartInclude`), so each library's
+    /// `library_analyzer.dart` `_buildPartInclude`), so each library's
     /// namespace sees the part's members. The attribution ownership entry
     /// stays the path-smallest claimant's.
     #[test]
@@ -4637,7 +4638,7 @@ pub(crate) mod tests {
     }
 
     /// Nested `part of` chains join transitively in the oracle's unit order
-    /// (#2883, the application_order_A01_t02 corpus shape): the member set is
+    /// (#2883, the `application_order_A01_t02` corpus shape): the member set is
     /// the depth-first pre-order over part includes (upstream
     /// `LibraryFileKind.fileKinds`) — a part's own part subtree lands before
     /// the next sibling — in written directive order even when path bytes

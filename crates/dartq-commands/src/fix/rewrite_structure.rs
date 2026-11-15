@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    FixInput, FxHashSet, Keyword, TokenKind, TokenTable, angle_group_end, angle_group_start,
+    byte_line_starts, cut_line, depth0_find, drop_enclosing_const, eol_of, hit_tokens, kind_of,
+    line_start_before, matching_begin, member_block_start, remove_override_member, slice16,
+    span_over, token_end, token_starting_at, token_text, utf16_count, utf16_end,
+    utf16_offset_to_byte, word_at,
+};
 
 /// `unawaited_futures`: `await ` lands at the reported expression
 /// statement's head — the official `AddAwait.unawaited` arm (`await ` at
@@ -292,10 +298,10 @@ pub(crate) fn expression_function_body(input: &FixInput<'_>) -> Option<(u32, u32
     // The modifier words sit immediately before `{` — `async`, `sync`, or
     // either plus `*` (a generator never converts). They ride the parent's
     // payload outside the replaced span and stay put.
-    if let Some(prev) = brace.checked_sub(1) {
-        if kind_of(tokens, prev) == Some(TokenKind::Star) {
-            return None; // `sync*`/`async*` — the official generator bail
-        }
+    if let Some(prev) = brace.checked_sub(1)
+        && kind_of(tokens, prev) == Some(TokenKind::Star)
+    {
+        return None; // `sync*`/`async*` — the official generator bail
     }
     let close = tokens.matching_end(brace)?;
     // One statement inside: `return e;` or `e;` (the producer's
@@ -393,8 +399,7 @@ pub(crate) fn token_end_byte(tokens: &TokenTable, index: usize) -> usize {
 pub(crate) fn trivia_text(text: &str, byte_at: usize, tokens: &TokenTable, next: usize) -> String {
     let end = tokens
         .get(next)
-        .map(|t| t.byte_offset as usize)
-        .unwrap_or(text.len());
+        .map_or(text.len(), |t| t.byte_offset as usize);
     let slice = text.get(byte_at..end).unwrap_or("");
     let mut out = String::new();
     let bytes = slice.as_bytes();
@@ -567,7 +572,7 @@ pub(crate) fn utf16_span_between(
     first: usize,
     last: usize,
 ) -> core::ops::Range<u32> {
-    let start = tokens.get(first).map(|t| t.utf16_offset).unwrap_or(0);
+    let start = tokens.get(first).map_or(0, |t| t.utf16_offset);
     let end = last
         .checked_sub(1)
         .and_then(|i| utf16_end(tokens, text, i))
@@ -614,7 +619,7 @@ pub(crate) fn required_named_parameters_first(input: &FixInput<'_>) -> Option<(u
         match kind_of(tokens, index)? {
             TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => d += 1,
             TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
-                d = d.checked_sub(1)?
+                d = d.checked_sub(1)?;
             }
             TokenKind::Comma if d == 0 => {
                 bounds.push((start, index));
@@ -656,13 +661,13 @@ pub(crate) fn required_named_parameters_first(input: &FixInput<'_>) -> Option<(u
                         kind_of(tokens, j),
                         Some(TokenKind::Identifier | TokenKind::Period | TokenKind::Keyword(_))
                     ) && token_end_byte(tokens, j - 1)
-                        == tokens.get(j).map(|t| t.byte_offset as usize).unwrap_or(0)
+                        == tokens.get(j).map_or(0, |t| t.byte_offset as usize)
                     {
                         j += 1;
                     }
                     if kind_of(tokens, j) == Some(TokenKind::OpenParen)
                         && token_end_byte(tokens, j - 1)
-                            == tokens.get(j).map(|t| t.byte_offset as usize).unwrap_or(0)
+                            == tokens.get(j).map_or(0, |t| t.byte_offset as usize)
                     {
                         j = tokens.matching_end(j)? + 1;
                     }
@@ -759,16 +764,12 @@ pub(crate) fn required_named_parameters_first(input: &FixInput<'_>) -> Option<(u
 /// The raw source text of a token-index range (comments and trivia
 /// preserved verbatim).
 pub(crate) fn segment_text(text: &str, tokens: &TokenTable, range: (usize, usize)) -> String {
-    let start = tokens
-        .get(range.0)
-        .map(|t| t.byte_offset as usize)
-        .unwrap_or(0);
+    let start = tokens.get(range.0).map_or(0, |t| t.byte_offset as usize);
     let end = range
         .1
         .checked_sub(1)
         .and_then(|i| tokens.get(i))
-        .map(|t| token_end(t))
-        .unwrap_or(start);
+        .map_or(start, token_end);
     text.get(start..end).unwrap_or("").to_owned()
 }
 
@@ -934,8 +935,7 @@ pub(crate) fn constructor_first(input: &FixInput<'_>) -> Option<(u32, u32, Strin
         let next_line = after
             .split('\n')
             .nth(1)
-            .map(|s| s.trim().is_empty())
-            .unwrap_or(false);
+            .is_some_and(|s| s.trim().is_empty());
         line_rest.trim().is_empty() && next_line
     };
     let blank_sep = if had_blank && !already_blank_after {
@@ -975,15 +975,12 @@ pub(crate) fn is_enum_body(tokens: &TokenTable, open: usize) -> bool {
 
 /// A member's first-token byte offset.
 pub(crate) fn member_start_byte(_text: &str, tokens: &TokenTable, index: usize) -> usize {
-    tokens
-        .get(index)
-        .map(|t| t.byte_offset as usize)
-        .unwrap_or(0)
+    tokens.get(index).map_or(0, |t| t.byte_offset as usize)
 }
 
 /// A member's last-token byte end.
 pub(crate) fn member_end_byte(_text: &str, tokens: &TokenTable, index: usize) -> usize {
-    tokens.get(index).map(token_end).unwrap_or(0)
+    tokens.get(index).map_or(0, token_end)
 }
 
 /// `sort_unnamed_constructors_first`: the reported unnamed/`new`
@@ -1174,25 +1171,22 @@ pub(crate) fn field_public(input: &FixInput<'_>) -> Option<(u32, u32, String)> {
     // parameter of the class's primary-constructor head (upstream Dart SDK
     // source, pkg/analysis_server/lib/src/services/correction/dart/
     // make_field_public.dart:73-77,160-175).
-    let (name_byte, name_end) = match field_idx {
-        Some(field_idx) => {
-            let f = members[field_idx];
-            let name_tok = (f.0..f.1).find(|&i| {
-                matches!(kind_of(tokens, i), Some(TokenKind::Identifier))
-                    && tokens.lexeme(text, i) == field_name
-                    && matches!(
-                        kind_of(tokens, i + 1),
-                        Some(TokenKind::Semicolon | TokenKind::Eq | TokenKind::Comma)
-                    )
-            })?;
-            let start = tokens.get(name_tok)?.byte_offset as usize;
-            (start, start + field_name.len())
-        }
-        None => {
-            let name_tok = primary_ctor_declaring_param(tokens, text, body_open, &field_name)?;
-            let start = tokens.get(name_tok)?.byte_offset as usize;
-            (start, start + field_name.len())
-        }
+    let (name_byte, name_end) = if let Some(field_idx) = field_idx {
+        let f = members[field_idx];
+        let name_tok = (f.0..f.1).find(|&i| {
+            matches!(kind_of(tokens, i), Some(TokenKind::Identifier))
+                && tokens.lexeme(text, i) == field_name
+                && matches!(
+                    kind_of(tokens, i + 1),
+                    Some(TokenKind::Semicolon | TokenKind::Eq | TokenKind::Comma)
+                )
+        })?;
+        let start = tokens.get(name_tok)?.byte_offset as usize;
+        (start, start + field_name.len())
+    } else {
+        let name_tok = primary_ctor_declaring_param(tokens, text, body_open, &field_name)?;
+        let start = tokens.get(name_tok)?.byte_offset as usize;
+        (start, start + field_name.len())
     };
     // The official `_deleteMembers` runs over member indices: a contiguous
     // removed run at index 0 deletes `[members[0].start, members[upper+1].start)`
@@ -1409,7 +1403,7 @@ pub(crate) fn primary_ctor_declaring_param(
                 seg_start = cursor + 1;
             }
             TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly | TokenKind::Lt => {
-                depth += 1
+                depth += 1;
             }
             TokenKind::CloseParen
             | TokenKind::CloseSquare
@@ -1657,8 +1651,8 @@ pub(crate) fn cascade_operator(
     }
     // The statement's last token (before `;` — `e` is the `;` index).
     let last = e.checked_sub(1)?;
-    let selector_name;
-    match kind_of(tokens, last)? {
+
+    let selector_name = match kind_of(tokens, last)? {
         TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
             // `recv.sel(args)` / `recv[…].sel(…)` — the selector name is
             // the identifier right before the matching open of the last
@@ -1670,7 +1664,7 @@ pub(crate) fn cascade_operator(
                 let lt = angle_group_start(tokens, name)?;
                 name = lt.checked_sub(1)?;
             }
-            selector_name = name;
+            name
         }
         _ => {
             // `recv.sel = v` / `recv.sel` — scan back over the `=` tail to
@@ -1720,9 +1714,9 @@ pub(crate) fn cascade_operator(
                     }
                 }
             }
-            selector_name = name;
+            name
         }
-    }
+    };
     // The operator is the `.`-family token right before the selector name.
     let op = selector_name.checked_sub(1)?;
     match kind_of(tokens, op)? {
@@ -1792,14 +1786,11 @@ pub(crate) fn inline_typedef(input: &FixInput<'_>) -> Option<(u32, u32, String)>
         while interp_ends.last().is_some_and(|&end| i >= end) {
             interp_ends.pop();
         }
-        match kind_of(tokens, i) {
-            Some(TokenKind::StringInterpolationExpression) => {
-                if let Some(end) = tokens.matching_end(i) {
-                    interp_ends.push(end);
-                }
-                continue;
+        if let Some(TokenKind::StringInterpolationExpression) = kind_of(tokens, i) {
+            if let Some(end) = tokens.matching_end(i) {
+                interp_ends.push(end);
             }
-            _ => {}
+            continue;
         }
         if !interp_ends.is_empty() || (i >= typedef_kw && i <= decl_end) {
             continue;
@@ -2090,20 +2081,24 @@ pub(crate) fn variable_list_head(
         && let Some(prev) = start.checked_sub(1)
         && matches!(
             kind_of(tokens, prev),
-            Some(TokenKind::Keyword(
-                Keyword::Return
-                    | Keyword::Case
-                    | Keyword::In
-                    | Keyword::Is
-                    | Keyword::As
-                    | Keyword::Throw
-                    | Keyword::Extends
-                    | Keyword::Implements
-                    | Keyword::With
-                    | Keyword::On
-                    | Keyword::Import
-                    | Keyword::Export
-            )) | Some(TokenKind::Semicolon | TokenKind::Comma | TokenKind::Eq)
+            Some(
+                TokenKind::Keyword(
+                    Keyword::Return
+                        | Keyword::Case
+                        | Keyword::In
+                        | Keyword::Is
+                        | Keyword::As
+                        | Keyword::Throw
+                        | Keyword::Extends
+                        | Keyword::Implements
+                        | Keyword::With
+                        | Keyword::On
+                        | Keyword::Import
+                        | Keyword::Export
+                ) | TokenKind::Semicolon
+                    | TokenKind::Comma
+                    | TokenKind::Eq
+            )
         )
     {
         type_run_start = None;
@@ -2218,9 +2213,10 @@ pub(crate) fn drop_head_const_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u3
     // back when the report opens inside the creation (`const <T>[` — the
     // report's head can be the `<`).
     let _ = (head, type_head);
-    let expr_head = match kind_of(tokens, first)? {
-        TokenKind::Keyword(Keyword::Const | Keyword::New) => first,
-        _ => {
+    let expr_head =
+        if let TokenKind::Keyword(Keyword::Const | Keyword::New) = kind_of(tokens, first)? {
+            first
+        } else {
             let mut head = first;
             loop {
                 match kind_of(tokens, head.checked_sub(1)?)? {
@@ -2238,26 +2234,22 @@ pub(crate) fn drop_head_const_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u3
                 }
             }
             head
-        }
-    };
-    match kind_of(tokens, expr_head)? {
-        TokenKind::Keyword(Keyword::Const | Keyword::New) => {
-            // `startStart(keyword, keyword.next!)` — the trivia run
-            // between two real tokens rides (comments included).
-            let start = tokens.get(expr_head)?.utf16_offset;
-            let end = tokens.get(expr_head + 1)?.utf16_offset;
-            Some(vec![(start, end.checked_sub(start)?, String::new())])
-        }
-        _ => {
-            let prev = expr_head.checked_sub(1)?;
-            match kind_of(tokens, prev)? {
-                TokenKind::Keyword(Keyword::Const | Keyword::New) => {
-                    let start = tokens.get(prev)?.utf16_offset;
-                    let end = tokens.get(expr_head)?.utf16_offset;
-                    Some(vec![(start, end.checked_sub(start)?, String::new())])
-                }
-                _ => None,
+        };
+    if let TokenKind::Keyword(Keyword::Const | Keyword::New) = kind_of(tokens, expr_head)? {
+        // `startStart(keyword, keyword.next!)` — the trivia run
+        // between two real tokens rides (comments included).
+        let start = tokens.get(expr_head)?.utf16_offset;
+        let end = tokens.get(expr_head + 1)?.utf16_offset;
+        Some(vec![(start, end.checked_sub(start)?, String::new())])
+    } else {
+        let prev = expr_head.checked_sub(1)?;
+        match kind_of(tokens, prev)? {
+            TokenKind::Keyword(Keyword::Const | Keyword::New) => {
+                let start = tokens.get(prev)?.utf16_offset;
+                let end = tokens.get(expr_head)?.utf16_offset;
+                Some(vec![(start, end.checked_sub(start)?, String::new())])
             }
+            _ => None,
         }
     }
 }
@@ -2272,7 +2264,7 @@ pub(crate) fn drop_head_const_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u3
 /// token upstream's `constantContext` would resolve — both rewriters
 /// answer `None` there and the row stays silent rather than fabricate.
 /// Upstream's `ExpressionImpl → constantContext` dispatch and the
-/// `SourceRange(offset, length + 1)` CompilationUnit arm read resolved
+/// `SourceRange(offset, length + 1)` `CompilationUnit` arm read resolved
 /// nodes the fix pass does not carry and stay absent.
 pub(crate) fn invalid_const_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
     // The declaration-list arm first — a `const`/`final` keyword heading
@@ -2513,10 +2505,10 @@ pub(crate) fn constructor_params_list(tokens: &TokenTable, at: usize) -> Option<
 /// depth-0 declarator list contains `name` (a `T x = e, y` group reports
 /// each declarator). The `name` token must be a declarator head —
 /// followed at its own level by `=`, `,`, or `;`.
-pub(crate) fn field_member_named<'m>(
+pub(crate) fn field_member_named(
     tokens: &TokenTable,
     text: &str,
-    members: &'m [(usize, usize)],
+    members: &[(usize, usize)],
     name: &str,
 ) -> Option<((usize, usize), usize)> {
     for &member in members {
@@ -2836,9 +2828,9 @@ pub(crate) fn convert_to_init_formal_entry(
     // `range.deletionRange(type)` cut covers the type plus its trailing
     // trivia run).
     let replacement = format!("this.{field_name}");
-    let param_type = (type_start < param_name_tok).then(|| (type_start, param_name_tok));
+    let param_type = (type_start < param_name_tok).then_some((type_start, param_name_tok));
     let field_type =
-        (field_type_start < field_name_tok).then(|| (field_type_start, field_name_tok));
+        (field_type_start < field_name_tok).then_some((field_type_start, field_name_tok));
     let same_type = match (param_type, field_type) {
         (Some((ps, pe)), Some((fs, fe))) => {
             let p_text = span_over(text, tokens, ps, pe - 1)?;
@@ -3065,7 +3057,7 @@ pub(crate) fn convert_to_declaring_param_entry(
         {
             cursor += 1;
         }
-        (cursor < field_name_tok).then(|| (cursor, field_name_tok))
+        (cursor < field_name_tok).then_some((cursor, field_name_tok))
     };
     // The field's declarator is single — the upstream's own lines-range
     // face; a multi-declarator list is out of the bounded face.
@@ -3260,15 +3252,14 @@ pub(crate) fn convert_to_declaring_param_entry(
                     let start = tokens.get(colon)?.utf16_offset;
                     let end = tokens.get(body_tok)?.utf16_offset;
                     edits.push((start, end - start, String::new()));
-                } else if let Some(index) = entries.iter().position(|&(s, e)| {
-                    (s..e).any(|i| {
-                        let lexeme = tokens.lexeme(text, i);
-                        lexeme == name || lexeme == format!("_{name}").as_str()
-                    })
-                }) {
-                    edits.push(node_in_list_cut(tokens, text, &entries, index)?);
                 } else {
-                    return None;
+                    let index = entries.iter().position(|&(s, e)| {
+                        (s..e).any(|i| {
+                            let lexeme = tokens.lexeme(text, i);
+                            lexeme == name || lexeme == format!("_{name}").as_str()
+                        })
+                    })?;
+                    edits.push(node_in_list_cut(tokens, text, &entries, index)?);
                 }
             }
         }
@@ -3622,8 +3613,7 @@ pub(crate) fn organize_directives_entry(input: &FixInput<'_>) -> Option<Vec<(u32
         let uri16 = (kw + 1..semi)
             .find(|&i| kind_of(tokens, i) == Some(TokenKind::String))
             .and_then(|i| tokens.get(i))
-            .map(|token| token.utf16_offset)
-            .unwrap_or(u32::MAX);
+            .map_or(u32::MAX, |token| token.utf16_offset);
         // The shown names the file flags `unused_shown_name` (imports only
         // — the official collection gates on `directive is ImportDirective`),
         // in written order: identifiers between a `show` keyword and the
@@ -3636,10 +3626,10 @@ pub(crate) fn organize_directives_entry(input: &FixInput<'_>) -> Option<Vec<(u32
                 match kind_of(tokens, i)? {
                     TokenKind::Keyword(Keyword::Show) => in_show = true,
                     TokenKind::Keyword(Keyword::Hide) => in_show = false,
-                    TokenKind::Identifier if in_show => {
-                        if unused_shown.contains(&tokens.get(i)?.utf16_offset) {
-                            flagged_shown.push(tokens.lexeme(text, i).to_owned());
-                        }
+                    TokenKind::Identifier
+                        if in_show && unused_shown.contains(&tokens.get(i)?.utf16_offset) =>
+                    {
+                        flagged_shown.push(tokens.lexeme(text, i).to_owned());
                     }
                     _ => {}
                 }
@@ -3836,7 +3826,7 @@ pub(crate) fn organize_doc_imports(
         let (start, end) = lines[index];
         let raw = &text[start..end];
         let body = if index + 1 == line_count {
-            raw.strip_suffix("*/").map(str::trim_end).unwrap_or(raw)
+            raw.strip_suffix("*/").map_or(raw, str::trim_end)
         } else {
             raw
         };
@@ -3917,7 +3907,7 @@ pub(crate) fn organize_doc_imports(
     doc_imports.sort_by(|a, b| {
         a.1.cmp(&b.1)
             .then_with(|| compare_directive_uri(&a.2, &b.2))
-            .then_with(|| a.3.cmp(&b.3))
+            .then_with(|| a.3.cmp(b.3))
     });
     // A blank comment line separates priority groups, styled by the first
     // sorted row (`docCommentLinePrefix`); a block comment uses the empty
@@ -4020,7 +4010,7 @@ pub(crate) fn doc_import_uri(rest: &str) -> Option<String> {
         }
         let quote = quote as char;
         let close = body[1..].find(quote)?;
-        uri.push_str(&body[1..1 + close]);
+        uri.push_str(&body[1..=close]);
         s = body[1 + close + 1..].trim_start();
         let next = s.strip_prefix('r').unwrap_or(s);
         if next.starts_with('\'') || next.starts_with('"') {

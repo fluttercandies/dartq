@@ -5,6 +5,7 @@
 //! tear-off-instantiation faces (`implicit_call_tearoffs`), and the
 //! `typesAreUnrelated` matrix (`unrelated_type_equality_checks`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_resolution::{LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};

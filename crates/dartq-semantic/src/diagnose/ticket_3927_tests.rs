@@ -15,6 +15,7 @@
 //!   `subst_params`'s `Ty::Function` arm keeps the written `<T extends
 //!   num>` group, which shadows the substitution map.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{code_names, report_ops, rows};
 

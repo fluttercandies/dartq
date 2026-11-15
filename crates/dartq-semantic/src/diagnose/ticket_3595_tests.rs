@@ -4,6 +4,7 @@
 //! from the later arguments, and a `dynamic`/non-null solution owes no
 //! unchecked verdict (the oracle's ground truth below).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 fn unchecked_present(report: &super::FileReport) -> bool {

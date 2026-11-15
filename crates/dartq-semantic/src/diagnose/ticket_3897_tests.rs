@@ -9,6 +9,7 @@
 //! Offsets are UTF-16; `at` shifts by [`CORE_PRELUDE`] because the rig
 //! carries the fixture behind it on one line. All fixtures are ASCII.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -47,12 +48,12 @@ fn at(source: &str, needle: &str) -> u32 {
 #[test]
 #[ignore = "held: the flatten head arm's one-level peel for `Future<Future<int>>` keeps producing `Future<int>` but the new superinterface walk's return type is wrong — oracle-verified `await f` types `Future<int>` so `Future<int> a = await f` is silent and `String bad = a` reports 'Future<int>'->'String'; re-verified 2026-11-05 vs oracle 3.13.7: still fails — `invalid_assignment` count is 2 where the oracle emits 1; owner engine_core.rs flatten_ty/flatten_param"]
 fn flatten_written_future_head_peels_one_level() {
-    let source = r#"
+    let source = r"
 void f(Future<Future<int>> f) async {
   Future<int> a = await f;
   String bad = a;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -72,7 +73,7 @@ void f(Future<Future<int>> f) async {
 #[test]
 #[ignore = "held: flatten_param (engine_core.rs:9074) never feeds the parameter's bound back through the superinterface walk — `X extends SubFuture` where `SubFuture implements Future<int>` should await to `int` via `_futureTypeOfBounded`; re-verified 2026-11-05 vs oracle 3.13.7: still fails — `await x` keeps `SubFuture` and emits invalid_assignment 'SubFuture'->'int' (2 rows where oracle emits 1); owner engine_core.rs lane V"]
 fn flatten_parameter_bound_derives_through_superinterface() {
-    let source = r#"
+    let source = r"
 class SubFuture implements Future<int> {
   SubFuture();
 }
@@ -80,11 +81,11 @@ void f<X extends SubFuture>(X x) async {
   int a = await x;
   String bad = a;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
-    assert_eq!(rows[0].0, at(source, "bad"), "{:#?}", rows);
+    assert_eq!(rows[0].0, at(source, "bad"), "{rows:#?}");
     assert!(
         rows[0].2.contains("'int'") && rows[0].2.contains("'String'"),
         "{}",
@@ -105,11 +106,11 @@ void f<X extends SubFuture>(X x) async {
 /// answered `double` and the `int` sink reported `'double'`→`'int'`.
 #[test]
 fn numeric_ladder_excludes_written_never_operand() {
-    let source = r#"
+    let source = r"
 void f(int i, Never n) {
   int x = i + n;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -125,11 +126,11 @@ void f(int i, Never n) {
 /// the `int` sink reports the `double` face.
 #[test]
 fn numeric_ladder_keeps_int_double_refinement() {
-    let source = r#"
+    let source = r"
 void f(int i) {
   int x = i + 1.5;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -153,18 +154,18 @@ void f(int i) {
 #[test]
 #[ignore = "held: the binary fold reads the declared operand type instead of the flow-promoted face — `visitBinaryExpression` upstream reads `node.leftOperand.staticType` through the branch's flow facts so `if (n is int) n + i` resolves on `int`, not `num`; re-verified 2026-11-05 vs oracle 3.13.7: still fails — `(n + i)` types `num` and reports `'num'->'double'` instead of `'int'->'double'`; owner the binary fold's promoted-operand read"]
 fn binary_fold_reads_promoted_operand() {
-    let source = r#"
+    let source = r"
 void f(num n, int i) {
   if (n is int) {
     var r = n + i;
     double d = r;
   }
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
-    assert_eq!(rows[0].0, at(source, "d = r"), "{:#?}", rows);
+    assert_eq!(rows[0].0, at(source, "d = r"), "{rows:#?}");
     assert!(
         rows[0].2.contains("'int'") && rows[0].2.contains("'double'"),
         "{}",
@@ -177,7 +178,7 @@ void f(num n, int i) {
 #[test]
 #[ignore = "held: same root as the left-operand pin — `n + m` where `m` is the promoted operand types `num` instead of `int` (the flow-promoted right operand never reaches the ladder); re-verified 2026-11-05 vs oracle 3.13.7: still fails — `(n + m)` types `num` and reports `'num'->'double'`; owner the binary fold's promoted-operand read"]
 fn binary_fold_reads_promoted_right_operand() {
-    let source = r#"
+    let source = r"
 void f(num i, int n) {
   if (n == 0) {
     num m = i;
@@ -187,7 +188,7 @@ void f(num i, int n) {
     }
   }
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -213,7 +214,7 @@ void f(num i, int n) {
 #[test]
 #[ignore = "held: the literal leaf faces join at `Object`/dynamic instead of the shared superinterface (`least_upper_bound.dart`) — `{1: 'x', 3.0: new RegExp('.')}` should bind `Map<num, Pattern>`: `int`/`double`->`num` on the keys and `String`/`RegExp`->`Pattern` on the values; re-verified 2026-11-05 vs oracle 3.13.7: still fails — the sink reports the wrong LUB pair; owner the literal leaf faces' superinterface join"]
 fn literal_leaf_faces_join_shared_superinterface() {
-    let source = r#"
+    let source = r"
 class Pattern {}
 class RegExp implements Pattern {
   RegExp(String source) {}
@@ -223,11 +224,11 @@ void f() {
   Map<num, Pattern> good = x;
   Map<int, String> bad = x;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
-    assert_eq!(rows[0].0, at(source, "bad = x"), "{:#?}", rows);
+    assert_eq!(rows[0].0, at(source, "bad = x"), "{rows:#?}");
     assert!(
         rows[0].2.contains("'Map<num, Pattern>'"),
         "expected the joined 'Map<num, Pattern>' face, got {}",
@@ -254,11 +255,11 @@ void f() {
 /// return reported `return_of_invalid_type` (the 4E face).
 #[test]
 fn conditional_async_return_types_context_not_lub() {
-    let source = r#"
+    let source = r"
 Future<int> f(bool x) async {
   return x ? 42 : Future.value(42);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_of(&report, "return_of_invalid_type").is_empty(),
@@ -271,11 +272,11 @@ Future<int> f(bool x) async {
 /// the same `FutureOr<int>` (the context arm walks the matching parens).
 #[test]
 fn conditional_parens_return_keeps_context() {
-    let source = r#"
+    let source = r"
 Future<int> f(bool x) async {
   return (x ? 42 : Future.value(42));
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         rows_of(&report, "return_of_invalid_type").is_empty(),
@@ -291,11 +292,11 @@ Future<int> f(bool x) async {
 #[test]
 #[ignore = "held: the conditional fold's return-context arm over-applies — when the context `int` fits only `42` but not `Future.value(42)`, `x ? 42 : Future.value(42)` should keep the plain `Object` LUB and the return should report `'Object'->'int'`; re-verified 2026-11-05 vs oracle 3.13.7: still fails — the sync return emits 0 `return_of_invalid_type` rows where the oracle reports 1; owner engine_core.rs conditional fold"]
 fn conditional_sync_return_keeps_lub() {
-    let source = r#"
+    let source = r"
 int f(bool x) {
   return x ? 42 : Future.value(42);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "return_of_invalid_type");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
@@ -313,12 +314,12 @@ int f(bool x) {
 #[test]
 #[ignore = "held: `var y = cond` carries no context and should bind the plain `Object` LUB of `x ? 42 : Future.value(42)` so `return y` reports `'Object'->'Future<int>'` — the fold binds nothing and the return stays silent; re-verified 2026-11-05 vs oracle 3.13.7: still fails — 0 `return_of_invalid_type` rows where the oracle reports 1; owner engine_core.rs conditional fold"]
 fn conditional_var_binding_joins_lub() {
-    let source = r#"
+    let source = r"
 Future<int> f(bool x) async {
   var y = x ? 42 : Future.value(42);
   return y;
 }
-"#;
+";
     let report = report_ops(source);
     let rows = rows_of(&report, "return_of_invalid_type");
     assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);

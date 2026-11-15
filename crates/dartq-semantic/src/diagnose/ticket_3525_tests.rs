@@ -35,6 +35,7 @@
 //! Each pin below names the corpus function it reproduces; a negative
 //! control proves the row still reports where the oracle does.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops, rows};
 
 /// The corpus `enum E` + four constant records the constant-pattern
@@ -341,8 +342,10 @@ fn null_wildcard_covers_null_space_over_nullable() {
         .diagnostics
         .iter()
         .find(|d| d.code.name == "unreachable_switch_case")
-        .map(|d| d.range.offset as usize)
-        .unwrap_or_else(|| panic!("no unreachable_switch_case row: {:#?}", rows(&report)));
+        .map_or_else(
+            || panic!("no unreachable_switch_case row: {:#?}", rows(&report)),
+            |d| d.range.offset as usize,
+        );
     let null_case = analyzed.find("case Null").unwrap();
     let int_case = analyzed.find("case int").unwrap();
     assert!(

@@ -1,14 +1,20 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::needless_range_loop,
+    clippy::unnecessary_debug_formatting,
+    clippy::many_single_char_names
+)]
 use crate::testsupport::{Fixture, one_rule};
 
-/// The #3776 shared-walk pins: `discarded_futures` and
-/// `unawaited_futures` oracle shapes through the production bridge
-/// (the semantic face mounted — both rules read it). Every pin cites
-/// the conformance row it mirrors (`conformance/expected.tsv`,
-/// extracted from the pinned `dart analyze` 3.13.7 oracle), so the
-/// conformance diff and the pin assert the same verdict.
+// The #3776 shared-walk pins: `discarded_futures` and
+// `unawaited_futures` oracle shapes through the production bridge
+// (the semantic face mounted — both rules read it). Every pin cites
+// the conformance row it mirrors (`conformance/expected.tsv`,
+// extracted from the pinned `dart analyze` 3.13.7 oracle), so the
+// conformance diff and the pin assert the same verdict.
 
-/// One report row as the oracle renders it: 1-based line, 1-based
-/// UTF-16 column, UTF-16 length.
+// One report row as the oracle renders it: 1-based line, 1-based
+// UTF-16 column, UTF-16 length.
 type Row = (u32, u32, u32);
 
 fn rows_of(source: &str, rule: &str) -> Vec<Row> {
@@ -25,8 +31,8 @@ fn rows_of(source: &str, rule: &str) -> Vec<Row> {
     rows
 }
 
-/// `test_instanceProperty_unawaited#0` — `INFO|unawaited_futures|
-/// lib/test.dart|3:5|1` — the `c.p;` statement reports at the property
+// `test_instanceProperty_unawaited#0` — `INFO|unawaited_futures|
+// lib/test.dart|3:5|1` — the `c.p;` statement reports at the property
 /// name, not at the zero-width close after `;` (the `NoArguments`
 /// tear-off send plus trailing `DotAccess` marker tiles: the marker's
 /// `Operator` word is the dot, the name is the token after it).

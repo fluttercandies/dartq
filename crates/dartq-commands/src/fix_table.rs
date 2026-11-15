@@ -105,7 +105,7 @@
 //! The [`FixAction::CreateFile`] family serves the one cross-file face the
 //! evidence proves: `uri_does_not_exist`, whose official producer
 //! (`CreateFile`, upstream Dart SDK source,
-//! pkg/analysis_server/lib/src/services/correction/dart/create_file.dart)
+//! `pkg/analysis_server/lib/src/services/correction/dart/create_file.dart`)
 //! creates the missing URI target — the import/export face born with the
 //! `// TODO Implement this library.` stub, the `part` face with the
 //! `part of '<library>';` head. The row re-verifies the shape the code
@@ -124,7 +124,7 @@
 //!
 //! The [`FixSource::Parser`] rows serve the engine's syntax diagnostics
 //! against the official non-lint fix registry (upstream Dart SDK source,
-//! pkg/analysis_server/lib/src/services/correction/fix_internal.dart):
+//! `pkg/analysis_server/lib/src/services/correction/fix_internal.dart)`:
 //! every parser code the registry serves with a mechanical producer has a
 //! row whose edit shape is that producer's — the modifier removals
 //! (`RemoveLexeme`), the keyword drops (`RemoveKeyword`, `RemoveConst`,
@@ -147,7 +147,7 @@
 //!
 //! The [`FixSource::Lint`] rows serve the lint face's mechanical producers
 //! (upstream Dart SDK source, keyed through the lint registry of
-//! fix_internal.dart): every row's edit shape is its official producer's,
+//! `fix_internal.dart)`: every row's edit shape is its official producer's,
 //! rebuilt from the diagnostic row's span, the token stream, and the
 //! surrounding text, and re-verified before the edit lands. The served
 //! families: annotation insertion, directive insertion and naming, the
@@ -220,6 +220,7 @@
 //! `ReplaceWithBrackets` face on a construct body (`while (x) ;` →
 //! `while (x) {}`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_diagnostics::Diagnostic;
 use dartq_scanner::TokenTable;
 use dartq_source::SourceRange;
@@ -2754,6 +2755,7 @@ pub fn synthesis_arm(code: &str) -> Option<SynthesisArm> {
 /// Runs a row's transform over `input` — the one place the action kinds
 /// execute. The data kinds run the shared shapes; the rewriter runs
 /// itself.
+#[must_use]
 pub fn expand(spec: &FixSpec, input: &FixInput<'_>) -> Option<(u32, u32, String)> {
     match spec.action {
         FixAction::DropLexeme(word) => fix::drop_keyword(input.text, input.range.start, word),

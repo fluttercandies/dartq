@@ -17,6 +17,7 @@
 //! Every pin records the oracle expectation verbatim so a future failure
 //! names both sides.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// The rows whose code name is `name`, as `code @offset: message` strings.

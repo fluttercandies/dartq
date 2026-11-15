@@ -7,6 +7,7 @@
 //! a constructor's field-formal slot, and a walked getter's
 //! `List<Und>` return.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops};
 
 /// `rules.values.map((node) => node.value)` with the map's value type an

@@ -52,6 +52,9 @@
 //! Single-threaded like [`TypeTable`] (its interior `RefCell` memo):
 //! the flow replays on the fold's thread.
 
+#![allow(clippy::assert_is_empty)]
+#![allow(clippy::redundant_closure)]
+
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 
@@ -299,7 +302,7 @@ pub struct LibraryTypes {
     invalid_property_tys: FxHashSet<(StringId, StringId)>,
     /// Extension-type declaration → the head of its representation type:
     /// the erasure every exhaustiveness ask recurses through (upstream
-    /// Dart SDK source, pkg/analyzer/lib/src/dart/element/type_system.dart
+    /// Dart SDK source, `pkg/analyzer/lib/src/dart/element/type_system.dart`
     /// `isAlwaysExhaustive`'s `ExtensionTypeElement` arm,
     /// `isAlwaysExhaustive(type.extensionTypeErasure)`), so
     /// `extension type W(E _)` over an enum `E` closes a switch exactly
@@ -351,6 +354,7 @@ pub struct ClauseTrees {
 impl ClauseTrees {
     /// An empty face: every container's edges instantiate to bounds, the
     /// pre-Phase-D behavior.
+    #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
@@ -371,15 +375,15 @@ impl ClauseTrees {
     }
 }
 
-/// The `dart:` SDK libraries' public type names — the flat fallback the
-/// lossy-spelling overload set reads for a PREFIXED SDK import whose
-/// target carries no element model (the SDK is not part of the census's
-/// element index, so `export_scope` answers nothing for it). The names
-/// matter exactly as overload markers: the flow layer's bare-head type
-/// question can never say the source meant `io.File` rather than the
-/// bare-registered `File`, so the verdict gates keep the name-level
-/// answer over these spellings. Extend per library as the corpora
-/// prefix-import more of the SDK.
+// The `dart:` SDK libraries' public type names — the flat fallback the
+// lossy-spelling overload set reads for a PREFIXED SDK import whose
+// target carries no element model (the SDK is not part of the census's
+// element index, so `export_scope` answers nothing for it). The names
+// matter exactly as overload markers: the flow layer's bare-head type
+// question can never say the source meant `io.File` rather than the
+// bare-registered `File`, so the verdict gates keep the name-level
+// answer over these spellings. Extend per library as the corpora
+// prefix-import more of the SDK.
 
 const SDK_LIBRARY_TYPE_NAMES: &[(&str, &[&str])] = &[(
     "dart:io",
@@ -461,13 +465,6 @@ impl LibraryTypes {
     /// element model never carried.
     pub(crate) fn param_bound(&self, file: FileId, name: StringId) -> Option<StringId> {
         self.type_param_bounds.get(&(file, name)).copied()
-    }
-
-    /// Test-only face of [`Self::facts`] — the pins read the binder bounds
-    /// the typedef-alias expansion feeds (#3383).
-    #[cfg(test)]
-    pub(crate) fn testing_facts(&self) -> &ParamFactsTable {
-        &self.facts
     }
 
     /// Test-only face of [`Self::table`].
@@ -994,9 +991,9 @@ impl LibraryTypes {
                     else {
                         continue;
                     };
-                    if !index
+                    if index
                         .get(target_file)
-                        .is_some_and(|els| els.container(head).is_some())
+                        .is_none_or(|els| els.container(head).is_none())
                     {
                         continue;
                     }
@@ -1337,7 +1334,7 @@ impl LibraryTypes {
                     .zip(params.iter().copied())
                     .collect();
                 let mut bounds: Vec<Option<TypeId>> = Vec::with_capacity(params.len());
-                for tree in capture.param_bounds.iter() {
+                for tree in &capture.param_bounds {
                     let bound = tree.as_ref().and_then(|tree| {
                         clause_arg_ty(
                             strings,
@@ -1617,6 +1614,7 @@ impl ClosureEdges {
     /// graph: each library's own units (the `library_of_file` identity)
     /// plus each library's export scope (a re-exported file registers
     /// under the exporting library).
+    #[must_use]
     pub fn pairs(graph: &LibraryGraph) -> Vec<(FileId, LibraryId)> {
         let mut pairs: FxHashSet<(FileId, LibraryId)> = FxHashSet::default();
         for lib in graph.libraries() {
@@ -1664,11 +1662,13 @@ impl ClosureEdges {
     /// Assembles a table from precomputed pairs ([`Self::compute`] per
     /// entry of [`Self::pairs`]) — the engine builds this in parallel
     /// before the fan-out.
+    #[must_use]
     pub fn from_map(map: FxHashMap<(FileId, LibraryId), Box<[(StringId, FileId)]>>) -> Self {
         Self(map)
     }
 
     /// One pair's edge list, when the table holds it.
+    #[must_use]
     pub fn get(&self, file: FileId, owner: LibraryId) -> Option<&[(StringId, FileId)]> {
         self.0.get(&(file, owner)).map(|boxed| &boxed[..])
     }
@@ -1920,7 +1920,7 @@ impl Registry<'_> {
         // body switching over an `St`-bounded parameter asks this ledger.
         for face in elements.extension_faces() {
             self.record_param_bounds(file, &face.type_param_names, &face.type_param_bounds);
-            for (_, entry) in face.members.iter() {
+            for (_, entry) in &face.members {
                 self.record_param_bounds(file, &entry.type_param_names, &entry.type_param_bounds);
             }
         }
@@ -1985,7 +1985,7 @@ impl Registry<'_> {
             // gate: a field's declared type / a getter's return type
             // whose head resolves nowhere makes the property sub-pattern
             // may-fail (see `LibraryTypes::invalid_property_tys`).
-            for (member, entry) in container.members.iter() {
+            for (member, entry) in &container.members {
                 // A member's own group (`void m<T extends E>(T t)`) bounds
                 // exactly like the container's — the declaring file is the
                 // same one the body replays in.
@@ -2728,7 +2728,7 @@ fn builtin_super(
 /// into one argument: the shared facts table (each fresh binder's
 /// substituted bound lands beside the declared facts) and the snapshot's
 /// parameter-id allocator (the per-use freshness, upstream
-/// type_algebra.dart's freshCopy per signature parameter).
+/// `type_algebra.dart`'s freshCopy per signature parameter).
 struct AliasBinder<'a> {
     /// The snapshot's facts table under construction.
     facts: &'a mut ParamFactsTable,
@@ -2778,7 +2778,6 @@ fn rebind_clause_binders(
 /// head instantiates to bounds. `None` on an unresolvable name — the
 /// declaration keeps its remaining edges plus the implicit `Object` the
 /// builder adds (the open direction).
-#[expect(clippy::too_many_arguments)] // one operand per snapshot face the resolution reads
 /// Collects every named head a written supertype tree mentions — the
 /// root head beside each written argument's — feeding the supertype
 /// closure's registration worklist. A record/function-shaped node can
@@ -3489,7 +3488,7 @@ impl<'a> ResolvedTypeOps<'a> {
                     .registry
                     .get(&name)
                     .filter(|_| !self.snapshot.non_containers.contains(&name))
-                    .and_then(|&decl| {
+                    .map(|&decl| {
                         let params = self
                             .snapshot
                             .decl_params
@@ -3505,7 +3504,7 @@ impl<'a> ResolvedTypeOps<'a> {
                             )
                             .defaults
                         };
-                        Some((decl, args))
+                        (decl, args)
                     })
                     .map_or_else(
                         || {
@@ -4277,7 +4276,7 @@ impl<'a> ResolvedTypeOps<'a> {
         sup: Ty,
         pool: &crate::model::ArgPool,
     ) -> Option<bool> {
-        fn map(ops: &ResolvedTypeOps, ty: Ty, pool: &crate::model::ArgPool) -> Option<TypeId> {
+        fn map(ops: &ResolvedTypeOps<'_>, ty: Ty, pool: &crate::model::ArgPool) -> Option<TypeId> {
             if let Some(strict) = ops.map_ty_strict(ty, pool) {
                 return Some(strict);
             }
@@ -5284,14 +5283,13 @@ impl<'a> ResolvedTypeOps<'a> {
         for _ in 0..8 {
             let own = {
                 let mut closed = self.closed.borrow_mut();
-                match closed.get(&decl) {
-                    Some(&own) => own,
-                    None => {
-                        let own = self.snapshot.hierarchy.is_sealed(decl)
-                            || self.snapshot.hierarchy.enum_constant_count(decl).is_some();
-                        closed.insert(decl, own);
-                        own
-                    }
+                if let Some(&own) = closed.get(&decl) {
+                    own
+                } else {
+                    let own = self.snapshot.hierarchy.is_sealed(decl)
+                        || self.snapshot.hierarchy.enum_constant_count(decl).is_some();
+                    closed.insert(decl, own);
+                    own
                 }
             };
             if own {
@@ -5644,7 +5642,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// `InvalidType <: X` vacuously true, so `factor(T, InvalidType)` is
     /// `Never` and the `x is Missing` else branch deads exactly as the
     /// analyzer reports it (the broken-import corpus's dominant
-    /// dead_code root); a name the registry misses AND the import scopes
+    /// `dead_code` root); a name the registry misses AND the import scopes
     /// cannot resolve IS the oracle's `InvalidType` — a name the scopes
     /// do resolve (`non_containers`) maps opaque instead
     /// ([`ResolvedTypeOps::opaque_decl`]), keeping the remainder live
@@ -5710,7 +5708,6 @@ impl TypeOps for ResolvedTypeOps<'_> {
         arena: &[Vec<ArgTy>],
         names: &[Box<str>],
     ) -> bool {
-        let mark = self.work_mark();
         // A lossy-overload head answers name-level
         // ([`Self::head_overloaded`]) — the resolved verdict would ride
         // the wrong class half the time, and its `Invalid` face would
@@ -5859,7 +5856,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// decide the inferred spelling a strict-subtype step (the promotion
     /// gate's `is_subtype` walk refuses the dynamic-erased argument), so
     /// the answer changes nothing until the written clause trees land
-    /// (the TypedModel migration) — this body is that migration's
+    /// (the `TypedModel` migration) — this body is that migration's
     /// consumer, final-form on both faces.
     fn downcast_infer(
         &self,
@@ -5893,9 +5890,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
             .filter(|_| !self.snapshot.non_containers.contains(&from_name))?;
         // The superclass-hop CHAIN spelling the matched declaration. The
         // declared-ness gate keeps `supertypes`'s panic contract.
-        if self.snapshot.hierarchy.decl(tested_decl).is_none() {
-            return None;
-        }
+        self.snapshot.hierarchy.decl(tested_decl)?;
         // The official `downwardInferObjectPatternRequiredType` walks the
         // superclass chain step by step — `final class AD<T> extends
         // AR<T>` under `sealed class AR<T> extends AV<T>` reaches `AV` in
@@ -5927,7 +5922,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
                 continue;
             };
             if decl == from_decl {
-                break self.snapshot.table.args(range).to_vec();
+                break self.snapshot.table.args(range).clone();
             }
             // Extend the path: this hop's own supertype edges, their
             // clause arguments instantiated against the arguments the
@@ -5979,6 +5974,132 @@ impl TypeOps for ResolvedTypeOps<'_> {
             return None;
         }
         Some((tested, from_args))
+    }
+}
+/// The `?`-stripped projection of `ty` (same kind, non-nullable face).
+/// Function/record shapes have no nullable re-intern here and keep their
+/// suffix — the binding sites that reach them are cold edge faces.
+fn non_nullable_of(table: &TypeTable, ty: TypeId) -> TypeId {
+    let face = table.get(ty);
+    if !face.is_nullable() {
+        return ty;
+    }
+    let uninterned = match face.kind() {
+        TypeKind::Never => UninternedType::Never,
+        TypeKind::Dynamic => UninternedType::Dynamic,
+        TypeKind::Void => UninternedType::Void,
+        TypeKind::Invalid => UninternedType::Invalid,
+        TypeKind::Null => UninternedType::Null,
+        TypeKind::Interface { decl, args } => UninternedType::Interface {
+            decl,
+            args: table.args(args),
+        },
+        TypeKind::TypeParameter { parameter } => UninternedType::TypeParameter { parameter },
+        TypeKind::Function { .. } | TypeKind::FutureOr { .. } | TypeKind::Record { .. } => {
+            return ty;
+        }
+    };
+    table.intern(uninterned, false)
+}
+
+impl ResolvedTypeOps<'_> {
+    /// `recv` viewed as an instance of the container `target` (the official
+    /// `asInstanceOf`, element.dart `InterfaceTypeImpl.asInstanceOf`):
+    /// `target`'s type parameters paired with the instantiated arguments
+    /// (`List<int>` as `Iterable` reads `E := int`), mapped back into the
+    /// diagnosing pool. `None` when the receiver does not map into the
+    /// snapshot, `target` is unregistered, the receiver is not an instance
+    /// of it, or an argument carries a shape the pool cannot spell.
+    pub(crate) fn instance_env(
+        &self,
+        recv: Ty,
+        target: StringId,
+        pool: &RefCell<ArgPool>,
+    ) -> Option<Vec<(StringId, Ty)>> {
+        let from = self.map_ty_strict(recv, &pool.borrow())?;
+        let &decl = self
+            .snapshot
+            .registry
+            .get(&target)
+            .filter(|_| !self.snapshot.non_containers.contains(&target))?;
+        let instance = self.system.as_instance_of(from, decl)?;
+        let TypeKind::Interface { args, .. } = self.snapshot.table.get(instance).kind() else {
+            return None;
+        };
+        let params = self.snapshot.decl_params.get(&decl)?;
+        let args = self.snapshot.table.args(args);
+        if args.len() != params.len() {
+            return None;
+        }
+        let mut env = Vec::with_capacity(args.len());
+        for (&param, &arg) in params.iter().zip(args.iter()) {
+            env.push((self.param_name(param)?, self.unmap_ty(arg, pool)?));
+        }
+        Some(env)
+    }
+
+    /// A snapshot type spelled back into the diagnosing pool: interfaces
+    /// and type parameters through the inverted registries, the atoms as
+    /// themselves. Function and record shapes answer `None` (their
+    /// re-interning is not a question any consumer asks yet).
+    fn unmap_ty(&self, id: TypeId, pool: &RefCell<ArgPool>) -> Option<Ty> {
+        let ty = self.snapshot.table.get(id);
+        let nullable = ty.is_nullable();
+        match ty.kind() {
+            TypeKind::Dynamic => Some(Ty::Dynamic),
+            TypeKind::Void => Some(Ty::Void),
+            TypeKind::Null => Some(Ty::Null),
+            TypeKind::Never => Some(if nullable { Ty::Null } else { Ty::Never }),
+            TypeKind::Invalid | TypeKind::Function { .. } | TypeKind::Record { .. } => None,
+            TypeKind::TypeParameter { parameter } => Some(Ty::Named {
+                name: self.param_name(parameter)?,
+                nullable,
+                args: ArgListId::EMPTY,
+            }),
+            TypeKind::FutureOr { base } => {
+                let base = self.unmap_ty(base, pool)?;
+                let head = self.strings.intern("FutureOr");
+                Some(pool.borrow_mut().named(head, nullable, &[base]))
+            }
+            TypeKind::Interface { decl, args } => {
+                let name = self.decl_name(decl)?;
+                let ids = self.snapshot.table.args(args);
+                let mut mapped = Vec::with_capacity(ids.len());
+                for id in ids {
+                    mapped.push(self.unmap_ty(id, pool)?);
+                }
+                Some(pool.borrow_mut().named(name, nullable, &mapped))
+            }
+        }
+    }
+
+    fn decl_name(&self, decl: TypeDeclId) -> Option<StringId> {
+        let mut cache = self.decl_names.borrow_mut();
+        let names = cache.get_or_insert_with(|| {
+            self.snapshot
+                .registry
+                .iter()
+                .map(|(&name, &decl)| (decl, name))
+                .collect()
+        });
+        names.get(&decl).copied()
+    }
+
+    /// A container's own parameter spelling, or the name-keyed synthetic
+    /// parameter's (the element-model `TypeParam` declarations).
+    fn param_name(&self, param: TypeParamId) -> Option<StringId> {
+        if let Some(&name) = self.snapshot.param_names.get(&param) {
+            return Some(name);
+        }
+        let mut cache = self.param_names.borrow_mut();
+        let names = cache.get_or_insert_with(|| {
+            self.snapshot
+                .type_params
+                .iter()
+                .map(|(&name, &param)| (param, name))
+                .collect()
+        });
+        names.get(&param).copied()
     }
 }
 
@@ -6113,7 +6234,7 @@ typedef U<T> = T Function();
             .expect("`A` registers");
         let g_return = table.get(alias_return("G")).kind();
         assert!(
-            matches!(g_return, TypeKind::Interface { decl, args } if decl == num_decl && args.len() == 0),
+            matches!(g_return, TypeKind::Interface { decl, args } if decl == num_decl && args.is_empty()),
             "`T extends num` must read `num Function()`, got {g_return:?}"
         );
         let h_return = table.get(alias_return("H")).kind();
@@ -6139,16 +6260,12 @@ typedef U<T> = T Function();
     /// synthetic cycles no real build produces), a per-call budget
     /// override, a probe over the mounted ops (run before the fold), and
     /// the fuel counters read after it.
-    #[expect(
-        clippy::type_complexity,
-        reason = "the pin's harness shape; folding the closures into a config struct would grow the test surface, not shrink it"
-    )]
     fn diagnose_codes_probe(
         source: &str,
         make_edge: impl FnOnce(&StringTable) -> Option<ImportEdge>,
         mutate: impl FnOnce(&StringTable, &mut LibraryTypes),
         budget: Option<u32>,
-        probe: impl FnOnce(&ResolvedTypeOps),
+        probe: impl FnOnce(&ResolvedTypeOps<'_>),
     ) -> (Vec<&'static str>, u32, u32) {
         let strings = StringTable::new();
         let mut files = FileTable::new();
@@ -6310,7 +6427,7 @@ typedef U<T> = T Function();
     /// clause argument to `dynamic`, so the promotion gate's subtype walk
     /// refuses the inferred spelling (`AL<Num> <: AV<Num>` walks the
     /// dynamic-erased hop and refuses). The written clause trees are the
-    /// TypedModel migration's transport; revive this pin when they land.
+    /// `TypedModel` migration's transport; revive this pin when they land.
     #[ignore = "dormant: erased hierarchy edges refuse the inferred subtype (TypedModel clause-tree transport pending)"]
     #[test]
     fn raw_object_pattern_downcast_promotes() {
@@ -6424,7 +6541,7 @@ typedef U<T> = T Function();
         );
     }
 
-    /// The archive-corpus DEAD_CODE cascade pins (2026-10-19). A name the
+    /// The archive-corpus `DEAD_CODE` cascade pins (2026-10-19). A name the
     /// import scopes resolve but no element model carries (a `dart:` SDK
     /// class outside the builtin table) maps to an unrelated opaque
     /// declaration, so an `is`-test against it keeps both branches live —
@@ -6607,13 +6724,13 @@ typedef U<T> = T Function();
     ///
     /// Oracle proofs (dart analyze 3.13.7): the RESOLVED analog
     /// (`Stream<List<int>> stream; stream is Stream<Uint8List>` over
-    /// dart:async/dart:typed_data/dart:core) reports NOTHING — distinct
+    /// `dart:async/dart:typed_data/dart:core`) reports NOTHING — distinct
     /// resolved instantiations keep both branches live. The former fixture
     /// spelled `Stream<List<int>>` with `List` outside the rig's declared
     /// names — the UNDEFINED-argument universe, whose oracle face
     /// (`import 'dart:core' hide List`) is the OPPOSITE:
     /// `non_type_as_type_argument` + `unnecessary_type_check` (always
-    /// 'true') + `dead_code` on the else — the InvalidType argument's
+    /// 'true') + `dead_code` on the else — the `InvalidType` argument's
     /// vacuous 0c subtype arm (#3443), which the engine answers
     /// faithfully. Both written arguments must resolve for the
     /// distinguishing rule to be the deciding face; `File` joins the
@@ -8207,131 +8324,5 @@ typedef U<T> = T Function();
             peak * 10 < WORK_BUDGET_PER_CALL,
             "legit peak {peak} within 10x of the budget"
         );
-    }
-}
-/// The `?`-stripped projection of `ty` (same kind, non-nullable face).
-/// Function/record shapes have no nullable re-intern here and keep their
-/// suffix — the binding sites that reach them are cold edge faces.
-fn non_nullable_of(table: &TypeTable, ty: TypeId) -> TypeId {
-    let face = table.get(ty);
-    if !face.is_nullable() {
-        return ty;
-    }
-    let uninterned = match face.kind() {
-        TypeKind::Never => UninternedType::Never,
-        TypeKind::Dynamic => UninternedType::Dynamic,
-        TypeKind::Void => UninternedType::Void,
-        TypeKind::Invalid => UninternedType::Invalid,
-        TypeKind::Null => UninternedType::Null,
-        TypeKind::Interface { decl, args } => UninternedType::Interface {
-            decl,
-            args: table.args(args),
-        },
-        TypeKind::TypeParameter { parameter } => UninternedType::TypeParameter { parameter },
-        TypeKind::Function { .. } | TypeKind::FutureOr { .. } | TypeKind::Record { .. } => {
-            return ty;
-        }
-    };
-    table.intern(uninterned, false)
-}
-
-impl ResolvedTypeOps<'_> {
-    /// `recv` viewed as an instance of the container `target` (the official
-    /// `asInstanceOf`, element.dart `InterfaceTypeImpl.asInstanceOf`):
-    /// `target`'s type parameters paired with the instantiated arguments
-    /// (`List<int>` as `Iterable` reads `E := int`), mapped back into the
-    /// diagnosing pool. `None` when the receiver does not map into the
-    /// snapshot, `target` is unregistered, the receiver is not an instance
-    /// of it, or an argument carries a shape the pool cannot spell.
-    pub(crate) fn instance_env(
-        &self,
-        recv: Ty,
-        target: StringId,
-        pool: &RefCell<ArgPool>,
-    ) -> Option<Vec<(StringId, Ty)>> {
-        let from = self.map_ty_strict(recv, &pool.borrow())?;
-        let &decl = self
-            .snapshot
-            .registry
-            .get(&target)
-            .filter(|_| !self.snapshot.non_containers.contains(&target))?;
-        let instance = self.system.as_instance_of(from, decl)?;
-        let TypeKind::Interface { args, .. } = self.snapshot.table.get(instance).kind() else {
-            return None;
-        };
-        let params = self.snapshot.decl_params.get(&decl)?;
-        let args = self.snapshot.table.args(args);
-        if args.len() != params.len() {
-            return None;
-        }
-        let mut env = Vec::with_capacity(args.len());
-        for (&param, &arg) in params.iter().zip(args.iter()) {
-            env.push((self.param_name(param)?, self.unmap_ty(arg, pool)?));
-        }
-        Some(env)
-    }
-
-    /// A snapshot type spelled back into the diagnosing pool: interfaces
-    /// and type parameters through the inverted registries, the atoms as
-    /// themselves. Function and record shapes answer `None` (their
-    /// re-interning is not a question any consumer asks yet).
-    fn unmap_ty(&self, id: TypeId, pool: &RefCell<ArgPool>) -> Option<Ty> {
-        let ty = self.snapshot.table.get(id);
-        let nullable = ty.is_nullable();
-        match ty.kind() {
-            TypeKind::Dynamic => Some(Ty::Dynamic),
-            TypeKind::Void => Some(Ty::Void),
-            TypeKind::Null => Some(Ty::Null),
-            TypeKind::Never => Some(if nullable { Ty::Null } else { Ty::Never }),
-            TypeKind::Invalid | TypeKind::Function { .. } | TypeKind::Record { .. } => None,
-            TypeKind::TypeParameter { parameter } => Some(Ty::Named {
-                name: self.param_name(parameter)?,
-                nullable,
-                args: ArgListId::EMPTY,
-            }),
-            TypeKind::FutureOr { base } => {
-                let base = self.unmap_ty(base, pool)?;
-                let head = self.strings.intern("FutureOr");
-                Some(pool.borrow_mut().named(head, nullable, &[base]))
-            }
-            TypeKind::Interface { decl, args } => {
-                let name = self.decl_name(decl)?;
-                let ids = self.snapshot.table.args(args);
-                let mut mapped = Vec::with_capacity(ids.len());
-                for id in ids {
-                    mapped.push(self.unmap_ty(id, pool)?);
-                }
-                Some(pool.borrow_mut().named(name, nullable, &mapped))
-            }
-        }
-    }
-
-    fn decl_name(&self, decl: TypeDeclId) -> Option<StringId> {
-        let mut cache = self.decl_names.borrow_mut();
-        let names = cache.get_or_insert_with(|| {
-            self.snapshot
-                .registry
-                .iter()
-                .map(|(&name, &decl)| (decl, name))
-                .collect()
-        });
-        names.get(&decl).copied()
-    }
-
-    /// A container's own parameter spelling, or the name-keyed synthetic
-    /// parameter's (the element-model `TypeParam` declarations).
-    fn param_name(&self, param: TypeParamId) -> Option<StringId> {
-        if let Some(&name) = self.snapshot.param_names.get(&param) {
-            return Some(name);
-        }
-        let mut cache = self.param_names.borrow_mut();
-        let names = cache.get_or_insert_with(|| {
-            self.snapshot
-                .type_params
-                .iter()
-                .map(|(&name, &param)| (param, name))
-                .collect()
-        });
-        names.get(&param).copied()
     }
 }

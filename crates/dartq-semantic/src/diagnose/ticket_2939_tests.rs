@@ -18,6 +18,7 @@
 //! Behavioral oracle: dart 3.13.7 `deprecated_member_use_test.dart`
 //! parameter probes (`_visitParametersAndArguments`'s positional loop).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::library::ElementIndex;
 use crate::model::MicroKind;
@@ -285,7 +286,7 @@ fn dmu_named_constructor_display_joins_class() {
 
 /// The unnamed face's `displayName` is the class's own spelling — `A()`'s
 /// lookup key normalizes to the container, and the rendered form follows
-/// it (upstream's unnamed ConstructorElement has no selector segment).
+/// it (upstream's unnamed `ConstructorElement` has no selector segment).
 #[test]
 fn dmu_unnamed_constructor_display_is_class() {
     let report = member_use_report(

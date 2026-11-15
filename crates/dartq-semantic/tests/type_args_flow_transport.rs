@@ -8,7 +8,7 @@
 //! `handle_type` consumes it, `handle_no_type_arguments` clears it — all
 //! three fire immediately before the row (official `parseArguments`,
 //! upstream Dart SDK source,
-//! pkg/_fe_analyzer_shared/lib/src/parser/type_info_impl.dart:1158/1191).
+//! pkg/_`fe_analyzer_shared/lib/src/parser/type_info_impl.dart:1158/1191`).
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -101,10 +101,10 @@ fn unit_fold(source: &str, strings: &StringTable) -> UnitFold {
 /// row's `(base, nullable, args)` payload.
 fn read_type_at(facts: &[FlowFact], offset: usize) -> (Base, bool, u32) {
     for fact in facts {
-        if let FlowFact::ReadType { span, ty, args } = fact {
-            if span.range.offset as usize == offset {
-                return (ty.base, ty.nullable, *args);
-            }
+        if let FlowFact::ReadType { span, ty, args } = fact
+            && span.range.offset as usize == offset
+        {
+            return (ty.base, ty.nullable, *args);
         }
     }
     panic!("no ReadType row at {offset}: {facts:?}");

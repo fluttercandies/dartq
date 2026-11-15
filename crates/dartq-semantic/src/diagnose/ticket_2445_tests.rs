@@ -26,6 +26,7 @@
 //! scope bound) silent on the enum constant and reporting on `case 1`,
 //! p7 (`String` scrutinee) reporting both rows.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

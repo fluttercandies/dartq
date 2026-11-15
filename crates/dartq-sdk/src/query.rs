@@ -1,6 +1,7 @@
 //! The query surface of a loaded [`SdkSnapshot`]: target tables, `dart:` URI
 //! resolution, and conditional-import support values.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Component, Path, PathBuf};
 
 use crate::metadata::{SdkSnapshot, TargetLibraries};
@@ -163,12 +164,11 @@ impl SdkSnapshot {
     /// the dart-sdk `lib/` root otherwise.
     fn join_part(&self, library_uri: &str, part: &str) -> PathBuf {
         let dart_lib_root;
-        let lib_root: &Path = match self.embedder.as_ref() {
-            Some(embedder) => embedder.base_dir.as_path(),
-            None => {
-                dart_lib_root = self.dart_sdk_root.join("lib");
-                &dart_lib_root
-            }
+        let lib_root: &Path = if let Some(embedder) = self.embedder.as_ref() {
+            embedder.base_dir.as_path()
+        } else {
+            dart_lib_root = self.dart_sdk_root.join("lib");
+            &dart_lib_root
         };
         let library_file = lib_root.join(library_uri);
         match part {

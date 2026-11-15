@@ -21,6 +21,7 @@
 //! `row_resolution.rs::extension_application`, and the face must apply
 //! there exactly as it does for a written declaration.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
 /// The fixture's own byte offset, shifted by the rig's prelude (which
@@ -70,7 +71,7 @@ fn undefined_getters(report: &super::FileReport) -> Vec<u32> {
 /// and a `dynamic`-argument receiver all resolve `nonNulls`; the
 /// `map`/`expand` chain that ends in the getter resolves too (the `on`
 /// argument's `?` absorbs the receiver argument before the `T extends
-/// Object` bound runs — applicable_extensions.dart's `applicableTo`).
+/// Object` bound runs — `applicable_extensions.dart`'s `applicableTo`).
 #[test]
 fn non_nulls_resolves_across_the_nullable_element_receiver_family() {
     let report = report_ops(FIXTURE);

@@ -36,6 +36,7 @@
 //! context locators via [`crate::config::compat_axis_roots`]) stays at the
 //! process edges: this core takes explicit roots.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

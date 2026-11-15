@@ -10,6 +10,8 @@
 //! downward re-bind (#2500) types the closure's untyped formals and the
 //! member reads inside no longer emit the unchecked-nullable FP.
 
+#![allow(unused_imports, clippy::semicolon_if_nothing_returned)]
+
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
@@ -29,7 +31,7 @@ fn unchecked_rows(report: &FileReport) -> Vec<String> {
 /// — zero unchecked rows.
 #[test]
 fn upward_member_read_arg_solves_closure_formals() {
-    let source = r#"
+    let source = r"
 void forPairs<T1, T2>(Iterable<T1> a, Iterable<T2> b, void cb(T1 x, T2 y)) {}
 extension<T> on List<T> {
   Iterable<T> get withDecl => this;
@@ -39,7 +41,7 @@ void main() {
   List<String> ys = List<String>();
   forPairs(xs.withDecl, ys.withDecl, (a, b) => a + b.length);
 }
-"#;
+";
     let report = report_ops(source);
     let rows = unchecked_rows(&report);
     assert!(
@@ -62,7 +64,7 @@ void main() {
 /// pin verbatim.
 #[test]
 fn upward_feed_does_not_report_could_not_infer() {
-    let source = r#"
+    let source = r"
 void forPairs<T1, T2>(Iterable<T1> a, Iterable<T2> b, void cb(T1 x, T2 y)) {}
 extension<T> on List<T> {
   Iterable<T> get withDecl => this;
@@ -71,7 +73,7 @@ void main() {
   List<int> xs = List<int>();
   forPairs(xs.withDecl, xs.withDecl, (a, b) => a + b);
 }
-"#;
+";
     let report = report_ops(source);
     assert!(
         !report
@@ -92,18 +94,18 @@ void main() {
 /// gate's `infer_closure`/`infer_schema_closure` through a nested `Named`
 /// argument list — the recursive fold must materialize the pool's argument
 /// list BEFORE recursing (the inner `intern_list`/`function_generic` takes
-/// `borrow_mut` on the same RefCell, and a read borrow held across it
+/// `borrow_mut` on the same `RefCell`, and a read borrow held across it
 /// panics). The pin only asserts the pass completes: the panic was the
 /// whole defect.
 #[test]
 fn mutually_recursive_bound_does_not_reenter_args_pool() {
-    let source = r#"
+    let source = r"
 class Comparable<T> { int compareTo(T other) => 0; }
 void f<T extends Comparable<T>>(T t) {}
 void main() {
   f(0);
 }
-"#;
+";
     let report = report_ops(source);
     // Reaching here is the assertion — the closure fold over
     // `Comparable<T>` recursed into the same `args` RefCell.
@@ -116,13 +118,13 @@ void main() {
 /// the same re-intern path through the schema arm.
 #[test]
 fn mutually_recursive_schema_closure_does_not_reenter() {
-    let source = r#"
+    let source = r"
 class Comparable<T> { int compareTo(T other) => 0; }
 class C<T extends Comparable<T>, S extends List<T>> { C(T t, S s); }
 void main() {
   var c = C(0, List<int>());
 }
-"#;
+";
     let report = report_ops(source);
     let _ = report.diagnostics.len();
 }

@@ -16,6 +16,7 @@
 //! while the daemon paths (whose read task has just run the analysis pass)
 //! enter at the `_after_analysis` faces with the raw UTF-16 offset.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -31,7 +32,7 @@ use crate::query::{decl_kind_name, ref_kind_name};
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
     /// A `file` the analyzed view never interned (the daemon's
-    /// INVALID_PARAMS tier — the fail-loud rule for a typo'd path; a
+    /// `INVALID_PARAMS` tier — the fail-loud rule for a typo'd path; a
     /// resident-but-unanalyzed file answers `hit: null` like every other
     /// uncovered position).
     #[error("not a resident file: {0}")]

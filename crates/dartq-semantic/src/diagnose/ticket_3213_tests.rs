@@ -24,6 +24,7 @@
 //! Anchors are asserted as `(offset, length)` triples: `dead_code` carries
 //! a fixed message ("Dead code."), so the span IS the observable.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::report_ops_bare;
 
 /// The `dead_code` rows of `report` as `(offset, length)`, source order.
@@ -171,7 +172,7 @@ fn case_label_dead_statement_keeps_semicolon() {
     assert_eq!(dead_rows(&report_ops_bare(fixture)), [(63, 2)]);
 }
 
-/// `for (x; false; x) {}` — the void_param corpus shape with an
+/// `for (x; false; x) {}` — the `void_param` corpus shape with an
 /// expression INIT before the false condition: the init runs once and
 /// stays live, the cond-false exit keeps the statement after the loop
 /// reachable, and a `throw` tail still merges downstream statements into

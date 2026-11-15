@@ -19,6 +19,11 @@
 //! planning documents. Case sources live verbatim in
 //! `tests/fixtures/st_sweep/<case id>.dart`.
 
+#![allow(
+    clippy::type_complexity,
+    clippy::format_push_string,
+    clippy::semicolon_if_nothing_returned
+)]
 use std::collections::BTreeSet;
 
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -28,6 +33,7 @@ use dartq_semantic::collector::collect;
 use dartq_semantic::diagnose::{StrictModes, fold_unit};
 use dartq_semantic::library::ElementIndex;
 use dartq_source::{FileTable, StringTable};
+use std::fmt::Write;
 
 /// The synthetic dart:core name face: the top-level names these fixtures
 /// consume (the engine's implicit core import resolves the same spellings;
@@ -376,11 +382,10 @@ fn golden_rows(case_id: &str, code: &str) -> Vec<(usize, usize)> {
         .iter()
         .find(|(id, _)| *id == case_id)
         .unwrap_or_else(|| panic!("no golden embedded for case {case_id}"));
-    codes
-        .iter()
-        .find(|(c, _)| *c == code)
-        .map(|(_, rows)| rows.to_vec())
-        .unwrap_or_else(|| panic!("no golden rows embedded for {case_id}/{code}"))
+    codes.iter().find(|(c, _)| *c == code).map_or_else(
+        || panic!("no golden rows embedded for {case_id}/{code}"),
+        |(_, rows)| rows.to_vec(),
+    )
 }
 
 /// Runs `source` through the live pipeline in the corpus posture and
@@ -450,7 +455,7 @@ fn unit_report(source: &str) -> dartq_semantic::FileReport {
     );
     let mut report = fold.report;
     let mut diagnostics = fold.parse_diagnostics;
-    diagnostics.extend(report.diagnostics.drain(..));
+    diagnostics.append(&mut report.diagnostics);
     report.diagnostics = diagnostics;
     report
 }
@@ -458,7 +463,7 @@ fn unit_report(source: &str) -> dartq_semantic::FileReport {
 /// The 1-based line/column of a diagnostic offset in `source`.
 fn line_col(source: &str, offset: usize) -> (usize, usize) {
     let line = source[..offset].bytes().filter(|b| *b == b'\n').count() + 1;
-    let column = offset - source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0) + 1;
+    let column = offset - source[..offset].rfind('\n').map_or(0, |i| i + 1) + 1;
     (line, column)
 }
 
@@ -466,14 +471,14 @@ fn line_col(source: &str, offset: usize) -> (usize, usize) {
 /// deliberately does not, each attributed outside this crate's face. The
 /// pins assert parity modulo this table — removing an entry without
 /// closing its root cause fails the pin.
-/// - (`666ddbb1`, final_not_initialized, 32:26): `external augment final
+/// - (`666ddbb1`, `final_not_initialized`, 32:26): `external augment final
 ///   field;` — the final-field face is parser-owned (the declaration
 ///   walk), and the external-augment recovery shape drops the row there;
 ///   a parser-lane rider closes it.
-/// - (`f600b4ad`, not_a_type, 14:3): `Function ok;` — the bare `Function`
+/// - (`f600b4ad`, `not_a_type`, 14:3): `Function ok;` — the bare `Function`
 ///   keyword head (no `<`/`(` follows) fires no type-reference event in
 ///   the parser, so no type-position row exists for the semantic layer to
-///   classify; the oracle resolves the head as a NamedType and reports.
+///   classify; the oracle resolves the head as a `NamedType` and reports.
 ///   A parser-lane rider closes it.
 const RESIDUALS: &[(&str, &str, (usize, usize))] = &[
     ("666ddbb1", "final_not_initialized", (32, 26)),
@@ -506,10 +511,7 @@ fn assert_case(case: &Case) {
         if oracle == dartq {
             continue;
         }
-        diff.push_str(&format!(
-            "  {code}: oracle {:?} != dartq {:?}\n",
-            oracle, dartq
-        ));
+        let _ = writeln!(diff, "  {code}: oracle {oracle:?} != dartq {dartq:?}");
     }
     assert!(diff.is_empty(), "case {} diverged:\n{diff}", case.id);
 }

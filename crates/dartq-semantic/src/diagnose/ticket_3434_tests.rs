@@ -42,6 +42,7 @@
 //! `analysis_options.yaml` `analyzer: enable-experiment: [augmentations]`);
 //! each pin names the oracle verdict it encodes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, report_ops_experiments_with, rows};
 
 /// One single-unit fixture with the `augmentations` experiment enabled.
@@ -220,8 +221,7 @@ fn a_member_in_neither_fragment_still_reports() {
         reported
             .iter()
             .any(|row| row.contains("undefined_identifier") && row.contains("'absent'")),
-        "{:#?}",
-        reported
+        "{reported:#?}"
     );
     assert_eq!(
         code_names(&report)
@@ -229,8 +229,7 @@ fn a_member_in_neither_fragment_still_reports() {
             .filter(|name| name.starts_with("undefined_"))
             .count(),
         1,
-        "{:#?}",
-        reported
+        "{reported:#?}"
     );
 }
 
@@ -263,7 +262,7 @@ fn two_fragments_fold_in_declaration_order() {
 /// Oracle: `class Base { A m() => A(); } class D extends Base {}` plus
 /// `augment class D { @override B m() => B(); }` (both classes declared in
 /// the fixture) reports `invalid_override` at the fragment's `m` ("'D.m'
-/// ('B Function()') isn't a valid override of 'Base.m' ('A Function()')").
+/// ('B `Function()`') isn't a valid override of 'Base.m' ('A `Function()`')").
 /// Fails while the fragment's member is absent from the resolved container's
 /// member map.
 #[test]

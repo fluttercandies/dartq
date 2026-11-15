@@ -31,6 +31,7 @@
 //! That is a missing-row defect on the alias route, not an extent defect —
 //! the widened name walk above already spells `A.foo` when the row lands.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
 
@@ -68,12 +69,12 @@ fn messages_at<'r>(report: &'r FileReport, name: &str, offset: usize, len: usize
 /// `'A<A<Object?, Object?>, A<Object?, Object?>>'`).
 #[test]
 fn detail_prints_an_unsolved_sibling_as_underscore() {
-    let src = r#"
+    let src = r"
 class A<X1 extends X2, X2 extends A<X1, X2>> {}
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "A();");
     assert_eq!(
@@ -107,7 +108,7 @@ main() {
 /// 13:3 len 3 (`P._`), the twins at 13:3 len 1 (the `NamedType` head).
 #[test]
 fn named_constructor_rows_anchor_the_whole_name() {
-    let src = r#"
+    let src = r"
 class C<T> {}
 class P<T extends C<T>, U extends C<U>> {
   P._();
@@ -115,7 +116,7 @@ class P<T extends C<T>, U extends C<U>> {
 void main() {
   P._();
 }
-"#;
+";
     let report = report_ops(src);
     let head = at_last(src, "P._();");
     assert_eq!(
@@ -155,13 +156,13 @@ void main() {
 /// sibling shape (`B()` over `class B<T extends Box<T>>`, 13:3 len 1).
 #[test]
 fn unnamed_creation_keeps_the_head_anchor() {
-    let src = r#"
+    let src = r"
 class Box<T> {}
 class B<T extends Box<T>> {}
 void main() {
   B();
 }
-"#;
+";
     let report = report_ops(src);
     let head = at(src, "B();");
     assert_eq!(
@@ -195,13 +196,13 @@ void main() {
 /// 77:3.
 #[test]
 fn alias_creation_detail_prints_the_unsolved_slot_as_underscore() {
-    let src = r#"
+    let src = r"
 class B<X extends B<X, Y>, Y> {}
 typedef A<X1 extends B<X1, X2>, X2> = B<X1, X2>;
 main() {
   A();
 }
-"#;
+";
     let report = report_ops(src);
     let offset = at(src, "A();");
     assert_eq!(

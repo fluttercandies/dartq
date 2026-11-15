@@ -24,6 +24,7 @@
 //! arms, :3653 assignment RHS, :5795 prefix `!`) reports on bare `super`
 //! sub-expressions.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.
@@ -196,7 +197,7 @@ fn builtin_type_variable_heads_take_the_keep_face() {
 /// Reserved keep-set members keep the extends/super posture. The
 /// missing-closer cascade after the spliced name is silent upstream
 /// (`parseUnexpectedEnd`'s `errorReported = token.isSynthetic`,
-/// type_info_impl.dart:1589) — dartq still reports that one row until the
+/// `type_info_impl.dart:1589`) — dartq still reports that one row until the
 /// type-args caller threads the synthetic token3 bit (#2995 residual).
 #[test]
 fn reserved_type_variable_heads_take_the_keep_face() {
@@ -237,7 +238,7 @@ fn non_keep_set_reserved_heads_stay_consumed() {
 }
 
 /// The `reportErrorIfSuper` wrappers beyond the core arm set: the is/as
-/// operand (`handleIsOperator` ast_builder.dart:4619,
+/// operand (`handleIsOperator` `ast_builder.dart:4619`,
 /// `handleAsOperator` :3619 — the operand, never the type), the bracket
 /// content (`handleIndexedExpression` :4504 — `g[super]` reports, `super[0]`
 /// checks the `0`), and the parenthesized reading

@@ -20,6 +20,7 @@
 //! `subtype.dart:45-47`). The gate lives in `assignability.rs` under the
 //! #3869 lane's scope; this file pins only the negative side.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, report_ops_augment_intro_experiments};
 use crate::FileReport;
 

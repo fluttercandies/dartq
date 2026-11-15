@@ -7,7 +7,7 @@
 //! [`Snapshot::take`] stats every file an analysis can read on every
 //! request — the only O(repo) cost left in the daemon's answer path. The
 //! watcher turns freshness into O(changed paths): a recursive OS stream
-//! over the walked roots (FSEvents through the crate's own binding on
+//! over the walked roots (`FSEvents` through the crate's own binding on
 //! macOS, `notify`'s inotify watcher elsewhere) records touched paths
 //! into a deduplicated journal, and each request re-stats only that set
 //! (plus the handful of out-of-root config files) through
@@ -56,15 +56,15 @@
 //!   machinery with it.
 //!
 //! * **Fallbacks, all to the same walk.** `walk_required` is raised on
-//!   the stream's rescan flags (FSEvents
-//!   MustScanSubDirs/UserDropped/KernelDropped, inotify Q_OVERFLOW), on
+//!   the stream's rescan flags (`FSEvents`
+//!   MustScanSubDirs/UserDropped/KernelDropped, inotify `Q_OVERFLOW`), on
 //!   any watcher error, on journal overflow (the dirty set is capped at
 //!   [`DIRTY_CAP`] paths), on cookie timeout, on any dirty path the
 //!   journal cannot safely merge (outside the watched set, link paths,
 //!   symlinked trees — [`Snapshot::take_into`] decides), once after the
 //!   arm (the initial take predates the stream, and no substrate
 //!   replays what predates its own start), and on macOS once after a
-//!   changed watch set (an FSEvents stream's paths are fixed, so a new
+//!   changed watch set (an `FSEvents` stream's paths are fixed, so a new
 //!   set is a new stream and the old one's in-flight events die with
 //!   it). A root-set change (pool join/evict) re-plans and re-walks once.
 //!
@@ -85,6 +85,7 @@
 //! any dirty path touching a link falls back to the walk — reachability
 //! under a link's spelling is never guessed.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -137,8 +138,8 @@ const COOKIE_TIMEOUTS: u32 = 3;
 /// [`Freshness::trust_ready`].)
 #[allow(dead_code)] // production-only; the tests use a shortened cool-off
 const COOL_OFF: Duration = Duration::from_secs(60);
-const COOL_OFF_MAX: Duration = Duration::from_secs(30 * 60);
-const HEALTHY_FOR: Duration = Duration::from_secs(10 * 60);
+const COOL_OFF_MAX: Duration = Duration::from_mins(30);
+const HEALTHY_FOR: Duration = Duration::from_mins(10);
 
 /// How fresh the stream's last proven delivery (a cookie event the
 /// drain observed) must be for a request to serve from the journal
@@ -189,7 +190,7 @@ fn cool_off() -> Duration {
 const VERIFY_IDLE: Duration = Duration::from_secs(30);
 
 /// The minimum gap between verification walks.
-const VERIFY_PERIOD: Duration = Duration::from_secs(5 * 60);
+const VERIFY_PERIOD: Duration = Duration::from_mins(5);
 
 /// The cookie file's name prefix inside a watched root (dot-named: the
 /// walk skips it, and even an unfiltered event for it is only ever a
@@ -199,7 +200,7 @@ const COOKIE_PREFIX: &str = ".dartq-fresh-";
 /// How old a stray cookie may be before the arm sweep removes it — a
 /// crashed request's leftovers, never a live barrier's (one hour bounds
 /// a cookie's whole life by orders of magnitude).
-const COOKIE_STALE: Duration = Duration::from_secs(60 * 60);
+const COOKIE_STALE: Duration = Duration::from_hours(1);
 
 /// One watched stream: the canonical path the OS stream is armed on and
 /// the directory its sync cookie is written to — `<dir>/.dart_tool/dartq/`
@@ -587,9 +588,9 @@ impl Watcher {
         }
     }
 
-    /// macOS: moves the ONE FSEvents stream from `have` to `want`.
+    /// macOS: moves the ONE `FSEvents` stream from `have` to `want`.
     /// Returns the wanted dirs that vanished since the plan (dropped,
-    /// not stream evidence — FSEvents would take a missing path without
+    /// not stream evidence — `FSEvents` would take a missing path without
     /// complaint, so the check is ours), `None` on a stream failure. An
     /// unchanged set leaves the stream alone.
     #[cfg(target_os = "macos")]
@@ -919,10 +920,9 @@ impl Freshness {
         });
         let mut watcher = Watcher::spawn(&shared);
         let plan = Snapshot::preplan(roots, packages, sdk_home);
-        let armed = watcher.as_mut().is_some_and(|watcher| {
-            let armed = !matches!(watcher.reconcile(&plan, &shared), Arm::Failed);
-            armed
-        });
+        let armed = watcher
+            .as_mut()
+            .is_some_and(|watcher| !matches!(watcher.reconcile(&plan, &shared), Arm::Failed));
         if !armed {
             watcher = None;
         }
@@ -1033,16 +1033,15 @@ impl Freshness {
         };
         let primed = priming.wait();
         self.primed = true;
-        let (snapshot, plan, take) = match primed {
-            Some(primed) => (primed.snapshot, primed.plan, primed.take),
-            None => {
-                let roots = self.plan_roots();
-                let packages = self.plan_packages();
-                let sdk = self.plan_sdk_home();
-                let start = Instant::now();
-                let (snapshot, plan) = Snapshot::take_with_plan(&roots, packages.as_deref(), &sdk);
-                (snapshot, plan, start.elapsed())
-            }
+        let (snapshot, plan, take) = if let Some(primed) = primed {
+            (primed.snapshot, primed.plan, primed.take)
+        } else {
+            let roots = self.plan_roots();
+            let packages = self.plan_packages();
+            let sdk = self.plan_sdk_home();
+            let start = Instant::now();
+            let (snapshot, plan) = Snapshot::take_with_plan(&roots, packages.as_deref(), &sdk);
+            (snapshot, plan, start.elapsed())
         };
         self.install(snapshot, plan, take);
     }
@@ -1171,15 +1170,13 @@ impl Freshness {
         // stream: its doubt boundary begins here — the trust window
         // opens only after a delivery observed on the new stream.
         let spawned = self.watcher.is_none();
-        let failed = match self.watcher.as_mut() {
-            Some(watcher) => watcher.reconcile(&self.plan, &self.shared),
-            None => {
-                self.watcher = Watcher::spawn(&self.shared);
-                self.watcher
-                    .as_mut()
-                    .map(|watcher| watcher.reconcile(&self.plan, &self.shared))
-                    .unwrap_or(Arm::Failed)
-            }
+        let failed = if let Some(watcher) = self.watcher.as_mut() {
+            watcher.reconcile(&self.plan, &self.shared)
+        } else {
+            self.watcher = Watcher::spawn(&self.shared);
+            self.watcher.as_mut().map_or(Arm::Failed, |watcher| {
+                watcher.reconcile(&self.plan, &self.shared)
+            })
         };
         #[cfg(target_os = "macos")]
         if !before.is_empty() && !matches!(failed, Arm::Failed) {
@@ -1232,10 +1229,7 @@ impl Freshness {
         let backoff = cool_off()
             .saturating_mul(1u32 << strikes.min(5))
             .min(COOL_OFF_MAX);
-        eprintln!(
-            "dartq-analyzer-host: watch: {cause} — walking for {:?}",
-            backoff
-        );
+        eprintln!("dartq-analyzer-host: watch: {cause} — walking for {backoff:?}");
         self.cool_off = Some(((self.shared.now)(), strikes));
         self.since = Some((self.shared.now)());
         self.timeouts = 0;
@@ -1865,7 +1859,8 @@ fn unwatched_of(plan: &WalkPlan) -> Vec<PathBuf> {
     plan.configs
         .iter()
         .zip(plan.watched.iter())
-        .filter_map(|(file, watched)| (!watched).then(|| file.clone()))
+        .filter(|&(_file, watched)| !watched)
+        .map(|(file, _watched)| file.clone())
         .chain(plan.walked.iter().filter(|root| !root.is_dir()).cloned())
         .collect()
 }
@@ -1977,7 +1972,7 @@ mod portable {
     }
 }
 
-/// The macOS substrate: the crate's own FSEvents binding — one stream
+/// The macOS substrate: the crate's own `FSEvents` binding — one stream
 /// over the whole watch set, owned by a dedicated CoreFoundation
 /// run-loop thread whose callback folds events straight into the
 /// journal (no channel, no second thread).
@@ -2360,7 +2355,7 @@ mod fsevents {
         }
     }
 
-    /// The stream's path list: a CFArray of the paths' CFStrings.
+    /// The stream's path list: a `CFArray` of the paths' `CFStrings`.
     fn path_array(paths: &[PathBuf]) -> Result<Owned, String> {
         let strings = paths
             .iter()
@@ -2791,7 +2786,7 @@ mod tests {
 
     /// Gives the fixture's adaptive barrier real headroom: a tiny
     /// tree's EWMA seeds the wait near the [`WAIT_MIN`] floor — below
-    /// real FSEvents latency, so a healthy stream's cookie would time
+    /// real `FSEvents` latency, so a healthy stream's cookie would time
     /// out spuriously. The priming baseline settles first (its install
     /// re-seeds the bound from the take), then tests that exercise the
     /// journal path (not the timeout path) pin the bound to 500 ms —
@@ -2807,7 +2802,7 @@ mod tests {
     /// one suite pid got zero live deliveries for 30 s while siblings
     /// delivered), so concurrent live tests throttle each other into
     /// spurious `walk`-flag fallbacks. One guard held for the whole test
-    /// keeps delivery deterministic; parking_lot mutexes are unpoisoned,
+    /// keeps delivery deterministic; `parking_lot` mutexes are unpoisoned,
     /// so a panicking test never wedges the rest.
     static WATCH_SERIAL: Mutex<()> = Mutex::new(());
 
@@ -2817,7 +2812,7 @@ mod tests {
         WATCH_SERIAL.lock()
     }
 
-    /// The real OS watcher end to end (FSEvents on this host): an edit
+    /// The real OS watcher end to end (`FSEvents` on this host): an edit
     /// made after the barrier lands must surface in the diff — never a
     /// stale answer — and the journal path must produce the same
     /// snapshot the walk does.
@@ -2865,7 +2860,7 @@ mod tests {
 
     /// How long the live-delivery tests wait on the OS: generous next to
     /// any delivery a loaded host makes — behind a saturated `fseventsd`
-    /// the raw FSEvents API was measured at 2.3–3.8 s per event, and a
+    /// the raw `FSEvents` API was measured at 2.3–3.8 s per event, and a
     /// host running a parallel benchmark lane's watchers was measured
     /// delivering in 20–30 s — and finite, so a substrate that stops
     /// delivering live events still fails these loudly, every run.
@@ -2940,7 +2935,7 @@ mod tests {
         );
         // Back-date the cool-off so the next request re-arms at once.
         if let Some((since, _)) = &mut freshness.cool_off {
-            *since = Instant::now() - cool_off() * 2;
+            *since = Instant::now().checked_sub(cool_off() * 2).unwrap();
         }
         let _ = freshness.check(&tree.roots());
         assert!(freshness.armed(), "the cool-off's re-arm restored it");
@@ -2984,7 +2979,7 @@ mod tests {
         // dirty entry is the event the stream would have delivered.
         let edit = tree.app.join("lib/after_prime.dart");
         fs::write(&edit, "var p;\n").expect("edit");
-        freshness.inject_dirty(&[edit.clone()]);
+        freshness.inject_dirty(std::slice::from_ref(&edit));
         let diff = freshness.check(&tree.roots());
         assert_eq!(
             freshness.last_check().mode,
@@ -3098,7 +3093,7 @@ mod tests {
         let tree = Tree::build("cap");
         let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
         generous_wait(&mut freshness);
-        let flood: Vec<PathBuf> = (0..DIRTY_CAP + 1)
+        let flood: Vec<PathBuf> = (0..=DIRTY_CAP)
             .map(|i| tree.app.join(format!("lib/f{i}.dart")))
             .collect();
         freshness.inject_dirty(&flood);
@@ -3132,9 +3127,12 @@ mod tests {
         for index in 0..3 {
             let name = format!("{COOKIE_PREFIX}expired-{index}");
             freshness.shared.journal.lock().late.insert(name.clone());
-            freshness
-                .late
-                .push((name, Instant::now() - Duration::from_millis(1)));
+            freshness.late.push((
+                name,
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .unwrap(),
+            ));
         }
         freshness.sweep_late();
         assert_eq!(freshness.timeouts, 0, "the abandon cleared the count");
@@ -3145,7 +3143,7 @@ mod tests {
         // Back-date the cool-off so the next request re-arms without a
         // real-time wait.
         if let Some((since, _)) = &mut freshness.cool_off {
-            *since = Instant::now() - cool_off() * 2;
+            *since = Instant::now().checked_sub(cool_off() * 2).unwrap();
         }
         let _ = freshness.check(&tree.roots());
         assert!(freshness.armed(), "the cool-off's re-arm restored it");
@@ -3200,7 +3198,7 @@ mod tests {
     fn open_trust(freshness: &mut Freshness) {
         freshness.timeouts = 0;
         let now = (freshness.shared.now)();
-        freshness.health_since = Some(now - Duration::from_secs(1));
+        freshness.health_since = Some(now.checked_sub(Duration::from_secs(1)).unwrap());
         freshness.late.clear();
         let mut journal = freshness.shared.journal.lock();
         journal.late.clear();
@@ -3242,8 +3240,13 @@ mod tests {
         freshness.health_since = Some((freshness.shared.now)());
         assert!(!freshness.trust_ready(), "an unproven stream closes it");
         open_trust(&mut freshness);
-        freshness.shared.journal.lock().proven =
-            Some((freshness.shared.now)() - TRUST_WINDOW - Duration::from_secs(1));
+        freshness.shared.journal.lock().proven = Some(
+            (freshness.shared.now)()
+                .checked_sub(TRUST_WINDOW)
+                .unwrap()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
+        );
         assert!(!freshness.trust_ready(), "a stale proof closes it");
         freshness.shared.journal.lock().proven = Some((freshness.shared.now)());
         freshness.inject_dirty(&[tree.app.join("lib/a.dart")]);
@@ -3738,7 +3741,7 @@ mod tests {
         // rebuilds `want` (its `is_dir` now fails, so it drops off the
         // want list) while `have` still arms it: the unwatch path runs.
         fs::remove_dir_all(&gone).expect("vanish");
-        let before = freshness.watcher.as_ref().map(|w| w.errors).unwrap_or(0);
+        let before = freshness.watcher.as_ref().map_or(0, |w| w.errors);
         let outcome = freshness
             .watcher
             .as_mut()
@@ -3820,7 +3823,7 @@ mod tests {
 
         let file = tree.app.join("lib/a.dart");
         fs::write(&file, "var diag;\n").expect("edit");
-        freshness.inject_dirty(&[file.clone()]);
+        freshness.inject_dirty(std::slice::from_ref(&file));
         let diff = freshness.check(&tree.roots());
         let diag = freshness.last_check();
         assert_eq!(diag.mode, CheckMode::Journal);
@@ -3958,7 +3961,7 @@ mod tests {
         fs::remove_dir_all(&tree.base).ok();
     }
 
-    /// macOS FSEvents: a reconcile that watches or unwatches on a live
+    /// macOS `FSEvents`: a reconcile that watches or unwatches on a live
     /// stream restarts it from `now` and drops the other roots' events
     /// inside the window — the journal must flag a walk so the next
     /// request re-covers once, then converges on a no-op reconcile.
@@ -4022,7 +4025,7 @@ mod tests {
         // The watcher reports the dir; the merge subtree-walks it. An
         // OS rescan flag racing the request takes the walk instead —
         // re-inject and retry; a merge carry must eventually appear.
-        freshness.inject_dirty(&[dir.clone()]);
+        freshness.inject_dirty(std::slice::from_ref(&dir));
         let mut carried = false;
         for _ in 0..20 {
             let walks = freshness.walks;
@@ -4035,7 +4038,7 @@ mod tests {
                 freshness.walks > walks,
                 "the merge neither carried nor walked — the dirty path was lost"
             );
-            freshness.inject_dirty(&[dir.clone()]);
+            freshness.inject_dirty(std::slice::from_ref(&dir));
         }
         assert!(
             carried,
@@ -4284,8 +4287,16 @@ mod tests {
         // (or the stream's own events) holds them.
         let file = tree.app.join("lib/a.dart");
         fs::write(&file, "var edited = 1;\n").expect("edit");
-        freshness.last_request = Instant::now() - VERIFY_IDLE - Duration::from_secs(1);
-        freshness.last_verify = Instant::now() - VERIFY_PERIOD - Duration::from_secs(1);
+        freshness.last_request = Instant::now()
+            .checked_sub(VERIFY_IDLE)
+            .unwrap()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
+        freshness.last_verify = Instant::now()
+            .checked_sub(VERIFY_PERIOD)
+            .unwrap()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(400));
         for _ in 0..8 {
             let _ = freshness.check(&tree.roots());
@@ -4327,7 +4338,7 @@ mod tests {
         // barrier's `moved` check must void the verdict.
         let file = tree.app.join("lib/a.dart");
         fs::write(&file, "var racing = 1;\n").expect("race write");
-        freshness.inject_dirty(&[file.clone()]);
+        freshness.inject_dirty(std::slice::from_ref(&file));
         let previous = freshness.snapshot.clone();
         assert_eq!(
             freshness.verify_at_sync(&previous),
@@ -4368,8 +4379,7 @@ mod tests {
         let (now, errors) = freshness
             .watcher
             .as_ref()
-            .map(|w| (w.stream_id, w.errors))
-            .unwrap_or((u64::MAX, 0));
+            .map_or((u64::MAX, 0), |w| (w.stream_id, w.errors));
         assert!(
             now == generation.unwrap() || errors > 0,
             "the generation changed only on a real stream error; \
@@ -4450,8 +4460,16 @@ mod tests {
         // inconclusive by design — the audit retries next period, so
         // retry the due check until the verdict lands.
         for _ in 0..20 {
-            freshness.last_request = Instant::now() - VERIFY_IDLE - Duration::from_secs(1);
-            freshness.last_verify = Instant::now() - VERIFY_PERIOD - Duration::from_secs(1);
+            freshness.last_request = Instant::now()
+                .checked_sub(VERIFY_IDLE)
+                .unwrap()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap();
+            freshness.last_verify = Instant::now()
+                .checked_sub(VERIFY_PERIOD)
+                .unwrap()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap();
             let _ = freshness.check(&tree.roots());
             if !freshness.armed() {
                 break;

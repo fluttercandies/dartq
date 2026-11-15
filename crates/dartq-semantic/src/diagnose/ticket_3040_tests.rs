@@ -10,6 +10,7 @@
 //! on `lints/discarded_futures/DiscardedFuturesTest/test_cascadeSection#0`
 //! (`var _ = 0..g();` over `extension on int`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

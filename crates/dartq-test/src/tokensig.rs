@@ -36,6 +36,7 @@
 //! reads — are likewise extracted from the raw source and keep taking
 //! effect on comment-only edits.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{ScanConfig, TokenKind, TokenTable};
 use dartq_source::FileTable;
 use std::path::Path;

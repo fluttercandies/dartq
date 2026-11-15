@@ -30,6 +30,7 @@
 //! Oracle rows captured 2026-10-31 against `dart analyze --format
 //! machine` 3.13.7.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use super::*;
 
@@ -64,7 +65,7 @@ fn at(source: &str, needle: &str, nth: usize) -> (u32, u32) {
 // —— The enum-constructor self-reference leak ————————————————————————————
 
 /// `enum _E { a(0); const _E(int i); }` — the declared constructor's own
-/// `_E` NamedType leaks the enum element into `usedElements.elements`
+/// `_E` `NamedType` leaks the enum element into `usedElements.elements`
 /// (the upstream `_enclosingClass` gap); `_E` never reports. The `a`
 /// constant's own `unused_field` verdict is the Field arm's, not this
 /// face's.
@@ -83,7 +84,7 @@ fn enum_with_declared_unnamed_ctor_is_used() {
 }
 
 /// The named-selector half: `const _E.n()`'s returnType is the same `_E`
-/// NamedType — the enum reads used identically.
+/// `NamedType` — the enum reads used identically.
 #[test]
 fn enum_with_declared_named_ctor_is_used() {
     let report = report_ops(
@@ -99,7 +100,7 @@ fn enum_with_declared_named_ctor_is_used() {
 }
 
 /// An empty-but-present argument list is still a constructor invocation:
-/// `a()` over `const _E()` spares `_E` through the same NamedType leak —
+/// `a()` over `const _E()` spares `_E` through the same `NamedType` leak —
 /// the constant's own `unused_field` verdict is unchanged.
 #[test]
 fn enum_empty_args_with_declared_ctor_is_used() {
@@ -149,7 +150,7 @@ fn enum_bare_constants_still_report() {
 }
 
 /// A private class's own constructor does NOT leak — `visitClass
-/// Declaration` sets `_enclosingClass`, so `const _C()`'s `_C` NamedType
+/// Declaration` sets `_enclosingClass`, so `const _C()`'s `_C` `NamedType`
 /// self-skips: the class reports exactly as before.
 #[test]
 fn class_with_ctor_still_reports() {

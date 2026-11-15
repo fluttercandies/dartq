@@ -2,16 +2,17 @@
 //! the record-literal field face of `use_of_void_result`. A `void`
 //! receiver's value is consumed by the access, so the oracle reports there
 //! (upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-//! property_element_resolver.dart — `_resolve`'s `targetType is VoidType`
+//! `property_element_resolver.dart` — `_resolve`'s `targetType is VoidType`
 //! arm anchors the member's own name for a read/write, `_reportUnresolved
 //! Index` anchors the bracket pair, and a member *invocation* takes
-//! error_verifier.dart `visitAnonymousMethodInvocation`'s
+//! `error_verifier.dart` `visitAnonymousMethodInvocation`'s
 //! `checkForUseOfVoidResult(node.target2)` — the receiver node;
-//! record_literal_resolver.dart:160 anchors the literal field).
+//! `record_literal_resolver.dart:160` anchors the literal field).
 //!
 //! `void v() {}` + `var a = v();` types the local `void` (the oracle's
 //! inferred slot), which is the receiver every fixture below consumes.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// The message the oracle spells for every face — parameterless
@@ -92,7 +93,7 @@ fn ticket_3249_index_write_void_receiver() {
 }
 
 /// A record literal's field reports on the FIELD node
-/// (record_literal_resolver.dart:159 `.at(field)`) — its whole extent, not
+/// (`record_literal_resolver.dart:159` `.at(field)`) — its whole extent, not
 /// the value row's own token: a named field is the
 /// `RecordLiteralNamedField` (`a: v()` — label through the value's
 /// expression end), a positional field is the value expression itself
@@ -117,9 +118,7 @@ fn ticket_3249_non_void_receiver_stays_silent() {
     let fixture = "class A {\n  int bar = 0;\n  void baz() {}\n}\nvoid main() {\n  A a = A();\n  a.bar;\n  a.bar = 1;\n  a.baz();\n}";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report)
-            .iter()
-            .any(|name| *name == "use_of_void_result"),
+        !code_names(&report).contains(&"use_of_void_result"),
         "{:?}",
         rows(&report)
     );

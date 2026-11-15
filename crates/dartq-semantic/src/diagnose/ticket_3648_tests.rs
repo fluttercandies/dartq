@@ -19,6 +19,7 @@
 //!   which `void` and `typedef A = T?` spellings answer `false`; the flow's
 //!   bit only reads the use-site `?` and misses `Base::Void`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{code_names, report_ops, report_ops_wildcards, rows};
 
 fn not_assigned(source: &str) -> Vec<String> {

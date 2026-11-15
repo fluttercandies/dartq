@@ -8,6 +8,7 @@
 //! the false `body_might_complete_normally` the unknown scrutinee reported
 //! disappears.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

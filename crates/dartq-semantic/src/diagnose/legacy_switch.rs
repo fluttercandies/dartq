@@ -5,9 +5,9 @@
 //! pkg/analyzer/lib/src/dart/constant/constant_verifier.dart:1145-1182 —
 //! `_validateSwitchStatement_nullSafety` gated on
 //! `!featureSet.isEnabled(Feature.patterns)` — plus
-//! pkg/analyzer/lib/src/generated/error_verifier.dart's
+//! `pkg/analyzer/lib/src/generated/error_verifier.dart`'s
 //! `_checkForMissingEnumConstantInSwitch` and
-//! pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart's
+//! pkg/_`fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart`'s
 //! `caseExpressionTypeMismatch` arm). A patterns-era switch takes the
 //! exhaustiveness faces instead; this whole pass never runs there.
 //!
@@ -16,11 +16,12 @@
 //! `end_case_expression`; [`Engine::report_legacy_switch`] consumes the
 //! closed context's entries.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::switch_tracker::SwitchCtx;
 use dartq_source::StringId;
 
-impl<'a> Engine<'a> {
+impl Engine<'_> {
     /// The deferred-import face of a legacy case head (upstream
     /// `evaluation.dart`'s `_getDeferredLibraryError` →
     /// `nonConstantCaseExpressionFromDeferredLibrary`): a constant
@@ -299,7 +300,7 @@ impl<'a> Engine<'a> {
         if container.kind != ContainerKind::Enum {
             return;
         }
-        let mut missing: Vec<StringId> = container.enum_constants.iter().copied().collect();
+        let mut missing: Vec<StringId> = container.enum_constants.to_vec();
         let mut has_case_null = false;
         for case in &ctx.legacy_cases {
             match &case.value {

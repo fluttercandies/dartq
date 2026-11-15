@@ -6,7 +6,7 @@
 //! `GenericInferrer.constrainReturnType(declaredType, contextType)`
 //! solving the head's parameters against the matched type along the
 //! superclass chain — upstream Dart SDK source,
-//! pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart:
+//! pkg/_`fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart`:
 //! 1497-1513, pkg/analyzer/lib/src/generated/resolver.dart:869-913,
 //! 4596-4620). The riverpod corpus' four ATNA rows (`case AsyncData():` /
 //! `case AsyncError():` over `AsyncValue<ValueT>`) trace to the
@@ -24,6 +24,9 @@
 //! tested head — the single-parameter chain the repro shapes share
 //! (`AsyncData<T> extends AsyncResult<T> extends AsyncValue<T>`: the
 //! solution `T ↦ ValueT` IS the scrutinee's argument list).
+
+#![allow(clippy::assert_is_empty, clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::cast_possible_truncation)]
 
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
@@ -199,6 +202,7 @@ fn analyze<'t>(
 /// triple the instantiated-face assertions need (the `args` arena index
 /// distinguishes the raw `AsyncData` head from the inferred
 /// `AsyncData<ValueT>` spelling).
+#[allow(clippy::type_complexity)]
 fn reads<'a>(
     source: &'a str,
     facts: &[FlowFact],
@@ -212,7 +216,7 @@ fn reads<'a>(
         match fact {
             FlowFact::ReadType { span, ty, args } => read.push((at(span.range), *ty, *args)),
             FlowFact::PromotedRead { span, ty, args } => {
-                promoted.push((at(span.range), *ty, *args))
+                promoted.push((at(span.range), *ty, *args));
             }
             _ => {}
         }

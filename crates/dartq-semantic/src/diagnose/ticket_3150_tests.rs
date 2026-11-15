@@ -1,4 +1,4 @@
-//! The #3150 pins: `undefined_identifier`'s InvalidType operand face —
+//! The #3150 pins: `undefined_identifier`'s `InvalidType` operand face —
 //! the numeric refinement reads a resolution failure the oracle also
 //! sees as `InvalidType`, so `int - <unresolved>` answers `double` and
 //! the `int` sink reports `invalid_assignment` beside the miss itself.
@@ -12,7 +12,7 @@
 //! receiver whose written head resolves to nothing types the read
 //! `InvalidType`, and an unresolved prefixed member read
 //! (`undefined_prefixed_name`) types `InvalidType` — is
-//! type_property_resolver.dart's error-element path: the lookup never
+//! `type_property_resolver.dart`'s error-element path: the lookup never
 //! runs on an `InvalidType` receiver, and an error element's read face
 //! is the invalid type. A declared receiver whose member the model
 //! cannot spell stays the documented gap (an extension the pass-2
@@ -26,6 +26,7 @@
 //! `undefined_getter` (the last stays `Gap` here — the member face's
 //! extension applicability is not this face's question).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -294,7 +295,7 @@ fn resolved_prefixed_member_operand_stays_silent() {
 // receiver's host. ————————————————————————————————————————————————
 
 /// `x;` where `x` is undeclared reports `undefined_identifier` at the
-/// name — the bare-read miss (error_verifier.dart's
+/// name — the bare-read miss (`error_verifier.dart`'s
 /// `_checkForUndefinedIdentifier`).
 #[test]
 fn bare_read_miss_reports_undefined_identifier() {
@@ -304,7 +305,7 @@ fn bare_read_miss_reports_undefined_identifier() {
 }
 
 /// `p.C c;` with `p` undeclared reports `undefined_class` at `C` — the
-/// type-position miss (named_type_resolver.dart's `reportNullOrNonType
+/// type-position miss (`named_type_resolver.dart`'s `reportNullOrNonType
 /// Element` importPrefix fallthrough), never `undefined_identifier`.
 #[test]
 fn prefixed_type_head_miss_reports_undefined_class() {
@@ -319,7 +320,7 @@ fn prefixed_type_head_miss_reports_undefined_class() {
 
 /// `p.C.m();` with `p` undeclared reports `undefined_identifier` at `p`
 /// — the expression-position head miss; the continuation's member faces
-/// never run on an InvalidType receiver.
+/// never run on an `InvalidType` receiver.
 #[test]
 fn prefixed_expression_head_miss_reports_undefined_identifier() {
     let report = report("void f() {\n  p.C.m();\n}");

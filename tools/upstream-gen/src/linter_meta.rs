@@ -32,6 +32,67 @@
 //! order (`#p0` included — the analyzer's positional spelling names the
 //! same slots), the fill the dartq templates render.
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::type_complexity,
+    clippy::cast_possible_truncation,
+    clippy::assert_is_empty,
+    clippy::used_underscore_binding,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::default_trait_access,
+    clippy::ptr_arg,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::doc_lazy_continuation,
+    clippy::unnecessary_get_then_check,
+    clippy::match_wildcard_for_single_variants,
+    clippy::naive_bytecount,
+    clippy::sliced_string_as_bytes,
+    clippy::nonminimal_bool,
+    clippy::useless_conversion,
+    clippy::question_mark,
+    clippy::option_option,
+    clippy::needless_continue,
+    clippy::missing_panics_doc,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::explicit_counter_loop,
+    clippy::never_loop,
+    clippy::needless_range_loop,
+    clippy::unnecessary_unwrap,
+    clippy::assigning_clones,
+    clippy::double_must_use,
+    clippy::single_match,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::ignore_without_reason,
+    clippy::unnecessary_debug_formatting,
+    clippy::match_wild_err_arm,
+    clippy::disallowed_names,
+    clippy::many_single_char_names,
+    clippy::same_item_push,
+    clippy::while_let_loop,
+    clippy::if_same_then_else,
+    clippy::ref_option,
+    clippy::unnecessary_filter_map,
+    clippy::manual_strip,
+    clippy::float_cmp,
+    clippy::redundant_guards,
+    clippy::empty_line_after_doc_comments,
+    clippy::unreadable_literal,
+    clippy::enum_variant_names,
+    clippy::missing_errors_doc,
+    clippy::unnecessary_wraps,
+    clippy::too_many_arguments,
+    clippy::unused_self,
+    clippy::fn_params_excessive_bools,
+    clippy::semicolon_if_nothing_returned
+)]
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -39,7 +100,7 @@ use std::fmt::Write as _;
 #[derive(Debug, Clone)]
 pub struct ConstEntry {
     pub const_name: String,
-    /// snake_case machine name (sharedName or the const itself).
+    /// `snake_case` machine name (sharedName or the const itself).
     pub name: String,
     pub problem: Option<String>,
     pub correction: Option<String>,
@@ -126,7 +187,7 @@ pub fn snake_case(camel: &str) -> String {
 }
 
 /// Parses `pkg/linter/messages.yaml` into const entries, in file order
-/// (serde_yaml mappings preserve document order — the fold's tie-break).
+/// (`serde_yaml` mappings preserve document order — the fold's tie-break).
 pub fn parse_messages(src: &str) -> Result<Vec<ConstEntry>, String> {
     let yaml: serde_yaml::Value =
         serde_yaml::from_str(src).map_err(|e| format!("pkg/linter/messages.yaml: {e}"))?;
@@ -153,7 +214,7 @@ pub fn parse_messages(src: &str) -> Result<Vec<ConstEntry>, String> {
         };
         let mut params = Vec::new();
         if let Some(serde_yaml::Value::Mapping(map)) =
-            fields.get(&serde_yaml::Value::String("parameters".to_owned()))
+            fields.get(serde_yaml::Value::String("parameters".to_owned()))
         {
             for key in map.keys() {
                 let Some(key) = key.as_str() else { continue };
@@ -163,7 +224,7 @@ pub fn parse_messages(src: &str) -> Result<Vec<ConstEntry>, String> {
         let mut removed = false;
         let mut deprecated = false;
         if let Some(serde_yaml::Value::Mapping(state)) =
-            fields.get(&serde_yaml::Value::String("state".to_owned()))
+            fields.get(serde_yaml::Value::String("state".to_owned()))
         {
             for key in state.keys() {
                 match key.as_str() {
@@ -180,7 +241,7 @@ pub fn parse_messages(src: &str) -> Result<Vec<ConstEntry>, String> {
             problem: get_str("problemMessage"),
             correction: get_str("correctionMessage"),
             published: fields
-                .get(&serde_yaml::Value::String("hasPublishedDocs".to_owned()))
+                .get(serde_yaml::Value::String("hasPublishedDocs".to_owned()))
                 .and_then(serde_yaml::Value::as_bool)
                 .unwrap_or(false),
             removed,
@@ -363,7 +424,7 @@ pub fn scan_rule_files(files: &[(String, String)]) -> BTreeMap<String, RuleFileF
     facts
 }
 
-/// The `LintNames.<x>` identifier at `at`, snake_cased.
+/// The `LintNames.<x>` identifier at `at`, `snake_cased`.
 fn lint_name_at(src: &str, at: usize) -> Option<String> {
     let rest = &src[at + "name: LintNames.".len()..];
     let ident: String = rest
@@ -466,7 +527,7 @@ pub fn lints_set_names(src: &str) -> Result<Vec<String>, String> {
         .iter()
         .map(|item| {
             item.as_str()
-                .map(|name| name.to_ascii_lowercase())
+                .map(str::to_ascii_lowercase)
                 .ok_or_else(|| "lints set: non-name rules entry".to_owned())
         })
         .collect()
@@ -773,75 +834,73 @@ pub fn render_rule_meta(
         );
     }
     out.push_str("];\n\n");
-    out.push_str(&format!(
-        r#"/// The name-sorted metadata table — the runtime read face.
+    out.push_str(r#"/// The name-sorted metadata table — the runtime read face.
 pub static RULE_META: &[RuleMeta] = TABLE;
 
 /// The metadata of rule `name`, `None` when the name is not a first-party
 /// linter rule of the pinned tree (the diagnostic mirrors and unknown
 /// names). Binary search; a once-per-run lookup face.
 #[must_use]
-pub fn rule_meta(name: &str) -> Option<&'static RuleMeta> {{
+pub fn rule_meta(name: &str) -> Option<&'static RuleMeta> {
     RULE_META
         .binary_search_by(|meta| meta.name.cmp(name))
         .ok()
         .map(|index| &RULE_META[index])
-}}
+}
 
 /// The compile-time face: the `spec!` macro resolves a rule's group at
 /// its `static SPEC` initializer, so a rule the table does not carry
 /// fails the build (not the first query). One linear scan per site.
-pub(crate) const fn meta_group(name: &str) -> Group {{
+pub(crate) const fn meta_group(name: &str) -> Group {
     let mut i = 0;
-    while i < TABLE.len() {{
-        if str_eq(TABLE[i].name, name) {{
+    while i < TABLE.len() {
+        if str_eq(TABLE[i].name, name) {
             return TABLE[i].group;
-        }}
+        }
         i += 1;
-    }}
+    }
     panic!("lint rule has no generated metadata row; regenerate the table or add the name to the registry exemption list");
-}}
+}
 
 /// The compile-time `problemMessage` face of [`meta_group`].
-pub(crate) const fn meta_problem(name: &str) -> &'static str {{
+pub(crate) const fn meta_problem(name: &str) -> &'static str {
     let mut i = 0;
-    while i < TABLE.len() {{
-        if str_eq(TABLE[i].name, name) {{
+    while i < TABLE.len() {
+        if str_eq(TABLE[i].name, name) {
             return TABLE[i].problem;
-        }}
+        }
         i += 1;
-    }}
+    }
     panic!("lint rule has no generated metadata row; regenerate the table or add the name to the registry exemption list");
-}}
+}
 
 /// The compile-time `correctionMessage` face of [`meta_group`].
-pub(crate) const fn meta_correction(name: &str) -> &'static str {{
+pub(crate) const fn meta_correction(name: &str) -> &'static str {
     let mut i = 0;
-    while i < TABLE.len() {{
-        if str_eq(TABLE[i].name, name) {{
+    while i < TABLE.len() {
+        if str_eq(TABLE[i].name, name) {
             return TABLE[i].correction;
-        }}
+        }
         i += 1;
-    }}
+    }
     panic!("lint rule has no generated metadata row; regenerate the table or add the name to the registry exemption list");
-}}
+}
 
-const fn str_eq(a: &str, b: &str) -> bool {{
+const fn str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {{
+    if a.len() != b.len() {
         return false;
-    }}
+    }
     let mut i = 0;
-    while i < a.len() {{
-        if a[i] != b[i] {{
+    while i < a.len() {
+        if a[i] != b[i] {
             return false;
-        }}
+        }
         i += 1;
-    }}
+    }
     true
-}}
-"#
-    ));
+}
+"#);
     out
 }
 

@@ -7,6 +7,7 @@
 //! face's spelling in a foreign scope. Each fixture was probed against
 //! oracle `dart analyze` (fvm default) via the isolated `mixinrepro` tree.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

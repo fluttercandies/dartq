@@ -2,6 +2,7 @@
 //! Hand-written because the shell carries no Dart
 //! semantics; the format is ~40 lines and pinned by the tests below.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{self, BufRead, Read, Write};
 
 /// Upper bound for one header line (#947 F1): frame headers are tiny, and

@@ -23,6 +23,7 @@
 //! arguments; the analyzer's `wrong_number_of_type_arguments_constructor` is
 //! a semantic face, not this one).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.

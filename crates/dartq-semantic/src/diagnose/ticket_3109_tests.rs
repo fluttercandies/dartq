@@ -16,6 +16,7 @@
 //!   parameter (`thisType <: superType || superType <: thisType`), else the
 //!   oracle reports plain `invalid_override` even for a setter face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

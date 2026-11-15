@@ -8,6 +8,7 @@
 //! genuine miss still reports, and an alias cycle terminates instead of
 //! re-anchoring forever.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, report_ops, report_ops_imports};
 use crate::diagnose::FileReport;
 

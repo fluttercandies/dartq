@@ -29,6 +29,7 @@
 //! `!`/`-` and reported `(34,3)`/`(49,5)` against the oracle's
 //! `(35,2)`/`(51,3)`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
 use crate::library::ElementIndex;

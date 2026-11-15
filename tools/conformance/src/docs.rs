@@ -7,6 +7,7 @@
 //! skip list, `%language=` / `%uri=` / `%experiments=` / `%ignore=`
 //! directives, and the auxiliary-file accumulation semantics.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::case::Case;
 use crate::messages_yaml::{self, MessageEntry};
 use crate::setup;
@@ -195,17 +196,18 @@ fn parse_documentation(documentation: &str) -> Vec<(Section, Block)> {
             }
             continue;
         }
-        if line.starts_with('#') && !line.starts_with("#####") {
-            if let Some(next) = section_of(line) {
-                section = Some(next);
-            }
+        if line.starts_with('#')
+            && !line.starts_with("#####")
+            && let Some(next) = section_of(line)
+        {
+            section = Some(next);
         }
     }
     parts
 }
 
 fn skip_block(lines: &mut std::iter::Peekable<std::str::Lines<'_>>) {
-    while let Some(l) = lines.next() {
+    for l in lines.by_ref() {
         if l.starts_with("```") {
             return;
         }
@@ -253,7 +255,7 @@ struct Snippet {
 /// Extracts all doc-example cases from one parsed messages.yaml.
 pub fn extract_messages(entries: &[MessageEntry], origin: &str) -> DocExtraction {
     let mut out = DocExtraction::default();
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_ids: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
     for entry in entries {
         let Some(documentation) = &entry.documentation else {
             continue;
@@ -348,7 +350,7 @@ fn snake_case(name: &str) -> String {
 
 fn push_snippet(
     out: &mut DocExtraction,
-    seen: &mut std::collections::HashSet<String>,
+    seen: &mut rustc_hash::FxHashSet<String>,
     code: &str,
     name: &str,
     snippet: &Snippet,
@@ -399,7 +401,10 @@ fn push_snippet(
         id,
         source: format!("{origin}#{}", entry.analyzer_code),
         language: snippet.language_version.clone(),
-        packages: setup::MOCK_PACKAGES.iter().map(|s| s.to_string()).collect(),
+        packages: setup::MOCK_PACKAGES
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
         aux_packages,
         options: Some(setup::analysis_options_content(
             &snippet.experiments,

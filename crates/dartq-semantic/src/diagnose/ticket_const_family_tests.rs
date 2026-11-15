@@ -36,6 +36,7 @@
 //! (`equal_keys_in_const_map` / `equal_elements_in_const_set`) over const
 //! literals.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -632,7 +633,7 @@ fn annotation_head_checks_non_constant_argument() {
 /// The argument-count faces in annotation position: upstream
 /// `resolveArgumentsToParameters` anchors a deficit at the argument
 /// list's close `)` (`lastPositionalArgument?.endToken.next ??
-/// leftParenthesis.next ?? rightParenthesis`, type_analyzer.dart) and a
+/// leftParenthesis.next ?? rightParenthesis`, `type_analyzer.dart`) and a
 /// surplus at the first extra positional argument's expression (the
 /// probed `@P()` / `@P(1, 2, 3)` pairings — capacity two puts the surplus
 /// on the third). The `dynamic` fields keep the unit-less rig free of

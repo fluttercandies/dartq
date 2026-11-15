@@ -3,10 +3,11 @@
 //! type-variable group (`Function<extends int>()`) never validates as a
 //! generalized function type: the alias degrades to the bare return type,
 //! `ensureSemicolon` anchors `expectedToken(';')` on it
-//! (parser_impl.dart:5048), and the `Function<...>(...)` tail is re-read
+//! (`parser_impl.dart:5048`), and the `Function<...>(...)` tail is re-read
 //! as a top-level member whose `;` reports `missingFunctionBody`
 //! (`parseFunctionBody`, `diag.expectedBody`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{latest_features, scan_ok};
 
 /// Parser rows of `source` as (code, start, end) UTF-16 triples, sorted.

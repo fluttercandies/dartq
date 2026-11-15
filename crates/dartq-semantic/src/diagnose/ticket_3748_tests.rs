@@ -8,6 +8,7 @@
 //! `extends num`, and a narrower bound is not the bound itself), so the
 //! oracle reports `invalid_assignment` for all three.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{report_ops, rows};
 
 fn invalid_assignments(source: &str) -> Vec<String> {
@@ -79,7 +80,7 @@ fn extension_override_nullable_on_accepts_null_receiver() {
 /// declaring class via its `call` signature, so the oracle reports only
 /// `invalid_null_aware_operator` (the `?.` on the non-null `s`) — never
 /// `invalid_assignment` on the value nor `type_argument_not_matching_bounds`
-/// on the `expectStaticType` bound. The full inference_update_3 census face
+/// on the `expectStaticType` bound. The full `inference_update_3` census face
 /// (~110 rows of `CallableClass<..> → Function?`) reduces to this arm.
 #[test]
 fn callable_class_if_null_extension_write_reports_no_assignment() {

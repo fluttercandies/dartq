@@ -4,6 +4,7 @@
 //! a dead region that starts on such a statement still reports exactly one
 //! dead row for the tail.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// A live cascade over a `void` member: the `use_of_void_result` row

@@ -3,6 +3,7 @@
 //! read-only group scanning (`scanTypeGroup`, `gtGroupLen`, record probe)
 //! and the full-group consume paths (`parseArguments`/`parseVariables`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_scanner::{Keyword, TokenKind};
 
 use crate::cursor::CursorMark;
@@ -31,6 +32,7 @@ pub enum TypeParamOrArg {
 
 /// Full-group scan result payload (pure data; Copy by design).
 #[derive(Clone, Copy, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ComplexTypeParamOrArg {
     pub start: TokenId,
     pub end: TokenId,
@@ -346,9 +348,8 @@ pub(crate) fn closer_units(kind: TokenKind) -> usize {
 pub(crate) fn last_unit_remainder(kind: TokenKind) -> Option<TokenKind> {
     match kind {
         TokenKind::GtGt => Some(TokenKind::Gt),
-        TokenKind::GtGtEq => Some(TokenKind::Eq),
+        TokenKind::GtGtEq | TokenKind::GtGtGtEq => Some(TokenKind::Eq),
         TokenKind::GtGtGt => Some(TokenKind::GtGt),
-        TokenKind::GtGtGtEq => Some(TokenKind::Eq),
         _ => None,
     }
 }
@@ -617,7 +618,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// [`Self::group_skip_len`] with the group's own `recovered` flag — the
     /// official `TypeParamOrArgInfo.recovered` that a containing type folds
     /// into its own (`recovered = recovered | typeInfo.recovered`,
-    /// type_info_impl.dart:1357).
+    /// `type_info_impl.dart:1357`).
     fn group_skip_len_full(
         &self,
         lt_offset: usize,
@@ -698,7 +699,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     )
                 {
                     recovered = true;
-                    member_recovered = true;
                     scan += 1;
                     continue;
                 }
@@ -1195,7 +1195,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// [`Self::skip_type_len_in`] plus the scanned type's own `recovered`
     /// flag (official `TypeInfo.recovered`, folded by every containing group
     /// scan — `recovered = recovered | typeInfo.recovered`,
-    /// type_info_impl.dart:1357). Returning it from the same walk keeps the
+    /// `type_info_impl.dart:1357`). Returning it from the same walk keeps the
     /// group scan single-pass: a second probe per nesting level would make
     /// the scan quadratic in the type depth.
     fn skip_type_len_in_full(
@@ -1226,10 +1226,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // (:949-959) falls back to plain `voidType` when
                 // `gftHasReturnType` stays null (a broken
                 // `Function [<...>]` without the formal-parameter group).
-                if self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
-                    if let Some(fn_len) = self.gft_suffix_len(offset + n, depth + 1) {
-                        n += fn_len;
-                    }
+                if self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function)
+                    && let Some(fn_len) = self.gft_suffix_len(offset + n, depth + 1)
+                {
+                    n += fn_len;
                 }
                 (n, false)
             }
@@ -1257,20 +1257,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         // non-declaration read then rejects the whole record
                         // (the `!required` follower veto), while a
                         // declaration keeps it and flags the group.
-                        if !in_declaration {
-                            if !self.record_type_fields_valid(
-                                offset,
-                                self.offset_of(end),
-                                depth + 1,
-                            ) {
-                                return (0, false);
-                            }
-                        } else {
+                        if in_declaration {
                             recovered = !self.record_type_fields_valid(
                                 offset,
                                 self.offset_of(end),
                                 depth + 1,
                             );
+                        } else if !self.record_type_fields_valid(
+                            offset,
+                            self.offset_of(end),
+                            depth + 1,
+                        ) {
+                            return (0, false);
                         }
                         let mut n = self.offset_of(end) - offset + 1;
                         if self.kind_at(offset + n) == TokenKind::Question {
@@ -1359,46 +1357,40 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // neither `,` nor a closer, so the compute returns
                     // noTypeParamOrArg) leaves the type as the bare identifier
                     // and the `<...>` outside it.
-                    match self.group_skip_len_full(offset + n, in_declaration, depth + 1) {
-                        Some((len, group_recovered)) => {
-                            recovered |= group_recovered;
-                            // The group length covers only the `<...>` tail;
-                            // the identifier (or `id.id`) prefix stays.
-                            n += len;
-                            // A compound closer whose surplus closers belong
-                            // to the enclosing groups ends the type here
-                            // (the official scan splits the compound at the
-                            // inner group): the successor reads the split
-                            // remainder — never a `?`, never a `Function`
-                            // intro — so the type ends on the compound and
-                            // the GFT chain below stays off
-                            // (`List<List<int>> Function()` keeps its GFT on
-                            // the OUTER type).
-                            let tail = self.kind_at(offset + n - 1);
-                            let shared = is_compound_closer(tail) && {
-                                let mut opens = 0usize;
-                                let mut closed = 0usize;
-                                for i in offset..offset + n - 1 {
-                                    match self.kind_at(i) {
-                                        TokenKind::Lt => opens += 1,
-                                        kind => closed += closer_units(kind),
-                                    }
+                    if let Some((len, group_recovered)) =
+                        self.group_skip_len_full(offset + n, in_declaration, depth + 1)
+                    {
+                        recovered |= group_recovered;
+                        // The group length covers only the `<...>` tail;
+                        // the identifier (or `id.id`) prefix stays.
+                        n += len;
+                        // A compound closer whose surplus closers belong
+                        // to the enclosing groups ends the type here
+                        // (the official scan splits the compound at the
+                        // inner group): the successor reads the split
+                        // remainder — never a `?`, never a `Function`
+                        // intro — so the type ends on the compound and
+                        // the GFT chain below stays off
+                        // (`List<List<int>> Function()` keeps its GFT on
+                        // the OUTER type).
+                        let tail = self.kind_at(offset + n - 1);
+                        let shared = is_compound_closer(tail) && {
+                            let mut opens = 0usize;
+                            let mut closed = 0usize;
+                            for i in offset..offset + n - 1 {
+                                match self.kind_at(i) {
+                                    TokenKind::Lt => opens += 1,
+                                    kind => closed += closer_units(kind),
                                 }
-                                closer_units(tail) > opens.saturating_sub(closed)
-                            };
-                            if shared {
-                                return (n, recovered);
                             }
-                            if self.kind_at(offset + n) == TokenKind::Question {
-                                n += 1;
-                            }
+                            closer_units(tail) > opens.saturating_sub(closed)
+                        };
+                        if shared {
+                            return (n, recovered);
                         }
-                        // Rejected group: the type stays the bare identifier
-                        // (`computeSimpleWithTypeArguments` never runs; the
-                        // plain-identifier dispatch returns `simpleType`,
-                        // type_info.dart:380-384) — the `<...>` tail remains
-                        // outside the type for the enclosing scan to judge.
-                        None => {}
+                        if self.kind_at(offset + n) == TokenKind::Question {
+                            n += 1;
+                        }
                     }
                 } else if self.kind_at(offset + n) == TokenKind::Question {
                     n += 1;

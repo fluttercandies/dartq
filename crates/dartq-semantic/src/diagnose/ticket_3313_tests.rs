@@ -32,7 +32,7 @@
 //! container lookup a type-use verdict and a receiver walk both read) and
 //! [`member_lookup`] / [`member_lookup_defining`] (the superclass → mixin →
 //! interface walk; upstream Dart SDK source, pkg/analyzer/lib/src/dart/
-//! resolver/inheritance_manager3.dart — the application order at :571-579).
+//! `resolver/inheritance_manager3.dart` — the application order at :571-579).
 //! Both answers are `Option`-shaped on purpose: a `None` is *not* proof of
 //! absence, and the over-report direction the cluster shows is exactly a
 //! caller reading `None` as a report. The pins lock both halves — the found
@@ -44,6 +44,7 @@
 //! callee-return face and the shape-receiver verdict); these pins are the
 //! regression floor the fixing lane must keep green.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::collector::collect;
 use crate::library::{ElementIndex, member_lookup, member_lookup_defining, resolve_container};
 use crate::model::{FileElements, MemberKind, MicroKind};

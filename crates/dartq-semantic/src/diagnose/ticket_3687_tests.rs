@@ -32,6 +32,7 @@
 //! the weight; the error controls fence the fix so it cannot degenerate
 //! into "never report".
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, assert_silent, report_ops, rows};
 

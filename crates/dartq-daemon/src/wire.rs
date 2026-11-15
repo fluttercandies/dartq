@@ -9,6 +9,7 @@
 //! 1-based position, lowercase severity word). Everything else about the
 //! protocol stays untyped [`serde_json::Value`].
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

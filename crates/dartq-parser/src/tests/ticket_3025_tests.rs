@@ -31,6 +31,7 @@
 //!   `switch (s) { "one" => 1, _ => 0 };` costs exactly one
 //!   `expected 'case'` at `"one"`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::collector::{Collector, latest_features, scan_ok};
 use crate::ParserFeatures;
 

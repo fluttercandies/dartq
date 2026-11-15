@@ -271,8 +271,8 @@ fn top_level_const_initializer(c: &Check<'_>, name: &str) -> Option<core::ops::R
     for top in c.collect_direct(root) {
         for inner in c.collect_direct(top) {
             if c.kind(inner) != NodeKind::TopLevelFields
-                || !crate::rules::variables_declaration_keyword(c, inner)
-                    .is_some_and(|kw| c.lexeme(kw) == "const")
+                || crate::rules::variables_declaration_keyword(c, inner)
+                    .is_none_or(|kw| c.lexeme(kw) != "const")
             {
                 continue;
             }

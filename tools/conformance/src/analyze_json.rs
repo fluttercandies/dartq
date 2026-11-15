@@ -3,6 +3,7 @@
 //! run: `{"version":1,"diagnostics":[...]}`. Any non-envelope stdout lines
 //! (progress noise) are ignored.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use serde_json::Value;
 
 /// One diagnostic, canonicalized from the envelope shape:
@@ -11,7 +12,7 @@ use serde_json::Value;
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Diag {
     pub severity: String,
-    /// Lowercase snake_case code as both tools emit it; empty when the
+    /// Lowercase `snake_case` code as both tools emit it; empty when the
     /// writer emits a codeless row.
     pub code: String,
     /// Absolute file path exactly as reported; callers relativize it.

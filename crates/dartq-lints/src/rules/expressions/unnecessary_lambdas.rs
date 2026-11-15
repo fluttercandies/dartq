@@ -22,15 +22,15 @@ use dartq_semantic::{Analysis, FnSig};
 /// deferred-prefix callee or receiver bails (:255, :264,
 /// `mightBeDeferred` :314-324); the bare callee (:260) or the receiver
 /// (:283) is final (`isFinalNode` :50-79, `isFinal` :326-335 — the
-/// VariableElement arm reads `isFinal && !isLate`, so a `final`
+/// `VariableElement` arm reads `isFinal && !isLate`, so a `final`
 /// parameter is final, a plain parameter is not, and the lambda's OWN
 /// parameters are excluded by :74); the receiver chain carries no
 /// null-aware link (:282) and the invocation no explicit type
 /// arguments (:285). The named-argument and variable-declaration
 /// positions add a pure-subtype check of the tear-off against the
-/// context type (:269-279, MethodInvocation arm only — a bare-name
-/// callee IS a null-target MethodInvocation upstream; a variable-typed
-/// callee is FunctionExpressionInvocation and skips the gate): the
+/// context type (:269-279, `MethodInvocation` arm only — a bare-name
+/// callee IS a null-target `MethodInvocation` upstream; a variable-typed
+/// callee is `FunctionExpressionInvocation` and skips the gate): the
 /// context type is a function type the `Ty` face cannot represent, so
 /// the gate is unprovable and the no-face posture stays silent. The
 /// constructor face (:189-226): a non-`const`, non-deferred creation
@@ -90,7 +90,7 @@ use dartq_semantic::{Analysis, FnSig};
 /// compiling forward every invocable callee carries a function-typed
 /// invocation type whose required counts the arguments-match gate has
 /// already tied, so the arm cannot fail the assignability relation.
-/// The FunctionType path (:112-150): the required-positional counts
+/// The `FunctionType` path (:112-150): the required-positional counts
 /// match, the optional-positional pairs to the minimum length and the
 /// invocation's named formals assign — an undecided leaf passing, a
 /// decided-false one failing. The constructor gate keeps plain
@@ -370,33 +370,32 @@ fn check_invocation(
         /// No callable face composes (unresolved or unmodelled).
         None,
     }
-    let target = match marker {
-        None => analysis
+    let target = if marker.is_none() {
+        analysis
             .function_signature_of(query_site(c, probe))
-            .map_or(Target::None, Target::Sig),
-        Some(_) => {
-            let method = analysis
-                .strings()
-                .intern(c.lexeme(c.head_token(run[selector])));
-            match analysis.member_of(query_site(c, probe), method) {
-                Some(member) => match FnSig::of_member(member.entry) {
-                    Some(sig) => Target::Sig(sig),
-                    // A method without a captured formal table (the
-                    // synthesized core entries carry only the kind)
-                    // composes no model signature — the
-                    // non-`FunctionType` posture fires it like an
-                    // unresolved member. A getter/field/setter reads
-                    // the `methodName.element.isFinal` leaf (:284).
-                    None => {
-                        if member.entry.kind == dartq_semantic::model::MemberKind::Method {
-                            Target::None
-                        } else {
-                            Target::NonMethod(member.entry)
-                        }
+            .map_or(Target::None, Target::Sig)
+    } else {
+        let method = analysis
+            .strings()
+            .intern(c.lexeme(c.head_token(run[selector])));
+        match analysis.member_of(query_site(c, probe), method) {
+            Some(member) => match FnSig::of_member(member.entry) {
+                Some(sig) => Target::Sig(sig),
+                // A method without a captured formal table (the
+                // synthesized core entries carry only the kind)
+                // composes no model signature — the
+                // non-`FunctionType` posture fires it like an
+                // unresolved member. A getter/field/setter reads
+                // the `methodName.element.isFinal` leaf (:284).
+                None => {
+                    if member.entry.kind == dartq_semantic::model::MemberKind::Method {
+                        Target::None
+                    } else {
+                        Target::NonMethod(member.entry)
                     }
-                },
-                None => Target::None,
-            }
+                }
+            },
+            None => Target::None,
         }
     };
     let fires = match target {
@@ -448,7 +447,7 @@ fn check_invocation(
     }
 }
 
-/// The MethodInvocation context gates (:269-279): the lambda is the
+/// The `MethodInvocation` context gates (:269-279): the lambda is the
 /// value of a named argument (its argument group ends in a
 /// `NamedArgument` row — the production tiling keeps the label a
 /// sibling of the value, not a parent), or sits in a variable
@@ -716,7 +715,7 @@ fn lambda_accepts(
     }
 }
 
-/// The `parametersMatch` FunctionType path (:112-150), the undecided
+/// The `parametersMatch` `FunctionType` path (:112-150), the undecided
 /// face's gate: the required-positional counts match (:112-120); the
 /// optional-positional pairs to the minimum length (:121-128) and the
 /// invocation's named formals (:129-149 — absent required fails,
@@ -750,7 +749,7 @@ fn parameters_match(invocation: &FnSig<'_>, node: &Formals) -> bool {
     {
         return false;
     }
-    for invocation_param in invocation.formals.named.iter() {
+    for invocation_param in &invocation.formals.named {
         match node.named_formal(invocation_param.name) {
             None => {
                 if invocation_param.required {
@@ -1044,7 +1043,7 @@ fn resolves_to_lambda_parameter(
 }
 
 /// The `isFinal` verdict of `name` bound as a parameter of `owner`
-/// (`None` when no formal of that name exists): the VariableElement
+/// (`None` when no formal of that name exists): the `VariableElement`
 /// arm (:329 — `isFinal && !isLate`) over the formal's written
 /// keywords — `final`/`const` final unless `late`, everything else
 /// (a plain or `var` formal) not final.
@@ -1125,7 +1124,7 @@ fn block_binds(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> Optio
 
 /// The finality verdict of the binding `name` at the use site (the
 /// upstream `isFinal` extension, :326-335, under `isFinalNode`'s
-/// SimpleIdentifier arm, :70-76): a `final`/`const` variable, field,
+/// `SimpleIdentifier` arm, :70-76): a `final`/`const` variable, field,
 /// or any function is final; a getter, `late` variable, or mutable
 /// variable is not; a parameter is final UNLESS it is one of the
 /// linted lambda's own (:74 — `parameters.contains(element)`, then the

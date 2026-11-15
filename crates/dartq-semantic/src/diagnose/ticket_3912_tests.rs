@@ -45,6 +45,7 @@
 //! shadowed-binder fixture; `UNDEFINED_METHOD 'A'`/`'int'` on the
 //! if-null and named-constructor fixtures.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, RigImport, code_names, report_ops, report_ops_with, rows};
 use crate::diagnose::FileReport;
 

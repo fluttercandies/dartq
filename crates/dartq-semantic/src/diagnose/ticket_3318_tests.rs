@@ -28,6 +28,7 @@
 //! directive's edge does, the neighbouring imports keep their own rows and
 //! their own URIs.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{RigImport, report_ops_imports};
 use super::*;
 

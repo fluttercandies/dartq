@@ -6,6 +6,7 @@
 //! standing buffer as one `Arc` bump instead of re-walking the merge, and a
 //! partial recompute splices only the changed contributors' runs.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -376,29 +377,26 @@ pub(crate) fn analyze(
                 // to-bounds face (`Parser<dynamic>`), losing the `is`
                 // promotions that ride the written clause arguments.
                 let face = state.settled_face(file).map(|face| (*face).clone());
-                let (face, text) = match face {
-                    Some(face) => {
-                        let content = state.residency[&file].content;
-                        let bytes = state.store.get(content)?;
-                        let text = std::str::from_utf8(bytes).ok()?;
-                        (face, text)
-                    }
-                    None => {
-                        let content = state.residency[&file].content;
-                        let bytes = state.store.get(content)?;
-                        let text = std::str::from_utf8(bytes).ok()?;
-                        let version = l1::language_version_for(&state.packages, &state.files, file);
-                        let (feature_set, settled, scanned, _) =
-                            l1::scan_unit(text, version, file, &state.grants());
-                        (
-                            crate::state::ScannedFace {
-                                tokens: scanned.tokens,
-                                features: feature_set,
-                                version: settled,
-                            },
-                            text,
-                        )
-                    }
+                let (face, text) = if let Some(face) = face {
+                    let content = state.residency[&file].content;
+                    let bytes = state.store.get(content)?;
+                    let text = std::str::from_utf8(bytes).ok()?;
+                    (face, text)
+                } else {
+                    let content = state.residency[&file].content;
+                    let bytes = state.store.get(content)?;
+                    let text = std::str::from_utf8(bytes).ok()?;
+                    let version = l1::language_version_for(&state.packages, &state.files, file);
+                    let (feature_set, settled, scanned, _) =
+                        l1::scan_unit(text, version, file, &state.grants());
+                    (
+                        crate::state::ScannedFace {
+                            tokens: scanned.tokens,
+                            features: feature_set,
+                            version: settled,
+                        },
+                        text,
+                    )
                 };
                 let mut trees = dartq_semantic::ClauseTrees::empty();
                 dartq_semantic::capture_clause_trees(
@@ -865,16 +863,14 @@ fn splice_merged(
             held = old.next();
             continue;
         }
-        match fresh.next_if(|candidate| compare_canonical(files, candidate, &row) == Ordering::Less)
+        if let Some(candidate) =
+            fresh.next_if(|candidate| compare_canonical(files, candidate, &row) == Ordering::Less)
         {
-            Some(candidate) => {
-                out.push(candidate);
-                held = Some(row);
-            }
-            None => {
-                out.push(row);
-                held = old.next();
-            }
+            out.push(candidate);
+            held = Some(row);
+        } else {
+            out.push(row);
+            held = old.next();
         }
     }
     // The old side is exhausted and every surviving row sits in `out`. Each
@@ -1299,7 +1295,7 @@ fn diagnose_library(
 
 /// Per-file diagnostics cap at the engine's aggregation sink
 /// (defense-in-depth). The scanner and parser fuses bound their own faces
-/// at 10_000 rows per file and the lint stage bounds its sink the same way
+/// at `10_000` rows per file and the lint stage bounds its sink the same way
 /// (`MAX_LINTS_PER_FILE`), but the rows reaching this sink — baked syntax
 /// rows, URI staleness, combinators, the part family, imports verification,
 /// and above all the semantic fold's report — carry no cap as a number. A
@@ -1717,7 +1713,7 @@ fn canonical_uri_spelling(state: &EngineState, file: FileId) -> String {
 
 /// Whether the code `name` may be suppressed by `// ignore:` /
 /// `// ignore_for_file:` citations in `file` — the governing options'
-/// `analyzer.cannot-ignore` gate (`is_ignorable`, library_analyzer.dart
+/// `analyzer.cannot-ignore` gate (`is_ignorable`, `library_analyzer.dart`
 /// :552-555). A file under no options root (or a root whose set lacks the
 /// code) keeps its rows suppressible. Mirrors the output face's per-file
 /// options resolution: the longest `options`-keyed ancestor directory.
@@ -2488,7 +2484,7 @@ fn is_extension_decl(
 /// then class-modifier facts for the class family, the plain declaration
 /// otherwise.
 fn declare_element(
-    builder: &mut LibraryGraphBuilder,
+    builder: &mut LibraryGraphBuilder<'_>,
     node: dartq_resolution::LibraryId,
     elements: &dartq_semantic::FileElements,
     name: StringId,
@@ -2608,43 +2604,40 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     };
     for (uri, names) in SDK_LIBRARY_FACES {
         let node = builder.intern(&format!("dart:{uri}"));
-        match sdk_loaded.iter().find(|(name, _)| name == uri) {
-            Some((_, files)) => {
-                register_sdk_units(&mut builder, node, files);
-                // The face names the sources never declare (`Never` is a
-                // built-in type with no `dart:core` declaration; the
-                // generated face reads the analyzer's export namespace,
-                // which carries it) stay declared on the synthetic face
-                // file, so the spelling resolves exactly as before.
-                let declared: FxHashSet<StringId> = files
-                    .iter()
-                    .filter_map(|file| state.deps.units.get(file))
-                    .flat_map(|unit| unit.facts.elements.declarations().map(|(name, _)| name))
-                    .collect();
-                let face_only: Vec<(StringId, FaceKind)> = names
-                    .iter()
-                    .map(|(name, kind)| (state.strings.intern(name), *kind))
-                    .filter(|(name, _)| !declared.contains(name))
-                    .collect();
-                if !face_only.is_empty() {
-                    let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
-                    builder.face_unit(node, file);
-                    for (name, kind) in face_only {
-                        builder.declare_face(node, name, file, kind);
-                    }
+        if let Some((_, files)) = sdk_loaded.iter().find(|(name, _)| name == uri) {
+            register_sdk_units(&mut builder, node, files);
+            // The face names the sources never declare (`Never` is a
+            // built-in type with no `dart:core` declaration; the
+            // generated face reads the analyzer's export namespace,
+            // which carries it) stay declared on the synthetic face
+            // file, so the spelling resolves exactly as before.
+            let declared: FxHashSet<StringId> = files
+                .iter()
+                .filter_map(|file| state.deps.units.get(file))
+                .flat_map(|unit| unit.facts.elements.declarations().map(|(name, _)| name))
+                .collect();
+            let face_only: Vec<(StringId, FaceKind)> = names
+                .iter()
+                .map(|(name, kind)| (state.strings.intern(name), *kind))
+                .filter(|(name, _)| !declared.contains(name))
+                .collect();
+            if !face_only.is_empty() {
+                let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
+                builder.face_unit(node, file);
+                for (name, kind) in face_only {
+                    builder.declare_face(node, name, file, kind);
                 }
             }
-            None => {
-                let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
-                // The face file registers as the node's unit so the graph's
-                // `library_of_file` answers it: the namespace merge's SDK
-                // preference reads the declaring library's URI (a `dart:`
-                // name loses to a same-spelling package declaration,
-                // `element/scope.dart:811-832`).
-                builder.face_unit(node, file);
-                for (name, kind) in *names {
-                    builder.declare_face(node, state.strings.intern(name), file, *kind);
-                }
+        } else {
+            let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
+            // The face file registers as the node's unit so the graph's
+            // `library_of_file` answers it: the namespace merge's SDK
+            // preference reads the declaring library's URI (a `dart:`
+            // name loses to a same-spelling package declaration,
+            // `element/scope.dart:811-832`).
+            builder.face_unit(node, file);
+            for (name, kind) in *names {
+                builder.declare_face(node, state.strings.intern(name), file, *kind);
             }
         }
         sdk_faces.insert((*uri).to_string(), node);
@@ -4567,7 +4560,7 @@ mod tests {
         );
     }
 
-    /// The relink-down arm (#2100): removing a file whose target FileId a
+    /// The relink-down arm (#2100): removing a file whose target `FileId` a
     /// resident's directive points at must re-code the directive
     /// `uri_does_not_exist` and restore the tail row — symmetric to
     /// relink-up, and the second half of the same divergence class.
@@ -5646,7 +5639,7 @@ mod tests {
     /// byte-identical (the hot path's one-comparison gate — a library whose
     /// whole run fits under the cap cannot carry an over-cap file), and a
     /// file sitting exactly at the cap is not truncated either (the parser
-    /// fuse's full run — 9_999 admitted rows plus its terminal row — passes
+    /// fuse's full run — `9_999` admitted rows plus its terminal row — passes
     /// intact, so a fuse-tripped file needs no engine truncation of its
     /// own).
     #[test]

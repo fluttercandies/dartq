@@ -21,6 +21,7 @@
 //! (`inference_update_2/field_in_mixin_test.dart`,
 //! `do_promote_abstract_getters_test.dart`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// `if (c._f != null) c._f.m()` — the promoted field's use resolves on

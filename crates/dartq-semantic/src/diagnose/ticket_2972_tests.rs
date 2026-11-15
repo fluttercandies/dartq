@@ -13,6 +13,7 @@
 //! disallowed-subtype row. The prelude rig carries user declarations of
 //! `String`/`int`/`bool`/`num`/`double`, which is the shadow face itself.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, report_ops, report_ops_bare};
 
 /// The `subtype_of_disallowed_type` rows of `report` as

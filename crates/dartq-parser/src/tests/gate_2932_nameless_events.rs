@@ -6,17 +6,20 @@
 //! first; the parser-level wrapper then fires the event at :4038 whatever
 //! identifier came back), so every name-producing declaration context's
 //! synthetic slot carries the event. The no-parens catch recovery's
-//! synthetic parameter carries the CatchParameter event too:
-//! `insertParens(includeIdentifier: true)` (token_stream_rewriter.dart:29)
+//! synthetic parameter carries the `CatchParameter` event too:
+//! `insertParens(includeIdentifier: true)` (`token_stream_rewriter.dart:29`)
 //! makes the re-parse's name slot an identifier, whose event fires via
 //! :4038 after the single `catch_syntax` row (:10741). Pinned here: one
 //! synthetic name event per enabled declaration context, the catch slot's
 //! event beside its single row, and the named-declaration order-stability
 //! controls (the real name's event count is unchanged — exactly one
-//! CatchParameter for `catch (e)`, no synthetic Typedef shadow).
+//! `CatchParameter` for `catch (e)`, no synthetic Typedef shadow).
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::semicolon_if_nothing_returned
+)]
 use super::collector::{Collector, setup};
-use crate::parser::Parser;
 
 /// Whether a ZERO-length identifier event fired in `context` at `target`'s
 /// offset inside `needle` (the recovery synthetic splices at the offending
@@ -69,7 +72,7 @@ fn code_count(c: &Collector, code: &str) -> usize {
 
 /// `typedef = void Function();`: the missing name recovers synthetically
 /// before the `=` (keep-set follower, branch-2 drain posture) and the slot
-/// fires its TypedefDeclaration event — the parser_impl.dart:4038
+/// fires its `TypedefDeclaration` event — the `parser_impl.dart:4038`
 /// unconditional fire the recovery used to swallow.
 #[test]
 fn nameless_typedef_fires_name_event() {
@@ -90,7 +93,7 @@ fn nameless_typedef_fires_name_event() {
 // —— nameless catch —————————————————————————————————————————————————————
 
 /// `on A catch }`: the no-parens recovery's synthetic parameter fires the
-/// CatchParameter event (zero-length at the offending token), with the
+/// `CatchParameter` event (zero-length at the offending token), with the
 /// clause's single `catch_syntax` row and the empty formals-list pair.
 #[test]
 fn nameless_catch_fires_catch_parameter_event() {
@@ -125,7 +128,7 @@ fn named_typedef_emits_exactly_one_name_event() {
     assert!(c.errors.is_empty(), "{:?}", c.errors);
 }
 
-/// `catch (e)`: exactly one CatchParameter event (the pre-scan slot) — the
+/// `catch (e)`: exactly one `CatchParameter` event (the pre-scan slot) — the
 /// no-parens change must not double-fire the normal path.
 #[test]
 fn named_catch_emits_exactly_one_catch_parameter_event() {
@@ -151,7 +154,7 @@ fn named_catch_emits_exactly_one_catch_parameter_event() {
 // the tail restructure must not shift.
 
 /// Top-level `int = 42;`: the head is consumed as the field's name (the
-/// type is the missing face) and the TopLevelVariableDeclaration event
+/// type is the missing face) and the `TopLevelVariableDeclaration` event
 /// rides the real name.
 #[test]
 fn top_level_variable_real_name_event_unchanged() {
@@ -170,7 +173,7 @@ fn top_level_variable_real_name_event_unchanged() {
     assert_eq!(code_count(c, "missing_const_final_var_or_type"), 1);
 }
 
-/// Class `int 5;`: the FieldDeclaration event rides the real name `int`
+/// Class `int 5;`: the `FieldDeclaration` event rides the real name `int`
 /// (the member name-missing-type face).
 #[test]
 fn field_real_name_event_unchanged() {
@@ -184,7 +187,7 @@ fn field_real_name_event_unchanged() {
 
 /// Local `int <> () {}`: the statement dispatch reads a local function
 /// named `int` (the identifier-head pre-verification), so the
-/// LocalFunctionDeclaration event rides the real name.
+/// `LocalFunctionDeclaration` event rides the real name.
 #[test]
 fn local_function_real_name_event_unchanged() {
     let source = "void f() { int <> () {} }";
@@ -204,14 +207,14 @@ fn local_function_real_name_event_unchanged() {
 // —— the reachable synthetic faces over the remaining contexts ———————————
 
 /// `void () {}` in a class body: the method name slot's `(` follower takes
-/// the branch-2 posture and the MethodDeclaration event fires.
+/// the branch-2 posture and the `MethodDeclaration` event fires.
 #[test]
 fn nameless_method_fires_name_event() {
     let source = "class C { void () {} }";
     let mut p = setup(source);
     p.parse_unit();
     assert!(
-        synthetic_named(&p.listener, source, "void (", "(", "MethodDeclaration"),
+        synthetic_named(p.listener, source, "void (", "(", "MethodDeclaration"),
         "{:?}",
         p.listener.idents
     );
@@ -219,34 +222,28 @@ fn nameless_method_fires_name_event() {
 
 /// Local `var = 3;`: the local-var walk consumes `var` as the modifier and
 /// the name slot's `=` follower keeps the branch-2 drain posture — the
-/// LocalVariableDeclaration event fires on the synthetic.
+/// `LocalVariableDeclaration` event fires on the synthetic.
 #[test]
 fn nameless_local_variable_fires_name_event() {
     let source = "void f() { var = 3; }";
     let mut p = setup(source);
     p.parse_unit();
     assert!(
-        synthetic_named(
-            &p.listener,
-            source,
-            "var =",
-            "=",
-            "LocalVariableDeclaration"
-        ),
+        synthetic_named(p.listener, source, "var =", "=", "LocalVariableDeclaration"),
         "{:?}",
         p.listener.idents
     );
 }
 
 /// `typedef R = ({int});`: the record-type named field's required name slot
-/// fires the RecordFieldDeclaration event on its synthetic.
+/// fires the `RecordFieldDeclaration` event on its synthetic.
 #[test]
 fn nameless_record_field_fires_name_event() {
     let source = "typedef R = ({int});";
     let mut p = setup(source);
     p.parse_unit();
     assert!(
-        synthetic_named(&p.listener, source, "int}", "}", "RecordFieldDeclaration"),
+        synthetic_named(p.listener, source, "int}", "}", "RecordFieldDeclaration"),
         "{:?}",
         p.listener.idents
     );

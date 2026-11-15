@@ -25,6 +25,7 @@
 //! next borrower's serving server with the same first roots assignment a
 //! fresh spawn runs.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -47,7 +48,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// answers (alive but wedged, or analyzing forever) is a fault after this —
 /// `analyze_result` restarts the server once, then the caller falls back.
 /// Generous: the largest monorepo's first analysis can take many minutes.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const REQUEST_TIMEOUT: Duration = Duration::from_hours(1);
 /// After a request's response, how long a server that never reports
 /// `isAnalyzing: true` is given before the request counts as no work. The
 /// server queues the status event before it answers (the handlers run the
@@ -800,7 +801,7 @@ impl State {
         }
         let mut srows: Vec<Srow<'_>> = Vec::new();
         let mut priority = 0usize;
-        for (file, errors) in self.files.iter_mut() {
+        for (file, errors) in &mut self.files {
             if !aims.is_empty() && !crate::covered(Path::new(&**file), aims) {
                 continue;
             }
@@ -874,7 +875,7 @@ impl State {
             row: &'a Row,
         }
         let mut srows: Vec<Srow<'_>> = Vec::new();
-        for (file, errors) in self.files.iter_mut() {
+        for (file, errors) in &mut self.files {
             if !aims.is_empty() && !crate::covered(Path::new(&**file), aims) {
                 continue;
             }

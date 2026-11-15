@@ -11,6 +11,7 @@
 //! super-error files carry only unspecified analyzer rows (not this face)
 //! and stay silent here.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::CORE_PRELUDE;
 use super::{FileReport, StrictModes, fold_unit_with_ops, merge_source_ordered};
 use crate::library::ElementIndex;
@@ -283,8 +284,7 @@ fn shape_rows_inside_a_method_body() {
             .iter()
             .map(|&(offset, length)| (offset, length, WRONG_LIST_MESSAGE))
             .collect::<Vec<_>>(),
-        "{:#?}",
-        list
+        "{list:#?}"
     );
 }
 

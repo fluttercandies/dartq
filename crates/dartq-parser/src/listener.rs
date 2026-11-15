@@ -17,6 +17,7 @@
 //! `snake_case` (`beginClassDeclaration` → `begin_class_declaration`); no
 //! invented names. Token positions carry [`TokenSpan`].
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::message::Message;
 use crate::token_id::TokenSpan;
 
@@ -228,7 +229,7 @@ pub enum IdentifierContext {
     NamedArgumentReference,
     /// An object-pattern field label (`guard` in `case Foo(guard: v)`) —
     /// the official parser reuses `namedArgumentReference` for the parse
-    /// event (parser_impl.dart `parseObjectPatternRest`), but the label is
+    /// event (`parser_impl.dart` `parseObjectPatternRest`), but the label is
     /// a pattern field name, not an argument: the analyzer's resolver
     /// never opens an argument for it. This context is the diagnostic-tier
     /// discriminator so the named-argument faces stay silent on labels.
@@ -566,7 +567,7 @@ pub trait ParserListener {
     /// Flow-face extension fired the moment the `?[` of a null-aware index
     /// selector is consumed — before the index operand parses. The official
     /// analyzer's null-shorting begins at the `?` (`nullAwareAccess_rightBegin`,
-    /// flow_analysis.dart:9199): the operand runs on the not-null path, so a
+    /// `flow_analysis.dart:9199)`: the operand runs on the not-null path, so a
     /// `throw`/Never inside it must not kill the skip path the listener is
     /// asked to capture here. No official counterpart (the official parser
     /// reports the whole index at `handleIndexedExpression`); existing
@@ -575,7 +576,7 @@ pub trait ParserListener {
     /// Flow-face extension fired the moment the `?.` of a null-aware member
     /// selector is consumed — before the member name (and any invocation
     /// arguments on it) parses. Same official anchor as the index face
-    /// (`nullAwareAccess_rightBegin`, flow_analysis.dart:9199): a
+    /// (`nullAwareAccess_rightBegin`, `flow_analysis.dart:9199)`: a
     /// `throw`/Never inside `x?.m(throw _)`'s argument list must not kill
     /// the skip path. No official counterpart; existing listeners ignore it.
     fn handle_null_aware_member_begin(&mut self, question: Token) {}
@@ -721,7 +722,7 @@ pub trait ParserListener {
     fn handle_list_pattern(&mut self, count: usize, left: Token, right: Token) {}
     fn handle_map_pattern(&mut self, count: usize, left: Token, right: Token) {}
     /// A `key: value` map-pattern entry's key expression is about to be
-    /// parsed (`parseMapPatternSuffix`'s entry arm, parser_impl.dart:12087).
+    /// parsed (`parseMapPatternSuffix`'s entry arm, `parser_impl.dart:12087`).
     /// The constant-evaluation face brackets the key in a capture window so
     /// a non-constant key reports `non_constant_map_pattern_key`
     /// (constant_verifier.dart:342-358 `_evaluateAndReportError`).

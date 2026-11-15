@@ -25,6 +25,7 @@
 //! The crate depends only on `blake3`; the `serde` implementations are
 //! behind an opt-in `serde` feature.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 mod content_id;
 mod file_table;
 mod locator;

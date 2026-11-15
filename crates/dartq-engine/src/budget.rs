@@ -35,6 +35,7 @@
 //! emptied cache is a no-op, and re-emitting the row would only spam the
 //! output face.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use dartq_diagnostics::{DARTQ_MEMORY_DEGRADED, Diagnostic, Severity};
 use dartq_source::{FileId, SourceRange};
 

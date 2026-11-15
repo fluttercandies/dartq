@@ -1,7 +1,7 @@
 //! The #3652 pins: post-pattern promotion faces, mined from the 2026-11-02
 //! census's extra `type_argument_not_matching_bounds` rows. Those rows ride
 //! the corpus's `expectStaticType<Exactly<X>>()` family (upstream Dart SDK
-//! source, pkg/expect/lib/static_type_helper.dart — `T expectStaticType<R
+//! source, `pkg/expect/lib/static_type_helper.dart` — `T expectStaticType<R
 //! extends Exactly<T>>()` with `typedef Exactly<T> = T Function(T)`, so the
 //! bound check fires exactly when the receiver's static type differs from
 //! X). For every mirrored case `conformance/expected.tsv` carries no
@@ -10,6 +10,7 @@
 //! face — each asserts the scrutinee's own read (the declared type) and the
 //! matched arm's body read (the promoted type), in fact order.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -85,7 +86,7 @@ fn read_faces(source: &str, needle: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// The census rep (language/patterns/object_pattern_inference_test.dart,
+/// The census rep (`language/patterns/object_pattern_inference_test.dart`,
 /// `simpleInference`; its `conformance/expected.tsv` row is empty): a
 /// FIELD-BEARING generic object head promotes the switched variable for
 /// the case body (official `analyzeObjectPattern` —
@@ -117,7 +118,7 @@ fn field_bearing_object_head_promotes_the_switch_scrutinee() {
     );
 }
 
-/// The same face over a top-type scrutinee (object_pattern_inference_test's
+/// The same face over a top-type scrutinee (`object_pattern_inference_test`'s
 /// `inferBound`, `case D(...)` over `Object o`; empty expected row): the
 /// promotion lands on the head. The to-bounds argument the oracle spells
 /// (`D<num>`) is again the resolved back-end's inference.
@@ -144,7 +145,7 @@ fn raw_object_head_over_top_scrutinee_promotes_to_the_head() {
 /// `analyzeDeclaredVariablePattern` — `flow.promoteForPattern(matchedType,
 /// knownType: staticType)` promotes the matched value's reference, shared
 /// type_analyzer.dart:605-609). Mirrors
-/// flow_analysis/variable_pattern_error_test.dart block 4 (`if (x case int
+/// `flow_analysis/variable_pattern_error_test.dart` block 4 (`if (x case int
 /// y)` on `num x`), whose expected rows carry no bounds row: the matched
 /// arm reads `int`.
 #[test]
@@ -168,7 +169,7 @@ fn typed_variable_pattern_promotes_the_scrutinee() {
 /// head (official `analyzeLogicalAndPattern` dispatches both operands over
 /// the same matched value, and `promoteForPattern`'s promotion persists —
 /// shared type_analyzer.dart:1112-1133). Mirrors
-/// flow_analysis/logical_and_pattern_error_test.dart block 1 (`int _ &&
+/// `flow_analysis/logical_and_pattern_error_test.dart` block 1 (`int _ &&
 /// var y` on `num x`), whose expected rows carry no bounds row.
 #[test]
 fn typed_wildcard_operand_promotes_the_scrutinee() {
@@ -191,7 +192,7 @@ fn typed_wildcard_operand_promotes_the_scrutinee() {
 /// `analyzeLogicalOrPattern` joins the branches' promotion results —
 /// shared type_analyzer.dart:1156-1180): the left branch promotes to `num`
 /// then `int`, the right to `num`, and the body reads `num`. Mirrors
-/// flow_analysis/logical_or_pattern_error_test.dart block 1, whose expected
+/// `flow_analysis/logical_or_pattern_error_test.dart` block 1, whose expected
 /// rows carry no bounds row.
 #[test]
 fn or_alternation_joins_branch_promotions() {

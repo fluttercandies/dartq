@@ -476,12 +476,11 @@ impl AstBuilder {
     /// the slot through the error log and skip the write (it would
     /// overwrite a neighboring node's payload word).
     pub fn patch(&mut self, field: usize, value: u32) {
-        let (kind, payload_start) = match self.open.last() {
-            Some(node) => (node.kind, node.payload_start),
-            None => {
-                debug_assert!(false, "patch without an open node");
-                return;
-            }
+        let (kind, payload_start) = if let Some(node) = self.open.last() {
+            (node.kind, node.payload_start)
+        } else {
+            debug_assert!(false, "patch without an open node");
+            return;
         };
         if field >= payload_len(kind) as usize {
             // A field outside the open node's slot addresses a NEIGHBORING
@@ -529,15 +528,14 @@ impl AstBuilder {
             debug_assert!(false, "patch without an open node");
             return;
         };
-        match crate::fields::field_index(kind, field) {
-            Some(index) => self.patch(index as usize, value),
-            None => {
-                debug_assert!(
-                    false,
-                    "{field:?} is not a payload field of the open {kind:?}"
-                );
-                self.mark_error();
-            }
+        if let Some(index) = crate::fields::field_index(kind, field) {
+            self.patch(index as usize, value)
+        } else {
+            debug_assert!(
+                false,
+                "{field:?} is not a payload field of the open {kind:?}"
+            );
+            self.mark_error();
         }
     }
 

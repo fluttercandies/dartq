@@ -24,6 +24,7 @@
 //!   (file_state.dart:938-953); whatever else fires, the part-of literal
 //!   itself stays out of the `uri_does_not_exist` rows.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use dartq_pub::{LockFile, Pubspec, build_graph};
 

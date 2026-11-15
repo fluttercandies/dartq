@@ -9,6 +9,7 @@
 //! root) rides exactly when a file-bearing row does (`sym`/`files`/
 //! `tests`).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

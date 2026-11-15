@@ -3,6 +3,7 @@
 //! and leaves every original token untouched — the contiguous unified table
 //! the AST's span derivation reads.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::{scan_src, u32_of};
 use crate::{Token, TokenKind, TokenTable};
 

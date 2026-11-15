@@ -14,6 +14,7 @@
 //! feature (:73-75) and re-arms pre-3.13, matching the upstream
 //! `// @dart = 3.10` tests.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
 const PROBLEM: &str = "Local variables should not be marked as 'final'.";

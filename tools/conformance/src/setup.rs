@@ -4,6 +4,7 @@
 //! `pkg/analyzer_testing/lib/src/utilities/utilities.dart` and
 //! `context_collection_resolution.dart` semantics).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 /// The experiments the official harness enables for pub-package tests by
 /// default (`experimentsForTests`, in order).
 pub const DEFAULT_EXPERIMENTS: [&str; 5] = [
@@ -78,7 +79,10 @@ pub fn analysis_options_content(
 pub fn default_options(experiments_override: Option<&[String]>) -> String {
     let experiments: Vec<String> = match experiments_override {
         Some(list) => list.to_vec(),
-        None => DEFAULT_EXPERIMENTS.iter().map(|s| s.to_string()).collect(),
+        None => DEFAULT_EXPERIMENTS
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
     };
     analysis_options_content(&experiments, &[], false, false, false, &[], &[])
 }
@@ -133,7 +137,12 @@ pub fn analysis_options_from_call(args: &[crate::dart::Arg]) -> Option<String> {
 pub fn string_list(expr: &str) -> Option<Vec<String>> {
     let expr = expr.trim();
     if expr == "experiments" {
-        return Some(DEFAULT_EXPERIMENTS.iter().map(|s| s.to_string()).collect());
+        return Some(
+            DEFAULT_EXPERIMENTS
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+        );
     }
     if expr == "const []" || expr == "[]" {
         return Some(Vec::new());

@@ -25,6 +25,7 @@
 //!   declaration whose right-hand side was never captured) still stays
 //!   unfolded — the under-report direction, never a fabricated fold.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{RigImport, assert_silent, code_names, report_ops_imports, rows};
 
 /// The `Expect.throws` face both fixture libraries share: `check` spells

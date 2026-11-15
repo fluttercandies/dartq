@@ -11,11 +11,12 @@
 //! below mirrors one upstream case body; each enabled twin pins the same
 //! shape at 3.15 so the gate cannot over-close. The leg split is pinned
 //! both ways too: the bottom-tested (`is Never`) and `null == null`
-//! equality arms are mode-blind upstream (flow_analysis.dart checks
+//! equality arms are mode-blind upstream (`flow_analysis.dart` checks
 //! `isBottomType` before `_isTypeCheckGuaranteedToFail…` :5937-5941 and
 //! leaves `_GuaranteedEqual` ungated :7229-7240), so they must keep
 //! firing at 3.8.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
@@ -82,7 +83,7 @@ fn enabled(source: &str) -> Vec<String> {
 /// keep the else live.
 #[test]
 fn disabled_trivially_satisfied_check_stays_live() {
-    let source = r#"
+    let source = r"
 void test({required int intValue, required int Function() intFunction, required int other}) {
   if (intValue is int) {
     shouldBeDemoted = null;
@@ -96,7 +97,7 @@ void test({required int intValue, required int Function() intFunction, required 
   }
 }
 Object? shouldBeDemoted;
-"#;
+";
     assert_eq!(disabled(source), Vec::<String>::new());
 }
 
@@ -105,7 +106,7 @@ Object? shouldBeDemoted;
 /// (:7611 `if (!…Enabled) return false`) — both arms stay live at 3.8.
 #[test]
 fn disabled_is_null_disjoint_stays_live() {
-    let source = r#"
+    let source = r"
 void test({required int intValue, required int Function() intFunction}) {
   if (intValue is Null) {
     shouldBeDemoted1 = null;
@@ -125,7 +126,7 @@ void test({required int intValue, required int Function() intFunction}) {
 }
 Object? shouldBeDemoted1;
 Object? shouldBeDemoted2;
-"#;
+";
     assert_eq!(disabled(source), Vec::<String>::new());
 }
 
@@ -135,7 +136,7 @@ Object? shouldBeDemoted2;
 /// the continuation live — both directions of the disjointness.
 #[test]
 fn disabled_as_cast_disjoint_stays_live() {
-    let source = r#"
+    let source = r"
 void test({required int intValue, required Null nullValue}) {
   intValue as Null;
   shouldBeDemoted = null;
@@ -145,7 +146,7 @@ void test({required int intValue, required Null nullValue}) {
   shouldBeDemoted = null;
 }
 Object? shouldBeDemoted;
-"#;
+";
     assert_eq!(disabled(source), Vec::<String>::new());
 }
 
@@ -154,7 +155,7 @@ Object? shouldBeDemoted;
 /// `soundFlowAnalysisEnabled`, flow_analysis.dart:5857-5864).
 #[test]
 fn disabled_if_null_rhs_stays_live() {
-    let source = r#"
+    let source = r"
 void test({required int intValue, required int Function() intFunction, required int other}) {
   intValue ?? other;
   shouldBeDemoted = null;
@@ -162,7 +163,7 @@ void test({required int intValue, required int Function() intFunction, required 
   shouldBeDemoted = null;
 }
 Object? shouldBeDemoted;
-"#;
+";
     assert_eq!(disabled(source), Vec::<String>::new());
 }
 
@@ -173,7 +174,7 @@ Object? shouldBeDemoted;
 /// stay live at 3.8.
 #[test]
 fn disabled_pattern_cannot_match_stays_live() {
-    let source = r#"
+    let source = r"
 void test({required Null nullValue, required int intValue}) {
   if (nullValue case int()) {
     shouldBeDemoted1 = null;
@@ -188,7 +189,7 @@ void test({required Null nullValue, required int intValue}) {
 }
 Object? shouldBeDemoted1;
 Object? shouldBeDemoted2;
-"#;
+";
     assert_eq!(disabled(source), Vec::<String>::new());
 }
 
@@ -199,7 +200,7 @@ Object? shouldBeDemoted2;
 /// (the disjoint arm sits before it upstream).
 #[test]
 fn disabled_constant_null_disjoint_stays_live() {
-    let source = r#"
+    let source = r"
 void test({required int intValue}) {
   if (intValue case null) {
     shouldBeDemoted1 = null;
@@ -209,7 +210,7 @@ void test({required int intValue}) {
 }
 Object? shouldBeDemoted1;
 Object? shouldBeDemoted2;
-"#;
+";
     assert_eq!(disabled(source), Vec::<String>::new());
 }
 
@@ -217,7 +218,7 @@ Object? shouldBeDemoted2;
 /// not known not-equal at 3.8, so neither side of the condition dies.
 #[test]
 fn disabled_eq_null_disjoint_stays_live() {
-    let source = r#"
+    let source = r"
 void test({required int intValue}) {
   if (intValue == null) {
     shouldBeDemoted1 = null;
@@ -227,7 +228,7 @@ void test({required int intValue}) {
 }
 Object? shouldBeDemoted1;
 Object? shouldBeDemoted2;
-"#;
+";
     assert_eq!(disabled(source), Vec::<String>::new());
 }
 
@@ -239,13 +240,13 @@ Object? shouldBeDemoted2;
 /// (`unreachable_via_never_test` rides this leg).
 #[test]
 fn disabled_bottom_tested_still_kills() {
-    let source = r#"
+    let source = r"
 void test({required int intValue}) {
   if (intValue is Never) {
     intValue = 1;
   }
 }
-"#;
+";
     let dead = disabled(source);
     assert_eq!(dead.len(), 1, "{dead:?}");
     assert!(dead[0].contains("intValue = 1"), "{dead:?}");
@@ -257,7 +258,7 @@ void test({required int intValue}) {
 /// exception rides this arm).
 #[test]
 fn disabled_null_null_equal_still_kills() {
-    let source = r#"
+    let source = r"
 void test() {
   if (null == null) {
     ok = 1;
@@ -267,7 +268,7 @@ void test() {
 }
 Object? ok;
 Object? dead;
-"#;
+";
     let dead_rows = disabled(source);
     assert_eq!(dead_rows.len(), 1, "{dead_rows:?}");
     assert!(dead_rows[0].contains("dead = 1"), "{dead_rows:?}");
@@ -282,7 +283,7 @@ Object? dead;
 /// semantic layer stages the resolved return — so it pins nothing here.)
 #[test]
 fn enabled_trivially_satisfied_check_kills_else() {
-    let source = r#"
+    let source = r"
 void test({required int intValue}) {
   if (intValue is int) {
     shouldBeDemoted = null;
@@ -291,7 +292,7 @@ void test({required int intValue}) {
   }
 }
 Object? shouldBeDemoted;
-"#;
+";
     let dead = enabled(source);
     assert_eq!(dead.len(), 1, "{dead:?}");
     assert!(dead[0].contains("shouldBeDemoted = 0"), "{dead:?}");
@@ -304,7 +305,7 @@ Object? shouldBeDemoted;
 /// both anchors.
 #[test]
 fn enabled_is_and_as_null_kill() {
-    let source = r#"
+    let source = r"
 void test({required int intValue, required Null nullValue}) {
   if (intValue is Null) {
     thenDead = null;
@@ -320,7 +321,7 @@ Object? thenDead;
 Object? elseLive;
 Object? afterCast;
 Object? afterNullCast;
-"#;
+";
     let dead = enabled(source);
     assert_eq!(dead.len(), 2, "{dead:?}");
     assert!(dead[0].contains("thenDead"), "{dead:?}");
@@ -334,12 +335,12 @@ Object? afterNullCast;
 /// RHS at 3.15.
 #[test]
 fn enabled_if_null_kills_rhs() {
-    let source = r#"
+    let source = r"
 void test({required int intValue, required int Function() intFunction, required int other}) {
   intValue ?? other;
   intFunction() ?? other;
 }
-"#;
+";
     let dead = enabled(source);
     // Probed dart analyze 3.13.7 on this exact fixture: ONE generic
     // `dead_code` row at the first `?? other` (upstream's
@@ -360,7 +361,7 @@ void test({required int intValue, required int Function() intFunction, required 
 /// `pattern_never_matches_value_type` face, not a flow row.)
 #[test]
 fn enabled_pattern_cannot_match_kills_body() {
-    let source = r#"
+    let source = r"
 void test({required Null nullValue}) {
   if (nullValue case int()) {
     thenDead = null;
@@ -370,7 +371,7 @@ void test({required Null nullValue}) {
 }
 Object? thenDead;
 Object? elseLive;
-"#;
+";
     let dead = enabled(source);
     assert_eq!(dead.len(), 1, "{dead:?}");
     assert!(dead[0].contains("thenDead"), "{dead:?}");
@@ -383,7 +384,7 @@ Object? elseLive;
 /// `Null`).
 #[test]
 fn enabled_constant_null_over_promoted_scrutinee_kills_body() {
-    let source = r#"
+    let source = r"
 void test(Object? objectValue) {
   if (objectValue != null) {
     if (objectValue case null) {
@@ -395,7 +396,7 @@ void test(Object? objectValue) {
 }
 Object? thenDead;
 Object? elseLive;
-"#;
+";
     let dead = enabled(source);
     assert_eq!(dead.len(), 1, "{dead:?}");
     assert!(dead[0].contains("thenDead"), "{dead:?}");
@@ -405,7 +406,7 @@ Object? elseLive;
 /// known-not-equal and deads the then branch at 3.15.
 #[test]
 fn enabled_eq_null_disjoint_kills_then() {
-    let source = r#"
+    let source = r"
 void test({required int intValue}) {
   if (intValue == null) {
     thenDead = null;
@@ -415,7 +416,7 @@ void test({required int intValue}) {
 }
 Object? thenDead;
 Object? elseLive;
-"#;
+";
     let dead = enabled(source);
     assert_eq!(dead.len(), 1, "{dead:?}");
     assert!(dead[0].contains("thenDead"), "{dead:?}");

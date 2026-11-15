@@ -18,6 +18,7 @@
 //! reporting shapes carry `INVALID_ASSIGNMENT` over the whole right-hand side
 //! (`c ? a : s` — nine columns), and the shapes that fit report nothing.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, assert_silent, code_names, report_ops};
 
 /// The `invalid_assignment` row's span over `source`, with `window` the

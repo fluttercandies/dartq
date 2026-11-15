@@ -45,6 +45,7 @@
 //! maintained index (the audit's query-path multiplication), and the
 //! per-query scan over the maintained arenas died with the directories.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -573,10 +574,10 @@ fn supertype_closure(
             continue;
         };
         for edge in surface.supertypes_of(node.0, node.1).into_iter().flatten() {
-            if let TargetRef::Decl(file, name) = edge.supertype {
-                if visited.insert((file, name)) {
-                    worklist.push((file, name));
-                }
+            if let TargetRef::Decl(file, name) = edge.supertype
+                && visited.insert((file, name))
+            {
+                worklist.push((file, name));
             }
         }
     }
@@ -620,11 +621,11 @@ fn supertype_closure(
 /// `query symbols` answer pays at hierarchy scale. The answer sorts by
 /// `(file, container id)` and borrows the interned spellings — no
 /// allocation beyond the result Vec and the walk's transient sets.
-pub(crate) fn override_family<'a>(
-    state: &'a EngineState,
+pub(crate) fn override_family(
+    state: &EngineState,
     container: (FileId, StringId),
     name: StringId,
-) -> Vec<(FileId, &'a str)> {
+) -> Vec<(FileId, &str)> {
     let subtypes = reverse_supertypes(state);
     // The fixpoint worklist: a member joins exactly once, when first
     // discovered, and is then processed once — contributing every
@@ -739,11 +740,7 @@ pub(crate) fn callers<'a>(state: &'a EngineState, name: &str) -> Vec<DeclHit<'a>
 /// projection's containment law (module docs of [`callers`]): the
 /// partition-point candidate row, inflated by [`declaration_span`], must
 /// cover the site.
-fn enclosing_declaration<'a>(
-    state: &'a EngineState,
-    file: FileId,
-    offset: u32,
-) -> Option<DeclHit<'a>> {
+fn enclosing_declaration(state: &EngineState, file: FileId, offset: u32) -> Option<DeclHit<'_>> {
     let capture = state.capture(file)?;
     let order = state.decl_order(file)?;
     let decls = capture.index.decls();
@@ -2265,7 +2262,7 @@ mod tests {
 
     /// The `None` boundary: a file whose rows the latest analyze has not
     /// produced answers `None`, and so does an offset past the file's end
-    /// — resolve_at's boundary, verbatim.
+    /// — `resolve_at`'s boundary, verbatim.
     #[test]
     fn completion_misses_answer_none_outside_the_maintained_rows() {
         let (root, engine, _a, b) = analyzed("completion-none");

@@ -15,6 +15,7 @@
 //! the property face alone; shadow-free members, the bare local face,
 //! and the promotable-field promotion keep their verdicts.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};

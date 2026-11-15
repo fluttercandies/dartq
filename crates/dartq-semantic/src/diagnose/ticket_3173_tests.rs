@@ -1,8 +1,8 @@
 //! The #3173 Lane C `dead_code` pins: the assignability switch-chain —
 //! statement members entered dead and the never-matching constant — and
 //! the switch-expression arm rows (upstream Dart SDK source
-//! pkg/analyzer/lib/src/error/dead_code_verifier.dart, `flowEnd`'s
-//! SwitchMember arm :237-241 — `deadCode.at(node.keyword)` when the member
+//! `pkg/analyzer/lib/src/error/dead_code_verifier.dart`, `flowEnd`'s
+//! `SwitchMember` arm :237-241 — `deadCode.at(node.keyword)` when the member
 //! itself is the first dead node — and the member trim
 //! `node.statements.last` :275-279 when a body statement is).
 //!
@@ -15,6 +15,7 @@
 //! reachable and the body span reports. A switch expression's dead arm
 //! is one dead node: the whole `pattern => body` span.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 fn dead_ranges(source: &str) -> Vec<(usize, usize)> {
@@ -128,7 +129,7 @@ fn ticket_3173_plain_switch_stays_silent() {
         "void f(int x) {\n  switch (x) {\n    case 1:\n      break;\n    case 2:\n      break;\n  }\n}",
     );
     assert!(
-        !code_names(&report).iter().any(|name| *name == "dead_code"),
+        !code_names(&report).contains(&"dead_code"),
         "{:?}",
         rows(&report)
     );

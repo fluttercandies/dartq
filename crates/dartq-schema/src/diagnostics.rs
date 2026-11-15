@@ -2,6 +2,7 @@
 //! oracle-exact writers). The envelope keeps the oracle's `version` key — see
 //! the crate docs, "The `version` alias".
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};

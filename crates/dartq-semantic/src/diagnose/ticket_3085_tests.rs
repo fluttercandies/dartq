@@ -18,6 +18,7 @@
 //! shapes report nothing, the unguarded read reports one
 //! `unchecked_use_of_nullable_value`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// The switch-arm write promotion (reference.dart:680): `var reference =

@@ -20,5 +20,9 @@ dartq-source = { workspace = true }
 dartq-diagnostics = { workspace = true }
 memchr = { workspace = true }
 
+[dev-dependencies]
+# The dedup test's seen-set follows the workspace's Fx-only hash policy.
+rustc-hash = { workspace = true }
+
 [lints]
 workspace = true

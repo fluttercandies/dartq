@@ -8,6 +8,7 @@
 //! container's static send types through the table where the member walk
 //! chain-breaks (`assignability.rs`'s callee-return face).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -110,11 +111,11 @@ fn error_throw_with_stack_trace_types_never() {
     let report = report_sdk_faces(source);
     let names = code_names(&report);
     assert!(
-        !names.iter().any(|&c| c == "return_of_invalid_type"),
+        !names.contains(&"return_of_invalid_type"),
         "return_of_invalid_type on the Never-typed send: {names:?}"
     );
     assert!(
-        !names.iter().any(|&c| c == "undefined_method"),
+        !names.contains(&"undefined_method"),
         "undefined_method on the static send: {names:?}"
     );
 }
@@ -129,7 +130,7 @@ fn future_error_types_future() {
     let report = report_sdk_faces(source);
     let names = code_names(&report);
     assert!(
-        !names.iter().any(|&c| c == "undefined_method"),
+        !names.contains(&"undefined_method"),
         "undefined_method on the static send: {names:?}"
     );
 }
@@ -144,7 +145,7 @@ fn future_error_in_future_body_stays_clean() {
     let report = report_sdk_faces(source);
     let names = code_names(&report);
     assert!(
-        !names.iter().any(|&c| c == "return_of_invalid_type"),
+        !names.contains(&"return_of_invalid_type"),
         "return_of_invalid_type on the Future send: {names:?}"
     );
 }

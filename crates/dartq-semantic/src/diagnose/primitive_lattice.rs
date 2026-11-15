@@ -9,6 +9,7 @@
 //! does a container the SDK itself declares (`dart:core`'s own `int`
 //! implementations).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::*;
 
 impl Engine<'_> {

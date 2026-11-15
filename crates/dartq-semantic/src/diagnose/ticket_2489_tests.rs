@@ -24,6 +24,7 @@
 //! The harness is the #2477 one: the sole file of a library folded with
 //! the resolved `TypeOps` mounted, diagnostics read off the joined
 //! report.
+#![allow(dead_code, clippy::semicolon_if_nothing_returned)]
 
 use super::*;
 use crate::collector::collect;

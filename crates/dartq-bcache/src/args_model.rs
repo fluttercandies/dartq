@@ -1,8 +1,8 @@
 //! Flutter command-line model: the slice of a `flutter build|run|test`
-//! argv that feeds the cache key, and the name flutter_tools gives the
+//! argv that feeds the cache key, and the name `flutter_tools` gives the
 //! build directory of one build configuration.
 //!
-//! Pinned to the flutter_tools of the lines
+//! Pinned to the `flutter_tools` of the lines
 //! [`crate::orchestrator::SUPPORTED_FLUTTER_LINES`] (derived from 3.47.1)
 //! and the `package:args` 2.7.0 parser they use. Everything here is pure:
 //! no file system, no process environment, no flutter invocation.
@@ -18,7 +18,7 @@
 //! token is a positional argument. Global options are accepted before and
 //! after the command, and a single-valued option keeps its last value.
 //! Every option of the modeled commands is known with the arity
-//! flutter_tools declares for it and one role:
+//! `flutter_tools` declares for it and one role:
 //!
 //! * structured — the build mode flags, `--flavor`, `-t/--target` and
 //!   `--dart-define` land in [`TargetSpec`] and [`ParsedFlutterCmd`];
@@ -30,18 +30,19 @@
 //!   `--print-dtd` and `--debug-logs-dir` change no artifact and are
 //!   dropped.
 //!
-//! Options flutter_tools 3.47.1 does not declare are kept verbatim: worst
+//! Options `flutter_tools` 3.47.1 does not declare are kept verbatim: worst
 //! case a spurious miss, never a wrong hit. An unknown `--name` or `-x`
 //! without an inline value may consume the next token, so from it on the
 //! rest of the argv is kept verbatim and left uninterpreted.
 //!
 //! `build` and `run` take the first positional argument as the target file
 //! when `-t` is absent (flutter's `targetFile`); `test` takes positional
-//! arguments as test paths. flutter_tools has no runtime-argument
+//! arguments as test paths. `flutter_tools` has no runtime-argument
 //! passthrough: tokens after `--` are positional arguments too, so for
 //! `run` and `test` they stay in the key behind a `--` marker, and a `--`
 //! in `flutter build` is rejected as unsupported.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -57,14 +58,14 @@ pub struct ParsedFlutterCmd {
     /// `--dart-define` map exactly as passed (before define filtering). A
     /// repeated key keeps its last value, as the Dart compilers do. A
     /// define without a key (`V`, `=V`) or an empty one stays verbatim in
-    /// `extra_key_args` instead. flutter_tools 3.41+ drops an empty
+    /// `extra_key_args` instead. `flutter_tools` 3.41+ drops an empty
     /// define, but 3.38 and older forward it as a bare `-D` that swallows
     /// the next define while their test kernel-cache name hashes it as
     /// nothing — keyed as dropped, it would merge two configurations those
     /// lines compile differently.
     pub defines: BTreeMap<String, String>,
     /// `--dart-define-from-file` paths in argv order, relative to the
-    /// flutter working directory. flutter_tools folds the files' contents
+    /// flutter working directory. `flutter_tools` folds the files' contents
     /// into the define list and no depfile records them, so the cache key
     /// must hash their contents; the option tokens also stay in
     /// `extra_key_args`.
@@ -78,7 +79,7 @@ pub enum ArgModelError {
     /// uncached.
     #[error("unsupported flutter invocation: {0}")]
     Unsupported(String),
-    /// An argv flutter_tools 3.47.1 itself rejects.
+    /// An argv `flutter_tools` 3.47.1 itself rejects.
     #[error("invalid flutter invocation: {0}")]
     Invalid(String),
 }
@@ -132,7 +133,7 @@ pub fn parse_flutter_args(argv: &[String]) -> Result<ParsedFlutterCmd, ArgModelE
     Ok(parser.finish(command))
 }
 
-/// The `.dart_tool/flutter_build/<name>` directory name flutter_tools 3.47.1
+/// The `.dart_tool/flutter_build/<name>` directory name `flutter_tools` 3.47.1
 /// gives one build configuration (the `Environment` factory):
 ///
 /// `md5_hex(utf8(engine_revision ++ k1 ++ v1 ++ … ++ kn ++ vn ++ output_dir))`
@@ -161,7 +162,7 @@ pub fn parse_flutter_args(argv: &[String]) -> Result<ParsedFlutterCmd, ArgModelE
 ///   `output_dir` is the `--output` directory, made absolute against the
 ///   project directory. This is the map [`crate::assemble`] captures and
 ///   this function recomputes a recorded dir name from.
-/// * `BundleBuilder` (`build bundle`, flutter_tools 3.47.1
+/// * `BundleBuilder` (`build bundle`, `flutter_tools` 3.47.1
 ///   `bundle_builder.dart`): `TargetPlatform`, `TargetFile`,
 ///   `DeferredComponents=false` spread before
 ///   `BuildInfo.toBuildSystemEnvironment()` (`build_info.dart`) — always
@@ -225,7 +226,7 @@ enum Role {
     Simulator,
     /// Prints usage or exits before any command runs.
     NoBuild,
-    /// Declared, but flutter_tools rejects it in this position.
+    /// Declared, but `flutter_tools` rejects it in this position.
     Reject(&'static str),
 }
 
@@ -291,7 +292,7 @@ const fn value(name: &'static str) -> Opt {
     Opt::new(name, Arity::Value)
 }
 
-/// The options one flutter_tools helper declares.
+/// The options one `flutter_tools` helper declares.
 type Group = &'static [Opt];
 /// Every option one parser level declares.
 type Grammar = &'static [Group];

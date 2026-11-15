@@ -26,6 +26,7 @@
 //! promoted-read face re-decides the else read on the pattern type.
 //! Routing: dartq-flow `ThenControlFlow` needs the `if_case_then` arm.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// `[if (x case int y) y]` — the then element reads the pattern variable:

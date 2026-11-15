@@ -16,6 +16,7 @@
 //! pending the receive is bounded by the window's remainder, so an idle
 //! daemon wakes at the deadline to save — still no timer thread.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -185,7 +186,7 @@ where
 pub fn run_with_signal<R, W>(
     input: R,
     output: W,
-    mut session: &mut Session,
+    session: &mut Session,
     watch: Option<WatchOptions>,
     signal: Option<&AtomicBool>,
     on_turn: &mut dyn FnMut(),
@@ -374,16 +375,16 @@ where
         for incoming in batch {
             match incoming {
                 Incoming::Message(Message::Request(request)) => {
-                    if let Some(response) = handle_request(&mut session, request) {
+                    if let Some(response) = handle_request(session, request) {
                         write_message(&mut output, &Message::Response(response))?;
                     }
                 }
                 Incoming::Message(Message::Notification(notification)) => {
-                    handle_notification(&mut session, &notification);
+                    handle_notification(session, &notification);
                 }
                 Incoming::Message(Message::Response(_)) => {} // clients never send these
                 Incoming::Watch { touched } => {
-                    handle_watch(&mut session, touched);
+                    handle_watch(session, touched);
                 }
                 Incoming::Unparsable { code, message } => {
                     write_message(
@@ -820,10 +821,10 @@ fn handle_watch(session: &mut Session, touched: Vec<PathBuf>) {
             failed("watch refresh", &error);
         }
     }
-    if !sources.is_empty() {
-        if let Err(error) = session.queue_disk_changes(&sources) {
-            failed("watch sync", &error);
-        }
+    if !sources.is_empty()
+        && let Err(error) = session.queue_disk_changes(&sources)
+    {
+        failed("watch sync", &error);
     }
 }
 
@@ -1013,7 +1014,7 @@ fn write_turn(output: &mut impl Write, turn: Turn) -> io::Result<()> {
         match answer {
             Ok(AnswerPayload::Wire(bytes)) => write_wire_response(output, id, &bytes)?,
             Ok(AnswerPayload::Value(result)) => {
-                write_message(output, &Message::Response(Response::ok(id, result)))?
+                write_message(output, &Message::Response(Response::ok(id, result)))?;
             }
             Err(error) => write_message(output, &Message::Response(answer_error(id, &error)))?,
         }
@@ -1716,8 +1717,7 @@ mod tests {
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
         })
         .expect("store opens on a temp root");
-        let mut session =
-            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let session = Session::with_store(workspace.engine_config(), store, None).expect("session");
         let (client, receiver) = mpsc::channel::<Vec<u8>>();
         let output = TestOutput::default();
         let server_output = output.clone();

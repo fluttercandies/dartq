@@ -3,6 +3,7 @@
 //! failure is an [`Outcome::PerRun`]: the caller runs `dart analyze` per
 //! run, so the resident path can only make a run faster, never fail it.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,13 +17,13 @@ use crate::{Files, SERVE_FLAG, Spec};
 const BIND_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a failure marker sends runs straight to the per-run path.
 #[cfg(unix)]
-const FAILED_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+const FAILED_COOLDOWN: Duration = Duration::from_mins(10);
 /// The most one answer may take once the request is written: covers the
 /// daemon's own worst wait (the 30-minute job-gate lease wait of
 /// `daemon::MEMORY_WAIT`) plus slack. A wedged daemon hits the deadline
 /// and the caller falls back instead of hanging forever.
 #[cfg(unix)]
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(35 * 60);
+const ANSWER_TIMEOUT: Duration = Duration::from_mins(35);
 
 /// The most bytes one `Answer::Face` header may announce. The daemon's own
 /// face cache caps payloads far below this (64 MiB), so a header claiming
@@ -215,12 +216,10 @@ pub fn analyze(request: &Request) -> Outcome {
             Ok(Answered::Budget(message)) => Outcome::Budget(message),
             // `Yielded` is handled inside `ask_gated`'s re-queue loop; a
             // bare `ask` (the pool path) maps it to `Unavailable` there.
-            Ok(Answered::Yielded) | Ok(Answered::Cooling) | Ok(Answered::NotServed) => {
-                Outcome::PerRun {
-                    reason: None,
-                    sdk: Some(sdk),
-                }
-            }
+            Ok(Answered::Yielded | Answered::Cooling | Answered::NotServed) => Outcome::PerRun {
+                reason: None,
+                sdk: Some(sdk),
+            },
             Err(reason) => Outcome::PerRun {
                 reason: Some(format!(
                     "dartq analyze: resident analyzer unavailable ({reason}) — running dart analyze"
@@ -278,7 +277,7 @@ enum Answered {
 /// deadline the daemon's own lease wait uses, so a memory-tight host
 /// gets every honest wait, and a host that never frees still bounds.
 #[cfg(unix)]
-const YIELD_REQUEUE: Duration = Duration::from_secs(30 * 60);
+const YIELD_REQUEUE: Duration = Duration::from_mins(30);
 
 /// [`ask`] with the growth brake's re-queue: an `Answer::Yield` means the
 /// daemon's server was the youngest heavy holder on a critically low host
@@ -298,15 +297,15 @@ fn ask_gated(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Result<An
                 yields += 1;
                 if std::time::Instant::now() + Duration::from_millis(500) >= deadline {
                     return Ok(Answered::Budget(format!(
-                        "dartq analyze: host memory stayed critically low through {} yields — \
-                         the analyzer never got its memory back",
-                        yields
+                        "dartq analyze: host memory stayed critically low through {yields} yields — \
+                         the analyzer never got its memory back"
                     )));
                 }
                 if yields == 1 {
-                    let free = dartq_toolchain::ledger::available_memory()
-                        .map(|bytes| format!("{:.1} GB free", bytes as f64 / f64::from(1u32 << 30)))
-                        .unwrap_or_else(|| "low memory".into());
+                    let free = dartq_toolchain::ledger::available_memory().map_or_else(
+                        || "low memory".into(),
+                        |bytes| format!("{:.1} GB free", bytes as f64 / f64::from(1u32 << 30)),
+                    );
                     eprintln!(
                         "dartq analyze: the analyzer yielded to keep the machine alive ({free}); \
                          re-queuing {} behind the job gate",
@@ -398,7 +397,7 @@ fn pool_join(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Option<Po
             // daemon — the pool never silently spawns a second analyzer.
             // A yielded pooled server is the same path: the worktree's
             // own daemon re-queues the job.
-            Ok(Answer::NotServed) | Ok(Answer::Yield) | Ok(Answer::Fault(_)) | Err(_) => {
+            Ok(Answer::NotServed | Answer::Yield | Answer::Fault(_)) | Err(_) => {
                 return Some(PoolAnswer::Unavailable);
             }
         }

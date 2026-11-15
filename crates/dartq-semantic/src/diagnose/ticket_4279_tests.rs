@@ -18,6 +18,7 @@
 //! pattern fields `Object?` (`record_over_int_keeps_object_question_leaves`
 //! pins that shape here too, the r.dart receipt).
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::FileReport;
 use super::test_rig::report_ops;
 
@@ -198,7 +199,7 @@ fn map_record_key_element_face() {
 
 /// The corpus's `runRecord` shape: a record as `Future`'s type argument
 /// keeps its shape through `await`, so the record pattern's binders get
-/// the real field types (the cockpit_record_commands_test FP family:
+/// the real field types (the `cockpit_record_commands_test` FP family:
 /// `final (startExit, started) = await runRecord(...)` and `started[...]`).
 #[test]
 fn future_record_argument_survives_await() {
@@ -309,7 +310,7 @@ fn typed_literal_record_with_unresolved_field_head_stays_silent() {
 /// argument-list parens as an expression group and type the send by the
 /// first argument's read row (`_pick(nullableMap, keys)` answering
 /// `Map?`), fabricating `unchecked_use_of_nullable_value` the oracle
-/// never emits (the cli_output spread-churn rows of the +33 family —
+/// never emits (the `cli_output` spread-churn rows of the +33 family —
 /// `..._pick(schemaMap, const <String>['type'])` inside the null-guarded
 /// element). The callee-keyed leg (`call_ends`' completed-send swap)
 /// owns the send's answer; the argument list is not an expression.

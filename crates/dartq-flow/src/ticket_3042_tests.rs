@@ -33,6 +33,7 @@
 //! break; }` → row `{ break; }` with a live tail; `for (…; true;) {
 //! break; }` → clean.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;

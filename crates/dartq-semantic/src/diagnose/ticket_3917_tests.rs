@@ -27,7 +27,7 @@
 //!   carries no declared-vs-promoted distinction at the read site, so
 //!   the fix needs the intersection face in the flow fold or both faces
 //!   at the read site.
-//! * the `FutureOr<void>` source face: the Left FutureOr conjunction
+//! * the `FutureOr<void>` source face: the Left `FutureOr` conjunction
 //!   asks its legs as pure subtypes (upstream `subtype.dart:371-385` —
 //!   `FutureOr<S0> <: T1` iff `S0 <: T1` and `Future<S0> <: T1`), and
 //!   `void <: Object` is FALSE (Left Void answers the top faces only),
@@ -36,6 +36,7 @@
 //!   `void`-source suppression (`use_of_void_result`'s business) left
 //!   the conjunction undecided and the row unreported.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::report_ops;
 use crate::FileReport;
 
@@ -220,7 +221,7 @@ void f<X, X1 extends Future<Never>>(X x) async {
 }
 
 /// The `FutureOr<void>` source refuses the `Object` target: the Left
-/// FutureOr conjunction asks `void <: Object` (false — a void source
+/// `FutureOr` conjunction asks `void <: Object` (false — a void source
 /// subtypes only the top faces) and `Future<void> <: Object` (true), so
 /// `Object o = h()` over `FutureOr<void> h()` reports the oracle's
 /// `FutureOr<void>` -> `Object` row at the right-hand span.

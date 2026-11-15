@@ -41,6 +41,7 @@
 //! reports nothing. Conformance cases: `bool_context_error_test`,
 //! `equality_error_test`, `grammar_A05`, `non_ambiguity_A02_*`.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 use crate::diagnose::FileReport;
 

@@ -1,6 +1,7 @@
 //! Diagnostic data model: severity, type layering, source locations, and the
 //! file-layout abstraction the output writers consume.
 
+#![allow(clippy::semicolon_if_nothing_returned)]
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Deref;
