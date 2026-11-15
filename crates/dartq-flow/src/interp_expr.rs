@@ -4869,14 +4869,33 @@ impl Interp<'_> {
         }
         // The legacy (pre-sound-flow) arm's step gate is the resolved
         // subtype question, which cannot decide a spelling no declaration
-        // owns — keep the optimistic step the name level would take over
-        // such a head (the under-report direction; refusing it reported
-        // the guard's continuation against the declared type, #4294).
-        if (tested, tested_args) != (previous, previous_args)
-            && (self.ops.head_unattributable(tested, self.names)
-                || self.ops.head_unattributable(previous, self.names))
-        {
-            return Some(tested);
+        // owns. A PREFIXED spelling keeps the strict gate — the same
+        // posture `is_subtype_typed`'s lossy arm takes; the source may
+        // have named the prefixed class, so no promotion is provable
+        // (#4304 reverted the optimistic step here: `w is u.Image` reports
+        // against the declared `Widget` again). The one step the lossy
+        // spelling cannot invalidate is a promotion FROM a top type — every
+        // tested spelling sits under `Object`/`dynamic`/`void` — so a
+        // standing top takes it (the corpus's `Object`-declared receivers:
+        // refusing left `value.resolve` reading `Object`). A bare
+        // cross-file collision the unit's own scope cannot pin keeps the
+        // optimistic name-level step (the under-report direction; refusing
+        // it reported the guard's continuation against the declared type,
+        // #4294).
+        if (tested, tested_args) != (previous, previous_args) {
+            if self.ops.head_lossy(tested, self.names) || self.ops.head_lossy(previous, self.names)
+            {
+                if self.is_top_head(previous) {
+                    return Some(tested);
+                }
+                // Any other lossy pair falls through to the strict gate.
+            } else if self.ops.head_unattributable(tested, self.names)
+                || self.ops.head_unattributable(previous, self.names)
+                || self.ops.head_foreign(tested, self.names)
+                || self.ops.head_foreign(previous, self.names)
+            {
+                return Some(tested);
+            }
         }
         if self.ops.is_subtype_typed(
             tested,
@@ -4890,6 +4909,23 @@ impl Interp<'_> {
             return Some(tested);
         }
         None
+    }
+
+    /// Whether one lattice spelling is a TOP type — the `dynamic` and
+    /// `void` bases, the unknown marker, or the `Object` class spelling.
+    /// A promotion FROM a top type is valid for every tested spelling, so
+    /// the legacy arm's lossy refusal must not refuse it (#4304: the
+    /// corpus's `Object`-declared receivers, whose promotion the oracle
+    /// makes and the name-level lossy gate leaves unpromoted).
+    fn is_top_head(&self, ty: Ty) -> bool {
+        match ty.base {
+            Base::Dynamic | Base::Unknown | Base::Void => true,
+            Base::Name(id) => self
+                .names
+                .get(id as usize)
+                .is_some_and(|lexeme| &**lexeme == "Object"),
+            _ => false,
+        }
     }
 
     /// The promoted-property read's flow-type row (#3430): when the

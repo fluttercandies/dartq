@@ -459,12 +459,12 @@ impl<'a> Engine<'a> {
                         key: self.utf16_of(we - 1),
                     })
                     .or_else(|| {
-                        self.untyped_literals
-                            .get(&self.utf16_of(lw))
-                            .map(|kind| NestedLiteralElem {
+                        self.untyped_literals.get(&self.utf16_of(lw)).map(|kind| {
+                            NestedLiteralElem {
                                 kind: *kind,
                                 key: self.utf16_of(lw),
-                            })
+                            }
+                        })
                     }),
                 _ => None,
             }
@@ -807,102 +807,101 @@ impl<'a> Engine<'a> {
             // answering row IS the record literal's own
             // ([`RowShape::Record`] — its range covers the `)` alone, so
             // the report re-anchors on `elem_span`).
-            let (mut element_ty, row_range, int_literal, record_row) =
-                if let Some(elem) = literal {
-                    // A nested collection literal is the element: its static
-                    // type adopts the context when the declared face's head
-                    // matches (`['x']` under `List<int>` resolves `List<int>`
-                    // and coerces), else the leaves' upward inference
-                    // (`['x']` under `int` reads `List<String>`; `{k: v}`
-                    // under `Map<K2, V2>` adopts and the entry face owns the
-                    // key/value verdicts).
-                    let (ty, range) = self.nested_literal_ty(elem, declared);
-                    (ty, range, false, false)
-                } else {
-                    // The element expression's own row: the outermost row
-                    // spanning the trimmed window exactly — an inner row
-                    // (`{k: f()}`'s `f` leaf, `a + b`'s `b`) types its own
-                    // operand, never the element. A nested literal's `]`/`}`
-                    // row drains into the deferred queue at its own close,
-                    // so both stacks scan.
-                    let (s16, e16) = (self.utf16_of(ws), self.utf16_of(we));
-                    let exact = |row: &&Row| {
-                        row.range.offset == s16
-                            && row.range.end() == e16
-                            && !matches!(row.shape, RowShape::TypeUse(..))
-                    };
-                    let row = self
-                        .rows
-                        .iter()
-                        .rev()
-                        .take_while(|row| row.range.offset >= s16)
-                        .find(|row| exact(row))
-                        .or_else(|| {
-                            self.deferred_miss_rows
-                                .iter()
-                                .rev()
-                                .take_while(|row| row.range.offset >= s16)
-                                .find(|row| exact(row))
-                        })
-                        .cloned();
-                    match row {
-                        Some(row) => {
-                            let mut ty = self.operand_static_ty(&row);
-                            if ty == Ty::UNKNOWN {
-                                // A for-in body element whose loop variable's
-                                // element type only the pass-2 pre-pass derives
-                                // (`local_init_rows` — the iterable literal's
-                                // row was still opaque at `)` close): the
-                                // element check fires at parse time, before that
-                                // pass exists, so the literal channel answers
-                                // the same face itself.
-                                ty = self.for_in_literal_element_ty(&row).unwrap_or(Ty::UNKNOWN);
-                            }
-                            if ty == Ty::UNKNOWN {
-                                continue;
-                            }
-                            (
-                                ty,
-                                row.range,
-                                self.is_int_literal_row(&row),
-                                matches!(row.shape, RowShape::Record(_)),
-                            )
-                        }
-                        None => {
-                            // No single row spans the window (a composite
-                            // operand the row model leaves unfolded): keep the
-                            // legacy last-typed-row posture — the element's
-                            // inner row is the best face available. A control
-                            // segment's multi-arm body never folds to one row,
-                            // so the leaf grab stays off it entirely.
-                            if control {
-                                continue;
-                            }
-                            let stop16 = e16;
-                            let Some((row_ty, row_range, row_lit, row_record)) = self
-                                .rows
-                                .iter()
-                                .rev()
-                                .find(|row| {
-                                    row.ty != Ty::UNKNOWN
-                                        && row.range.offset >= s16
-                                        && row.range.end() <= stop16
-                                })
-                                .map(|row| {
-                                    (
-                                        row.ty,
-                                        row.range,
-                                        self.is_int_literal_row(row),
-                                        matches!(row.shape, RowShape::Record(_)),
-                                    )
-                                })
-                            else {
-                                continue;
-                            };
-                            (row_ty, row_range, row_lit, row_record)
-                        }
-                    }
+            let (mut element_ty, row_range, int_literal, record_row) = if let Some(elem) = literal {
+                // A nested collection literal is the element: its static
+                // type adopts the context when the declared face's head
+                // matches (`['x']` under `List<int>` resolves `List<int>`
+                // and coerces), else the leaves' upward inference
+                // (`['x']` under `int` reads `List<String>`; `{k: v}`
+                // under `Map<K2, V2>` adopts and the entry face owns the
+                // key/value verdicts).
+                let (ty, range) = self.nested_literal_ty(elem, declared);
+                (ty, range, false, false)
+            } else {
+                // The element expression's own row: the outermost row
+                // spanning the trimmed window exactly — an inner row
+                // (`{k: f()}`'s `f` leaf, `a + b`'s `b`) types its own
+                // operand, never the element. A nested literal's `]`/`}`
+                // row drains into the deferred queue at its own close,
+                // so both stacks scan.
+                let (s16, e16) = (self.utf16_of(ws), self.utf16_of(we));
+                let exact = |row: &&Row| {
+                    row.range.offset == s16
+                        && row.range.end() == e16
+                        && !matches!(row.shape, RowShape::TypeUse(..))
                 };
+                let row = self
+                    .rows
+                    .iter()
+                    .rev()
+                    .take_while(|row| row.range.offset >= s16)
+                    .find(|row| exact(row))
+                    .or_else(|| {
+                        self.deferred_miss_rows
+                            .iter()
+                            .rev()
+                            .take_while(|row| row.range.offset >= s16)
+                            .find(|row| exact(row))
+                    })
+                    .cloned();
+                match row {
+                    Some(row) => {
+                        let mut ty = self.operand_static_ty(&row);
+                        if ty == Ty::UNKNOWN {
+                            // A for-in body element whose loop variable's
+                            // element type only the pass-2 pre-pass derives
+                            // (`local_init_rows` — the iterable literal's
+                            // row was still opaque at `)` close): the
+                            // element check fires at parse time, before that
+                            // pass exists, so the literal channel answers
+                            // the same face itself.
+                            ty = self.for_in_literal_element_ty(&row).unwrap_or(Ty::UNKNOWN);
+                        }
+                        if ty == Ty::UNKNOWN {
+                            continue;
+                        }
+                        (
+                            ty,
+                            row.range,
+                            self.is_int_literal_row(&row),
+                            matches!(row.shape, RowShape::Record(_)),
+                        )
+                    }
+                    None => {
+                        // No single row spans the window (a composite
+                        // operand the row model leaves unfolded): keep the
+                        // legacy last-typed-row posture — the element's
+                        // inner row is the best face available. A control
+                        // segment's multi-arm body never folds to one row,
+                        // so the leaf grab stays off it entirely.
+                        if control {
+                            continue;
+                        }
+                        let stop16 = e16;
+                        let Some((row_ty, row_range, row_lit, row_record)) = self
+                            .rows
+                            .iter()
+                            .rev()
+                            .find(|row| {
+                                row.ty != Ty::UNKNOWN
+                                    && row.range.offset >= s16
+                                    && row.range.end() <= stop16
+                            })
+                            .map(|row| {
+                                (
+                                    row.ty,
+                                    row.range,
+                                    self.is_int_literal_row(row),
+                                    matches!(row.shape, RowShape::Record(_)),
+                                )
+                            })
+                        else {
+                            continue;
+                        };
+                        (row_ty, row_range, row_lit, row_record)
+                    }
+                }
+            };
             if spread {
                 // A spread element contributes its operand's ELEMENT type
                 // (type_analyzer.dart's spread-element resolution), never

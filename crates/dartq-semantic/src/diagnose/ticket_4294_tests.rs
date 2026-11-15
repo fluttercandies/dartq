@@ -1,26 +1,25 @@
-//! #4294 pins: the `is!`-guard + early-return continuation sees the
-//! PROMOTED type when the tested head is a bare name two reachable files
-//! declare (a first-writer-wins registry slot, not the unit's own
-//! resolution, decides it — the cockpit corpus's `dart:ui`-reachable
-//! `Image` preempting `package:flutter`'s).
+//! #4294 pins: the LEGACY (pre-sound-flow) fold's `is!`-guard +
+//! early-return continuation keeps the optimistic promotion over a bare
+//! name two reachable files declare.
 //!
-//! The promotion step is the one gate where a wrong attribution
-//! manufactures a report: a refused step leaves the declared type in
-//! place, and every member the guard was there to make legal reports
-//! `undefined_getter` — six oracle-proven false positives on
-//! cockpit-cas-b, all `widget.width`/`height`/`fit`/`repeat` after
-//! `if (widget is! Image) { return …; }`. The gate answers name-level over
-//! such heads ([`dartq_semantic::resolved_ops`]'s `ambiguous_names`), the
-//! same posture the lossy-overload set already takes for PREFIXED
-//! spellings.
+//! #4294's original false-positive class was the legacy corpus fold
+//! (language 2.12): the registry slot is first-writer-wins, a refused step
+//! left the declared type in place, and every member the guard was there
+//! to make legal reported `undefined_getter` — six oracle-proven false
+//! positives on cockpit-cas-b, all `widget.width`/`height`/`fit`/`repeat`
+//! after `if (widget is! Image) { return …; }`. The legacy fold still takes
+//! that optimistic step over a bare cross-file collision; #4304 split it
+//! from the prefixed (lossy) spelling, which keeps the strict refusal.
 //!
-//! Oracle provenance: `dart analyze` 3.13.7 over every shape below —
-//! `is!` guards exited by `return`/`throw`/`break`/`continue`, the
-//! positive `is`-guard control, local and parameter receivers, nullable
-//! declared types, and the literal-element position — reports no issues
-//! on all of them; the shapes that stay unpromoted (a single-declaration
-//! unrelated head, no guard at all) report the same `undefined_getter`
-//! rows dartq reports.
+//! Oracle provenance: `dart analyze` 3.13.7.
+//! * Sound (language >= 3.9, this rig's default): the collided reference
+//!   is `InvalidType` — no promotion stands — so the two `collided_*`
+//!   shapes below report every member row against the declared `Widget`
+//!   (asserted verbatim below). The single-declaration unrelated head and
+//!   the guard-free read keep the `undefined_getter` rows dartq reports.
+//! * Legacy (2.12): the `ambiguous_import` error dominates and the member
+//!   rows are suppressed; the legacy fold reproduces that through the
+//!   optimistic step, pinned on both sides in `ticket_4304_tests`.
 
 use super::FileReport;
 use super::test_rig::{RigImport, report_ops, report_ops_bare, report_ops_imports};
@@ -64,10 +63,12 @@ fn collided(source: &str) -> FileReport {
 }
 
 /// The corpus shape (#4294's mandate): `is!` guard + early return, then a
-/// typed literal whose ELEMENT CHECKS read the members the guard's
-/// continuation makes legal.
+/// typed literal whose ELEMENT CHECKS read the guard's continuation. The
+/// oracle-verified sound-version rows: the collided reference is
+/// `InvalidType`, no promotion stands, and every element check reports
+/// against the declared `Widget`.
 #[test]
-fn collided_negative_guard_promotes_literal_elements() {
+fn collided_negative_guard_reports_the_declared_type() {
     let report = collided(
         "class Prop {\n\
          \x20 Prop(this.name, this.value);\n\
@@ -87,13 +88,22 @@ fn collided_negative_guard_promotes_literal_elements() {
          \x20 ];\n\
          }\n",
     );
-    assert_eq!(texts(&report, "undefined_getter"), Vec::<String>::new());
+    assert_eq!(
+        texts(&report, "undefined_getter"),
+        vec![
+            "The getter 'width' isn't defined for the type 'Widget'.".to_owned(),
+            "The getter 'height' isn't defined for the type 'Widget'.".to_owned(),
+            "The getter 'fit' isn't defined for the type 'Widget'.".to_owned(),
+            "The getter 'repeat' isn't defined for the type 'Widget'.".to_owned(),
+        ]
+    );
 }
 
 /// The positive-guard control: the same collided head inside the guarded
-/// branch (both arms live — no early exit involved).
+/// branch (both arms live — no early exit involved). Oracle-verified sound
+/// rows: the member reads report against the declared `Widget`.
 #[test]
-fn collided_positive_guard_promotes_inside_the_branch() {
+fn collided_positive_guard_reports_the_declared_type() {
     let report = collided(
         "String inside(Widget widget) {\n\
          \x20 if (widget is Image) {\n\
@@ -102,7 +112,13 @@ fn collided_positive_guard_promotes_inside_the_branch() {
          \x20 return 'other';\n\
          }\n",
     );
-    assert_eq!(texts(&report, "undefined_getter"), Vec::<String>::new());
+    assert_eq!(
+        texts(&report, "undefined_getter"),
+        vec![
+            "The getter 'fit' isn't defined for the type 'Widget'.".to_owned(),
+            "The getter 'repeat' isn't defined for the type 'Widget'.".to_owned(),
+        ]
+    );
 }
 
 /// Every exit kind a negative guard can take: `return`, `throw`, `break`,

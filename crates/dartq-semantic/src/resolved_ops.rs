@@ -125,6 +125,27 @@ const BUILTINS: &[(&str, &[&str], &[&str])] = &[
     ("Enum", &[], &[]),
 ];
 
+/// How the analyzed library's own scope resolves a bare spelling the
+/// registry saw claimed by two files — the promotion gates' verdict
+/// (`LibraryTypes::head_collisions`, #4304). The flow layer's bare head
+/// carries no declaration, so the only trustworthy answer is the one the
+/// unit's scope gives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadCollision {
+    /// The scope names a single declaration that is not the registered
+    /// slot's: the slot is the wrong class, but a real declaration is in
+    /// scope. Both folds keep the name-level optimistic step — refusing
+    /// would report the guard's continuation against the declared type
+    /// (#4294).
+    Foreign,
+    /// The scope names no single declaration (two unprefixed imports
+    /// export it): the oracle resolves the reference to `InvalidType`.
+    /// Legacy folding keeps the optimistic step (#4294); sound folding
+    /// refuses it, so the member reads report against the declared type
+    /// (#4304).
+    Unattributable,
+}
+
 /// The per-library resolved-type world: one interned [`TypeTable`] plus
 /// the [`TypeHierarchy`] over it, a `StringId → TypeDeclId` name registry
 /// covering every reachable declaration (in-library and imported
@@ -174,17 +195,16 @@ pub struct LibraryTypes {
     /// so the adapter's verdict gates keep the name-level default's
     /// answer over them ([`ResolvedTypeOps::head_overloaded`]).
     lossy_overloads: FxHashSet<StringId>,
-    /// Bare spellings this build saw claimed by two DIFFERENT declarations
-    /// — two reachable files declare the name, and first-writer-wins
-    /// decided the registry slot by registration order. The flow layer's
-    /// bare-head question cannot attribute such a spelling either, so the
-    /// promotion gate keeps the name-level default's optimistic answer over
-    /// them ([`ResolvedTypeOps::head_ambiguous`]) — the same posture
-    /// [`Self::lossy_overloads`] takes for PREFIXED spellings, extended to
-    /// the collision registration order would otherwise settle
-    /// (#4294: a `dart:ui`-reachable `Image` preempting `package:flutter`'s
-    /// refused the oracle's `Widget is Image` promotion).
-    ambiguous_names: FxHashSet<StringId>,
+    /// Bare spellings the registry saw claimed by two files, resolved
+    /// against the ANALYZED library's own scope — how the promotion gates
+    /// must read the spelling ([`HeadCollision`], #4304). A claim whose
+    /// scope names the registered declaration is absent: the slot is the
+    /// declaration the source sees, so the strict resolved gate may trust
+    /// it. A claim whose scope names another single declaration is
+    /// [`HeadCollision::Foreign`] (a real in-scope class the slot is not);
+    /// one the scope cannot pin at all is
+    /// [`HeadCollision::Unattributable`].
+    head_collisions: FxHashMap<StringId, HeadCollision>,
     /// `typedef` name → the aliased head name plus its own `?` flag —
     /// captured only when the element model carried the RHS as a bare
     /// `Ty::Named` with no written arguments and the alias declares no
@@ -789,8 +809,8 @@ impl LibraryTypes {
                 if registry.registry.contains_key(&name) || registry.non_containers.contains(&name)
                 {
                     // The slot is taken — possibly by another file that
-                    // declares the same spelling (see the deviation the
-                    // verdict gates read, `LibraryTypes::ambiguous_names`).
+                    // declares the same spelling (the claim ledger the
+                    // promotion gates resolve, `LibraryTypes::head_collisions`).
                     registry.note_claim(name, entry.file);
                     continue;
                 }
@@ -864,8 +884,8 @@ impl LibraryTypes {
                     }
                 } else {
                     // Prefixed-only names carry no bare claim, but a slot
-                    // another file filled makes the spelling ambiguous all
-                    // the same (`LibraryTypes::ambiguous_names`).
+                    // another file filled makes the spelling contingent all
+                    // the same (`LibraryTypes::head_collisions`).
                     registry.note_claim(name, entry.file);
                 }
                 let Some(&decl) = registry.registry.get(&name) else {
@@ -931,8 +951,8 @@ impl LibraryTypes {
                         {
                             // This foreign scope resolves the spelling to
                             // another file than the registered slot's —
-                            // the bare name is unattributable in this
-                            // build (`LibraryTypes::ambiguous_names`).
+                            // registration order cannot settle the claim
+                            // (`LibraryTypes::head_collisions`).
                             registry.note_claim(head, target_file);
                             continue;
                         }
@@ -993,14 +1013,14 @@ impl LibraryTypes {
             }
         }
         // A names-only face entry standing beside a real declaration of the
-        // same spelling: the bare name is unattributable, so the promotion
-        // gate answers name-level over it
-        // ([`LibraryTypes::ambiguous_names`]). The SDK projection is the
-        // common carrier — `dart:ui`'s native `Image` is a face entry while
-        // `package:flutter/widgets.dart` re-exports a real widget class of
-        // the same name, and which one a fold consults must not depend on
-        // registration order (#4294: the six oracle-proven
-        // `undefined_getter` rows all came from the refused
+        // same spelling: the slot cannot be trusted without asking the
+        // analyzed library's own scope, so the claim joins the ledger the
+        // promotion gates resolve ([`LibraryTypes::head_collisions`]). The
+        // SDK projection is the common carrier — `dart:ui`'s native `Image`
+        // is a face entry while `package:flutter/widgets.dart` re-exports a
+        // real widget class of the same name, and which one a fold consults
+        // must not depend on registration order (#4294: the six
+        // oracle-proven `undefined_getter` rows all came from the refused
         // `Widget is Image` promotion).
         for &name in &face_only {
             if registry.registry.contains_key(&name) {
@@ -1038,6 +1058,15 @@ impl LibraryTypes {
                 }
             }
         }
+        // —— the promotion-gate collision verdicts ————————————————————————
+        // `ambiguous_names` is the build's claim ledger; the analyzed
+        // library's own scope decides what each claim means at the
+        // promotion gates (#4304, [`HeadCollision`]).
+        let head_collisions: FxHashMap<StringId, HeadCollision> = registry
+            .ambiguous_names
+            .iter()
+            .filter_map(|&name| registry.head_collision(name).map(|kind| (name, kind)))
+            .collect();
         // The alias RHS shapes flatten after every registration pass (the
         // library's units and the import sweep) — a co-alias chain needs
         // its target's registration first.
@@ -1048,7 +1077,6 @@ impl LibraryTypes {
             decl_params,
             decl_owner,
             non_containers,
-            ambiguous_names,
             typedef_targets,
             mut typedef_shapes,
             aliases,
@@ -1483,7 +1511,7 @@ impl LibraryTypes {
             decl_params,
             non_containers,
             lossy_overloads,
-            ambiguous_names,
+            head_collisions,
             typedef_targets,
             typedef_shapes,
             fn_shapes,
@@ -1700,7 +1728,7 @@ struct Registry<'g> {
     /// The analyze-wide resolution pair the name claims consult: a spelling
     /// several libraries declare is attributed by the ANALYZED library's own
     /// scope, never by registration order
-    /// ([`LibraryTypes::ambiguous_names`]).
+    /// ([`LibraryTypes::head_collisions`]).
     graph: &'g LibraryGraph,
     namespaces: &'g Namespaces,
     lib: LibraryId,
@@ -1708,9 +1736,9 @@ struct Registry<'g> {
     decl_params: FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     decl_owner: FxHashMap<TypeDeclId, (FileId, LibraryId)>,
     non_containers: FxHashSet<StringId>,
-    /// See [`LibraryTypes::ambiguous_names`]: filled by
-    /// [`Self::register_file`] whenever a container name a file declares is
-    /// already registered from a DIFFERENT file.
+    /// The build-time claim ledger [`Self::head_collision`] resolves into
+    /// [`LibraryTypes::head_collisions`]: filled whenever a container name
+    /// a file declares is already registered from a DIFFERENT file.
     ambiguous_names: FxHashSet<StringId>,
     /// Bare `Ty::Named` typedef right-hand sides keyed on the alias's
     /// own spelling — the only alias shape the snapshot can resolve
@@ -1834,11 +1862,11 @@ fn bound_head(bound: &Ty) -> Option<StringId> {
 
 impl Registry<'_> {
     /// Records a bare-name claim that lost (or would lose) the registry
-    /// slot to a declaration in ANOTHER file: the spelling is
-    /// unattributable in this build, so the promotion gate keeps the
-    /// name-level answer over it (`LibraryTypes::ambiguous_names`). A claim
-    /// from the file that already owns the slot (a re-scan of the same
-    /// declaration) records nothing.
+    /// slot to a declaration in ANOTHER file: registration order cannot
+    /// settle the spelling, so the claim joins the ledger
+    /// (`LibraryTypes::head_collisions`). A claim from the file that
+    /// already owns the slot (a re-scan of the same declaration) records
+    /// nothing.
     fn note_claim(&mut self, name: StringId, file: FileId) {
         let Some(&existing) = self.registry.get(&name) else {
             return;
@@ -1849,6 +1877,24 @@ impl Registry<'_> {
             .is_some_and(|&(owner_file, _)| owner_file != file)
         {
             self.ambiguous_names.insert(name);
+        }
+    }
+
+    /// The promotion-gate verdict for one recorded claim ([`HeadCollision`],
+    /// #4304). The analyzed library's own scope is the arbiter: `None`
+    /// when it names the registered declaration (the slot is what the
+    /// source sees, so the strict resolved gate may trust it), otherwise
+    /// the kind of divergence both folds read.
+    fn head_collision(&self, name: StringId) -> Option<HeadCollision> {
+        let slot_file = self
+            .registry
+            .get(&name)
+            .and_then(|decl| self.decl_owner.get(decl))
+            .map(|&(file, _)| file);
+        match self.namespaces.lookup(self.graph, self.lib, name) {
+            Lookup::Found(NamespaceEntry::Decl(file)) if Some(file) == slot_file => None,
+            Lookup::Found(NamespaceEntry::Decl(_)) => Some(HeadCollision::Foreign),
+            _ => Some(HeadCollision::Unattributable),
         }
     }
 
@@ -1889,8 +1935,8 @@ impl Registry<'_> {
             // A spelling several libraries declare is attributed by the
             // ANALYZED library's own scope: when that scope resolves the
             // name to a different file, this registration order's winner
-            // is not the declaration the unit sees — mark the spelling
-            // unattributable ([`LibraryTypes::ambiguous_names`]). The
+            // is not the declaration the unit sees — the spelling joins
+            // the claim ledger ([`LibraryTypes::head_collisions`]). The
             // multi-declaration membership test is one hash probe, and
             // only the (rare) multi-declared spellings pay the namespace
             // lookup.
@@ -4866,6 +4912,20 @@ impl<'a> ResolvedTypeOps<'a> {
         self.overload_ids.borrow().contains(&id)
     }
 
+    /// The promotion-gate verdict for one spelled head — a bare cross-file
+    /// claim the analyzed library's scope could not pin to the registered
+    /// slot ([`LibraryTypes::head_collisions`], #4304).
+    fn collision_kind(&self, ty: FlowTy, names: &[Box<str>]) -> Option<HeadCollision> {
+        let Base::Name(id) = ty.base else {
+            return None;
+        };
+        let lexeme = names.get(id as usize)?;
+        self.snapshot
+            .head_collisions
+            .get(&self.strings.intern(lexeme))
+            .copied()
+    }
+
     /// [`ResolvedTypeOps::is_subtype`]'s walk (#2636): a lossy-overload id
     /// answers name-level ([`Self::overload_ids`]) — the resolved verdict
     /// would ride whichever class registered bare, or the vacuous
@@ -5334,26 +5394,29 @@ impl TypeOps for ResolvedTypeOps<'_> {
         true
     }
 
-    /// [`TypeOps::head_unattributable`] over the resolved lattice: a lossy
-    /// (prefixed-import) spelling ([`Self::head_overloaded`]) or a bare
-    /// name this build could not attribute ([`LibraryTypes::ambiguous_names`]
-    /// — a cross-file registration collision or a names-only SDK face
-    /// beside a real declaration; #4294: a `dart:ui`-reachable `Image`
-    /// preempting `package:flutter`'s refused the oracle's `Widget is
-    /// Image` promotion, six oracle-proven `undefined_getter` rows).
+    /// [`TypeOps::head_lossy`] over the resolved lattice: a PREFIXED import
+    /// target exports the spelling, so the flow layer's bare head is not
+    /// the class the source named ([`Self::head_overloaded`]).
+    fn head_lossy(&self, ty: FlowTy, names: &[Box<str>]) -> bool {
+        self.head_overloaded(ty, names)
+    }
+
+    /// [`TypeOps::head_foreign`] over the resolved lattice: a bare
+    /// cross-file claim whose analyzed-library scope names a single
+    /// declaration other than the registered slot
+    /// ([`LibraryTypes::head_collisions`]). A real declaration is in
+    /// scope, but this lattice cannot map it; both folds keep the
+    /// name-level optimistic step (the under-report direction, #4294).
+    fn head_foreign(&self, ty: FlowTy, names: &[Box<str>]) -> bool {
+        self.collision_kind(ty, names) == Some(HeadCollision::Foreign)
+    }
+
+    /// [`TypeOps::head_unattributable`] over the resolved lattice: a bare
+    /// cross-file claim whose analyzed-library scope names no single
+    /// declaration ([`LibraryTypes::head_collisions`]) — the oracle's
+    /// `InvalidType` reference face (#4304).
     fn head_unattributable(&self, ty: FlowTy, names: &[Box<str>]) -> bool {
-        if self.head_overloaded(ty, names) {
-            return true;
-        }
-        let Base::Name(id) = ty.base else {
-            return false;
-        };
-        let Some(lexeme) = names.get(id as usize) else {
-            return false;
-        };
-        self.snapshot
-            .ambiguous_names
-            .contains(&self.strings.intern(lexeme))
+        self.collision_kind(ty, names) == Some(HeadCollision::Unattributable)
     }
 
     /// `is_subtype` over the resolved world where both sides map; either
@@ -5717,13 +5780,26 @@ impl TypeOps for ResolvedTypeOps<'_> {
         arena: &[Vec<ArgTy>],
         names: &[Box<str>],
     ) -> Option<FlowTy> {
-        // An unattributable head promotes name-level
-        // ([`Self::head_unattributable`]: a lossy overload or a bare name
-        // two reachable files declare) — the resolved strict gate would
+        // A PREFIXED spelling promotes name-level
+        // ([`Self::head_overloaded`]) — the resolved strict gate would
         // consult the wrong class half the time, forcing or refusing steps
         // the oracle decides otherwise; the name-level default's posture
         // stands over the spelling.
+        if self.head_overloaded(to, names) || self.head_overloaded(from, names) {
+            return NameTypeOps.try_promote_to_typed(to, to_args, from, from_args, arena, names);
+        }
+        // A bare cross-file claim the unit's own scope cannot pin is the
+        // oracle's `InvalidType` reference: no promotion step, so the
+        // member reads report against the declared type (#4304 — the
+        // name-level answer promoted over the collision and masked them).
         if self.head_unattributable(to, names) || self.head_unattributable(from, names) {
+            return None;
+        }
+        // A claim whose scope names a real declaration outside the
+        // registered slot has no resolved verdict either; keep the
+        // name-level optimistic answer (the under-report direction,
+        // #4294).
+        if self.head_foreign(to, names) || self.head_foreign(from, names) {
             return NameTypeOps.try_promote_to_typed(to, to_args, from, from_args, arena, names);
         }
         self.observe_names(names);

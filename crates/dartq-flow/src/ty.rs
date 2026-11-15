@@ -261,15 +261,34 @@ pub trait TypeOps {
     fn is_resolved_seam(&self) -> bool {
         false
     }
-    /// Whether one spelled head cannot be attributed to a single
-    /// declaration by this back-end: a lossy (prefixed-import) spelling, a
-    /// bare name several reachable files declare, or a names-only SDK face
-    /// standing beside a real declaration of the same spelling. The name
-    /// level answers `false` (it has no declarations to attribute); the
-    /// resolved seam lists them, and the promotion gates keep the
-    /// name-level optimistic answer over such heads — a wrong attribution
-    /// there manufactures a report (`Widget is Image` refusing the step
-    /// leaves the guard's continuation reading the declared type, #4294).
+    /// Whether one spelled head is lossy — a PREFIXED import target
+    /// exports the spelling, so this layer's bare head (`u.Image` reads
+    /// `Image`) is not the class the source named. The name level answers
+    /// `false`; the resolved seam lists them, and the legacy fold's
+    /// promotion gate keeps the strict refusal over such heads: the source
+    /// may have named either class, and a promotion cannot be proved
+    /// (#4304).
+    fn head_lossy(&self, ty: Ty, names: &[Box<str>]) -> bool {
+        let _ = (ty, names);
+        false
+    }
+    /// Whether one spelled head is a bare name the analyzed unit's own
+    /// scope binds to a single declaration other than this back-end's
+    /// registered slot — a cross-file name claim registration order would
+    /// otherwise settle. A real declaration is in scope, but no resolved
+    /// verdict can be trusted over the spelling; both folds keep the
+    /// name-level optimistic step (the under-report direction, #4294).
+    fn head_foreign(&self, ty: Ty, names: &[Box<str>]) -> bool {
+        let _ = (ty, names);
+        false
+    }
+    /// Whether one spelled head is a bare name the analyzed unit's own
+    /// scope binds to NO single declaration (two unprefixed imports
+    /// export it). The oracle resolves such a reference to `InvalidType`:
+    /// legacy folding keeps the optimistic step (#4294), sound folding
+    /// refuses it, so the member reads report against the declared type
+    /// (#4304 — the name-level answer promoted over the collision and
+    /// masked those rows).
     fn head_unattributable(&self, ty: Ty, names: &[Box<str>]) -> bool {
         let _ = (ty, names);
         false

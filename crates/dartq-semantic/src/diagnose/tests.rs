@@ -24360,3 +24360,13 @@ mod ticket_4293_tests;
 #[cfg(test)]
 #[path = "ticket_4294_tests.rs"]
 mod ticket_4294_tests;
+
+// —— #4304 (the promotion gate splits its unattributable-head answer: a
+// —— PREFIXED tested head keeps the strict refusal, a bare collision the
+// —— analyzed library's scope pins to the registered slot is no collision
+// —— at all, a FOREIGN collision keeps the optimistic step, and an
+// —— UNATTRIBUTABLE one refuses in the sound fold while the legacy fold
+// —— keeps #4294's optimistic step) ——
+#[cfg(test)]
+#[path = "ticket_4304_tests.rs"]
+mod ticket_4304_tests;
