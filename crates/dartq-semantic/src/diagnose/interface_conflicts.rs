@@ -1666,7 +1666,9 @@ impl IfaceWalk<'_, '_> {
     /// top.
     fn is_top(&self, ty: Ty) -> bool {
         match ty {
-            Ty::Unknown | Ty::Dynamic | Ty::Void => true,
+            // `isTop(InvalidType)` is true upstream — the broken
+            // annotation is a top face like `dynamic`/`void`.
+            Ty::Unknown | Ty::Dynamic | Ty::Void | Ty::Invalid => true,
             Ty::Null | Ty::Never => false,
             Ty::Named {
                 name,

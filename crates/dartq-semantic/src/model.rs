@@ -63,8 +63,19 @@ use std::hash::{Hash, Hasher};
 /// `TypeSystem::is_assignable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
+    /// The oracle's `InvalidType`: a written annotation that resolved to
+    /// no type at all (unresolved name, non-type name, wrong-side prefix).
+    /// Semantically a bottom-adjacent type — everything assigns into it
+    /// and it assigns everywhere (`subtype.dart` InvalidType rules), so
+    /// every assignability question it touches is decided `true` rather
+    /// than suppressed. Nothing produces this variant yet — the
+    /// production points land with the wave-2 wiring.
+    Invalid,
     /// No declared type (or a shape M1 does not model): every check
-    /// suppresses. Mirrors the oracle's `InvalidType` (rule 0c).
+    /// suppresses — the Gap sentinel (rule 0c). Distinct from
+    /// [`Ty::Invalid`]: `Unknown` means "M1 has no fact here" (absence),
+    /// `Invalid` means "a type was written and failed to resolve"
+    /// (presence of a broken annotation).
     Unknown,
     /// `Null` — the type of the `null` literal. Semantically nullable
     /// without a suffix (`type.dart:1276`).
@@ -144,6 +155,7 @@ impl Ty {
     #[must_use]
     pub fn render(&self, strings: &StringTable, args: &ArgPool) -> String {
         match *self {
+            Ty::Invalid => "InvalidType".to_string(),
             Ty::Unknown => String::new(),
             Ty::Null => "Null".to_string(),
             Ty::Dynamic => "dynamic".to_string(),
@@ -345,6 +357,10 @@ impl Ty {
     #[must_use]
     pub fn assignable_from(self, from: Ty) -> Option<bool> {
         match (from, self) {
+            // `InvalidType` decides both ways (`subtype.dart` InvalidType
+            // rules): the broken annotation is assignable to and from
+            // every type — a decided `true`, not a suppression.
+            (Ty::Invalid, _) | (_, Ty::Invalid) => Some(true),
             // Unknowns suppress both ways (rule 0c); `void` sources are
             // `use_of_void_result`'s business (unfrozen).
             (Ty::Unknown | Ty::Void, _) | (_, Ty::Unknown) => None,

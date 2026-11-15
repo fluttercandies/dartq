@@ -5936,6 +5936,10 @@ impl<'a> Engine<'a> {
             });
         match recv_ty {
             Some(Ty::Dynamic) => false,
+            // `InvalidType` receiver: the read types invalid outright
+            // (`type_property_resolver`'s invalid-bounded short-circuit) —
+            // never descends into the chain walk.
+            Some(Ty::Invalid) => true,
             Some(ty @ Ty::Named { .. }) => self.is_invalid_ty(ty),
             _ => match self.chain_node_read(read.recv_span, true) {
                 Some(prev) if prev.offset < read.offset => self.member_read_invalid(prev),
@@ -5993,6 +5997,19 @@ impl<'a> Engine<'a> {
             } => Some(Ty::named(*name)),
             _ => None,
         })?;
+        // The non-interface receiver faces answer through the member
+        // production fork directly (P3): a member reached through a
+        // `dynamic` target types `Dynamic`, one through an `Invalid`
+        // receiver `Invalid` — the `atDynamicTarget ? dynamic : Invalid`
+        // decision the oracle makes before the container walk a
+        // non-`Named` face cannot run anyway. Every other shape keeps the
+        // under-report (the record/function faces' own accessors live in
+        // their shape walks, not this name-level re-derivation).
+        match recv_ty {
+            Ty::Dynamic => return Some(Ty::Dynamic),
+            Ty::Invalid => return Some(Ty::Invalid),
+            _ => {}
+        }
         let Ty::Named { name, .. } = recv_ty else {
             return None;
         };
@@ -6288,20 +6305,45 @@ impl<'a> Engine<'a> {
                     let type_text = if row.intent == Intent::Invoke {
                         "<unknown>".to_owned()
                     } else {
-                        self.member_reads
-                            .binary_search_by(|read| read.offset.cmp(&row.range.offset))
-                            .ok()
-                            .and_then(|i| self.recv_expression_ty(self.member_reads[i].recv_span))
-                            .and_then(|ty| match ty {
-                                Ty::Dynamic => Some("dynamic".to_owned()),
-                                ty @ Ty::Named { name, .. } if !self.is_invalid_ty(ty) => {
-                                    Some(self.strings.resolve(name).to_string())
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| "InvalidType".to_owned())
+                        // The merge-time receiver witness answers first: a
+                        // chained receiver (`d.foo.new`) folded its class
+                        // into `member_recv_tys` where the flow re-derivation
+                        // below sees only `Named` heads — `d.foo` types
+                        // `Dynamic` through the P3 fork, so the `new`
+                        // selector names `'dynamic'` on the chain exactly
+                        // as it does on the bare `d.new` spelling.
+                        match self.member_recv_tys.get(&row.range.offset) {
+                            Some(Ty::Dynamic) => Some("dynamic".to_owned()),
+                            _ => self
+                                .member_reads
+                                .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+                                .ok()
+                                .and_then(|i| {
+                                    self.recv_expression_ty(self.member_reads[i].recv_span)
+                                })
+                                .and_then(|ty| match ty {
+                                    Ty::Dynamic => Some("dynamic".to_owned()),
+                                    ty @ Ty::Named { name, .. } if !self.is_invalid_ty(ty) => {
+                                        Some(self.strings.resolve(name).to_string())
+                                    }
+                                    _ => None,
+                                }),
+                        }
+                        .unwrap_or_else(|| "InvalidType".to_owned())
                     };
                     self.emit(code, row.range, name_text, &type_text);
+                    // The observed-miss latch (P3): the `new` selector's
+                    // `needsGetterError` fires unconditionally, but the
+                    // `atDynamicTarget` fork still types the read —
+                    // `d.new` over a `dynamic` receiver produces `dynamic`
+                    // upstream, so only a non-dynamic receiver latches the
+                    // `InvalidType` face.
+                    if !matches!(
+                        self.member_recv_tys.get(&row.range.offset),
+                        Some(Ty::Dynamic)
+                    ) {
+                        self.invalid_member_rows.insert(row.range.offset);
+                    }
                     self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                     return;
                 }
@@ -7053,6 +7095,10 @@ impl<'a> Engine<'a> {
             }
             Intent::Operator(..) => {}
         }
+        // The observed-miss latch (P3): the static/container trio proved
+        // the member unresolved — the oracle's `resolveProperty` failure
+        // types the read `InvalidType` exactly like an instance miss.
+        self.invalid_member_rows.insert(row.range.offset);
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
     }
 
@@ -7579,6 +7625,12 @@ impl<'a> Engine<'a> {
                 }
                 Intent::Operator(..) => {}
             }
+            // The observed-miss latch (P3): the `Type`-instance trio proved
+            // the member unresolved — `resolveProperty`'s failure types the
+            // read `InvalidType` exactly like an instance miss.
+            if !matches!(row.intent, Intent::Operator(..)) {
+                self.invalid_member_rows.insert(row.range.offset);
+            }
         }
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
         true
@@ -7609,6 +7661,9 @@ impl<'a> Engine<'a> {
         if !self.type_literal_face_resolves(row.name) {
             let name_text = self.strings.resolve(row.name);
             self.emit(SemanticCode::UndefinedMethod, row.range, name_text, "Type");
+            // The observed-miss latch (P3): the `Type`-instance send proved
+            // the member unresolved — the invocation types `InvalidType`.
+            self.invalid_member_rows.insert(row.range.offset);
         }
         self.record_miss(row.name, row.range, true, NameUse::Invoke);
         true
@@ -8296,6 +8351,10 @@ impl<'a> Engine<'a> {
                     }
                     Intent::Operator(..) => {}
                 }
+                // The observed-miss latch (P3): the record/`Function`
+                // shape's own member consult proved the miss — the read
+                // face types `InvalidType` upstream.
+                self.invalid_member_rows.insert(row.range.offset);
                 self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                 return;
             }
@@ -8479,6 +8538,14 @@ impl<'a> Engine<'a> {
                                 }
                             }
                         }
+                        // The observed-miss latch (P3): a non-nullable
+                        // bound receiver's trio proved the member
+                        // unresolved — the read face types `InvalidType`
+                        // upstream. A merely-nullable miss keeps its
+                        // unchecked row (no `undefined_*` stood).
+                        if !receiver_nullable {
+                            self.invalid_member_rows.insert(row.range.offset);
+                        }
                     }
                     self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                     return;
@@ -8638,6 +8705,10 @@ impl<'a> Engine<'a> {
                         }
                         Intent::Operator(..) => {}
                     }
+                    // The observed-miss latch (P3): the bound-face trio
+                    // proved the member unresolved — the read face types
+                    // `InvalidType` upstream.
+                    self.invalid_member_rows.insert(row.range.offset);
                     self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                     return;
                 }
@@ -8702,6 +8773,10 @@ impl<'a> Engine<'a> {
                     name_text,
                     &type_text,
                 );
+                // The observed-miss latch (P3): the compound write's
+                // getter half proved the member unresolved — the read
+                // face types `InvalidType` upstream.
+                self.invalid_member_rows.insert(row.range.offset);
                 self.record_miss(row.name, row.range, true, NameUse::Read);
                 return;
             }
@@ -8787,6 +8862,9 @@ impl<'a> Engine<'a> {
                             name_text,
                             &getter_text,
                         );
+                        // The observed-miss latch (P3): the frozen-face
+                        // getter verdict proved the read unresolved.
+                        self.invalid_member_rows.insert(row.range.offset);
                         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                         return;
                     }
@@ -8797,6 +8875,11 @@ impl<'a> Engine<'a> {
                             name_text,
                             &type_text,
                         );
+                        // The observed-miss latch (P3): the frozen-face
+                        // setter verdict proved the write unresolved —
+                        // the compound read's own face types `InvalidType`
+                        // upstream beside it.
+                        self.invalid_member_rows.insert(row.range.offset);
                         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                         return;
                     }
@@ -8903,6 +8986,11 @@ impl<'a> Engine<'a> {
                 }
                 Intent::Operator(..) => {}
             }
+            // The observed-miss latch (P3): the access-intent trio just
+            // proved the member unresolved on a non-dynamic receiver, so
+            // the read face types the row `InvalidType` upstream — the
+            // witness `invalid_member_rows` carries to the type asks.
+            self.invalid_member_rows.insert(row.range.offset);
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
@@ -9121,6 +9209,10 @@ impl<'a> Engine<'a> {
             }
             Intent::Operator(..) => unreachable!("operator intents returned above"),
         }
+        // The observed-miss latch (P3): the access-intent trio proved the
+        // member unresolved on a non-dynamic receiver — the read face
+        // types `InvalidType` upstream.
+        self.invalid_member_rows.insert(row.range.offset);
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
     }
 
@@ -9925,6 +10017,10 @@ impl<'a> Engine<'a> {
             ),
             Intent::Operator(..) => {}
         }
+        // The observed-miss latch (P3): the core-table trio proved the
+        // member unresolved on a non-dynamic receiver — the read face
+        // types `InvalidType` upstream.
+        self.invalid_member_rows.insert(row.range.offset);
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
     }
 
@@ -10003,6 +10099,10 @@ impl<'a> Engine<'a> {
             if self.record_extension_face(shape_ty, setter).is_some() {
                 let name_text = self.strings.resolve(row.name);
                 self.emit(SemanticCode::UndefinedGetter, row.range, name_text, display);
+                // The observed-miss latch (P3): the compound write's read
+                // face proved the member unresolved on the record — the
+                // read types `InvalidType` upstream.
+                self.invalid_member_rows.insert(row.range.offset);
             }
         }
         // `call` resolves a non-nullable function receiver's own signature
@@ -10181,6 +10281,14 @@ impl<'a> Engine<'a> {
                     display,
                 );
             }
+        }
+        // The observed-miss latch (P3): the shape receiver's trio proved
+        // the member unresolved — the read face types `InvalidType`
+        // upstream (the operator arm's own `Invalid` production is the
+        // wave-3 P5 face; the member read/write result beside it already
+        // latches here).
+        if !matches!(row.intent, Intent::Operator(..)) {
+            self.invalid_member_rows.insert(row.range.offset);
         }
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
     }

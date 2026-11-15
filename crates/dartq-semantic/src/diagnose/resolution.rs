@@ -4039,6 +4039,15 @@ impl<'a> Engine<'a> {
                     Ty::UNKNOWN
                 }
             }
+            // A bare miss types as the oracle's `InvalidType` (the
+            // `undefined_identifier` face — upstream `InvalidType`, never
+            // an untyped gap): `int b = a` over undefined `a` stays silent
+            // through the assignability accept. An opaque-`on` body's miss
+            // keeps `Unknown` — the constraint faces the model cannot
+            // walk may still define the name, so the gap posture stands.
+            BareInfo::Missing {
+                on_opaque: false, ..
+            } => Ty::Invalid,
             _ => Ty::UNKNOWN,
         };
         // The implicit-`this` member read's query row (#1869-2): a bare
@@ -4702,7 +4711,9 @@ impl<'a> Engine<'a> {
                         forms.push(form);
                     }
                 }
-                Ty::Unknown | Ty::Never | Ty::Void | Ty::Dynamic => return Ty::Dynamic,
+                Ty::Unknown | Ty::Never | Ty::Void | Ty::Dynamic | Ty::Invalid => {
+                    return Ty::Dynamic;
+                }
             }
         }
         let join = match forms.as_slice() {

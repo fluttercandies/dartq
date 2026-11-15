@@ -718,7 +718,9 @@ impl<'a> Analysis<'a> {
     pub fn implements_core_interface(&self, ty: Ty, interface: StringId) -> Option<bool> {
         let name = match ty {
             Ty::Named { name, .. } => name,
-            Ty::Unknown => return None,
+            // `InvalidType` is not an interface carrier either — the
+            // broken annotation under-reports with `Unknown`.
+            Ty::Unknown | Ty::Invalid => return None,
             // A function type is no interface carrier either.
             Ty::Dynamic
             | Ty::Void

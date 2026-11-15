@@ -74,7 +74,6 @@ fn ticket_3847_mixin_application_getter_instantiation_reports_true() {
 /// regression — a face still carrying the mixin's own `T` answers the ask
 /// vacuously and reports the informative sibling.
 #[test]
-#[ignore = "held: the folded creation receiver's written type arguments are not substituted into the getter's declared face (upstream _checkAllTypeReads the receiver's staticType through the mixin application, best_practices_verifier.dart:877-930); re-verified 2026-11-05 vs oracle 3.13.7: still fails — the `C1<int>().field is A<String>` mismatch reports unnecessary_type_check 'always true' instead of staying silent; owner the creation-receiver instantiation face"]
 fn ticket_3847_mixin_application_getter_mismatch_stays_silent() {
     let source = "mixin M<T> {\n\
                   \x20 A<T> get field => throw 0;\n\
@@ -112,7 +111,6 @@ fn ticket_3847_mixin_application_inferred_field_instantiation_reports_true() {
 
 /// The inferred-field mismatch twin: silent, exactly like the getter's.
 #[test]
-#[ignore = "held: same root as the getter twin — the inferred-field face never substitutes the creation's written `V := int` (best_practices_verifier.dart:877-930); re-verified 2026-11-05 vs oracle 3.13.7: still fails — the `C1<int>().field is A<String>` mismatch reports unnecessary_type_check 'always true'; owner the creation-receiver instantiation face"]
 fn ticket_3847_mixin_application_inferred_field_mismatch_stays_silent() {
     let source = "mixin M<T> {\n\
                   \x20 var field = A<T>();\n\
@@ -150,7 +148,6 @@ fn ticket_3847_same_container_creation_getter_instantiation_reports_true() {
 /// The same-container mismatch twin: `A<int> is A<String>` is informative
 /// and stays silent.
 #[test]
-#[ignore = "held: same-container creation `Box<int>().value` never zips `V := int` onto the getter's declared `A<V>` before the subtype ask — the formal leg answers `A<V>` vacuously and reports the informative sibling; re-verified 2026-11-05 vs oracle 3.13.7: still fails — `Box<int>().value is A<String>` reports unnecessary_type_check 'always true'; owner the creation-receiver instantiation face"]
 fn ticket_3847_same_container_creation_getter_mismatch_stays_silent() {
     let source = "class Box<V> {\n\
                   \x20 A<V> get value => throw 0;\n\
@@ -340,7 +337,6 @@ fn ticket_3861_nested_written_dynamic_argument_decides_covariance() {
 /// `f15 is F15<int>` and `m15 is F15<T>` are constant-true; the
 /// `F15<bool>` pair and the `confuse(m15)` operand stay informative.
 #[test]
-#[ignore = "held: the sibling-complete corpus shape reads `unnecessary_type_check` rows 1 short of the oracle's pair — the `f15 is F15<int>` arm reports but the `m15 is F15<T>` sibling-shaped arm does not (same receiver-substitution seam as the 3847 family); re-verified 2026-11-05 vs oracle 3.13.7: still fails — 1 row where 2 are expected (plus 2 unused_local_variable extras the corpus pins); owner the creation-receiver instantiation face"]
 fn ticket_3838_sibling_complete_test_method_matches_oracle() {
     let prologue = r"
 typedef F15<T> = List<T> Function(int y, [core.List<core.int> x]) Function(int x);

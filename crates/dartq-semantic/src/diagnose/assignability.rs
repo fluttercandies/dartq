@@ -2270,13 +2270,95 @@ impl<'a> Engine<'a> {
                                     self.instantiate_accessor_static(container, &recv, declared)
                                 })
                             }
-                            _ => self
-                                .core_accessor_read_ty(row, container, &recv)
-                                .or_else(|| self.core_element_read_ty(row, container, &recv))
-                                .unwrap_or_else(|| self.object_instance_read_ty(row)),
+                            _ => {
+                                // The observed-miss arm of the member
+                                // production fork (P3): the access-intent
+                                // trio already proved this member
+                                // unresolved on a non-dynamic receiver
+                                // (extensions and the `Object` consults
+                                // included — the verdict's own walk ran
+                                // them before the emit), so the oracle
+                                // types the read `InvalidType`
+                                // (`generated/resolver.dart:1758-1761`'s
+                                // non-dynamic arm). Without the latch the
+                                // miss stays the `Unknown` gap — which the
+                                // chain walk reads as "still decidable"
+                                // and reports `bar` in `c.foo.bar` where
+                                // the oracle silences the continuation on
+                                // an `InvalidType` receiver.
+                                if self.invalid_member_rows.contains(&row.range.offset) {
+                                    Ty::Invalid
+                                } else {
+                                    // The `Object` recovery runs before the
+                                    // receiver-class fallback: upstream's
+                                    // `isInvalidBounded` short-circuit looks
+                                    // the member up on `Object`
+                                    // (`type_property_resolver.dart:88-92`),
+                                    // so `u.hashCode` on an Invalid-typed
+                                    // `u` still resolves `int` — only a
+                                    // name `Object` itself does not declare
+                                    // falls through to the produced class.
+                                    let resolved = self
+                                        .core_accessor_read_ty(row, container, &recv)
+                                        .or_else(|| {
+                                            self.core_element_read_ty(row, container, &recv)
+                                        })
+                                        .unwrap_or_else(|| self.object_instance_read_ty(row));
+                                    if resolved != Ty::UNKNOWN {
+                                        resolved
+                                    } else {
+                                        // The Invalid-receiver arm of the
+                                        // same fork: every consult missed
+                                        // on a receiver whose own head
+                                        // resolution already failed
+                                        // (`is_invalid_ty` — the observed
+                                        // miss, never a model gap), so the
+                                        // oracle types the read
+                                        // `InvalidType`.
+                                        match recv {
+                                            Receiver::Typed { ty, .. }
+                                                if self.is_invalid_ty(ty) =>
+                                            {
+                                                Ty::Invalid
+                                            }
+                                            _ => resolved,
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
-                    None => self.object_instance_read_ty(row),
+                    None => {
+                        // The `Object` recovery precedes the member
+                        // production fork (P3,
+                        // `generated/resolver.dart:1758-1761` gated by
+                        // `type_property_resolver.dart:88-92`'s bounded
+                        // short-circuit): `d.toString()` over a `dynamic`
+                        // receiver resolves the `Object` face (`String`),
+                        // never the fork's `dynamic` — the fork types only
+                        // the names `Object` itself does not declare, so a
+                        // member read through a `dynamic` receiver types
+                        // `Dynamic`, one through an `Invalid` receiver
+                        // `Invalid` — the `atDynamicTarget ? dynamic :
+                        // Invalid` decision, carried here by the merge-time
+                        // receiver witness (`member_recv_tys` — the only
+                        // holder of the receiver class the
+                        // `Receiver::Unknown` merge folded away). Every
+                        // other undecidable receiver keeps the `Unknown`
+                        // under-report: a miss the walk cannot prove
+                        // (extensions could still claim the name) is the
+                        // Gap sentinel, never the Invalid face.
+                        let resolved = self.object_instance_read_ty(row);
+                        if resolved != Ty::UNKNOWN {
+                            resolved
+                        } else {
+                            match self.member_recv_tys.get(&row.range.offset) {
+                                Some(Ty::Dynamic) => Ty::Dynamic,
+                                Some(Ty::Invalid) => Ty::Invalid,
+                                _ => resolved,
+                            }
+                        }
+                    }
                 }
             }
             _ => Ty::UNKNOWN,
@@ -3019,6 +3101,35 @@ impl<'a> Engine<'a> {
                 _ => Ty::UNKNOWN,
             };
         }
+        // The invocation production fork (P4,
+        // `method_invocation_resolver.dart:643-647`): an Invalid-typed
+        // receiver short-circuits BEFORE the member lookup runs — the
+        // oracle resolves no element, reports nothing, and types the whole
+        // send `InvalidType`. The merge's side table is the only holder of
+        // the receiver class the `Receiver::Unknown` payload folded away,
+        // and the fork precedes even the `Object` face: the oracle's
+        // no-lookup contract means `u.toString()` on an Invalid `u` types
+        // `InvalidType`, never `String` (the dynamic receiver's `Object`
+        // lookup below is the bounded-recovery path P4 does not share).
+        if let RowShape::Member {
+            recv: Receiver::Unknown,
+        } = &row.shape
+            && let Some(Ty::Invalid) = self.member_recv_tys.get(&row.range.offset)
+        {
+            return Ty::Invalid;
+        }
+        // The same no-lookup contract on a `Receiver::Typed` face: the
+        // receiver's head is a name the engine itself failed to resolve
+        // (`is_invalid_ty` — the observed miss), so every member send on it
+        // types `InvalidType` whole — even a spelling `Object` declares,
+        // because the oracle's Invalid-receiver arm runs no lookup at all.
+        if let RowShape::Member {
+            recv: Receiver::Typed { ty, .. },
+        } = &row.shape
+            && self.is_invalid_ty(*ty)
+        {
+            return Ty::Invalid;
+        }
         match self.resolved_member(container, row.name) {
             Some(entry) if matches!(entry.kind, MemberKind::Method | MemberKind::Getter) => {
                 let recv = match &row.shape {
@@ -3108,6 +3219,28 @@ impl<'a> Engine<'a> {
                 {
                     return Ty::named(self.intern(head));
                 }
+                // The dynamic arm of the P4 production fork
+                // (`atDynamicTarget ? dynamic : Invalid`,
+                // `generated/resolver.dart:1758-1761` reached through
+                // `method_invocation_resolver.dart:1520-1551` — an
+                // unresolved member send through a `dynamic` target types
+                // `dynamic`): the `Object`-face ask above already answered
+                // every member the bounded recovery resolves, so reaching
+                // here is the genuine miss, and the merge's receiver
+                // witness decides the produced class. Every other
+                // undecidable receiver keeps the `Unknown` under-report —
+                // the evidence gate of ADR section-6.2 bars classifying a model
+                // gap as a resolution face.
+                if let RowShape::Member {
+                    recv: Receiver::Unknown,
+                } = &row.shape
+                {
+                    match self.member_recv_tys.get(&row.range.offset) {
+                        Some(Ty::Dynamic) => return Ty::Dynamic,
+                        Some(Ty::Invalid) => return Ty::Invalid,
+                        _ => {}
+                    }
+                }
                 // The builtin core receiver's accessor INVOKE face (#3869
                 // gap 2): the walk missed (the SDK libraries carry no
                 // element model; a stub rig declares no `first`), but a
@@ -3129,6 +3262,17 @@ impl<'a> Engine<'a> {
                     if let Some(elem) = elem {
                         return elem;
                     }
+                }
+                // The observed-miss arm of the P4 production fork: the
+                // access-intent trio already proved this callee unresolved
+                // on a non-dynamic receiver — the send's own
+                // `undefined_method` (or the tear-off face's
+                // `undefined_getter`) emitted — so the oracle types the
+                // whole invocation `InvalidType`
+                // (`method_invocation_resolver.dart:1520-1551`, the
+                // non-dynamic arm of the same fork the read face runs).
+                if self.invalid_member_rows.contains(&row.range.offset) {
+                    return Ty::Invalid;
                 }
                 let indexed = resolve_container(
                     self.graph,
@@ -4001,6 +4145,13 @@ impl<'a> Engine<'a> {
     /// (`isAssignableTo` answers true the moment either side is invalid),
     /// so every assignability face gates before its matrix.
     pub(crate) fn written_ty_invalid(&self, ty: Ty) -> bool {
+        // The lattice variant IS the oracle's `InvalidType` face —
+        // consumers asking "does this operand type spell the already-
+        // reported error" answer `true` here exactly as they would for the
+        // unresolved `Named` head the face replaced.
+        if ty == Ty::Invalid {
+            return true;
+        }
         let Ty::Named { name, args, .. } = ty else {
             return false;
         };
@@ -6595,8 +6746,15 @@ impl<'a> Engine<'a> {
         // emit no `return_of_invalid_type` (#1445). A compiler-known core
         // container head (`Future<int>`, the implicit dart:core import's
         // own) never gates: the oracle resolves it always.
+        // A declared type-parameter return is a genuine
+        // `TypeParameterType` target, never the `InvalidType` this gate
+        // suppresses — `named_type_is_type` reads the NAMED-type face only
+        // (a `T extends …` formal resolves as a parameter, not a named
+        // type), so `T gen<T>(T x) { return 3; }` would gate `int <: T`
+        // away entirely where the oracle's Left Variable arm reports.
         if let Ty::Named { name: head, .. } = to
             && !self.named_type_is_type(head)
+            && !self.declared_head_is_type_param(head)
             && !self.core_head(head)
         {
             return;
@@ -7448,10 +7606,10 @@ impl<'a> Engine<'a> {
                 Ty::Void => match from {
                     // `Never <: void` holds (Right Bottom — `return throw e;`).
                     Ty::Void | Ty::Dynamic | Ty::Null | Ty::Never => Some(true),
-                    Ty::Unknown => None,
+                    Ty::Unknown | Ty::Invalid => None,
                     Ty::Named { .. } | Ty::Record { .. } | Ty::Function { .. } => Some(false),
                 },
-                Ty::Unknown => None,
+                Ty::Unknown | Ty::Invalid => None,
                 // A declared return that spells a type parameter is a
                 // genuine `TypeParameterType` target (subtype.dart's Left
                 // Variable arm — `S <: T` is `false` for every interface
@@ -9961,8 +10119,19 @@ impl<'a> Engine<'a> {
         // own pair, and the deep legs re-enter `assignable` per argument
         // and meet the same shallow face).
         let shallow_never = |ty: Ty| if self.is_never_ty(ty) { Ty::Never } else { ty };
-        let from = shallow_never(self.fold_alias_verdict(from));
-        let to = shallow_never(self.fold_alias_verdict(to));
+        let folded_from = self.fold_alias_verdict(from);
+        let folded_to = self.fold_alias_verdict(to);
+        let from = shallow_never(self.fold_invalid_ty(folded_from));
+        let to = shallow_never(self.fold_invalid_ty(folded_to));
+        // `InvalidType` accepts both ways (subtype.dart 0c, decided ahead
+        // of every decomposition below — including the `to == Never` arm,
+        // which would otherwise reject an `Invalid` source as
+        // `Some(false)`). The strict-casts overlay needs no arm here:
+        // `from != Dynamic` on an `Invalid` source, so the overlay's
+        // downcast refusal never reaches this pair anyway.
+        if matches!(from, Ty::Invalid) || matches!(to, Ty::Invalid) {
+            return Some(true);
+        }
         // The folded-pair function read (#3368's foreign-alias face): the
         // written-pair probe above only reaches a same-file alias capture
         // ([`Engine::function_shape_sig`]'s Named arm answers through the
@@ -10312,17 +10481,21 @@ impl<'a> Engine<'a> {
             // `(FeatureSet, Version)`) leaves no assignable ask at all —
             // the oracle's splice stays silent on the other fields'
             // nullable-vs-non-nullable mismatches too. The scan runs over
-            // the whole shape before any field decides.
+            // the whole shape before any field decides. `Ty::Invalid`
+            // joins `Ty::Unknown` in the scan — wave 2 produces the
+            // `InvalidType` sentinel for an unresolved-element field
+            // (`(fs, zbad)`'s `zbad`), where the pre-wave face read the
+            // Gap marker; both poison the same question.
             if from
                 .positional
                 .iter()
                 .chain(from.named.iter().map(|(_, f)| f))
-                .any(|f| *f == Ty::Unknown)
+                .any(|f| matches!(*f, Ty::Unknown | Ty::Invalid))
                 || to
                     .positional
                     .iter()
                     .chain(to.named.iter().map(|(_, t)| t))
-                    .any(|t| *t == Ty::Unknown)
+                    .any(|t| matches!(*t, Ty::Unknown | Ty::Invalid))
             {
                 return None;
             }
@@ -11312,7 +11485,26 @@ impl<'a> Engine<'a> {
                     return None;
                 }
                 if args == ArgListId::EMPTY {
-                    self.alias_fn_sig(name)
+                    // A bare parameterized alias head resolves the way the
+                    // oracle's `staticType` does: instantiate-to-bounds
+                    // (`typedef Foo<S> = S Function<T>(T)` used as `Foo`
+                    // reads `Foo<dynamic>` = `dynamic Function<T>(T)`), so
+                    // the signature ask substitutes the alias's own
+                    // parameters by their bounds through the same path a
+                    // written argument list takes — a raw `S`-leaf return
+                    // would refuse the closure's `void` return on the
+                    // `relateTypeParameters` leg (#3881). A head the bounds
+                    // snapshot cannot fill keeps the raw-shape face.
+                    match self.instantiated_head_ty(ty) {
+                        Ty::Named {
+                            name: filled,
+                            args: filled_args,
+                            nullable: false,
+                        } if filled == name && filled_args != ArgListId::EMPTY => {
+                            self.instantiated_alias_sig(name, filled_args)
+                        }
+                        _ => self.alias_fn_sig(name),
+                    }
                 } else {
                     self.instantiated_alias_sig(name, args)
                 }

@@ -1047,7 +1047,12 @@ fn acceptable_when_void_expected(analysis: &dartq_semantic::Analysis<'_>, ty: Ty
         // `isTypeAcceptableWhenExpectingVoid` (:55-65) has no `Dynamic`
         // arm — only the `FutureOr` variant passes `dynamic` (:45), so a
         // `void` formal rejects a `dynamic` argument upstream.
-        Ty::Null | Ty::Void | Ty::Never | Ty::Unknown => true,
+        // `Invalid` joins `Unknown` — the oracle's `InvalidType` answers
+        // acceptability like the inference Gap sentinel (assignable to
+        // and from everything, upstream subtype.dart's `InvalidType`
+        // arm), so a broken-annotation value passes the cut the same
+        // way.
+        Ty::Null | Ty::Void | Ty::Never | Ty::Unknown | Ty::Invalid => true,
         Ty::Named { name, .. } => analysis.strings().resolve(name) == "Future",
         // A function-typed value is no `Future` head — it reports.
         Ty::Dynamic | Ty::Record { .. } | Ty::Function { .. } => false,

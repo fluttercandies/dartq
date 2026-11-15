@@ -2826,7 +2826,7 @@ impl<'a> Engine<'a> {
             return false;
         }
         match ty {
-            Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown => true,
+            Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown | Ty::Invalid => true,
             Ty::Named { name, nullable, .. }
                 if nullable || self.strings.resolve(name) != "FutureOr" =>
             {
@@ -7775,7 +7775,7 @@ impl<'a> Engine<'a> {
     /// `FutureOr<T>` over a top.
     fn is_top_ty(&self, ty: Ty) -> bool {
         match ty {
-            Ty::Unknown | Ty::Dynamic | Ty::Void => true,
+            Ty::Unknown | Ty::Dynamic | Ty::Void | Ty::Invalid => true,
             Ty::Null | Ty::Never => false,
             Ty::Named {
                 name,
@@ -10792,6 +10792,9 @@ impl<'a> Engine<'a> {
     /// types.
     pub(crate) fn declared_ty_text(&self, ty: Ty) -> String {
         match ty {
+            // `InvalidType` displays under its own name — the same spelling
+            // `Ty::render` produces (a broken annotation is not `dynamic`).
+            Ty::Invalid => "InvalidType".to_string(),
             Ty::Unknown | Ty::Dynamic => "dynamic".to_string(),
             Ty::Null => "Null".to_string(),
             Ty::Never => "Never".to_string(),

@@ -477,7 +477,7 @@ impl ConstLookup for Engine<'_> {
         match ty {
             // `isInvalid || castType.isInvalid → return this` — the
             // recovered splices and the unresolved-type face both pass.
-            Ty::Unknown | Ty::Dynamic | Ty::Void => Some(true),
+            Ty::Unknown | Ty::Dynamic | Ty::Void | Ty::Invalid => Some(true),
             // `hasTypeParameterReference → return this`: a parameter
             // head in scope defers (the creation's substitution runs in
             // `subst_init_tys`; a surviving spelling is unbound).

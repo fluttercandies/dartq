@@ -153,7 +153,9 @@ impl<'a> Engine<'a> {
                         .and_then(|elements| elements.decl(check.name))
                         .map(|decl| decl.var_ty),
                 };
-                if var_ty.is_some_and(|ty| ty != Ty::Unknown && self.written_nullable(ty)) {
+                if var_ty.is_some_and(|ty| {
+                    ty != Ty::Unknown && (self.written_nullable(ty) || self.is_invalid_ty(ty))
+                }) {
                     continue;
                 }
                 self.emit(
@@ -202,7 +204,10 @@ impl<'a> Engine<'a> {
     /// the generic arm, which is the under-report direction.
     fn written_nullable(&self, ty: Ty) -> bool {
         match ty {
-            Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown => true,
+            // `InvalidType` reads nullable here (`isPotentiallyNullable`
+            // treats it as a top face) — a broken annotation never reports
+            // the uninitialized faces this predicate gates.
+            Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown | Ty::Invalid => true,
             Ty::Named { name, nullable, .. }
                 if nullable || self.strings.resolve(name) != "FutureOr" =>
             {
@@ -608,7 +613,9 @@ impl<'a> Engine<'a> {
                     .and_then(|elements| elements.container(container))
                     .and_then(|decl| decl.members.get(&check.name))
                     .map(|entry| entry.var_ty);
-                if var_ty.is_some_and(|ty| ty != Ty::Unknown && self.written_nullable(ty)) {
+                if var_ty.is_some_and(|ty| {
+                    ty != Ty::Unknown && (self.written_nullable(ty) || self.is_invalid_ty(ty))
+                }) {
                     continue;
                 }
                 non_finals.push((name, check.range));
@@ -3276,7 +3283,7 @@ impl<'a> Engine<'a> {
                     kind: VarTreeKind::Record { fields },
                 })
             }
-            Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Never | Ty::Void => None,
+            Ty::Invalid | Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Never | Ty::Void => None,
         }
     }
 

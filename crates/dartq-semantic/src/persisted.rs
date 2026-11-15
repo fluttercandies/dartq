@@ -229,6 +229,12 @@ pub enum PersistedTy {
         #[serde(default)]
         required_positional: Option<u16>,
     },
+    /// The oracle's `InvalidType` — a written annotation that resolved to
+    /// no type at all. Appended at the END of the enum (the #539 additive
+    /// discipline): a pre-`Invalid` payload could not produce the variant
+    /// (no producer existed), so the additive arm decodes nothing
+    /// differently.
+    Invalid,
 }
 
 impl Default for PersistedTy {
@@ -808,6 +814,7 @@ impl<'a> Slice<'a> {
 
     fn ty(&mut self, ty: &Ty) -> PersistedTy {
         match *ty {
+            Ty::Invalid => PersistedTy::Invalid,
             Ty::Unknown => PersistedTy::Unknown,
             Ty::Null => PersistedTy::Null,
             Ty::Dynamic => PersistedTy::Dynamic,
@@ -1831,6 +1838,7 @@ fn into_args(list: Vec<PersistedTy>, ids: &[StringId], pool: &mut ArgPool) -> Ar
 
 fn into_ty(ty: PersistedTy, ids: &[StringId], pool: &mut ArgPool) -> Ty {
     match ty {
+        PersistedTy::Invalid => Ty::Invalid,
         PersistedTy::Unknown => Ty::Unknown,
         PersistedTy::Null => Ty::Null,
         PersistedTy::Dynamic => Ty::Dynamic,

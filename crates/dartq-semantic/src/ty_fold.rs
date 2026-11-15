@@ -4,8 +4,8 @@
 //! preserving rewrite descend through here instead of re-enumerating the
 //! variants at each use site. A named type's argument list, a function
 //! type's return and formal columns, and a record type's fields all count
-//! as children; the atoms (`dynamic`, `void`, `Never`, `Null`, `Unknown`)
-//! have none.
+//! as children; the atoms (`dynamic`, `void`, `Never`, `Null`, `Unknown`,
+//! `Invalid`) have none.
 //!
 //! A generic function shape (`T Function<T>(T)`) is an opaque leaf for
 //! both walks: its own parameters are nameless in the interned shape and
@@ -92,7 +92,7 @@ impl ArgPool {
                     self.record(&new_positional, &new_named, nullable)
                 }
             }
-            Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Never | Ty::Void => ty,
+            Ty::Invalid | Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Never | Ty::Void => ty,
         }
     }
 
@@ -130,7 +130,7 @@ impl ArgPool {
                     self.visit_named(*field, visit);
                 }
             }
-            Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Never | Ty::Void => {}
+            Ty::Invalid | Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Never | Ty::Void => {}
         }
     }
 }

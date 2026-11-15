@@ -5211,6 +5211,9 @@ impl ParserListener for DiagnoseListener<'_> {
                 (text.to_string(), head_id, head_id)
             }
         };
+        // The local leaf's own range for a prefixed completion (`p.C`
+        // keys its `Prefixed` verdict at `C`, not the armed head's `p`).
+        let leaf_offset = prefixed_leaf.map(|(_, leaf_range)| leaf_range.offset);
         // The #610 capture: every completed type head is a leaf of the open
         // window (the parser re-fires a parameterized head after its group,
         // carrying the trailing `?` — the sink merges that completion).
@@ -5301,10 +5304,15 @@ impl ParserListener for DiagnoseListener<'_> {
             let type_name = engine.strings.resolve(leaf_id).to_string();
             engine.stage_usage(SemanticCode::UnnecessaryQuestionMark, q.range, &type_name);
         }
-        // The head's resolution rides the armed slot: a `TypeUse Missing`
-        // row at the head's own offset means the oracle's element type is
+        // The head's resolution rides the armed slot: a `TypeUse` row at
+        // the head's own offset means the oracle's element type is
         // `InvalidType` — the uninitialized latch consults this (the FAM18
         // capture) beside the catch clause's own guard.
+        //
+        // `armed_ty_unresolved` keeps its ORIGINAL `Missing`-only
+        // semantics — its consumers (the unwritten-initializer faces,
+        // the const-eval latch) read exactly the unresolved-annotation
+        // face, not the wider broken-annotation set.
         engine.armed_ty_unresolved = matches!(
             engine.rows.last().map(|r| &r.shape),
             Some(RowShape::TypeUse(TypeVerdict::Missing, _))
@@ -5312,7 +5320,62 @@ impl ParserListener for DiagnoseListener<'_> {
             .rows
             .last()
             .is_some_and(|r| r.range.offset == name.range.offset);
-        engine.armed_ty = Some(ty);
+        // The widened `InvalidType` latch: every verdict family whose
+        // written type resolves to the oracle's `InvalidType` — a bare
+        // miss (`Unresolved x = null`), a non-type name in a type
+        // position (`int f() => 0; f v = null`), a real prefix's member
+        // miss (`p.C` with `C` absent), a broken prefix head (`p.C` with
+        // `p` itself undefined), or a redirecting-factory target miss —
+        // arms the declared type as `Ty::Invalid`, not the spelled name.
+        // The head offset is `name.range` for a bare completion and the
+        // `Prefixed` row keeps its anchor at the local leaf (`p.C` keys
+        // at `C`), so both anchors count. `ty` (the spelled `Named`)
+        // stays for the resolution faces below; only the armed slot
+        // widens.
+        let head_offset = name.range.offset;
+        // A declared type parameter's use answers `Missing`/`NonType` to
+        // the type-use walk too — the scoped table carries no
+        // `TypeParam` entry for the name-level verdict — but it is a real
+        // `TypeParameterType`, never the `InvalidType` a failed head
+        // resolution produces. `T gen<T>(T x)`'s `T` return would arm
+        // `Invalid` where the oracle keeps the parameter's own lattice
+        // face (`declared_head_is_type_param` is the same decl-table
+        // answer `is_invalid_ty` consults). The same blind spot hits the
+        // compiler-known heads — a primitive (`int`), a scope param, or
+        // a `core_head` face (`Future`/`List`/`Object`/…/`FutureOr` — the
+        // structural union face the subtype/exhaustion walks decompose by
+        // name) answers `Missing` in a rig with no mounted SDK and must
+        // not arm `Invalid` either (the identical exemption set
+        // `is_invalid_ty` consults).
+        let compiler_known = engine.is_scope_param(leaf_id)
+            || engine.name_world().is_known_head(leaf_id)
+            || engine.core_head(leaf_id)
+            || leaf_id == engine.intern("FutureOr")
+            // The canonical bottom/top faces (`Null`/`Never`/`dynamic`/
+            // `void`) — always resolvable `dart:core` faces to the oracle,
+            // folded to `Ty::Null`/`Ty::Never`/`Ty::Dynamic`/`Ty::Void`
+            // downstream. An unmounted SDK's `Missing` verdict must not
+            // arm them `Invalid` (`is_invalid_ty` exempts the same set).
+            || matches!(
+                engine.strings.resolve(leaf_id),
+                "Null" | "Never" | "dynamic" | "void"
+            )
+            || engine.declared_head_is_type_param(leaf_id);
+        let armed_ty_invalid = !compiler_known
+            && engine.rows.last().is_some_and(|r| {
+                matches!(
+                    r.shape,
+                    RowShape::TypeUse(
+                        TypeVerdict::Missing
+                            | TypeVerdict::NonType
+                            | TypeVerdict::Prefixed { .. }
+                            | TypeVerdict::PrefixHead
+                            | TypeVerdict::RedirectTarget,
+                        _
+                    )
+                ) && (r.range.offset == head_offset || Some(r.range.offset) == leaf_offset)
+            });
+        engine.armed_ty = Some(if armed_ty_invalid { Ty::Invalid } else { ty });
         // The written extent rides the armed slot (the pattern faces'
         // `pattern.type` anchor — the same span the return latch takes).
         let mut span = match question {
@@ -6151,7 +6214,9 @@ impl ParserListener for DiagnoseListener<'_> {
                     Ty::Dynamic => (None, true, Vec::new()),
                     Ty::Void => (None, false, Vec::new()),
                     Ty::Never => (None, false, Vec::new()),
-                    Ty::Function { .. } | Ty::Record { .. } | Ty::Unknown => return None,
+                    Ty::Function { .. } | Ty::Record { .. } | Ty::Unknown | Ty::Invalid => {
+                        return None;
+                    }
                 };
                 Some((offset, base, nullable, tree, ty))
             });

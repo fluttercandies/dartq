@@ -313,6 +313,11 @@ impl<'a> Face<'a> {
 
     fn ty(&mut self, ty: Ty) {
         match ty {
+            // The `InvalidType` digest rides its own field text — distinct
+            // from `Unknown`'s suppress marker (the signature is an
+            // identity column: a broken annotation and an absent one are
+            // different written forms).
+            Ty::Invalid => self.field("invalid"),
             Ty::Unknown => self.field("?"),
             Ty::Null => self.field("Null"),
             Ty::Dynamic => self.field("dynamic"),

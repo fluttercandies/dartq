@@ -1633,7 +1633,10 @@ pub(crate) const CORE_SUPERTYPES: [(&str, &str); 3] =
 impl NameTy {
     pub(crate) fn from_semantic(ty: Ty) -> Self {
         match ty {
-            Ty::Unknown | Ty::Dynamic | Ty::Void => NameTy::TopNullable,
+            // `InvalidType` joins the unknown/top face: the broken
+            // annotation suppresses the exhaustiveness question the same
+            // way an absent scrutinee type does.
+            Ty::Invalid | Ty::Unknown | Ty::Dynamic | Ty::Void => NameTy::TopNullable,
             Ty::Null => NameTy::Null,
             // The throw expression's bottom type joins the world as the
             // exhaustiveness `Never` (`switch (throw e)` matches

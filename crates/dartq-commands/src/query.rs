@@ -959,6 +959,10 @@ fn type_params_text(names: &[dartq_source::StringId], strings: &StringTable) -> 
 pub(crate) fn render_ty(ty: Ty, strings: &StringTable, args: &ArgPool) -> String {
     match ty {
         Ty::Unknown => "dynamic".to_owned(),
+        // `InvalidType` is the oracle's face for a written annotation
+        // that failed resolution — it renders as itself (`InvalidType`),
+        // not the uncaptured-shape `dynamic` convention `Unknown` takes.
+        Ty::Invalid => "InvalidType".to_owned(),
         Ty::Null => "Null".to_owned(),
         Ty::Dynamic => "dynamic".to_owned(),
         Ty::Never => "Never".to_owned(),

@@ -4114,6 +4114,21 @@ pub(crate) struct Engine<'a> {
     /// scope stack is consumed before the usage pass). The
     /// extension-credit Typed arm reads this witness instead of re-asking.
     pub(crate) invalid_typed_member_rows: FxHashSet<u32>,
+    /// Member-row offsets whose access-intent verdict emitted the
+    /// `undefined_getter`/`undefined_setter`/`undefined_method` miss — the
+    /// observed-miss witness (P3, `generated/resolver.dart:1758-1761`):
+    /// an unresolved member name on a non-dynamic receiver types
+    /// `InvalidType` upstream, and the read face types the row `Invalid`
+    /// exactly when this set latches it. Inserted beside each
+    /// `undefined_*` emit, never derived a second time — the verdict's own
+    /// extension/`Object`/core-table consults already ran, so the latch is
+    /// the only honest re-read of "the oracle proved the miss". A
+    /// `dynamic`-target miss never lands here (its verdict is silenced by
+    /// the bounded dispatch before any emit), which is exactly the
+    /// `atDynamicTarget` arm of the same fork. Consumed by
+    /// [`Engine::accessor_read_ty`] and [`Engine::callee_return_ty`], and
+    /// through them by [`Engine::member_read_invalid`]'s chain walk.
+    pub(crate) invalid_member_rows: FxHashSet<u32>,
     /// Member rows that resolved through a nullable-applicable extension
     /// face on a nullable receiver ([`Engine::member_defined`]'s safe
     /// `Single` verdict): the access needs no null check and the member's
@@ -6063,6 +6078,10 @@ impl Engine<'_> {
     /// or before the reference instead of the first declaration.
     pub(crate) fn potentially_nullable_at(&self, ty: Ty, at: Option<u32>) -> bool {
         match ty {
+            // `InvalidType` is potentially nullable upstream (the broken
+            // annotation never routes a receiver into the unchecked
+            // codes this predicate gates).
+            Ty::Invalid => true,
             Ty::Named { nullable: true, .. }
             | Ty::Function { nullable: true, .. }
             | Ty::Record { nullable: true, .. } => true,
@@ -6289,11 +6308,8 @@ impl Engine<'_> {
             // token glues it into a wider operand (`x.f is T`, `-x is T`,
             // `x as T is S` — the `as`/`is` target tokens left of the read
             // carry no read row and drop out at the join anyway).
-            let Some(operand) = i
-                .checked_sub(1)
-                .and_then(|j| tokens.get(j))
-                .filter(|t| t.kind == TokenKind::Identifier)
-            else {
+            let operand_tok = i.checked_sub(1).and_then(|j| tokens.get(j));
+            let Some(operand) = operand_tok.filter(|t| t.kind == TokenKind::Identifier) else {
                 continue;
             };
             if i >= 2 && GLUE.contains(&tokens[i - 2].kind) {
@@ -6309,6 +6325,22 @@ impl Engine<'_> {
                     length: text.chars().map(char::len_utf16).sum::<usize>() as u32,
                 }
             };
+            // Only a LOCAL read re-decides: promotion upstream is the
+            // local variable domain (`is`/`as`/`!= null` never promote a
+            // member or a method tear-off), and the read-side row a
+            // member's bare name stages here (`m15 is F15<int>` inside
+            // `class U0<T>`) substitutes its promoted `F15<int>` face for
+            // the declared `List<T>` — a reflexive-true the oracle never
+            // reports because the tear-off's own declared type decides
+            // the verdict. `local_decl_at_read` is the surviving join:
+            // populated only in `resolve_local`'s hits arm (resolution.rs)
+            // — members and tear-offs never enter — and its own contract
+            // is the non-moving twin of `local_hits`, never consumed by
+            // the write-only/useless-read folds or the receiver merge
+            // that empty `local_hits` before this pass runs.
+            if !self.local_decl_at_read.contains_key(&span.offset) {
+                continue;
+            }
             // The operand's flow-aware static type: a `PromotedRead` fact
             // at the read's own span substitutes outright (an opaque
             // `Unknown` marker is the nullability-only face — defer to
@@ -6354,6 +6386,11 @@ impl Engine<'_> {
             // scope): any named head failing `resolve_bare`'s
             // declaration face — a scope param, a local read, a prefix,
             // `this`, a miss — keeps the site's parse-time verdict.
+            // A promoted face that hides a scope-param declared face must
+            // not re-decide: `m15 is F15<int>` inside `U0<T>` promotes the
+            // method tear-off to `F15<int>`, but `m15`'s declared `List<T>`
+            // keeps `T` a scope head — the upstream verdict reads the
+            // declared `TypeParameterType` and stays silent.
             if self.ty_has_scope_head(operand_ty) || self.ty_args_have_scope_head(checked) {
                 continue;
             }

@@ -5722,10 +5722,17 @@ impl<'a> Engine<'a> {
         // `greatestClosure`'s nullable face: `T <: Null` binds `Object?`;
         // an invalid type argument (`List<Und>`'s `E`) collapses to the
         // same; a genuinely nullable schema type binds itself; `dynamic`
-        // never infers.
+        // never infers. `Ty::Invalid` forks on the receiver face: a BARE
+        // callee's invalid formal schema (`recv=Unknown` — `take`'s
+        // `void Function(Und)`) binds the `Object?` `greatestClosure`
+        // recovery (the oracle still sees the unresolvable head as a
+        // `T <: Null` collapse), while a RESOLVED member receiver's
+        // unnameable formal (`db.batch`'s `void Function(Batch)`,
+        // `recv=Typed`) keeps `dynamic` — the unnameable-face posture.
         match schema {
             Ty::Dynamic => None,
             Ty::Unknown => Some(self.object_question()),
+            Ty::Invalid if matches!(recv, Receiver::Unknown) => Some(self.object_question()),
             Ty::Null | Ty::Never => Some(self.object_question()),
             Ty::Named {
                 name: head,
@@ -8559,8 +8566,13 @@ impl<'a> Engine<'a> {
         match schema {
             // `dynamic` never infers — the formal keeps `dynamic`.
             Ty::Dynamic => None,
-            // `T <: Null` and the invalid faces: `Object?`.
-            Ty::Unknown | Ty::Null | Ty::Never => Some(self.object_question()),
+            // `T <: Null` and the invalid faces: `Object?`. `Ty::Invalid`
+            // joins the collapse — wave 2 produces the `InvalidType`
+            // sentinel for the unresolvable-head schema entry where the
+            // pre-wave face read the Gap marker; the oracle's
+            // `greatestClosure` binds `Object?` over both (the
+            // `isInvalidBounded` arm answers the top type).
+            Ty::Unknown | Ty::Null | Ty::Never | Ty::Invalid => Some(self.object_question()),
             Ty::Named {
                 name,
                 nullable,
@@ -9489,6 +9501,11 @@ impl<'a> Engine<'a> {
     /// type parameters, real declarations — keeps its written face.
     fn invalid_return_fold(&self, ty: Ty) -> Ty {
         match ty {
+            // An already-`Invalid` declared return keeps the same
+            // synchronous fold the unresolved-`Named` arm takes: the
+            // `InvalidType` stand-in is `Unknown` here, so the twin asks
+            // no nullability question.
+            Ty::Invalid => Ty::UNKNOWN,
             // The builtin bottom is never the invalid face: `Never`
             // resolves through the implicit dart:core import (the type
             // provider owns it, imports or not), and a same-spelled
@@ -9607,7 +9624,7 @@ impl<'a> Engine<'a> {
     /// the completion warning spares it (type_analyzer.dart:661-681).
     pub(crate) fn legal_async_return(&self, ty: Ty) -> bool {
         match ty {
-            Ty::Unknown | Ty::Dynamic | Ty::Void => true,
+            Ty::Unknown | Ty::Dynamic | Ty::Void | Ty::Invalid => true,
             // `Future<Never> <: Never` does not hold (the bottom type is no
             // `Future`), so a declared `Never` stays illegal. A record or
             // function type is no `Future`/`FutureOr` either.
@@ -9672,8 +9689,10 @@ impl<'a> Engine<'a> {
         };
 
         let code = match ret {
-            // (b)'s top faces: each is its own `FutureOr` base.
-            Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void => return None,
+            // (b)'s top faces: each is its own `FutureOr` base. `Invalid`
+            // (the `InvalidType` face, isNullable upstream) joins the
+            // silent group.
+            Ty::Invalid | Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void => return None,
             // (a): a non-nullable name, record, function, or `Never` (the
             // bottom type declares no null) is potentially non-nullable —
             // the ERROR twin reports. A named head that resolves to no
@@ -10018,7 +10037,7 @@ impl<'a> Engine<'a> {
     /// consulted).
     fn completion_nullable(&self, ty: Ty) -> bool {
         match self.completion_alias_face(ty) {
-            Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown => true,
+            Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown | Ty::Invalid => true,
             Ty::Named {
                 name,
                 nullable,

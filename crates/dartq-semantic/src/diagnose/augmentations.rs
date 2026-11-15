@@ -2119,7 +2119,7 @@ fn canon_into(
     depth: u8,
 ) -> Leaf {
     match ty {
-        Ty::Unknown => return Leaf::Invalid,
+        Ty::Unknown | Ty::Invalid => return Leaf::Invalid,
         Ty::Null => out.push_str("Null"),
         Ty::Dynamic => out.push_str("dynamic"),
         Ty::Never => out.push_str("Never"),
@@ -2457,7 +2457,7 @@ fn canon_alias_ty(
     depth: u8,
 ) -> Leaf {
     match ty {
-        Ty::Unknown => return Leaf::Invalid,
+        Ty::Unknown | Ty::Invalid => return Leaf::Invalid,
         Ty::Null => out.push_str("Null"),
         Ty::Dynamic => out.push_str("dynamic"),
         Ty::Never => out.push_str("Never"),

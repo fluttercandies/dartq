@@ -38,6 +38,12 @@ impl Engine<'_> {
     /// (the caller's [`Self::equality_operand_ty`] answer).
     pub(crate) fn operand_face(&self, row: &Row, ty: Ty) -> OperandFace {
         match ty {
+            // A `Ty::Invalid` static type IS the oracle's `InvalidType` —
+            // the refinement must not read it as a typed operand
+            // (`Typed(Invalid)` would decide `int - <inv>` `Invalid`
+            // rather than `double` through the subtype-of-everything
+            // short-circuit).
+            Ty::Invalid => return OperandFace::Invalid,
             Ty::Unknown => {}
             // A type parameter's head answers through its bound in the
             // oracle (`T extends num` refines to `num`, `T extends double`

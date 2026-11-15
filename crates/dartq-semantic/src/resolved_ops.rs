@@ -2363,7 +2363,7 @@ impl Registry<'_> {
         match ty {
             // A bare unit face (`void`/`dynamic`/`Never`) is not a shape
             // the chase stands for — the use keeps today's opaque read.
-            Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void | Ty::Never => None,
+            Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void | Ty::Never | Ty::Invalid => None,
             Ty::Record { shape, nullable } => {
                 let shape = pool.record_shape(shape);
                 let mut positional = Vec::with_capacity(shape.positional.len());
@@ -3931,7 +3931,7 @@ impl<'a> ResolvedTypeOps<'a> {
     /// flatten cannot mint — the under-report direction.
     fn local_fn_leaf(&self, ty: Ty, pool: &ArgPool) -> Option<TypeId> {
         match ty {
-            Ty::Unknown | Ty::Dynamic => Some(self.dynamic),
+            Ty::Unknown | Ty::Dynamic | Ty::Invalid => Some(self.dynamic),
             Ty::Void => Some(self.void),
             Ty::Never => Some(self.snapshot.table.intern(UninternedType::Never, false)),
             Ty::Null => None,
@@ -4060,7 +4060,10 @@ impl<'a> ResolvedTypeOps<'a> {
     /// list here always resolves in the diagnosing universe.
     pub(crate) fn map_ty_strict(&self, ty: Ty, pool: &crate::model::ArgPool) -> Option<TypeId> {
         match ty {
-            Ty::Unknown => None,
+            // `Ty::Invalid` (the written broken annotation) carries no
+            // structural fact either — the vacuous `Invalid` lattice arm
+            // must never leak into the applicability/specificity gates.
+            Ty::Unknown | Ty::Invalid => None,
             Ty::Null => Some(self.null),
             Ty::Dynamic => Some(self.dynamic),
             Ty::Never => Some(self.snapshot.table.intern(UninternedType::Never, false)),

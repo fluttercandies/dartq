@@ -7946,3 +7946,32 @@ mod ticket_4282_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_4287_tests.rs"]
 mod ticket_4287_tests;
+
+/// The #3544 pins: `Ty::Invalid` wave 1 — the new unit variant reads the
+/// oracle's `InvalidType` through the name-level relations
+/// (`assignable_from` decides `Some(true)` either side, `render` spells
+/// `"InvalidType"`, `is_strictly_non_nullable` answers `false`) while
+/// staying a sentinel distinct from `Ty::Unknown`'s Gap face. Nothing
+/// produces the variant yet — the production points land with 3544b.
+#[cfg(test)]
+#[path = "diagnose/ticket_3544_invalid_lattice_tests.rs"]
+mod ticket_3544_invalid_lattice_tests;
+
+/// The #3771 pins: `Ty::Invalid` wave 1b — the three production points
+/// (`Engine::assignable`'s entry fold, the `armed_ty_invalid` latch's
+/// widened TypeUse classes, `BareInfo::Missing`'s bare-miss typing) and
+/// the two side gates (`is_invalid_ty` on the uninitialized faces, the
+/// `f<int>`/`Unresolved<int>` arity silence) pinned against the oracle's
+/// 15 fixture forms.
+#[cfg(test)]
+#[path = "diagnose/ticket_3771_invalid_production_tests.rs"]
+mod ticket_3771_invalid_production_tests;
+
+/// The #3545 pins: `Ty::Invalid` wave 2 — the member/invocation face
+/// fork (P3, `atDynamicTarget ? dynamic : Invalid`) plus the
+/// Invalid-receiver silencing (`isInvalidBounded` short-circuit) and the
+/// invocation production (P4 — unresolved callee/Invalid receiver types
+/// the send `Invalid`), pinned per family.
+#[cfg(test)]
+#[path = "diagnose/ticket_3545_invalid_receiver_tests.rs"]
+mod ticket_3545_invalid_receiver_tests;

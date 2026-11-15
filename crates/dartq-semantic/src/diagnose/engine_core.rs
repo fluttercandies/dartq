@@ -479,6 +479,7 @@ impl<'a> Engine<'a> {
             invalid_closure_spans: Vec::new(),
             invalid_typed_locals: FxHashSet::default(),
             invalid_typed_member_rows: FxHashSet::default(),
+            invalid_member_rows: FxHashSet::default(),
             accessible_extensions: None,
             read_names: FxHashSet::default(),
             member_read_owners: FxHashMap::default(),
@@ -3951,6 +3952,9 @@ impl<'a> Engine<'a> {
     /// re-enter through [`Self::resolved_subtype`] and read the same
     /// face there.
     pub(crate) fn is_invalid_ty(&self, ty: Ty) -> bool {
+        if ty == Ty::Invalid {
+            return true;
+        }
         let Ty::Named { name, .. } = ty else {
             return ty == Ty::Unknown;
         };
@@ -3963,6 +3967,56 @@ impl<'a> Engine<'a> {
         // so an unimported spelling is the oracle's `InvalidType`
         // (the type-position miss reports `undefined_class` beside it).
         if self.is_scope_param(name) || self.name_world().is_known_head(name) {
+            return false;
+        }
+        // The compiler-known core faces the engine itself synthesizes —
+        // [`Self::core_head`]'s `List`/`Map`/`Set`/`Iterable`/`Object`/
+        // `Future`/`Stream`/`Function` set (a superset of
+        // `collection_heads`+`Stream`). These names carry the engine's
+        // own async/sequence/function faces, never a written annotation
+        // that failed resolution: an unmounted SDK in a synthetic rig
+        // leaves `type_resolution` answering `Missing` for them, and
+        // folding them into `Invalid` would poison both the
+        // engine-produced `Iterable<dynamic>`/`Stream<dynamic>` sequence
+        // target (the `NL extends DelegatingList` for-in face's
+        // `implements_interface` arm) and the `Future`-declared return
+        // the async verdict pairs (`Future<int> <: int` must decide on
+        // the declared-edge lattice, not accept vacuously).
+        // `FutureOr` stays OUT of this set on purpose: an unresolvable
+        // `FutureOr` spelling IS the oracle's `InvalidType` and must
+        // keep folding here — the structural `FutureOr<sealed>` split
+        // the exhaustion walk needs reads the WRITTEN `Named` spelling
+        // off `armed_ty` (which keeps `FutureOr` exempt), not this
+        // resolved-face answer.
+        if self.core_head(name) {
+            return false;
+        }
+        // The canonical bottom/top faces the engine itself normalizes —
+        // `Null`/`Never`/`dynamic`/`void` spellings fold to `Ty::Null`/
+        // `Ty::Never`/`Ty::Dynamic`/`Ty::Void` everywhere downstream
+        // (`normalized_null`/`normalized_never`). They are always
+        // resolvable `dart:core` faces to the oracle — never the
+        // `InvalidType` a failed head resolution produces — and an
+        // unmounted SDK in a synthetic rig leaves `type_resolution`
+        // answering `Missing` for them. Folding them into `Invalid`
+        // would poison the `is Null`/`is! Null` family (the checked
+        // side's `checked == Ty::Null` arm must read the canonical
+        // bottom face, not `InvalidType`) and every `void`/`dynamic`
+        // return or receiver.
+        if matches!(
+            self.strings.resolve(name),
+            "Null" | "Never" | "dynamic" | "void"
+        ) {
+            return false;
+        }
+        // A declared type parameter keeps its own lattice face
+        // (`TypeParameterTypeImpl`, never `InvalidType`) even after the
+        // live scope tables are gone: `type_params`/`pending_type_params`
+        // are parse-time captures torn down before the finalization asks,
+        // so a `T`/`S` head reads `Missing` to the scoped tail below
+        // without the decl-table answer — the same window
+        // `invalid_typed_member_rows` was built to witness at merge time.
+        if self.declared_head_is_type_param(name) {
             return false;
         }
         // A dot-joined `p.T` head names an element through an import
@@ -3984,12 +4038,6 @@ impl<'a> Engine<'a> {
         {
             return false;
         }
-        // A dot-joined `p.T` head names an element through an import
-        // prefix — the official resolver's `PrefixedType` arm, which the
-        // bare-scope walk below cannot see (the leaf is not in this
-        // library's own scope). The prefix table answers instead: a
-        // spelling that reaches a container is a real interface type, not
-        // the `InvalidType` an unresolved head is.
         match self.type_resolution(name).0 {
             TypeResolution::Missing | TypeResolution::NonType => true,
             TypeResolution::Type => matches!(
@@ -4004,6 +4052,68 @@ impl<'a> Engine<'a> {
                 ScopedHit::Ambiguous(_)
             ),
         }
+    }
+
+    /// The `InvalidType` production fold (the resolver's
+    /// `named_type_resolver.dart` face): a type whose written form fails
+    /// type-position resolution materializes as the oracle's
+    /// `InvalidType` — the whole type when the head itself misses
+    /// (`Undefined` as a declared type), and `Head<InvalidType>` when
+    /// only an argument misses (upstream's whole-vs-argument split: the
+    /// `Named` node's head resolves once, each argument resolves on its
+    /// own — `List<Unresolved>` is `List<InvalidType>`, not a whole-type
+    /// `InvalidType`). The predicate is [`Self::is_invalid_ty`] — NEVER
+    /// `named_type_is_type`: the latter returns `false` for an
+    /// ALREADY-RESOLVED `p.C` spelling too (the bare-scope walk cannot
+    /// see through an import prefix), so it would fold a resolved
+    /// `p.C` into `Invalid` and under-report; `is_invalid_ty`
+    /// compensates through `resolve_joined_container`.
+    ///
+    /// The recursion carries the pool's re-intern discipline: an
+    /// unchanged `Ty` keeps its identity (argument slots intern
+    /// canonically, so an untouched `List<int>` re-interns to the same
+    /// `Ty`), and only a changed argument forks the slot. Non-`Named`
+    /// shapes have no argument table the fold can reach — a `Record` or
+    /// `Function` face returns untouched (their inner columns are the
+    /// wave-2 question, not this fold's).
+    pub(crate) fn fold_invalid_ty(&self, ty: Ty) -> Ty {
+        // `Ty::Unknown` is the Gap sentinel — `is_invalid_ty` still reads
+        // it `true` this wave (the wave-5 split is pending), but it is an
+        // ABSENT face, not a written annotation that failed resolution.
+        // Folding it to `Invalid` would collapse the two sentinels and
+        // turn every suppression into a decided `true`.
+        if ty == Ty::Unknown {
+            return ty;
+        }
+        if self.is_invalid_ty(ty) {
+            return Ty::Invalid;
+        }
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return ty;
+        };
+        if args == ArgListId::EMPTY {
+            return ty;
+        }
+        let old: Vec<Ty> = {
+            let pool = self.boundary.pool();
+            pool.get(args).to_vec()
+        };
+        let mut new: Vec<Ty> = Vec::with_capacity(old.len());
+        let mut changed = false;
+        for &arg in &old {
+            let folded = self.fold_invalid_ty(arg);
+            changed |= folded != arg;
+            new.push(folded);
+        }
+        if !changed {
+            return ty;
+        }
+        self.boundary.args.borrow_mut().named(name, nullable, &new)
     }
 
     /// The strict subtype verdict over the resolved operand faces — the
@@ -6016,8 +6126,125 @@ impl<'a> Engine<'a> {
                 let out = self.instantiate_accessor_static(container, recv, raw);
                 (out != Ty::UNKNOWN).then_some(out)
             }
+            // A creation receiver's member read instantiates the declared
+            // face against the creation's written type arguments
+            // A creation receiver's member read instantiates the declared
+            // face against the creation's written type arguments — the
+            // oracle reads the receiver's resolved `staticType`
+            // (`best_practices_verifier.dart:877-930` over
+            // `InstanceCreationExpression`), so `C1<int>().field` asks the
+            // member through `C1<int>` and answers `A<int>`, never the raw
+            // `A<V>` a bare-parameter face would leave.
+            Receiver::Created { name, ty, .. } => {
+                // The receiver's resolved instance type: the send-close
+                // `Created` row folds away with the merge, so the written
+                // `<...>` group survives only in the source bytes —
+                // `created_head_offset` walks back from the member's `.`
+                // over the `(...)`/`<...>` groups to the head `C1`, and
+                // `written_creation_args` reads its `<int>`. A creation
+                // with no written group (`C()`, or `Created.ty` solved
+                // upstream) keeps `ty`/the to-bounds head — the same
+                // instantiate-to-bounds residual every display face takes.
+                let head_offset = self.created_head_offset(*name, row.range.offset);
+                let recv_ty = head_offset
+                    .and_then(|offset| self.written_creation_args(*name, offset))
+                    .map(|args| self.boundary.args.borrow_mut().named(*name, false, &args))
+                    .or(*ty)
+                    .filter(|t| matches!(t, Ty::Named { args, .. } if *args != ArgListId::EMPTY))
+                    .unwrap_or_else(|| self.instantiated_head_ty(Ty::named(*name)));
+                // The member face `member_entry_tear_off_ty` answers is
+                // already projected into the RECEIVER's parameter space —
+                // a member climbed through `with M<V>` reads `A<V>` (the
+                // application's clause substituted `T := V` at capture),
+                // never the declaring `M`'s own `A<T>`. The receiver-env
+                // therefore zips the creation's written arguments onto the
+                // CONTAINER's own parameters (`V := int`), the plain
+                // `name == container` leg — not the `asInstanceOf` hop,
+                // which would key the map on `M`'s `T` against a face that
+                // no longer spells it.
+                match self.member_recv_env(recv_ty, container, &entry) {
+                    Some(env) => self.subst_params(raw, &env).or(Some(raw)),
+                    None => Some(raw),
+                }
+            }
             _ => Some(raw),
         }
+    }
+
+    /// The source offset of a creation receiver's head identifier —
+    /// `C1<int>().field`'s `C1`: a backward walk from the member token's
+    /// `.` over the argument-list `(...)` and the written type-argument
+    /// `<...>` group, landing on the head's first byte. `None` when the
+    /// shape is not the `head<args>(args).member` spelling (a bare `C()`
+    /// receiver, a `?.` junction, or a group that does not balance) — the
+    /// caller keeps the `Created.ty`/to-bounds fallback. The head's own
+    /// identifier is verified against `name`, so a non-matching walk-back
+    /// (a different receiver shape folded into the member) never claims
+    /// the offset.
+    fn created_head_offset(&self, name: StringId, member_offset: u32) -> Option<u32> {
+        let bytes = self.source.as_bytes();
+        // The member's `.` immediately precedes the member token; the
+        // receiver expression ends one byte before it — `)` for a creation.
+        let mut i = self.byte_of(member_offset).checked_sub(2)?;
+        // Skip the argument list `(...)` — `.field` arrives at `)` for a
+        // creation receiver.
+        i = match bytes.get(i) {
+            Some(b')') => {
+                let mut depth = 0usize;
+                let mut j = i;
+                while j > 0 {
+                    match bytes[j] {
+                        b')' => depth += 1,
+                        b'(' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j -= 1;
+                }
+                if depth != 0 {
+                    return None;
+                }
+                j.checked_sub(1)?
+            }
+            _ => return None,
+        };
+        // Skip the written type-argument group `<...>` — `C1<int>` arrives
+        // at `>`; a bare `C().field` stops here (no args to read anyway).
+        // `i` lands on the head's last byte when no group stands, or on the
+        // `<` after the group — in both cases the head's byte span ends at
+        // `i` exclusive of the group's `<`.
+        let head_end = if bytes.get(i) == Some(&b'>') {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j > 0 {
+                match bytes[j] {
+                    b'>' => depth += 1,
+                    b'<' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j -= 1;
+            }
+            if depth != 0 {
+                return None;
+            }
+            j // the `<`'s index — the head ends just before it
+        } else {
+            i + 1 // the byte after the head's last byte
+        };
+        // The head identifier is `head_text` ending at `head_end`.
+        let head_text = self.strings.resolve(name);
+        let head_start = head_end.checked_sub(head_text.len())?;
+        (bytes.get(head_start..head_end) == Some(head_text.as_bytes()))
+            .then(|| self.utf16_of(head_start))
     }
 
     /// The constructor tear-off face at an `is` operand (`C.constr is
@@ -13530,6 +13757,14 @@ impl<'a> Engine<'a> {
         if matches!(right_ty, Ty::Unknown | Ty::Dynamic) {
             return;
         }
+        // The wave-2 `Invalid` operand is the oracle's `InvalidTypeImpl`
+        // — a subtype of everything (subtype.dart's `InvalidTypeImpl`
+        // arm), so `isAssignableTo` accepts it against every formal and
+        // the argument row never fires (the same under-report contract
+        // [`Self::written_ty_invalid`] carries into the compound face).
+        if matches!(right_ty, Ty::Invalid) {
+            return;
+        }
         let unbound = |engine: &Self, head| {
             engine.type_params.contains(&head) || engine.pending_type_params.contains(&head)
         };
@@ -13825,7 +14060,7 @@ impl<'a> Engine<'a> {
                 required.sort_unstable();
                 matched_names != required
             }
-            Ty::Unknown | Ty::Dynamic | Ty::Never | Ty::Void => false,
+            Ty::Unknown | Ty::Dynamic | Ty::Never | Ty::Void | Ty::Invalid => false,
         }
     }
 
@@ -13867,9 +14102,13 @@ impl<'a> Engine<'a> {
                     ..
                 }
             );
-        if self.name_subtype(matched, cast) {
+        if self.name_subtype(matched, cast) && !self.is_invalid_ty(cast) {
             // The official gate is `isSubtypeOf && castType is not
-            // InvalidType` — a `dynamic` target reports like any other.
+            // InvalidType` — a `dynamic` target reports like any other,
+            // but a cast type whose head never resolved (wave-2's
+            // `InvalidType`, the `var x as Missing7` face) is exempt:
+            // the subtype relation accepts `Invalid` vacuously, and the
+            // oracle reports only the `undefined_class` head row.
             self.stage_usage(SemanticCode::UnnecessaryCastPattern, at, "");
         } else if self.pattern_never_matches(matched, cast) {
             let a0 = self.ty_display(matched);

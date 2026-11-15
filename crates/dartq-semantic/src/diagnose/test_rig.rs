@@ -211,6 +211,19 @@ pub(super) fn report_ops_experiments_with(
     report_ops_env(source, imports, wildcards, experiments, &[])
 }
 
+/// [`report_ops`] with the language-strictness modes set (the
+/// `strict-casts: true` fixtures — the #480 modes ride the same fold).
+pub(super) fn report_ops_strict(source: &str, strict: StrictModes) -> FileReport {
+    report_ops_env_strict(
+        &format!("{CORE_PRELUDE}{source}"),
+        &[],
+        None,
+        &[],
+        &[],
+        strict,
+    )
+}
+
 /// The SDK container heads [`report_ops_core_ctor`] additionally mounts
 /// in the names-only `dart:core` stub posture: a fixture naming them
 /// sees the CLI's unindexed-SDK grade (the names resolve into a
@@ -237,6 +250,24 @@ fn report_ops_env(
     wildcards: Option<bool>,
     experiments: &[dartq_language::Feature],
     extra_core_stubs: &[&str],
+) -> FileReport {
+    report_ops_env_strict(
+        source,
+        imports,
+        wildcards,
+        experiments,
+        extra_core_stubs,
+        StrictModes::default(),
+    )
+}
+
+fn report_ops_env_strict(
+    source: &str,
+    imports: &[RigImport<'_>],
+    wildcards: Option<bool>,
+    experiments: &[dartq_language::Feature],
+    extra_core_stubs: &[&str],
+    strict: StrictModes,
 ) -> FileReport {
     let strings = StringTable::new();
     let mut files = FileTable::new();
@@ -365,7 +396,7 @@ fn report_ops_env(
         &graph,
         &namespaces,
         &index,
-        StrictModes::default(),
+        strict,
         &class_modifiers,
         set.is_enabled(Feature::InferenceUpdate2),
         Some(&ops),
