@@ -20,10 +20,11 @@
 //!    pub dependency, declared by package name and resolved by pub into
 //!    `package_config.json`). Each declared name resolves to its package
 //!    root; a root holding a manifest loads exactly like a convention hit
-//!    (a ported plugin), otherwise the manifest the official convention
-//!    implies is derived (entrypoint `lib/main.dart`, the manifest's default
-//!    budgets). A declared name pub never resolved is a reported issue,
-//!    never a silent skip — the user declared it.
+//!    (a ported plugin). A root without one — the official convention's
+//!    `lib/main.dart` — is reported unresolved for the launch faces'
+//!    bootstrap arm (synthetic package, generated `startPlugin`
+//!    entrypoint), never spawned raw. A declared name pub never resolved
+//!    is a reported issue, never a silent skip — the user declared it.
 //!
 //! Precedence follows source order — overrides first, then the convention
 //! scan, then pub-native; one manifest never loads twice (matched by
@@ -39,17 +40,7 @@ use std::path::{Path, PathBuf};
 
 use dartq_pub::{PackageConfig, normalize};
 
-use crate::capability::CapabilitySet;
-use crate::manifest::{
-    DEFAULT_IDLE_EVICT_MS, DEFAULT_MEMORY_BUDGET_MB, EntrypointKind, MANIFEST_FILE_NAME, Manifest,
-    ManifestError, Timeouts,
-};
-
-/// The entrypoint the official plugin convention fixes for a pub-native
-/// plugin package (upstream Dart SDK source,
-/// `pkg/analysis_server_plugin/doc/writing_a_plugin.md`: the package's single
-/// entry is a top-level `plugin` variable in `lib/main.dart`).
-const PUB_PLUGIN_ENTRYPOINT: &str = "lib/main.dart";
+use crate::manifest::{MANIFEST_FILE_NAME, Manifest, ManifestError};
 
 /// One discovered plugin: its parsed manifest and the directory the
 /// entrypoint resolves against ([`crate::SpawnSpec::dart`] consumes both).
@@ -249,42 +240,17 @@ pub fn discover(
             }
             continue;
         }
-        // Unported (the element-model gap is the runtime's adjudication, not
-        // discovery's): derive the manifest the official convention implies
-        // — the package itself is the plugin directory and `lib/main.dart`
-        // is the entry. The package's pubspec version is deliberately not
-        // read; identity comes from the declaration.
-        let manifest = Manifest {
-            name: name.clone(),
-            version: "0.0.0".to_owned(),
-            entrypoint: PUB_PLUGIN_ENTRYPOINT.to_owned(),
-            entrypoint_kind: EntrypointKind::Source,
-            capabilities: CapabilitySet::empty(),
-            timeouts: Timeouts::default(),
-            memory_budget_mb: DEFAULT_MEMORY_BUDGET_MB,
-            idle_evict_ms: DEFAULT_IDLE_EVICT_MS,
-        };
-        let script = root.join(PUB_PLUGIN_ENTRYPOINT);
-        if !script.is_file() {
-            report.skipped.push(DiscoveryIssue {
-                error: ManifestError::InvalidField(
-                    "entrypoint",
-                    format!("no script at `{}`", script.display()),
-                )
-                .into(),
-                path: script,
-            });
-            continue;
-        }
-        loaded.push(canonical(&script));
-        admit(
-            &mut report,
-            DiscoveredPlugin {
-                dir: root,
-                manifest,
-            },
-            script,
-        );
+        // Unported (no `dartq_plugin.json`): NOT a native hit. The official
+        // convention's `lib/main.dart` is a top-level `plugin` variable
+        // served by a host bootstrap, not a dartq-wire process entrypoint —
+        // spawning it raw dies at the handshake. The declaration stays
+        // `Unresolved` so the launch faces' bootstrap arm takes it over
+        // (synthetic package, generated `startPlugin` entrypoint, snapshot);
+        // a bootstrap failure surfaces as the plugin's crash row there.
+        report.skipped.push(DiscoveryIssue {
+            path: pub_native.options_file.to_path_buf(),
+            error: DiscoveryError::Unresolved(name.clone()),
+        });
     }
     report
 }
@@ -556,12 +522,13 @@ mod tests {
         let plugin = &report.plugins[0];
         assert_eq!(plugin.dir, root);
         assert_eq!(plugin.manifest.name, "ported");
-        // The package's own manifest wins over the derived default entrypoint.
+        // The package's own manifest names the entrypoint; only a
+        // manifest-less package would fall to the bootstrap arm.
         assert_eq!(plugin.manifest.entrypoint, "script.dart");
     }
 
     #[test]
-    fn pub_native_unported_package_gets_the_derived_default_manifest() {
+    fn pub_native_unported_package_falls_to_unresolved_for_the_bootstrap() {
         let workspace = Workspace::new("pub_unported");
         let root = workspace.package("unported");
         std::fs::create_dir_all(root.join("lib")).expect("create lib");
@@ -569,19 +536,20 @@ mod tests {
             .expect("write entrypoint");
         let options = workspace.path().join("analysis_options.yaml");
 
+        // No `dartq_plugin.json`: the package is an official-convention
+        // plugin (a top-level `plugin` variable a host serves), never a
+        // native wire process. Discovery admits nothing and reports the
+        // name unresolved — the launch faces' bootstrap arm owns it from
+        // here (synthetic package, generated `startPlugin` entrypoint).
         let report = discover_pub_native(&workspace, &["unported"], &options);
-        assert_eq!(report.skipped, Vec::new());
-        assert_eq!(report.plugins.len(), 1);
-        let plugin = &report.plugins[0];
-        assert_eq!(plugin.dir, root);
-        assert_eq!(plugin.manifest.name, "unported");
-        assert_eq!(plugin.manifest.entrypoint, PUB_PLUGIN_ENTRYPOINT);
-        // The budgets are the manifest's own defaults for absent fields; the
-        // package's pubspec version is deliberately not read.
-        assert_eq!(plugin.manifest.version, "0.0.0");
-        assert_eq!(plugin.manifest.timeouts, Timeouts::default());
-        assert_eq!(plugin.manifest.memory_budget_mb, DEFAULT_MEMORY_BUDGET_MB);
-        assert!(plugin.manifest.capabilities.is_empty());
+        assert!(report.plugins.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].path, options);
+        assert!(
+            report.skipped[0].error.to_string().contains("unported"),
+            "the declaration is the anomaly: {:?}",
+            report.skipped[0].error
+        );
     }
 
     #[test]
@@ -589,8 +557,8 @@ mod tests {
         let workspace = Workspace::new("pub_dir_manifest");
         let root = workspace.package("derped");
         // A pathological ported plugin: `dartq_plugin.json` exists, but as a
-        // directory. The issue must name the manifest, not fall through to
-        // the derived entrypoint it shadows.
+        // directory. The issue must name the manifest itself, never fall
+        // through to the manifest-less (bootstrap) arm.
         std::fs::create_dir_all(root.join(MANIFEST_FILE_NAME)).expect("create manifest dir");
         let options = workspace.path().join("analysis_options.yaml");
 

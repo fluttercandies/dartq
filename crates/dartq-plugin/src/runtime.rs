@@ -242,9 +242,10 @@ impl SpawnSpec {
     /// - `source` / `kernel`: `dart <entrypoint>`. Both share the argv;
     ///   they differ in what the VM does with the file. A source script is
     ///   compiled by the VM's in-process CFE at startup; a kernel snapshot
-    ///   (`.dill`) is recognized by magic number and loaded precompiled —
-    ///   no CFE source compile runs in the child (upstream Dart SDK source,
-    ///   `runtime/bin/dfe.cc`).
+    ///   (`.dill`) — and a trained app-jit snapshot (`.jit`, the
+    ///   bootstrap's per-plugin cache) — is recognized by magic number and
+    ///   loaded precompiled, no CFE source compile in the child (upstream
+    ///   Dart SDK source, `runtime/bin/dfe.cc`).
     /// - `exe`: the self-contained `dart compile exe` product is spawned
     ///   directly — no `dart` front end at all. The path is absolutized:
     ///   the executable is resolved against the *parent's* working

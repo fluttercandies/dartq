@@ -115,6 +115,37 @@
 //! dependents are deliberately not marked: the changed set is the files
 //! the client wrote.
 //!
+//! # Analyzed set — the whole-root contract
+//!
+//! The session's analyzed set is the `analysis.setAnalysisRoots`
+//! equivalent: the whole workspace tree from the session's bound (the
+//! directory holding `package_config.json`) down, expanded through the
+//! same context-root machinery the oracle's `ContextLocator` runs —
+//! every package root inside the bound **plus** every discovered nested
+//! self-resolved context root (a directory carrying its own
+//! `pubspec.yaml` + `.dart_tool/package_config.json`, the
+//! `packageConfigFileToUse != containingRoot.packagesFile` trigger of
+//! context_locator.dart:305-307), each carved out of its enclosing root's
+//! walk (`containingRoot.excluded.add(folder)`) and walked whole: dot
+//! paths never enter, the governing options' `exclude` globs prune per
+//! declaring directory, and no root descends into another. Per-file
+//! options resolve the deepest governing `analysis_options.yaml`
+//! (`deepest_containing` over the located map — the oracle's
+//! `optionsFileMap`).
+//!
+//! **This face's oracle is the analysis server's behavior on an
+//! identical `setAnalysisRoots` call — not `dart analyze <target>`.**
+//! The CLI face's target scoping is a *filter* over this same set (the
+//! shared `covered` rule the `dartq/analyze` pull applies to its
+//! targets), never a different analyzed set: a root-wide file outside
+//! every target still lands in the publish pushes and the unfiltered
+//! diagnostics, exactly as the server's whole-root errors notifications
+//! cover it. Differential runs against this face must therefore build
+//! the oracle answer from `analysis.setAnalysisRoots(<bound>)` on the
+//! same tree — never from a `dart analyze` invocation, whose
+//! `includedPaths` scoping drops precisely the rows this face exists to
+//! surface.
+//!
 //! # Warm-turn answers (#4240)
 //!
 //! A quiet warm turn's rendered `dartq/analyze` answer is a pure function
@@ -1748,10 +1779,14 @@ impl Session {
         self.quit.cancel();
     }
 
-    /// The session-start workspace sweep: discover every surface file
+    /// The session-start workspace sweep: discover the whole analyzed set
     /// into every context (content is shared, each engine interns its own
     /// residency) and enqueue the initial default-context analysis read
-    /// (its publishes flow from the turn's drain).
+    /// (its publishes flow from the turn's drain). The walked set is the
+    /// `analysis.setAnalysisRoots`-equivalent whole-root set — every
+    /// package root inside the bound plus each discovered nested context
+    /// root carved out of its enclosing root; see the module docs'
+    /// "Analyzed set" section for the contract and its oracle.
     ///
     /// # Errors
     ///
@@ -3884,6 +3919,23 @@ impl Session {
                 .map(|(path, file)| (path.clone(), file.set_at()))
                 .collect()
         });
+        // The plugin merge, ahead of the answers when this group carries
+        // them: the core publish is staged above (zero plugin interaction
+        // shared its latency), and the weave's findings — engine-shaped
+        // through the same conversion the one-shot CLI face applies — join
+        // the analyze answers' row set beside the crash rows, so a one-shot
+        // `dartq/analyze` ask renders the plugin rows the cold face renders.
+        // The bounded per-plugin drain prices the answers' latency exactly
+        // as `dart analyze` prices its own plugin merge; the publish face
+        // stages its wire rows below, appended after the engine rows.
+        let plugin_rows: Vec<Diagnostic> = if self.carries_plugins(context, agent) {
+            let (answer_rows, findings, crashes) =
+                self.weave_plugins(context, anchor, &diagnostics);
+            self.publish_plugin_rows(context, findings, crashes, turn);
+            answer_rows
+        } else {
+            Vec::new()
+        };
         let changes = commands::Changes::new(&self.changed, agent_changed);
         // Disjoint field borrows: runtime (read), workspace_root/changed
         // (read), symbols (read — the table is mutex-guarded; the full-tier
@@ -3898,6 +3950,7 @@ impl Session {
             root: &self.workspace_root,
             sdk_root: &self.sdk_root,
             diagnostics: &diagnostics,
+            plugin_rows: &plugin_rows,
             changes: &changes,
             cursor: self.cursor,
             advisory: self.workspace_advisory.as_ref(),
@@ -3912,23 +3965,15 @@ impl Session {
         // cacheable shape this group answered stores under the epoch as it
         // stands now — writes apply and universes rebuild ahead of the
         // read arm on this same thread, so an edit turn stores the very
-        // state it just answered and the next quiet turn serves it.
+        // state it just answered and the next quiet turn serves it. A
+        // plugin-bearing group never caches (its cycle is an observable of
+        // its own), so the plugin rows can never freeze in an answer.
         if answer_cacheable {
             self.store_answers(
                 self.answer_epoch,
                 &answer_keys,
                 &turn.answers[answers_before..],
             );
-        }
-        // The plugin merge step, strictly last: the plugin set is consulted
-        // only after the core publish is staged and the group's answers are
-        // built, so the bounded per-plugin drain (the timeout isolation) can
-        // never delay either. A plugin-bearing group is always the base
-        // group ([`Self::carries_plugins`]), so its rows ride this turn's
-        // publishes, appended after the engine rows.
-        if self.carries_plugins(context, agent) {
-            let (findings, crashes) = self.weave_plugins(context, anchor, &diagnostics);
-            self.publish_plugin_rows(context, findings, crashes, turn);
         }
     }
 
@@ -4042,6 +4087,7 @@ impl Session {
             root: &self.workspace_root,
             sdk_root: &self.sdk_root,
             diagnostics: &diagnostics,
+            plugin_rows: &[],
             changes: &changes,
             cursor: self.cursor,
             advisory: self.workspace_advisory.as_ref(),
@@ -4113,7 +4159,11 @@ impl Session {
         context: ContextId,
         anchor: Option<FileId>,
         engine_rows: &[Diagnostic],
-    ) -> (Vec<plugins::PluginFinding>, Vec<Diagnostic>) {
+    ) -> (
+        Vec<Diagnostic>,
+        Vec<plugins::PluginFinding>,
+        Vec<Diagnostic>,
+    ) {
         // Direct field access (not `self.engine`): the plugins' mutable
         // borrow and the engine's read must stay disjoint field borrows.
         // Invariant: the read task's context is session-lived, so the lookup cannot miss.
@@ -4191,29 +4241,43 @@ impl Session {
             let cycle =
                 self.plugins
                     .cycle(engine_rows, engine.file_table(), anchor, &cycle_context);
+            let resident = |file: FileId| {
+                let index = engine.line_index(file)?;
+                let text = engine.content(file)?;
+                // Invariant: the read layer decodes content lossily, so the bytes are
+                // valid UTF-8 (engine read-layer contract).
+                Some((
+                    index,
+                    std::str::from_utf8(text).expect("engine content is valid UTF-8"),
+                ))
+            };
             let findings = plugins::resolve_findings(
                 &cycle.findings,
                 engine.file_table(),
-                |file| {
-                    let index = engine.line_index(file)?;
-                    let text = engine.content(file)?;
-                    // Invariant: the read layer decodes content lossily, so the bytes are
-                    // valid UTF-8 (engine read-layer contract).
-                    Some((
-                        index,
-                        std::str::from_utf8(text).expect("engine content is valid UTF-8"),
-                    ))
-                },
+                resident,
                 &governing,
             );
-            (findings, cycle.crashes)
+            // The answer face's rows: the same engine-shape conversion the
+            // one-shot CLI face applies (`dartq_commands::plugins`), so a
+            // rendered `dartq/analyze` answer's plugin rows match the cold
+            // face's byte for byte — crashes ride beside the findings,
+            // unfiltered by any covered rule (the crash anchor may name any
+            // analyzed file), exactly the cold face's merge contract.
+            let answer_rows = dartq_commands::plugins::resolve_findings(
+                &cycle.findings,
+                engine.file_table(),
+                resident,
+                &governing,
+            );
+            let answer_rows = cycle.crashes.iter().cloned().chain(answer_rows).collect();
+            (answer_rows, findings, cycle.crashes)
         }));
-        if let Ok((findings, crashes)) = woven {
-            (findings, crashes)
+        if let Ok((answer_rows, findings, crashes)) = woven {
+            (answer_rows, findings, crashes)
         } else {
             eprintln!("dartq-daemon: the plugin cycle panicked; this cycle's findings are skipped");
             self.penalize_plugins("a panic in the plugin cycle");
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         }
     }
 
@@ -10340,6 +10404,82 @@ mod tests {
             turn.publishes.is_empty(),
             "the crash row never repeats: {:?}",
             turn.publishes
+        );
+    }
+
+    /// The one-shot answer face carries the plugin weave's rows: a queued
+    /// `dartq/analyze` ask on the plugin-bearing base group renders the
+    /// crash row beside the engine rows in its `diags` — the cold CLI
+    /// face's merge contract, where the crash rides unfiltered by any
+    /// covered rule (its anchor may name any analyzed file). The publish
+    /// face keeps its own staging; this pins the answer face alone.
+    #[test]
+    fn a_failing_plugin_surfaces_its_crash_row_in_the_analyze_answer() {
+        let (_workspace, mut session) = fixture("plugin-crash-answer");
+        session.inject_plugins(PluginSet::with_dead_plugin(
+            "dead",
+            "restart budget of 3 exhausted",
+        ));
+
+        session.sweep().expect("sweep");
+        session.queue_command(
+            RequestId::Num(1),
+            Request::Analyze {
+                targets: Vec::new(),
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: false,
+            },
+        );
+        let turn = session.service();
+        let view = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("analyze answers")
+            .as_value();
+        let entries = view["diags"].as_array().expect("diagnostics array");
+        let codes: Vec<&str> = entries
+            .iter()
+            .map(|row| row["code"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            codes.contains(&dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name),
+            "the crash row rides the answer beside the engine rows: {entries:?}"
+        );
+        assert!(
+            codes.contains(&"uri_does_not_exist"),
+            "the engine rows stay in the answer: {entries:?}"
+        );
+
+        // Once per session: the crash spent itself on the first cycle, so
+        // the next ask's answer carries the engine rows alone.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                targets: Vec::new(),
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                serve_early: false,
+            },
+        );
+        let turn = session.service();
+        let view = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("analyze answers")
+            .as_value();
+        let entries = view["diags"].as_array().expect("diagnostics array");
+        let codes: Vec<&str> = entries
+            .iter()
+            .map(|row| row["code"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            !codes.contains(&dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name),
+            "the crash row never repeats in an answer: {entries:?}"
         );
     }
 

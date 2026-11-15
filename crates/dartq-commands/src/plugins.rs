@@ -24,8 +24,10 @@
 //! # Blocking posture (synchronous-core policy)
 //!
 //! Every face here blocks the calling thread — the analyze run's thread —
-//! by design: [`PluginSet::launch`] spends only the discovery walks (no
-//! sidecar starts there); the first spawn handshake lands inside
+//! by design: [`PluginSet::launch`] spends the discovery walks plus, when
+//! the options declare plugins the pub-native arm cannot resolve, the
+//! bootstrap's one `dart pub get` (no sidecar starts there); the first
+//! spawn handshake lands inside
 //! [`PluginSet::cycle`]'s launch pass on the first cycle that has something
 //! to feed, and the cycle spends at most one [`DRAIN_BUDGET`] per plugin
 //! waiting for findings.
@@ -58,12 +60,12 @@ use std::time::Instant;
 
 use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, FileId, FindingOrigin, Severity};
 use dartq_engine::Engine;
-use dartq_engine::analysis_options::{AnalysisOptions, ConfiguredSeverity};
+use dartq_engine::analysis_options::{AnalysisOptions, ConfiguredSeverity, PluginSource};
 use dartq_index::{DeclRow, FileCapture};
 use dartq_plugin::{
-    CycleConfig, CyclePush, PendingQuery, PluginDiagnostic, PluginRuntime, PubNative, QueryKind,
-    RuleCensus, RuleKind, RuntimeError, Severity as PluginSeverity, SpawnSpec, crash_diagnostic,
-    discover,
+    CycleConfig, CyclePush, DiscoveredPlugin, DiscoveryError, OfficialPlugin, OfficialSource,
+    PendingQuery, PluginDiagnostic, PluginRuntime, PubNative, QueryKind, RuleCensus, RuleKind,
+    RuntimeError, Severity as PluginSeverity, SpawnSpec, bootstrap, crash_diagnostic, discover,
 };
 use dartq_pub::PackageConfig;
 use dartq_source::{FileTable, LineIndex, SourceRange, utf16_len_of};
@@ -107,11 +109,13 @@ type QueryServer<'a> = &'a dyn Fn(&PendingQuery) -> QueryAnswer;
 
 /// The census code's attribution for the finding conversion: the declaring
 /// rule's lowercased name (the `diagnostics` rule-level gate key) and its
-/// kind (the diagnostic-family pick).
+/// kind (the diagnostic-family pick). Public: the daemon's streaming
+/// plugin set builds the same map from the same census (its wire-side
+/// conversion gates identically), so one shape serves both faces.
 #[derive(Clone)]
-struct CodeMeta {
-    rule: String,
-    kind: RuleKind,
+pub struct CodeMeta {
+    pub rule: String,
+    pub kind: RuleKind,
 }
 
 /// One rule of a census, resolved for the cycle.
@@ -212,6 +216,125 @@ fn cycle_config(
     }
 }
 
+/// The engine source model → the bootstrap's mirror ([`OfficialSource`]):
+/// the two enums are shape-identical by design (the bootstrap is the spawn
+/// face of the same upstream `_parsePluginSource` family), so this is a
+/// field-for-field re-tag.
+fn official_source(source: &PluginSource) -> OfficialSource {
+    match source {
+        PluginSource::Versioned { constraint, hosted } => OfficialSource::Versioned {
+            constraint: constraint.clone(),
+            hosted: hosted.clone(),
+        },
+        PluginSource::Git {
+            url,
+            path,
+            reference,
+            tag_pattern,
+        } => OfficialSource::Git {
+            url: url.clone(),
+            path: path.clone(),
+            reference: reference.clone(),
+            tag_pattern: tag_pattern.clone(),
+        },
+        PluginSource::Path(path) => OfficialSource::Path(path.clone()),
+    }
+}
+
+/// The declared-but-unresolved official plugins of `options`, as bootstrap
+/// inputs: every `plugins:` entry whose name the pub-native discovery
+/// resolved (a name in `resolved`) drops — that arm already serves it —
+/// and the section's `dependency_overrides` ride along verbatim (they only
+/// ever apply to the synthetic package). Pure: no spawn, no filesystem.
+fn unresolved_official(
+    options: &AnalysisOptions,
+    resolved: &[String],
+) -> (Vec<OfficialPlugin>, Vec<(String, OfficialSource)>) {
+    let plugins = options
+        .plugins
+        .iter()
+        .filter(|config| !resolved.iter().any(|name| name == &config.name))
+        .map(|config| OfficialPlugin {
+            name: config.name.clone(),
+            source: official_source(&config.source),
+        })
+        .collect();
+    let overrides = options
+        .plugin_dependency_overrides
+        .as_ref()
+        .map(|map| {
+            map.iter()
+                .map(|(name, source)| (name.clone(), official_source(source)))
+                .collect()
+        })
+        .unwrap_or_default();
+    (plugins, overrides)
+}
+
+/// The official-plugins bootstrap outcome for one launch.
+pub struct BootstrapOutcome {
+    /// Spawn-ready plugins from the materialized synthetic package
+    /// (`dartq-plugin`'s bootstrap), appended after discovery's hits.
+    pub spawned: Vec<DiscoveredPlugin>,
+    /// (declared name, failure) pairs, one per declaration the bootstrap
+    /// could not serve — each surfaces as the face's one-shot
+    /// `dartq/plugin_crashed` row.
+    pub failed: Vec<(String, RuntimeError)>,
+}
+
+/// The launch faces' official-plugins arm: re-parses the governing options
+/// file through the engine's own loader (the full source model — invalid
+/// declarations stay the options face's rows and never reach a spawn),
+/// drops every declaration the pub-native discovery already resolved, and
+/// bootstraps the rest through the synthetic package
+/// ([`dartq_plugin::bootstrap`]: materialize, one `dart pub get`, generated
+/// `startPlugin` entrypoints). The empty shapes cost nothing: an absent
+/// options file or an all-resolved declaration set returns the empty
+/// outcome without a host lookup or a pub run.
+///
+/// A bootstrap failure is terminal for the declared set — the synthetic
+/// package is one pub resolution — and surfaces once per declaration (the
+/// caller logs it and records the crash-row failure): the dartq mirror of
+/// the official `PluginException` → stderr-only face, per the engine's
+/// source-pinned plugins model.
+#[must_use]
+pub fn bootstrap_declared(
+    options_file: &Path,
+    resolved: &[String],
+    pub_config: &PackageConfig,
+    config_dir: &Path,
+) -> BootstrapOutcome {
+    let mut outcome = BootstrapOutcome {
+        spawned: Vec::new(),
+        failed: Vec::new(),
+    };
+    if options_file.as_os_str().is_empty() {
+        return outcome;
+    }
+    let options = AnalysisOptions::load(options_file, pub_config, config_dir);
+    let (plugins, overrides) = unresolved_official(&options, resolved);
+    if plugins.is_empty() {
+        return outcome;
+    }
+    match bootstrap(&plugins, &overrides) {
+        Ok(spawned) => outcome.spawned = spawned,
+        Err(error) => {
+            outcome.failed = plugins
+                .into_iter()
+                .map(|plugin| {
+                    (
+                        plugin.name,
+                        RuntimeError::Crashed {
+                            reason: error.to_string(),
+                        },
+                    )
+                })
+                .collect();
+        }
+    }
+    outcome
+}
+
 /// Every plugin discovered under the workspace's `plugins/` convention plus
 /// the governing options' pub-native `plugins:` section (including
 /// `path:`-valued entries, resolved directly against their directories), in
@@ -240,27 +363,64 @@ struct PluginSlot {
     crash_emitted: bool,
 }
 
+/// One spawn-ready plugin's lazy slot: no sidecar starts at construction —
+/// the first cycle that feeds spawns it ([`PluginRuntime::lazy`]). The
+/// analyze face opts into the Query API: the run owns the engine view the
+/// reverse queries answer against.
+fn lazy_slot(plugin: DiscoveredPlugin) -> PluginSlot {
+    let name = plugin.manifest.name.clone();
+    let spec = SpawnSpec {
+        serve_queries: true,
+        ..SpawnSpec::dart(&plugin.dir, plugin.manifest)
+    };
+    PluginSlot {
+        name,
+        runtime: Some(PluginRuntime::lazy(spec)),
+        pending_crash: None,
+        crash_emitted: false,
+    }
+}
+
+/// One dead-on-arrival slot: the plugin never spawned (the bootstrap's
+/// terminal failure), recorded as the run's one-shot crash row against the
+/// first cycle that has an anchor.
+fn dead_slot(name: String, error: RuntimeError) -> PluginSlot {
+    PluginSlot {
+        name,
+        runtime: None,
+        pending_crash: Some(Box::new(error)),
+        crash_emitted: false,
+    }
+}
+
 impl PluginSet {
     /// Discovers plugins from the workspace's explicit sources — the
     /// `plugins/` convention and the governing `analysis_options`' pub-native
     /// `plugins:` section resolved through `pub_config` (the parsed
     /// `package_config.json` in `config_dir`, augmented by each
     /// `path:`-declared name's synthetic entry — a pub-resolved entry wins
-    /// over a `path:` shadow, matching upstream's precedence). **No sidecar
+    /// over a `path:` shadow, matching upstream's precedence) — plus the
+    /// official-plugins bootstrap for every declaration that arm cannot
+    /// resolve ([`bootstrap_declared`]: the synthetic package, one
+    /// `dart pub get`, generated `startPlugin` entrypoints). **No sidecar
     /// process starts here**: every runtime is built lazy, and the first
     /// generation spawns at the first cycle that has something to feed.
     ///
-    /// The whole boot cost, once per run: the options locator walk and read
-    /// plus the `plugins/` convention scan. A workspace that declares no
-    /// plugins and ships no `plugins/` directory pays the two absence
-    /// probes and allocates nothing; the per-cycle path then reduces to
-    /// [`PluginSet::is_empty`].
+    /// The whole boot cost, once per run: the options locator walk and
+    /// read, the `plugins/` convention scan, and — only when declarations
+    /// stay unresolved — the bootstrap's pub resolution. A workspace that
+    /// declares no plugins and ships no `plugins/` directory pays the two
+    /// absence probes and allocates nothing; the per-cycle path then
+    /// reduces to [`PluginSet::is_empty`].
     ///
     /// Skipped plugins (malformed, missing entrypoint, duplicate name,
-    /// declared but unresolved) are logged and ignored. A plugin whose
-    /// later spawn fails surfaces through the ordinary crash path on the
-    /// cycle that first needs it — one `dartq/plugin_crashed` row, the run
-    /// alive.
+    /// declared but unresolved) are logged and ignored — except the
+    /// declared-but-unresolved official plugins the bootstrap arm takes
+    /// over. A bootstrap failure is terminal for the declared set and
+    /// surfaces like a spawn failure — one `dartq/plugin_crashed` row per
+    /// declared plugin on the first anchored cycle, the run alive. A
+    /// plugin whose later spawn fails surfaces the same way on the cycle
+    /// that first needs it.
     #[must_use]
     pub fn launch(workspace_root: &Path, pub_config: &PackageConfig, config_dir: &Path) -> Self {
         let declared = declared_plugin_sources(workspace_root);
@@ -294,32 +454,47 @@ impl PluginSet {
                 options_file,
             },
         );
+        // The official-plugins arm: every declaration the pub-native
+        // resolution above could not serve bootstraps through the synthetic
+        // package — its pub run happens here, at boot; the spawn stays
+        // lazy like every other slot's.
+        let resolved: Vec<String> = report
+            .plugins
+            .iter()
+            .map(|plugin| plugin.manifest.name.clone())
+            .collect();
+        let boot = bootstrap_declared(options_file, &resolved, pub_config, config_dir);
+        // A declaration the bootstrap owns suppresses its discovery skip
+        // row — the "not resolved by pub; run `pub get`" hint would mislead
+        // for a plugin dartq is serving right here.
+        let bootstrapped: FxHashSet<&str> = boot
+            .spawned
+            .iter()
+            .map(|plugin| plugin.manifest.name.as_str())
+            .chain(boot.failed.iter().map(|(name, _)| name.as_str()))
+            .collect();
         for issue in &report.skipped {
+            if let DiscoveryError::Unresolved(name) = &issue.error
+                && bootstrapped.contains(name.as_str())
+            {
+                continue;
+            }
             eprintln!(
                 "dartq: skipping plugin manifest `{}`: {}",
                 issue.path.display(),
                 issue.error
             );
         }
-        let plugins = report
-            .plugins
-            .into_iter()
-            .map(|plugin| {
-                let name = plugin.manifest.name.clone();
-                // The analyze face opts into the Query API: the run owns the
-                // engine view the reverse queries answer against.
-                let spec = SpawnSpec {
-                    serve_queries: true,
-                    ..SpawnSpec::dart(&plugin.dir, plugin.manifest)
-                };
-                PluginSlot {
-                    name,
-                    runtime: Some(PluginRuntime::lazy(spec)),
-                    pending_crash: None,
-                    crash_emitted: false,
-                }
-            })
-            .collect();
+        for (name, error) in &boot.failed {
+            eprintln!("dartq: plugin `{name}` failed to bootstrap: {error}");
+        }
+        let mut plugins: Vec<PluginSlot> = report.plugins.into_iter().map(lazy_slot).collect();
+        plugins.extend(boot.spawned.into_iter().map(lazy_slot));
+        plugins.extend(
+            boot.failed
+                .into_iter()
+                .map(|(name, error)| dead_slot(name, error)),
+        );
         Self { plugins }
     }
 
@@ -557,13 +732,16 @@ pub struct Cycle {
 
 /// One plugin's drained findings, in wire arrival order, plus the
 /// census-derived `code → (rule, kind)` map the conversion resolves against.
+/// The daemon's streaming plugin set drains into the same shape (both
+/// faces' conversions gate on `codes`), so its cycle output feeds this
+/// crate's engine-row resolver directly.
 pub struct PluginBatch {
     /// The manifest name (the finding's provenance tag).
     pub name: String,
     /// The plugin's census codes to their rule attribution — the
     /// diagnostic-family lookup ([`intern_code`]) and the per-directory
     /// rule-level `diagnostics` gate's key; empty for a rule-less plugin.
-    codes: FxHashMap<String, CodeMeta>,
+    pub codes: FxHashMap<String, CodeMeta>,
     pub rows: Vec<PluginDiagnostic>,
 }
 
@@ -1085,6 +1263,92 @@ mod tests {
             "file:///synth/synthetic"
         );
         assert!(augmented.entry("pub_only").is_none());
+    }
+
+    /// The bootstrap input face: a declaration the pub-native arm resolved
+    /// drops, the rest convert source-for-source through every declared
+    /// form, and the section's `dependency_overrides` ride along verbatim.
+    #[test]
+    fn unresolved_official_converts_and_filters_declarations() {
+        let workspace = Workspace::new("official");
+        let options_file = workspace.options(
+            "plugins:\n  native:\n    path: ../plugins/native\n  ver: ^1.0.0\n  \
+             hosted_one:\n    version: '>=2.0.0 <3.0.0'\n    \
+             hosted: https://pub.example.com\n  gitty:\n    git:\n      \
+             url: https://example.com/repo.git\n      ref: main\n      \
+             path: packages/gitty\n      tag_pattern: v{version}\n  \
+             dependency_overrides:\n    transitive:\n      path: ../ov/transitive\n",
+        );
+        let options = AnalysisOptions::load(&options_file, &empty_config(), workspace.path());
+        let (plugins, overrides) = unresolved_official(&options, &["native".to_owned()]);
+        assert_eq!(plugins.len(), 3, "the resolved declaration drops");
+        assert_eq!(plugins[0].name, "ver");
+        assert_eq!(
+            plugins[0].source,
+            OfficialSource::Versioned {
+                constraint: "^1.0.0".to_owned(),
+                hosted: None,
+            }
+        );
+        assert_eq!(plugins[1].name, "hosted_one");
+        assert_eq!(
+            plugins[1].source,
+            OfficialSource::Versioned {
+                constraint: ">=2.0.0 <3.0.0".to_owned(),
+                hosted: Some("https://pub.example.com".to_owned()),
+            }
+        );
+        assert_eq!(plugins[2].name, "gitty");
+        assert_eq!(
+            plugins[2].source,
+            OfficialSource::Git {
+                url: "https://example.com/repo.git".to_owned(),
+                path: Some("packages/gitty".to_owned()),
+                reference: Some("main".to_owned()),
+                tag_pattern: Some("v{version}".to_owned()),
+            }
+        );
+        assert_eq!(
+            overrides,
+            vec![(
+                "transitive".to_owned(),
+                OfficialSource::Path(dartq_pub::normalize(
+                    &workspace.path().join("../ov/transitive")
+                )),
+            )],
+            "the override's relative path joins the options dir, upstream-arms style"
+        );
+    }
+
+    /// A `path:` declaration the pub-native arm missed keeps its engine
+    /// shape: already absolute (the parse joined and normalized it against
+    /// the options dir), re-tagged as the bootstrap's `Path`.
+    #[test]
+    fn unresolved_official_keeps_path_declarations_absolute() {
+        let workspace = Workspace::new("official_path");
+        let options_file = workspace.options("plugins:\n  local:\n    path: ../plugins/local\n");
+        let options = AnalysisOptions::load(&options_file, &empty_config(), workspace.path());
+        let (plugins, overrides) = unresolved_official(&options, &[]);
+        assert_eq!(
+            plugins,
+            vec![OfficialPlugin {
+                name: "local".to_owned(),
+                source: OfficialSource::Path(dartq_pub::normalize(
+                    &workspace.path().join("../plugins/local")
+                )),
+            }],
+        );
+        assert!(overrides.is_empty());
+    }
+
+    /// The absent posture of the bootstrap arm: an empty options-file path
+    /// (the no-declaration shape) returns the empty outcome without a host
+    /// lookup or a pub run.
+    #[test]
+    fn bootstrap_declared_absent_options_is_empty() {
+        let outcome = bootstrap_declared(Path::new(""), &[], &empty_config(), Path::new(""));
+        assert!(outcome.spawned.is_empty());
+        assert!(outcome.failed.is_empty());
     }
 
     /// The merge keeps duplicates: a plugin row exactly equal to a built-in

@@ -1542,6 +1542,13 @@ pub(crate) struct Drain<'a> {
     /// the analyze document's rows, the impact environment verdicts'
     /// input, and the delta filters' substrate.
     pub diagnostics: &'a [dartq_diagnostics::Diagnostic],
+    /// The plugin weave's answer rows (engine-shaped, crash rows first
+    /// then findings) — the plugin-bearing base group's addition to the
+    /// analyze document alone. Every other face (check, delta, query,
+    /// impact) reads engine rows only, matching the cold face's split
+    /// where the plugin merge feeds the analyze document's rows. Empty
+    /// for every group that does not carry plugins.
+    pub plugin_rows: &'a [dartq_diagnostics::Diagnostic],
     /// The analyzed view's changed-file table for `since` filtering.
     pub changes: &'a Changes<'a>,
     /// The session's current delta cursor, echoed by delta answers.
@@ -1875,15 +1882,24 @@ pub(crate) fn analyze_answer(
     } else {
         targets
     };
-    let layout = EngineLayout::over(drain.engine, drain.diagnostics.iter().map(|d| d.file));
-    let covered: Vec<Diagnostic> =
-        dartq_commands::analyze::oracle_order(drain.diagnostics, &layout)
-            .into_iter()
-            .filter(|diagnostic| {
-                dartq_commands::analyze::covered(layout.file_path(diagnostic.file), targets)
-            })
-            .cloned()
-            .collect();
+    // Engine rows first, then the plugin weave's answer rows (crashes
+    // first, findings after — the merge order the cold face sends through
+    // the same oracle sort; a stable sort keeps the order for ties). The
+    // layout covers the plugin rows' files too: a plugin-only file's rows
+    // must join the output set or the merged lookups panic (#2164).
+    let rows = drain.diagnostics.iter().chain(drain.plugin_rows.iter());
+    let layout = EngineLayout::over(drain.engine, rows.clone().map(|d| d.file));
+    let covered: Vec<Diagnostic> = dartq_commands::analyze::oracle_order(rows, &layout)
+        .into_iter()
+        .filter(|diagnostic| {
+            // A crash row rides unfiltered (the cold face's contract):
+            // its anchor names any analyzed file, not necessarily one
+            // inside the targets.
+            diagnostic.code.name == dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name
+                || dartq_commands::analyze::covered(layout.file_path(diagnostic.file), targets)
+        })
+        .cloned()
+        .collect();
     let document = DocumentLayout {
         inner: &layout,
         root: drain.engine.packages().workspace_root(),

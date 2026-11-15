@@ -435,10 +435,14 @@ where
     // #306: the clean-shutdown write, window or no window.
     session.flush_snapshot();
 
-    // The plugins' graceful teardown (both the cycle-fed set and the fix
-    // faces' hosts): `shutdown` per live runtime (the handshake; `Drop`
-    // alone is kill-only). Errors log inside.
-    session.shutdown_plugins();
+    // The plugins' graceful teardown is NOT here: this loop ends with the
+    // client connection, and the session (its plugin set included)
+    // outlives it — the serve shell's next client reuses the same set
+    // (`shutdown_plugins` takes the set, so a per-connection call would
+    // hand every later client an empty plugin face and let the answer
+    // cache freeze the plugin-less rows). The handshake runs at the two
+    // real retirements: the serve shell's shutdown ladder (SIGTERM, idle
+    // reap) and the stdio face's process end.
 
     if reader.is_finished() {
         let _ = reader.join();

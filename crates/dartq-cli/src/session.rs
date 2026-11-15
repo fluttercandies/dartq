@@ -1015,6 +1015,11 @@ fn serve_shutdown(
     // the next session cold-started from zero. The dirty gate inside
     // makes a clean session's flush a no-op.
     session.flush_snapshot();
+    // The plugins' graceful teardown (the cycle-fed set and the fix
+    // faces' hosts): per-connection tails no longer take the set (the
+    // session outlives every client), so THIS retirement owns the
+    // handshake — `shutdown` per live runtime; `Drop` alone is kill-only.
+    session.shutdown_plugins();
     let released = session.debug_shutdown().unwrap_or(0);
     let _ = events.append(
         "session",

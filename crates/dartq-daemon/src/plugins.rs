@@ -6,20 +6,22 @@
 //!
 //! # Representation contract (the merge's type-level boundary)
 //!
-//! Plugin *findings* convert directly to [`wire::Diagnostic`] with the
-//! plugin's manifest name as the `source` tag. They never pass through
-//! the engine [`Diagnostic`] — its `CodeInfo` requires `&'static` code
-//! names, and plugin codes are free-form. Only
-//! [`crash_diagnostic`] output (already a legal engine `Diagnostic`) rides
-//! the engine shape: the cycle hands it back beside the findings and the
-//! session's merge step converts it through the engine face into the
-//! turn's publishes — never into the analyze answers.
+//! Plugin *findings* convert to [`wire::Diagnostic`] with the plugin's
+//! manifest name as the `source` tag for the publish face, and through
+//! `dartq_commands::plugins::resolve_findings` to engine [`Diagnostic`]s
+//! for the analyze answers — the same conversion the one-shot CLI face
+//! applies, so a rendered answer's plugin rows match the cold face's
+//! byte for byte. The batches are the commands side's own shape (one
+//! `PluginBatch` type serves both faces' conversions); the wire side
+//! stays the publish face's alone.
 //!
 //! # Blocking posture (synchronous-core policy)
 //!
 //! Every face here blocks the calling thread — the main loop's thread — by
-//! design: [`PluginSet::launch`] spends only the discovery walks (no
-//! sidecar starts there); the first spawn handshake (up to the manifest's
+//! design: [`PluginSet::launch`] spends the discovery walks plus, when the
+//! options declare plugins the pub-native arm cannot resolve, the
+//! bootstrap's one `dart pub get` (no sidecar starts there); the first
+//! spawn handshake (up to the manifest's
 //! `request_ms × (retries + 1)` per plugin, defaults 10 s × 4)
 //! lands inside [`PluginSet::cycle`]'s launch pass on the first cycle that
 //! has something to feed, and each cycle after that waits out at most the
@@ -74,15 +76,16 @@ use std::time::Instant;
 
 use dartq_commands::SCHEMA_VERSION;
 use dartq_commands::fix::{DeclaredPlugin, declared_plugin_sources, plugin_package_config};
+use dartq_commands::plugins::{CodeMeta, PluginBatch, bootstrap_declared};
 use dartq_commands::query as commands_query;
 use dartq_diagnostics::{Diagnostic, FileId};
 use dartq_engine::Engine;
 use dartq_engine::analysis_options::{AnalysisOptions, ConfiguredSeverity};
 use dartq_index::{DeclRow, FileCapture};
 use dartq_plugin::{
-    CycleConfig, CyclePush, PendingQuery, PluginDiagnostic, PluginRuntime, PubNative, QueryKind,
-    RuleCensus, RuleKind, RuntimeError, Severity as PluginSeverity, SpawnSpec, crash_diagnostic,
-    discover,
+    CycleConfig, CyclePush, DiscoveredPlugin, DiscoveryError, PendingQuery, PluginDiagnostic,
+    PluginRuntime, PubNative, QueryKind, RuleCensus, RuleKind, RuntimeError,
+    Severity as PluginSeverity, SpawnSpec, crash_diagnostic, discover,
 };
 use dartq_pub::PackageConfig;
 use dartq_source::{FileTable, LineIndex, SourceRange, utf16_len_of};
@@ -147,14 +150,6 @@ fn serving_diagnostics<'a>(
         .iter()
         .find(|config| config.name == plugin)
         .map(|config| &config.diagnostics)
-}
-
-/// The census code's attribution for the finding conversion: the declaring
-/// rule's lowercased name (the `diagnostics` rule-level gate key) and its
-/// kind.
-#[derive(Clone)]
-struct CodeMeta {
-    rule: String,
 }
 
 /// One rule of a census, resolved for the cycle.
@@ -272,40 +267,80 @@ struct PluginSlot {
     crash_emitted: bool,
 }
 
+/// One spawn-ready plugin's lazy slot: no sidecar starts at construction —
+/// the first cycle that feeds spawns it ([`PluginRuntime::lazy`]). The
+/// analyze face opts into the T4 Query API: the daemon owns the engine
+/// view the reverse queries answer against.
+fn lazy_slot(plugin: DiscoveredPlugin) -> PluginSlot {
+    let name = plugin.manifest.name.clone();
+    let spec = SpawnSpec {
+        serve_queries: true,
+        ..SpawnSpec::dart(&plugin.dir, plugin.manifest)
+    };
+    PluginSlot {
+        name,
+        runtime: Some(PluginRuntime::lazy(spec)),
+        pending_crash: None,
+        crash_emitted: false,
+    }
+}
+
+/// One dead-on-arrival slot: the plugin never spawned (the bootstrap's
+/// terminal failure), recorded as the session's one-shot crash row against
+/// the first cycle that has an anchor.
+fn dead_slot(name: String, error: RuntimeError) -> PluginSlot {
+    PluginSlot {
+        name,
+        runtime: None,
+        pending_crash: Some(Box::new(error)),
+        crash_emitted: false,
+    }
+}
+
 impl PluginSet {
     /// Discovers plugins from the workspace's explicit sources — the
     /// `plugins/` convention and the governing `analysis_options`' pub-native
     /// `plugins:` section resolved through `pub_config` (the parsed
     /// `package_config.json` in `config_dir`, augmented by each
     /// `path:`-declared name's synthetic entry — a pub-resolved entry wins
-    /// over a `path:` shadow, matching upstream's precedence) —
-    /// and registers each hit. **No sidecar process starts here**: every
+    /// over a `path:` shadow, matching upstream's precedence) — plus the
+    /// official-plugins bootstrap for every declaration that arm cannot
+    /// resolve (`bootstrap_declared` on the commands side, the seam the
+    /// declaration faces already share: the synthetic package, one
+    /// `dart pub get`, generated `startPlugin` entrypoints) — and registers
+    /// each hit. **No sidecar process starts here**: every
     /// runtime is built lazy, and the first generation spawns at the first
     /// cycle that has something to feed ([`PluginSet::cycle`]'s launch
     /// pass), so a plugin whose capability is never needed never costs its
     /// resident set.
     ///
     /// This is the plugin subsystem's whole boot cost, once per session:
-    /// the options locator walk and read (`declared_plugin_sources`) and the
-    /// `plugins/` convention scan. A workspace that declares
-    /// no plugins and ships no `plugins/` directory pays the two absence
-    /// probes — one `read_dir` miss, one locator walk — and allocates
-    /// nothing (the `declared` source contributes an empty borrowed slice);
-    /// the per-cycle path then reduces to [`PluginSet::is_empty`].
+    /// the options locator walk and read (`declared_plugin_sources`), the
+    /// `plugins/` convention scan, and — only when declarations stay
+    /// unresolved — the bootstrap's pub resolution. A workspace that
+    /// declares no plugins and ships no `plugins/` directory pays the two
+    /// absence probes — one `read_dir` miss, one locator walk — and
+    /// allocates nothing (the `declared` source contributes an empty
+    /// borrowed slice); the per-cycle path then reduces to
+    /// [`PluginSet::is_empty`].
     ///
     /// Skipped plugins (malformed, missing entrypoint,
-    /// duplicate name, declared but unresolved) are logged and ignored. A
-    /// plugin whose later spawn fails surfaces through the ordinary crash
-    /// path on the cycle that first needs it — one `dartq/plugin_crashed`
-    /// row, the session alive.
+    /// duplicate name, declared but unresolved) are logged and ignored —
+    /// except the declared-but-unresolved official plugins the bootstrap
+    /// arm takes over. A bootstrap failure is terminal for the declared
+    /// set and surfaces like a spawn failure — one `dartq/plugin_crashed`
+    /// row per declared plugin on the first anchored cycle, the session
+    /// alive. A plugin whose later spawn fails surfaces the same way on
+    /// the cycle that first needs it.
     #[must_use]
     pub fn launch(workspace_root: &Path, pub_config: &PackageConfig, config_dir: &Path) -> Self {
         // The declaration seam is the commands side's single fact source
-        // (`declared_plugin_sources` + `plugin_package_config` in
-        // `dartq-commands`' fix face): the daemon depends on `dartq-commands`,
-        // so both faces consume one implementation — the same upstream
-        // `_parsePluginSource` arm order and the same `path:`-augmented
-        // package config — instead of a re-encoded daemon copy.
+        // (`declared_plugin_sources` + `plugin_package_config` +
+        // `bootstrap_declared` in `dartq-commands`): the daemon depends on
+        // `dartq-commands`, so both faces consume one implementation — the
+        // same upstream `_parsePluginSource` arm order, the same
+        // `path:`-augmented package config, and the same official-plugins
+        // bootstrap — instead of a re-encoded daemon copy.
         let declared = declared_plugin_sources(workspace_root);
         // The absent shape: a 'static empty path borrow and an empty vec —
         // the pub-native source contributes nothing and allocates nothing.
@@ -339,32 +374,47 @@ impl PluginSet {
                 options_file,
             },
         );
+        // The official-plugins arm: every declaration the pub-native
+        // resolution above could not serve bootstraps through the synthetic
+        // package — its pub run happens here, at boot; the spawn stays lazy
+        // like every other slot's.
+        let resolved: Vec<String> = report
+            .plugins
+            .iter()
+            .map(|plugin| plugin.manifest.name.clone())
+            .collect();
+        let boot = bootstrap_declared(options_file, &resolved, pub_config, config_dir);
+        // A declaration the bootstrap owns suppresses its discovery skip
+        // row — the "not resolved by pub; run `pub get`" hint would mislead
+        // for a plugin dartq is serving right here.
+        let bootstrapped: FxHashSet<&str> = boot
+            .spawned
+            .iter()
+            .map(|plugin| plugin.manifest.name.as_str())
+            .chain(boot.failed.iter().map(|(name, _)| name.as_str()))
+            .collect();
         for issue in &report.skipped {
+            if let DiscoveryError::Unresolved(name) = &issue.error
+                && bootstrapped.contains(name.as_str())
+            {
+                continue;
+            }
             eprintln!(
                 "dartq-daemon: skipping plugin manifest `{}`: {}",
                 issue.path.display(),
                 issue.error
             );
         }
-        let plugins = report
-            .plugins
-            .into_iter()
-            .map(|plugin| {
-                let name = plugin.manifest.name.clone();
-                // The analyze face opts into the T4 Query API: the daemon
-                // owns the engine view the reverse queries answer against.
-                let spec = SpawnSpec {
-                    serve_queries: true,
-                    ..SpawnSpec::dart(&plugin.dir, plugin.manifest)
-                };
-                PluginSlot {
-                    name,
-                    runtime: Some(PluginRuntime::lazy(spec)),
-                    pending_crash: None,
-                    crash_emitted: false,
-                }
-            })
-            .collect();
+        for (name, error) in &boot.failed {
+            eprintln!("dartq-daemon: plugin `{name}` failed to bootstrap: {error}");
+        }
+        let mut plugins: Vec<PluginSlot> = report.plugins.into_iter().map(lazy_slot).collect();
+        plugins.extend(boot.spawned.into_iter().map(lazy_slot));
+        plugins.extend(
+            boot.failed
+                .into_iter()
+                .map(|(name, error)| dead_slot(name, error)),
+        );
         Self {
             plugins,
             code_owners: FxHashMap::default(),
@@ -524,8 +574,10 @@ impl PluginSet {
                     .unwrap_or_default();
                 let resolved = resolve_census(&census, &slot.name, governing);
                 claim_codes(code_owners, index, &census, &resolved);
-                // The finding conversion's rule-level `diagnostics` gate
-                // key: every census code to its declaring rule's name.
+                // The finding conversion's lookups: every census code to
+                // its rule's name and kind (a code an uncensused emission
+                // names falls back to `STATIC_WARNING` at the answer-side
+                // conversion).
                 let codes = census
                     .iter()
                     .flat_map(|rule| {
@@ -534,6 +586,7 @@ impl PluginSet {
                                 code.name.to_ascii_lowercase(),
                                 CodeMeta {
                                     rule: rule.name.to_ascii_lowercase(),
+                                    kind: rule.kind,
                                 },
                             )
                         })
@@ -750,18 +803,6 @@ pub struct Cycle {
     /// merge step converts and publishes (never the engine vec itself; at
     /// most one per plugin per session).
     pub crashes: Vec<Diagnostic>,
-}
-
-/// One plugin's drained findings, in wire arrival order, plus the
-/// census-derived `code → rule` map the per-directory `diagnostics`
-/// rule-disable gate resolves against.
-pub struct PluginBatch {
-    /// The manifest name (the wire `source` tag for these rows).
-    pub name: String,
-    /// The plugin's census codes to their declaring rule's lowercased name —
-    /// the rule-level `diagnostics` gate key; empty for a rule-less plugin.
-    codes: FxHashMap<String, CodeMeta>,
-    pub rows: Vec<PluginDiagnostic>,
 }
 
 /// One plugin finding resolved onto a resident file, ready for [`merge`].

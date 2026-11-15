@@ -91,6 +91,12 @@
 //!   converts and pushes it (`notification/engine_diagnostics`, one batch
 //!   per analyze cycle) and drains plugin-emitted diagnostics back for the
 //!   caller's output merge. No engine crate changes are required.
+//!   Official `analysis_server_plugin`-style plugins — plain pub packages
+//!   with a top-level `plugin` variable, declared in the options file's
+//!   top-level `plugins:` section — bridge through [`bootstrap`]: the
+//!   synthetic-package counterpart of the official server's generated
+//!   shared plugin entrypoint (see that module's docs), serving each
+//!   declared plugin over wire v1 through the host's import shim.
 //! - **Extension points**: the wire layer is dartq's own v1 (the
 //!   official `analyzer_plugin` protocol is pre-1.0 and adapted here, risk
 //!   R2); the official `registerAssist`/`registerFixForRule` API shape is
@@ -146,6 +152,7 @@
 #![allow(dead_code)]
 #![allow(clippy::drop_non_drop)]
 
+pub mod bootstrap;
 pub mod capability;
 pub mod discovery;
 pub mod frame;
@@ -154,6 +161,7 @@ pub mod runtime;
 pub mod session;
 pub mod stats;
 
+pub use bootstrap::{BootstrapError, OfficialPlugin, OfficialSource, bootstrap};
 pub use capability::{Capability, CapabilitySet};
 pub use discovery::{
     DiscoveredPlugin, DiscoveryError, DiscoveryIssue, DiscoveryReport, PubNative, discover,
