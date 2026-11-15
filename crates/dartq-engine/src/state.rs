@@ -1955,6 +1955,14 @@ pub(crate) struct EngineState {
     /// globs, the lint face reads the rule names.
     pub options: FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>>,
 
+    /// The assembly's discovered nested context roots
+    /// ([`crate::EngineConfig::context_roots`]), kept beside `packages` so
+    /// the analyzed-set derivation ([`context_roots`]) can carve each one
+    /// out of its enclosing root's walk — the oracle's
+    /// `containingRoot.excluded.add(folder)` — even when the merge dropped
+    /// its self entry and the package table never names it.
+    pub(crate) nested_roots: Vec<PathBuf>,
+
     /// Warm-start staging (#482): a loaded facts snapshot's payloads, keyed
     /// by the entry triple. `Engine::ingest_facts_snapshot` fills it; an
     /// apply consumes exact identity matches — the lookup IS the
@@ -2087,9 +2095,14 @@ pub(crate) struct EngineState {
 
 /// The context roots the analysis surfaces derive from: every package root
 /// **inside the workspace bound** — the directory holding
-/// `package_config.json` and its tree — or, when no package qualifies (the
-/// bare no-pubspec floor, `PackageTable::basic` over `None`), the table's
-/// workspace root, the analyzed directory itself.
+/// `package_config.json` and its tree — **plus every discovered nested
+/// context root inside the bound** (the assembly's
+/// [`crate::EngineConfig::context_roots`]: directories carrying their own
+/// `pubspec.yaml` + `.dart_tool/package_config.json`, the oracle's
+/// separate-context-root trigger `packageConfigFileToUse !=
+/// containingRoot.packagesFile`, context_locator.dart:305-307) — or, when no
+/// package qualifies (the bare no-pubspec floor, `PackageTable::basic` over
+/// `None`), the table's workspace root, the analyzed directory itself.
 ///
 /// The bound is the oracle's context root: `PackageConfigWorkspace` is
 /// "rooted at the innermost package-config file" (pub.dart
@@ -2107,7 +2120,18 @@ pub(crate) struct EngineState {
 /// `BasicWorkspace` over `Packages.empty` rooting its context at the
 /// analyzed directory and walking that whole folder
 /// (context_locator.dart:517-522).
-pub(crate) fn context_roots(packages: &IdentityTable) -> Vec<PathBuf> {
+///
+/// The nested-root union is the `containingRoot.excluded.add(folder)` half
+/// of the oracle's split (context_locator.dart:321): a discovered context
+/// root is carved out of every enclosing root's walk — even when the merge
+/// could not keep its self entry (a same-named sibling loses the
+/// one-identity-per-name dedup, so the root never lands in the package
+/// table) — and walked as its own root under its own governing options.
+/// The oracle's other two split triggers are deliberately not roots here:
+/// a different legacy `plugins:` set (`pluginsDiffer`) changes the plugin
+/// host list, not the analyzed set, and `BUILD.gn` (`GnWorkspace`) has no
+/// dartq counterpart.
+pub(crate) fn context_roots(packages: &IdentityTable, nested: &[PathBuf]) -> Vec<PathBuf> {
     let bound = packages.workspace_root();
     let mut roots: Vec<PathBuf> = packages
         .iter()
@@ -2117,6 +2141,16 @@ pub(crate) fn context_roots(packages: &IdentityTable) -> Vec<PathBuf> {
         // roots beneath it stay walked by their own pass (each file is
         // discovered exactly once, attributed to its own package).
         .filter(|root| root.starts_with(bound))
+        // The discovered context roots ride the same bound: the assembly's
+        // nested walk runs inside the analyzed tree, which always sits
+        // inside the bound, so the filter is the same contract a package
+        // root answers.
+        .chain(
+            nested
+                .iter()
+                .filter(|root| root.starts_with(bound))
+                .cloned(),
+        )
         .collect();
     if roots.is_empty() {
         roots.push(bound.to_path_buf());
@@ -2154,7 +2188,7 @@ impl EngineState {
         // time). Built before the grant faces, which read the options
         // experiments (#936).
         let options = crate::analysis_options::AnalysisOptions::for_roots(
-            &context_roots(&packages),
+            &context_roots(&packages, nested_roots),
             pub_config,
             config_dir,
         );
@@ -2164,6 +2198,7 @@ impl EngineState {
             packages,
             uri_packages,
             sdk_file_kinds: Mutex::new(SdkFileKinds::default()),
+            nested_roots: nested_roots.to_vec(),
             sdk,
             feature_grants,
             target,
@@ -3874,6 +3909,38 @@ mod tests {
         assert!(
             !plain.is_enabled(dartq_language::Feature::Augmentations),
             "the baseline stands without a declaring entry"
+        );
+    }
+
+    /// The analyzed-set derivation's nested-root union (#4315): the oracle's
+    /// `containingRoot.excluded.add(folder)` carve-out makes every
+    /// discovered context root its own walk even when the merge dropped its
+    /// self entry — a same-named nested package never lands in the package
+    /// table, so the union is its only membership channel. Roots outside
+    /// the bound stay out (the bound is the contract, not the slice of
+    /// `nested` that happens to fit), an already-present package root
+    /// dedups, and the empty union still falls back to the bound itself.
+    #[test]
+    fn context_roots_unions_discovered_nested_roots_inside_the_bound() {
+        let bound = Path::new("/w");
+        let packages = IdentityTable::basic(bound, Some(("fixture", None))).expect("table");
+        let nested = vec![
+            PathBuf::from("/w/vendor/inner"),
+            PathBuf::from("/elsewhere/inner"),
+            bound.to_path_buf(),
+        ];
+        assert_eq!(
+            context_roots(&packages, &nested),
+            vec![PathBuf::from("/w"), PathBuf::from("/w/vendor/inner")],
+            "the dedup-dropped nested root joins the set inside the bound, \
+             sorted and deduped"
+        );
+        // The bare floor keeps its bound-only answer when nothing nests.
+        let bare = IdentityTable::basic(bound, None).expect("bare table");
+        assert_eq!(
+            context_roots(&bare, &[]),
+            vec![bound.to_path_buf()],
+            "the empty union falls back to the bound"
         );
     }
 }

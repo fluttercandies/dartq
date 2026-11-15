@@ -88,6 +88,11 @@ pub struct Request {
     /// rendered stdout bytes (the face path); `None` keeps the report
     /// line (the compat arm — the pooled join never carries one).
     pub face: Option<Face>,
+    /// Ask the daemon for the per-leg timing breakdown — the
+    /// `--metrics-json` surface. The legs arrive on a separate
+    /// `Answer::Metrics` line and land in the face's `meta.legs`; a
+    /// report-arm or per-run answer carries none.
+    pub metrics: bool,
 }
 
 /// The answer of the resident path.
@@ -178,6 +183,7 @@ pub fn analyze(request: &Request) -> Outcome {
     #[cfg(unix)]
     {
         let face = request.face.clone();
+        let metrics = request.metrics;
         let asked = if spec.pool {
             let mut own = spec.clone();
             own.pool = false;
@@ -187,13 +193,13 @@ pub fn analyze(request: &Request) -> Outcome {
                 // every request behind the pool's own work just to be
                 // refused again. Once the daemon idles out, the next run
                 // asks the pool first.
-                ask_gated(&own, &aims, face.as_ref())
+                ask_gated(&own, &aims, face.as_ref(), metrics)
             } else {
                 // The pool-first path: join the live pooled daemon, or
                 // found it. A refused join falls back to this worktree's
                 // own daemon — started on demand, never silently a second
                 // pooled server.
-                match pool_join(&spec, &aims, face.as_ref()) {
+                match pool_join(&spec, &aims, face.as_ref(), metrics) {
                     Some(PoolAnswer::Report(report)) => return Outcome::Report { report, sdk },
                     Some(PoolAnswer::Face { stdout, meta }) => {
                         return Outcome::Face { stdout, meta, sdk };
@@ -204,11 +210,13 @@ pub fn analyze(request: &Request) -> Outcome {
                     // `Unavailable` are one path. A yielded pooled server
                     // is the same: the worktree's own daemon re-queues
                     // the job.
-                    Some(PoolAnswer::Unavailable) | None => ask_gated(&own, &aims, face.as_ref()),
+                    Some(PoolAnswer::Unavailable) | None => {
+                        ask_gated(&own, &aims, face.as_ref(), metrics)
+                    }
                 }
             }
         } else {
-            ask_gated(&spec, &aims, face.as_ref())
+            ask_gated(&spec, &aims, face.as_ref(), metrics)
         };
         match asked {
             Ok(Answered::Report(report)) => Outcome::Report { report, sdk },
@@ -288,11 +296,16 @@ const YIELD_REQUEUE: Duration = Duration::from_mins(30);
 /// failure, never a per-run `dart analyze`, which would need the same
 /// memory the ledger just refused.
 #[cfg(unix)]
-fn ask_gated(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Result<Answered, String> {
+fn ask_gated(
+    spec: &Spec,
+    aims: &[crate::Aim],
+    face: Option<&Face>,
+    metrics: bool,
+) -> Result<Answered, String> {
     let deadline = std::time::Instant::now() + YIELD_REQUEUE;
     let mut yields = 0u32;
     loop {
-        match ask(spec, aims, face)? {
+        match ask(spec, aims, face, metrics)? {
             Answered::Yielded => {
                 yields += 1;
                 if std::time::Instant::now() + Duration::from_millis(500) >= deadline {
@@ -345,7 +358,12 @@ enum PoolAnswer {
 /// refuses answers [`PoolAnswer::Unavailable`], never a second pooled
 /// analyzer.
 #[cfg(unix)]
-fn pool_join(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Option<PoolAnswer> {
+fn pool_join(
+    spec: &Spec,
+    aims: &[crate::Aim],
+    face: Option<&Face>,
+    metrics: bool,
+) -> Option<PoolAnswer> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
@@ -373,19 +391,24 @@ fn pool_join(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Option<Po
         roots: spec.roots.clone(),
         aims: aims.to_vec(),
         face: face.cloned(),
+        metrics,
     })
     .expect("serializes");
     line.push(b'\n');
     (&stream).write_all(&line).ok()?;
     let mut reader = BufReader::new(&stream);
     let mut answer = String::new();
+    let mut legs = None;
     loop {
         answer.clear();
         reader.read_line(&mut answer).ok()?;
         match serde_json::from_str::<Answer>(&answer) {
             Ok(Answer::Note(note)) => eprintln!("{note}"),
+            Ok(Answer::Metrics(found)) => legs = Some(found),
             Ok(Answer::Report(report)) => return Some(PoolAnswer::Report(report)),
             Ok(Answer::Face { meta, bytes }) => {
+                let mut meta = meta;
+                meta.legs = legs.take();
                 let stdout = read_face(&mut reader, bytes).ok()?;
                 return Some(PoolAnswer::Face {
                     stdout: stdout?,
@@ -406,7 +429,12 @@ fn pool_join(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Option<Po
 
 /// The unix transport: election, start, request.
 #[cfg(unix)]
-fn ask(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Result<Answered, String> {
+fn ask(
+    spec: &Spec,
+    aims: &[crate::Aim],
+    face: Option<&Face>,
+    metrics: bool,
+) -> Result<Answered, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
@@ -436,6 +464,7 @@ fn ask(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Result<Answered
         roots: spec.roots.clone(),
         aims: aims.to_vec(),
         face: face.cloned(),
+        metrics,
     })
     .expect("serializes");
     line.push(b'\n');
@@ -444,6 +473,7 @@ fn ask(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Result<Answered
         .map_err(|error| format!("request failed: {error}"))?;
     let mut reader = BufReader::new(&stream);
     let mut answer = String::new();
+    let mut legs = None;
     loop {
         answer.clear();
         reader
@@ -451,8 +481,11 @@ fn ask(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Result<Answered
             .map_err(|error| format!("no answer: {error}"))?;
         match serde_json::from_str::<Answer>(&answer) {
             Ok(Answer::Note(note)) => eprintln!("{note}"),
+            Ok(Answer::Metrics(found)) => legs = Some(found),
             Ok(Answer::Report(report)) => return Ok(Answered::Report(report)),
             Ok(Answer::Face { meta, bytes }) => {
+                let mut meta = meta;
+                meta.legs = legs.take();
                 let stdout = read_face(&mut reader, bytes)
                     .map_err(|error| format!("no face payload: {error}"))?
                     .ok_or_else(|| "the daemon announced an oversized face".to_string())?;

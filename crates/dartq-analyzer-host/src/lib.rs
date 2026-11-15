@@ -120,7 +120,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use client::{Outcome, Request, analyze};
-pub use face::{Face, FaceFormat, FaceMeta, FaceRender, FaceRenderer};
+pub use face::{Face, FaceFormat, FaceMeta, FaceRender, FaceRenderer, Legs};
 pub use report::{Report, Row};
 pub use support::{Sdk, Support, Version, support};
 

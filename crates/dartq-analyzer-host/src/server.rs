@@ -188,6 +188,10 @@ struct CachedLine {
     /// The full wire bytes, ready to ship (the `Answer::Report` line, or
     /// the `Answer::Face` header line's newline followed by the payload).
     bytes: std::sync::Arc<[u8]>,
+    /// The face render's `(covered files, kept rows)` — `(0, 0)` on the
+    /// report line, which has no face counts. A cache hit restores them
+    /// so a metrics ask reads this shape's own numbers.
+    counts: (u64, u64),
 }
 
 /// The answer cache: one rendered answer per (aims, face) shape,
@@ -256,6 +260,10 @@ struct State {
     epoch: u64,
     /// The rendered `Answer::Report` lines, one per aims shape.
     answers: AnswerCache,
+    /// The last `render_face`'s `(covered files, kept rows)` — the metrics
+    /// legs' `files`/`diagnostics` counts, read by the daemon right after
+    /// the render it asked for (single-threaded asks, no interleaving).
+    face_counts: Option<(u64, u64)>,
 }
 
 #[derive(Default)]
@@ -283,6 +291,18 @@ pub struct Server {
     /// The facts the child was spawned under — an adoption's validation
     /// input (a standby serves the launch it was spawned for, no other).
     launch: Launch,
+    /// The `spawn_and_connect` wall-clock of the current child, ms — the
+    /// `server_spawn_ms` metrics leg. Stays at the standby's own spawn
+    /// figure across an [`Server::adopt`] (that spawn was background work,
+    /// not the borrowing ask's); the daemon reads it only on the fresh-
+    /// start arm.
+    spawn_ms: u64,
+    /// The last roots assignment's split, `(roots_ms, first_pass_ms)`:
+    /// the `analysis.setAnalysisRoots` call's round-trip and the settle
+    /// past it. Rewritten by every [`Server::set_roots_initial`] and
+    /// [`Server::set_roots`]; stale on a warm ask (the daemon reads it
+    /// only when this ask ran a roots assignment).
+    roots_legs: Option<(u64, u64)>,
 }
 
 impl Server {
@@ -330,6 +350,7 @@ impl Server {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let spawned = Instant::now();
         let mut child = command
             .spawn()
             .map_err(|error| Fault::Server(format!("cannot start the analysis server: {error}")))?;
@@ -343,7 +364,7 @@ impl Server {
         std::thread::spawn(move || {
             let _ = std::io::copy(&mut stderr, &mut std::io::sink());
         });
-        let server = Self {
+        let mut server = Self {
             child,
             stdin,
             shared,
@@ -351,8 +372,11 @@ impl Server {
             budget,
             peak: 0,
             launch: launch.clone(),
+            spawn_ms: 0,
+            roots_legs: None,
         };
         server.await_connected(launch.sdk.version)?;
+        server.spawn_ms = u64::try_from(spawned.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(server)
     }
 
@@ -384,6 +408,9 @@ impl Server {
         }
         let sdk = launch.sdk.version;
         standby.await_connected(sdk)?;
+        // The standby's spawn was background warm work, not this ask's
+        // wait — the adoption's own cost is the roots assignment below.
+        standby.spawn_ms = 0;
         let settled = standby.set_roots_initial(roots, &mut brake);
         if let Err(fault) = settled {
             standby.kill();
@@ -433,13 +460,24 @@ impl Server {
             "server.setSubscriptions",
             json!({"subscriptions": ["STATUS"]}),
         )?;
-        let included: Vec<String> = roots.iter().map(|root| root_spelling(root)).collect();
+        let included: Vec<String> = analysis_included(roots)
+            .iter()
+            .map(|root| root_spelling(root))
+            .collect();
         let mark = self.mark();
+        let called = Instant::now();
         self.call(
             "analysis.setAnalysisRoots",
             json!({"included": included, "excluded": []}),
         )?;
-        self.settle(mark, brake)
+        let roots_ms = u64::try_from(called.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let settling = Instant::now();
+        self.settle(mark, brake)?;
+        self.roots_legs = Some((
+            roots_ms,
+            u64::try_from(settling.elapsed().as_millis()).unwrap_or(u64::MAX),
+        ));
+        Ok(())
     }
 
     /// Replaces the server's analysis roots — the pooled daemon's
@@ -454,13 +492,23 @@ impl Server {
         roots: &[PathBuf],
         mut brake: impl FnMut() -> bool,
     ) -> Result<(), Fault> {
-        let included: Vec<String> = roots.iter().map(|root| root_spelling(root)).collect();
+        let included: Vec<String> = analysis_included(roots)
+            .iter()
+            .map(|root| root_spelling(root))
+            .collect();
         let mark = self.mark();
+        let called = Instant::now();
         self.call(
             "analysis.setAnalysisRoots",
             json!({"included": included, "excluded": []}),
         )?;
+        let roots_ms = u64::try_from(called.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let settling = Instant::now();
         self.settle(mark, &mut brake)?;
+        self.roots_legs = Some((
+            roots_ms,
+            u64::try_from(settling.elapsed().as_millis()).unwrap_or(u64::MAX),
+        ));
         // The served set changed (a join or an eviction): the pushed
         // notifications during the re-analysis already bumped the epoch,
         // and this drop is the belt to that suspender — a line rendered
@@ -589,6 +637,27 @@ impl Server {
     #[must_use]
     pub fn peak(&self) -> u64 {
         self.peak
+    }
+
+    /// The metrics legs this server can vouch for: `(server_spawn_ms,
+    /// roots_ms, first_pass_ms)`. `spawn_ms` is the current child's
+    /// spawn-to-connect wall-clock; `roots_ms`/`first_pass_ms` are the
+    /// last roots assignment's call round-trip and settle. The daemon
+    /// reads them only on the arms that ran those operations this ask —
+    /// a warm ask's values are the stale figures of an earlier start.
+    #[must_use]
+    pub fn metrics_legs(&self) -> (u64, u64, u64) {
+        let (roots_ms, first_pass_ms) = self.roots_legs.unwrap_or((0, 0));
+        (self.spawn_ms, roots_ms, first_pass_ms)
+    }
+
+    /// The last face render's `(covered files, kept rows)` — the metrics
+    /// legs' `files`/`diagnostics`. `(0, 0)` before any face render or
+    /// after a report-line render.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn face_counts(&self) -> (u64, u64) {
+        self.shared.state.lock().face_counts.unwrap_or((0, 0))
     }
 
     /// `server.shutdown`, then the tree's kill and reap.
@@ -753,6 +822,381 @@ fn root_spelling(root: &Path) -> String {
     }
 }
 
+/// The `included` set the server is asked to analyze, canonicalized to
+/// one context root per distinct analysis unit — the duplicate-context
+/// pass elimination (#4311). The analysis server builds a context per
+/// `included` root that names a different package-config closure, so a
+/// nested pub workspace's member aimed alongside its outer workspace
+/// root pays two full analysis passes over the same files; the printed
+/// report dedups the pushes, but the wall is paid twice.
+///
+/// The canonical set drops a root that is a strict descendant of a kept
+/// ancestor when the ancestor's walk reaches it under the same package
+/// config — the server's own auto-created context then covers the
+/// subtree once. Two guards keep a descendant root when dropping it
+/// would change what the server analyzes:
+///
+/// * **Dot-prefixed components**: `_createContextRootsIn.isExcluded`
+///   skips any folder whose `shortName` starts with `.` — a descendant
+///   under `.dart_tool`, `.idea`, etc. is unreachable by the ancestor's
+///   walk, so its explicit root is the only one that analyzes it.
+/// * **`analysis_options.yaml` `exclude:` patterns**: a descendant whose
+///   path the nearest governing options file excludes (or any options
+///   file between the ancestor and the descendant's parent excludes) is
+///   skipped by the ancestor's walk — the explicit root must stay so
+///   the file still gets analyzed under its own context.
+///
+/// `include:` chains and non-glob-safe patterns (`**`, `{`, `}`, `[`,
+/// `]`) keep the descendant: the included file's options may differ
+/// from the ancestor's, and a mis-evaluated glob could wrongly drop a
+/// needed root.
+///
+/// The function is pure: the caller's `roots` order and the server's
+/// `excluded` parameter (always empty upstream) are unchanged — only the
+/// `included` list is narrowed. A descendant that survives the guards
+/// is kept verbatim.
+fn analysis_included(roots: &[PathBuf]) -> Vec<PathBuf> {
+    // Sort shallow-first (ties by path) so an ancestor is always judged
+    // before its descendants — a dropped descendant never shields a
+    // deeper one — and the kept set comes out in one canonical order no
+    // matter how the caller spelled the input. Identical roots dedup.
+    let mut ordered: Vec<PathBuf> = roots.to_vec();
+    ordered.sort_by(|a, b| {
+        a.components()
+            .count()
+            .cmp(&b.components().count())
+            .then_with(|| a.cmp(b))
+    });
+    ordered.dedup();
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(ordered.len());
+    for root in ordered {
+        // A root is dropped when a kept ancestor's walk reaches it:
+        // strict descendant, no dot-prefixed component in between, and
+        // no options `exclude:` pattern matching it.
+        let drop = kept
+            .iter()
+            .any(|ancestor| descendant_reachable(ancestor, &root));
+        if !drop {
+            kept.push(root);
+        }
+    }
+    kept
+}
+
+/// Whether `descendant`'s path is reachable by `ancestor`'s context
+/// walk — the guards of [`analysis_included`]. Returns `false` when
+/// `ancestor` does not strictly contain `descendant`, when a
+/// dot-prefixed component sits between them, or when an
+/// `analysis_options.yaml` `exclude:` pattern matches the descendant.
+fn descendant_reachable(ancestor: &Path, descendant: &Path) -> bool {
+    let rel = match descendant.strip_prefix(ancestor) {
+        Ok(rel) if !rel.as_os_str().is_empty() => rel,
+        _ => return false,
+    };
+    // Guard 1: a dot-prefixed component in the relative path means the
+    // ancestor's walk skips this subtree (`isExcluded` checks
+    // `shortName.startsWith('.')`).
+    if rel.components().any(|c| {
+        c.as_os_str()
+            .as_encoded_bytes()
+            .first()
+            .is_some_and(|b| *b == b'.')
+    }) {
+        return false;
+    }
+    // Guard 2: an `analysis_options.yaml` `exclude:` pattern that
+    // matches the descendant's path (relative to the options file's
+    // parent) means the ancestor's walk skips it.
+    if options_exclude_matches(ancestor, descendant) {
+        return false;
+    }
+    true
+}
+
+/// Whether any `analysis_options.yaml` governing `descendant` carries
+/// an `exclude:` pattern matching `descendant`'s path or any directory
+/// above it inside the options file's scope. The candidates are the
+/// options files the ancestor's context collects: the nearest
+/// `analysis_options.yaml` at or above the ancestor (its governing
+/// file), then every options file in the directories strictly between
+/// the ancestor and the descendant's parent, inclusive of the parent —
+/// the same set the server's `_getExcludedGlobs` builds for the
+/// containing root as its walk descends.
+///
+/// Conservative by construction: `include:` chains, glob
+/// metacharacters beyond `*`/`?`, unreadable or malformed YAML — every
+/// case the simple evaluator cannot prove — returns `true` (the
+/// descendant root stays).
+fn options_exclude_matches(ancestor: &Path, descendant: &Path) -> bool {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    // The governing file: walk up from the ancestor, first
+    // `analysis_options.yaml` found.
+    for dir in ancestor.ancestors() {
+        let candidate = dir.join("analysis_options.yaml");
+        if candidate.is_file() {
+            candidates.push(candidate);
+            break;
+        }
+    }
+    // The intermediate options files: every directory the ancestor's
+    // walk descends through on the way to the descendant, down to and
+    // including the descendant's parent. The descendant's own
+    // `analysis_options.yaml` (if any) governs its children, not the
+    // descendant folder itself — it is not a candidate.
+    let mut dir = ancestor.to_path_buf();
+    loop {
+        let rel = match descendant.strip_prefix(&dir) {
+            Ok(rel) => rel,
+            Err(_) => break,
+        };
+        let Some(first) = rel.components().next() else {
+            break;
+        };
+        dir.push(first);
+        let candidate = dir.join("analysis_options.yaml");
+        if candidate.is_file() {
+            candidates.push(candidate);
+        }
+        if dir == descendant.parent().unwrap_or(descendant) {
+            break;
+        }
+    }
+    candidates
+        .iter()
+        .any(|options| exclude_pattern_matches(options, descendant))
+}
+
+/// Whether `options`'s `analyzer.exclude:` list contains a pattern
+/// matching `descendant`'s path — or any directory above it — relative
+/// to `options`'s parent directory. The walk checks `isExcluded` per
+/// folder, so a pattern matching an ancestor directory of the
+/// descendant excludes the whole subtree beneath it. The match is the
+/// server's `Glob` semantics: `*` within a segment, `?` one character,
+/// `**` across segments. Unreadable files, `include:` chains, and
+/// patterns the evaluator cannot prove all keep the descendant
+/// (return `true`).
+fn exclude_pattern_matches(options: &Path, descendant: &Path) -> bool {
+    let Some(parent) = options.parent() else {
+        return true; // cannot relativize — keep
+    };
+    let Ok(rel) = descendant.strip_prefix(parent) else {
+        return false; // outside this options file's scope
+    };
+    let Ok(text) = std::fs::read_to_string(options) else {
+        return true; // unreadable — keep
+    };
+    // A top-level `include:` key means the options file's excludes may
+    // come from an included file this scan cannot see — keep.
+    if text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !line.starts_with(' ')
+            && !line.starts_with('\t')
+            && trimmed
+                .split(':')
+                .next()
+                .is_some_and(|key| key.trim() == "include")
+    }) {
+        return true;
+    }
+    // The `exclude:` list lives under the top-level `analyzer:` key —
+    // a two-level scan: enter `analyzer:`, then collect `- item` lines
+    // under its `exclude:` key until the next key at the same or a
+    // shallower indent.
+    let Some(patterns) = analyzer_exclude_patterns(&text) else {
+        return true; // malformed — keep
+    };
+    // Every directory prefix of the descendant's relative path is a
+    // folder the walk visits before reaching the descendant: a pattern
+    // matching any of them excludes the descendant's subtree.
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for component in rel.components() {
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(&component.as_os_str().to_string_lossy());
+        prefixes.push(current.clone());
+    }
+    patterns
+        .iter()
+        .any(|pattern| prefixes.iter().any(|prefix| glob_match(pattern, prefix)))
+}
+
+/// Extracts the `analyzer.exclude:` pattern strings from options YAML
+/// text. Returns `None` when the file's structure is too unusual for
+/// the line scan to trust (the caller keeps the descendant). The scan
+/// is deliberately narrow: `analyzer:` at column 0, `exclude:` nested
+/// one level under it, `- item` entries under that.
+fn analyzer_exclude_patterns(text: &str) -> Option<Vec<String>> {
+    let mut in_analyzer = false;
+    let mut analyzer_indent = 0usize;
+    let mut in_exclude = false;
+    let mut exclude_indent = 0usize;
+    let mut patterns = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim_start();
+        // Leaving `analyzer:` ends its block.
+        if in_analyzer && indent <= analyzer_indent && !trimmed.starts_with("analyzer:") {
+            break;
+        }
+        if !in_analyzer {
+            if indent == 0 && trimmed.starts_with("analyzer:") {
+                // Flow-style (`analyzer: {…}`) or a scalar value is
+                // beyond the line scan — keep the descendant.
+                if trimmed["analyzer:".len()..].trim().is_empty() {
+                    in_analyzer = true;
+                    analyzer_indent = indent;
+                } else {
+                    return None;
+                }
+            }
+            continue;
+        }
+        // Inside `analyzer:`: `exclude:` at one level deeper.
+        if !in_exclude {
+            if indent > analyzer_indent && trimmed.starts_with("exclude:") {
+                // Flow-style or scalar `exclude:` is beyond the scan.
+                if trimmed["exclude:".len()..].trim().is_empty() {
+                    in_exclude = true;
+                    exclude_indent = indent;
+                } else {
+                    return None;
+                }
+            }
+            continue;
+        }
+        // Inside `exclude:`: `- item` lines, or the block ends at a
+        // key at the same-or-shallower indent.
+        if indent <= exclude_indent && !trimmed.starts_with("- ") {
+            break;
+        }
+        if let Some(item) = trimmed.strip_prefix("- ") {
+            let pattern = item.trim().trim_matches(|c| c == '\'' || c == '"');
+            if pattern.is_empty() {
+                return None;
+            }
+            patterns.push(pattern.to_owned());
+        }
+    }
+    Some(patterns)
+}
+
+/// The recursive glob matcher over a `/`-separated relative path: `*`
+/// matches within a segment, `?` one character, `**` across segments.
+/// The server's `Glob` uses posix separators, so callers spell paths
+/// with `/`. Conservative: `**` crosses `/`, `*` and
+/// `?` stay within a segment, and a pattern containing `{`, `}`, `[`,
+/// `]` (character classes and alternation the simple evaluator does
+/// not implement) returns `true` — the caller keeps the descendant.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    // One fuel budget for the whole match: `**/` prefix and `**`
+    // segment backtracking are both exponential on adversarial patterns,
+    // so exhaustion answers `true` — the conservative keep, never a
+    // wrong drop (the caller keeps the descendant root).
+    let mut fuel = 100_000u32;
+    glob_match_fuel(pattern, text, &mut fuel)
+}
+
+fn glob_match_fuel(pattern: &str, text: &str, fuel: &mut u32) -> bool {
+    if *fuel == 0 {
+        return true;
+    }
+    *fuel -= 1;
+    // Character classes and alternation are beyond the simple
+    // evaluator — keep the descendant rather than misjudge.
+    if pattern.contains(['{', '}', '[', ']']) {
+        return true;
+    }
+    // Fast path: no metacharacters — literal compare.
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return pattern == text;
+    }
+    // `**/` at the start matches zero or more leading directories.
+    if let Some(rest) = pattern.strip_prefix("**/") {
+        if glob_match_fuel(rest, text, fuel) {
+            return true;
+        }
+        for (i, c) in text.char_indices() {
+            if c == '/' && glob_match_fuel(rest, &text[i + 1..], fuel) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // Trailing `/**` matches the directory and everything under it.
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return text == prefix || text.starts_with(&format!("{prefix}/"));
+    }
+    // Segment-wise match.
+    let pat_segs: Vec<&str> = pattern.split('/').collect();
+    let txt_segs: Vec<&str> = text.split('/').collect();
+    segment_match(&pat_segs, &txt_segs, fuel)
+}
+
+/// Matches pattern segments against text segments: `**` consumes zero
+/// or more text segments, other segments match literally with `*`/`?`
+/// wildcards within the segment.
+fn segment_match(pattern: &[&str], text: &[&str], fuel: &mut u32) -> bool {
+    if *fuel == 0 {
+        return true;
+    }
+    *fuel -= 1;
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    if pattern[0] == "**" {
+        for skip in 0..=text.len() {
+            if segment_match(&pattern[1..], &text[skip..], fuel) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if text.is_empty() {
+        return false;
+    }
+    segment_glob_match(pattern[0], text[0], fuel) && segment_match(&pattern[1..], &text[1..], fuel)
+}
+
+/// Matches one pattern segment against one text segment: `*` any
+/// sequence, `?` one character, all else literal. `fuel` is the shared
+/// match budget — `*` backtracking is exponential in the star count on
+/// adversarial input, so exhaustion answers `true` (the conservative
+/// keep, never a wrong drop).
+fn segment_glob_match(pattern: &str, text: &str, fuel: &mut u32) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    segment_glob_inner(&p, &t, fuel)
+}
+
+fn segment_glob_inner(pattern: &[char], text: &[char], fuel: &mut u32) -> bool {
+    if *fuel == 0 {
+        return true;
+    }
+    *fuel -= 1;
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    match pattern[0] {
+        '*' => {
+            for skip in 0..=text.len() {
+                if segment_glob_inner(&pattern[1..], &text[skip..], fuel) {
+                    return true;
+                }
+            }
+            false
+        }
+        '?' => !text.is_empty() && segment_glob_inner(&pattern[1..], &text[1..], fuel),
+        c => {
+            !text.is_empty() && text[0] == c && segment_glob_inner(&pattern[1..], &text[1..], fuel)
+        }
+    }
+}
+
 /// The scoped report over one error map: the covered files' rows, or
 /// `None` when a `.dart` file aim names no analyzed file (the per-run
 /// fallback signal).
@@ -842,6 +1286,7 @@ impl State {
             CachedLine {
                 epoch: self.epoch,
                 bytes: std::sync::Arc::clone(&bytes),
+                counts: (0, 0),
             },
         );
         Some(bytes)
@@ -863,6 +1308,10 @@ impl State {
         if let Some(hit) = self.answers.get(&key)
             && hit.epoch == self.epoch
         {
+            // The hit's counts were computed at render time and ride the
+            // cache entry — a metrics ask over a cached face still reads
+            // this shape's own numbers.
+            self.face_counts = Some(hit.counts);
             return Some(std::sync::Arc::clone(&hit.bytes));
         }
         // The face's row view: `&Row` references beside the sort legs, so
@@ -875,10 +1324,12 @@ impl State {
             row: &'a Row,
         }
         let mut srows: Vec<Srow<'_>> = Vec::new();
+        let mut covered_files = 0u64;
         for (file, errors) in &mut self.files {
             if !aims.is_empty() && !crate::covered(Path::new(&**file), aims) {
                 continue;
             }
+            covered_files += 1;
             let rows = &errors.rows;
             let seg = errors.segs.get_or_insert_with(|| file_seg(file, rows));
             // Each fragment indexes its own `Row` — the one
@@ -891,6 +1342,8 @@ impl State {
                 row: &rows[frag.row as usize],
             }));
         }
+        let counts = (covered_files, srows.len() as u64);
+        self.face_counts = Some(counts);
         srows.sort_by(|a, b| {
             a.rank
                 .cmp(&b.rank)
@@ -914,6 +1367,7 @@ impl State {
             CachedLine {
                 epoch: self.epoch,
                 bytes: std::sync::Arc::clone(&bytes),
+                counts,
             },
         );
         Some(bytes)
@@ -1189,6 +1643,155 @@ mod tests {
     fn roots_are_spelled_without_trailing_separators() {
         assert_eq!(root_spelling(Path::new("/p/app/")), "/p/app");
         assert_eq!(root_spelling(Path::new("/")), "/");
+    }
+
+    /// The canonical `included` set: a descendant root drops when a kept
+    /// ancestor's walk reaches it — the nested-workspace duplicate pass
+    /// this eliminates. Every guard keeps the descendant when dropping
+    /// it would change what the server analyzes.
+    #[test]
+    fn analysis_included_drops_reachable_descendants_and_keeps_guarded_ones() {
+        let base = PathBuf::from("/w");
+        let outer = base.join("outer");
+        let nested = outer.join("nested");
+        let member = nested.join("member");
+        let deep = member.join("deep");
+
+        // The nested-workspace shape: outer + nested + member — both
+        // descendants drop. The ancestor's walk auto-creates a context
+        // at `nested` (its own package_config differs from the outer's)
+        // covering the whole nested subtree, so the explicit roots
+        // would only double-specify what the server already builds.
+        let roots = vec![outer.clone(), nested.clone(), member.clone()];
+        let canonical = analysis_included(&roots);
+        assert_eq!(
+            canonical,
+            vec![outer.clone()],
+            "only the outermost root stays — the server's own walk \
+             builds the nested contexts"
+        );
+
+        // A deeper descendant of a dropped root is still judged
+        // against the kept ancestors: `deep` under `member` drops too
+        // (outer's walk reaches it through nested/member).
+        let roots = vec![outer.clone(), member.clone(), deep.clone()];
+        let canonical = analysis_included(&roots);
+        assert_eq!(canonical, vec![outer.clone()]);
+
+        // A dot-prefixed component keeps the descendant: `.dart_tool`
+        // and `.idea` subtrees are skipped by the ancestor's walk.
+        let hidden = outer.join(".hidden");
+        let roots = vec![outer.clone(), hidden.clone()];
+        assert_eq!(analysis_included(&roots), vec![outer.clone(), hidden]);
+
+        // A non-descendant keeps its root: siblings never drop each
+        // other.
+        let sibling = base.join("sibling");
+        let roots = vec![outer.clone(), sibling.clone()];
+        assert_eq!(analysis_included(&roots), vec![outer.clone(), sibling]);
+
+        // Identical roots dedup to one.
+        let roots = vec![outer.clone(), outer.clone()];
+        assert_eq!(analysis_included(&roots), vec![outer]);
+    }
+
+    /// `analysis_included`'s output is deterministic regardless of
+    /// input order: the shallow-first sort decides drops, and the kept
+    /// set comes out in that same order.
+    #[test]
+    fn analysis_included_is_input_order_independent() {
+        let base = PathBuf::from("/w");
+        let outer = base.join("outer");
+        let member = outer.join("nested/member");
+        let sibling = base.join("sibling");
+        let forward = analysis_included(&[outer.clone(), member.clone(), sibling.clone()]);
+        let reversed = analysis_included(&[sibling.clone(), member, outer.clone()]);
+        assert_eq!(forward, reversed, "same set, same canonical order");
+        assert_eq!(forward.len(), 2, "outer + sibling survive");
+    }
+
+    /// The `exclude:` guard: an `analysis_options.yaml` under the
+    /// ancestor whose `analyzer.exclude:` names the descendant (or a
+    /// directory above it) keeps the descendant root — the ancestor's
+    /// walk would skip it.
+    #[test]
+    fn analysis_included_keeps_descendants_the_options_exclude() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonical");
+        let outer = base.join("outer");
+        let excluded = outer.join("gen");
+        let kept = outer.join("lib");
+        std::fs::create_dir_all(&excluded).expect("mkdir");
+        std::fs::create_dir_all(&kept).expect("mkdir");
+        std::fs::write(
+            outer.join("analysis_options.yaml"),
+            "analyzer:\n  exclude:\n    - gen\n",
+        )
+        .expect("options");
+
+        // `gen` is excluded by the outer's options — its root stays.
+        let roots = vec![outer.clone(), excluded.clone()];
+        let canonical = analysis_included(&roots);
+        assert!(canonical.contains(&outer));
+        assert!(
+            canonical.contains(&excluded),
+            "an excluded descendant keeps its root"
+        );
+
+        // `lib` is not excluded — its root drops.
+        let roots = vec![outer.clone(), kept.clone()];
+        let canonical = analysis_included(&roots);
+        assert!(canonical.contains(&outer));
+        assert!(!canonical.contains(&kept));
+
+        // A glob pattern (`gen/**`) also keeps the descendant.
+        std::fs::write(
+            outer.join("analysis_options.yaml"),
+            "analyzer:\n  exclude:\n    - 'gen/**'\n",
+        )
+        .expect("options");
+        let roots = vec![outer.clone(), excluded.clone()];
+        assert!(analysis_included(&roots).contains(&excluded));
+
+        // An `include:` chain keeps the descendant — the included
+        // file's excludes are beyond the scan.
+        std::fs::write(
+            outer.join("analysis_options.yaml"),
+            "include: other.yaml\nanalyzer:\n  exclude:\n    - gen\n",
+        )
+        .expect("options");
+        let roots = vec![outer.clone(), excluded.clone()];
+        assert!(analysis_included(&roots).contains(&excluded));
+    }
+
+    /// The glob matcher: the server's `Glob` semantics over relative
+    /// paths — `*` within a segment, `?` one character, `**` across
+    /// segments, and the conservative `true` on constructs the
+    /// evaluator does not implement.
+    #[test]
+    fn glob_match_follows_the_servers_glob_semantics() {
+        // Literals and `*`/`?` within a segment.
+        assert!(glob_match("foo", "foo"));
+        assert!(!glob_match("foo", "bar"));
+        assert!(glob_match("foo/*", "foo/bar"));
+        assert!(!glob_match("foo/*", "foo/bar/baz"));
+        assert!(glob_match("f?o", "foo"));
+        assert!(!glob_match("f?o", "fo"));
+        assert!(glob_match("*.dart", "a.dart"));
+        assert!(glob_match("gen_*", "gen_tmp"));
+
+        // `**` crosses segments.
+        assert!(glob_match("**/gen", "a/b/gen"));
+        assert!(glob_match("a/**/c", "a/b/c"));
+        assert!(glob_match("a/**/c", "a/c"));
+        assert!(glob_match("foo/**", "foo"));
+        assert!(glob_match("foo/**", "foo/bar/baz"));
+        assert!(!glob_match("foo/**", "bar/foo"));
+
+        // Character classes and alternation are beyond the evaluator —
+        // conservative `true`.
+        assert!(glob_match("foo[0-9]", "anything"));
+        assert!(glob_match("{a,b}", "anything"));
     }
 
     /// The scoped report: directory aims cover their files, `.dart` file

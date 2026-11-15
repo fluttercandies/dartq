@@ -82,6 +82,12 @@ pub(crate) struct Ask {
     /// arm — pre-face asks get the report line.
     #[serde(default)]
     pub face: Option<Face>,
+    /// Ask for the per-leg timing breakdown — the `--metrics-json`
+    /// surface. The daemon answers an [`Answer::Metrics`] line ahead of
+    /// the terminal answer; the client folds it into the face's
+    /// `meta.legs`. `false` sends no such line.
+    #[serde(default)]
+    pub metrics: bool,
 }
 
 /// One daemon answer line. [`Answer::Note`] lines (gate waits, released
@@ -107,6 +113,14 @@ pub(crate) enum Answer {
     /// caller falls back to a per-run `dart analyze` without a reason
     /// line — the run is correct, just not resident-served.
     NotServed,
+    /// The per-leg timing breakdown of a metrics ask, sent as its own
+    /// line immediately before the terminal answer (the timings are only
+    /// final once the render and persist legs have run, so they cannot
+    /// ride inside the answer's own header). The client merges it into
+    /// the face's `meta.legs`; asks without the `metrics` flag never see
+    /// it, and the answer-record family never stores it (the record is
+    /// the face wire alone).
+    Metrics(crate::face::Legs),
     /// The growth brake fired mid-request: the daemon killed its server
     /// and freed its lease (the observed peak is already recorded). The
     /// client re-queues behind the job gate — FIFO, never a per-run
@@ -457,6 +471,12 @@ struct Host {
     /// tree rewrites the bytes already on disk, so the write is skipped
     /// until it moves.
     record_saved: Option<([u8; 16], u64)>,
+    /// The in-flight ask's leg timings, reset at each `analyze`/
+    /// `analyze_scoped` entry and read once the terminal answer is built
+    /// — sent as [`Answer::Metrics`] ahead of it when the ask carried
+    /// the `metrics` flag. Timing is always collected (an `Instant` pair
+    /// is free); only the send is gated.
+    ask_legs: crate::face::Legs,
 }
 
 impl Host {
@@ -527,6 +547,7 @@ impl Host {
             records: records_enabled(&spec.roots),
             record_capture: None,
             record_saved: None,
+            ask_legs: crate::face::Legs::default(),
         }
     }
 
@@ -695,6 +716,13 @@ impl Host {
                 Some(server) => server.set_roots(&roots, || sample(disk, brake)),
                 None => Ok(()),
             };
+            if outcome.is_ok()
+                && let Some(server) = self.server.as_ref()
+            {
+                let (_, roots_ms, first_pass_ms) = server.metrics_legs();
+                self.ask_legs.roots_ms = roots_ms;
+                self.ask_legs.first_pass_ms = first_pass_ms;
+            }
             if let Err(fault) = outcome {
                 return match fault {
                     Fault::Budget { budget, measured } => {
@@ -772,18 +800,38 @@ impl Host {
                     // the clean face is the writer's render over no
                     // rows.
                     if owned.is_empty() {
+                        let rendering = Instant::now();
                         let render = (self.renderer)(&[], face);
+                        self.ask_legs.report_ms =
+                            u64::try_from(rendering.elapsed().as_millis()).unwrap_or(u64::MAX);
                         let Some(mut wire) = face_header(&render.meta, render.bytes.len()) else {
                             return Reply::Answer(Answer::NotServed);
                         };
                         wire.extend_from_slice(&render.bytes);
                         let line: Arc<[u8]> = wire.into();
+                        let peak = server.peak();
+                        let persisting = Instant::now();
                         self.record_persist(&owned, Some(face), &line);
+                        self.ask_legs.record_persist_ms =
+                            u64::try_from(persisting.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        self.ask_legs.max_rss_bytes = peak;
                         return Reply::Line(line);
                     }
-                    match server.render_face(&owned, face, self.renderer) {
+                    let rendering = Instant::now();
+                    let rendered = server.render_face(&owned, face, self.renderer);
+                    self.ask_legs.report_ms =
+                        u64::try_from(rendering.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    match rendered {
                         Some(line) => {
+                            let (files, diagnostics) = server.face_counts();
+                            let peak = server.peak();
+                            self.ask_legs.files = files;
+                            self.ask_legs.diagnostics = diagnostics;
+                            let persisting = Instant::now();
                             self.record_persist(&owned, Some(face), &line);
+                            self.ask_legs.record_persist_ms =
+                                u64::try_from(persisting.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            self.ask_legs.max_rss_bytes = peak;
                             Reply::Line(line)
                         }
                         None => Reply::Answer(Answer::NotServed),
@@ -826,14 +874,31 @@ impl Host {
         // One `statvfs`: a cache volume under the disk floor kicks an
         // urgent budget pass on the background thread.
         self.disk.check();
+        let mut metrics = false;
         let reply = match serde_json::from_str::<Ask>(&line) {
-            Ok(ask) if self.pooled => self.join(&stream, ask),
-            Ok(ask) if ask.roots == self.roots => {
-                self.analyze(&stream, &ask.aims, ask.face.as_ref())
+            Ok(ask) => {
+                metrics = ask.metrics;
+                self.ask_legs = crate::face::Legs::default();
+                let started = Instant::now();
+                let reply = if self.pooled {
+                    self.join(&stream, ask)
+                } else if ask.roots == self.roots {
+                    self.analyze(&stream, &ask.aims, ask.face.as_ref())
+                } else {
+                    Reply::Answer(Answer::Fault("the daemon serves other roots".into()))
+                };
+                self.ask_legs.total_ms =
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                reply
             }
-            Ok(_) => Reply::Answer(Answer::Fault("the daemon serves other roots".into())),
             Err(error) => Reply::Answer(Answer::Fault(format!("unreadable request: {error}"))),
         };
+        if metrics {
+            send_reply(
+                &stream,
+                Reply::Answer(Answer::Metrics(self.ask_legs.clone())),
+            );
+        }
         send_reply(&stream, reply);
         if let Some(lease) = &self.lease {
             lease.touch();
@@ -879,13 +944,28 @@ impl Host {
             Ok(()) => {
                 let server = self.server.as_ref().expect("a live server");
                 match face {
-                    Some(face) => match server.render_face(aims, face, self.renderer) {
-                        Some(line) => {
-                            self.record_persist(aims, Some(face), &line);
-                            Reply::Line(line)
+                    Some(face) => {
+                        let rendering = Instant::now();
+                        let rendered = server.render_face(aims, face, self.renderer);
+                        self.ask_legs.report_ms =
+                            u64::try_from(rendering.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        match rendered {
+                            Some(line) => {
+                                let (files, diagnostics) = server.face_counts();
+                                let peak = server.peak();
+                                self.ask_legs.files = files;
+                                self.ask_legs.diagnostics = diagnostics;
+                                let persisting = Instant::now();
+                                self.record_persist(aims, Some(face), &line);
+                                self.ask_legs.record_persist_ms =
+                                    u64::try_from(persisting.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX);
+                                self.ask_legs.max_rss_bytes = peak;
+                                Reply::Line(line)
+                            }
+                            None => Reply::Answer(Answer::NotServed),
                         }
-                        None => Reply::Answer(Answer::NotServed),
-                    },
+                    }
                     None => match server.render(aims) {
                         Some(line) => {
                             self.record_persist(aims, None, &line);
@@ -1008,11 +1088,14 @@ impl Host {
         // therefore never waits for the background priming walk; the
         // next ask settles it (and every later check pays the normal
         // freshness pass).
+        let checking = Instant::now();
         let diff = if cold_freshness_skip(self.server.is_some(), self.freshness.primed()) {
             Diff::default()
         } else {
             self.freshness.check(&roots)
         };
+        self.ask_legs.freshness_ms =
+            u64::try_from(checking.elapsed().as_millis()).unwrap_or(u64::MAX);
         // The sizing figure rides the walk the oracle already paid.
         self.source_bytes = self.freshness.dart_bytes().or(self.source_bytes);
         self.note_degradation(client);
@@ -1024,6 +1107,7 @@ impl Host {
         // faulting is a `fault`, an absent one a plain `start`.
         let served = self.server.is_some();
         let (brake, disk) = (&mut self.brake, &self.disk);
+        let settling = Instant::now();
         let outcome = match self.server.as_mut() {
             Some(server) if !diff.changed.is_empty() => {
                 // Incremental edit: never yield to the growth brake. This arm
@@ -1047,6 +1131,11 @@ impl Host {
             Some(server) => server.wait_idle(|| sample(disk, brake)),
             None => Err(Fault::Server("no server yet".into())),
         };
+        // The warm settle is this ask's analysis pass; the no-server arm
+        // measured ~0 and the start arm below overwrites with the fresh
+        // server's own legs.
+        self.ask_legs.first_pass_ms =
+            u64::try_from(settling.elapsed().as_millis()).unwrap_or(u64::MAX);
         let outcome = match outcome {
             Ok(()) => Ok(()),
             Err(Fault::Budget { budget, measured }) => {
@@ -1166,15 +1255,25 @@ impl Host {
         client: &UnixStream,
         why: &'static str,
     ) -> Result<(), Fault> {
-        match standby_admit(self.warm, self.standby.is_some(), self.sdk_facts_current()) {
-            None => self.start_fresh(launch, client, why),
-            Some(Adopt::Adopt) => self.start_by_adoption(launch, client),
-            Some(Adopt::Miss) => self.start_fresh(launch, client, "warm-miss"),
-            Some(Adopt::StaleSdk) => {
-                self.stop_standby("warm-stale-sdk");
-                self.start_fresh(launch, client, "warm-miss")
-            }
+        let started =
+            match standby_admit(self.warm, self.standby.is_some(), self.sdk_facts_current()) {
+                None => self.start_fresh(launch, client, why),
+                Some(Adopt::Adopt) => self.start_by_adoption(launch, client),
+                Some(Adopt::Miss) => self.start_fresh(launch, client, "warm-miss"),
+                Some(Adopt::StaleSdk) => {
+                    self.stop_standby("warm-stale-sdk");
+                    self.start_fresh(launch, client, "warm-miss")
+                }
+            };
+        if started.is_ok()
+            && let Some(server) = self.server.as_ref()
+        {
+            let (spawn_ms, roots_ms, first_pass_ms) = server.metrics_legs();
+            self.ask_legs.server_spawn_ms = spawn_ms;
+            self.ask_legs.roots_ms = roots_ms;
+            self.ask_legs.first_pass_ms = first_pass_ms;
         }
+        started
     }
 
     /// The fresh-spawn arm of [`Host::start`]: exactly the start the

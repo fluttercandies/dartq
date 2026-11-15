@@ -1508,7 +1508,7 @@ impl Engine {
     ///
     /// Propagates I/O errors from reading discovered files.
     pub fn discover_workspace(&mut self) -> std::io::Result<DiscoveryStats> {
-        let roots = state::context_roots(&self.state.packages);
+        let roots = state::context_roots(&self.state.packages, &self.state.nested_roots);
 
         let mut stats = DiscoveryStats::default();
         // Every package root, so a parent's walk stops at a nested root:
@@ -1626,7 +1626,7 @@ impl Engine {
     /// read and stat failures skip the file (the next pass retries — a
     /// transient race is never a failed refresh).
     pub fn refresh_workspace(&mut self, live_path_cap: usize) -> std::io::Result<RefreshStats> {
-        let roots = state::context_roots(&self.state.packages);
+        let roots = state::context_roots(&self.state.packages, &self.state.nested_roots);
         let all_roots: FxHashSet<PathBuf> = roots.iter().cloned().collect();
         let options = &self.state.options;
         let accepted: Vec<Vec<PathBuf>> = roots
@@ -1714,6 +1714,7 @@ impl Engine {
             &self.state.packages,
             &self.state.options,
             &self.context_root,
+            &self.state.nested_roots,
         )
     }
 }
@@ -1760,10 +1761,11 @@ fn workspace_stamps(
     packages: &PackageTable,
     options: &rustc_hash::FxHashMap<PathBuf, std::sync::Arc<analysis_options::AnalysisOptions>>,
     context_root: &Path,
+    nested_roots: &[PathBuf],
 ) -> Vec<(PathBuf, state::persist::AnswerStamp)> {
     // The discovered `.dart` universe: exactly the walk discovery
     // enqueues, stat-only.
-    let roots = state::context_roots(packages);
+    let roots = state::context_roots(packages, nested_roots);
     let all_roots: FxHashSet<PathBuf> = roots.iter().cloned().collect();
     let mut paths: Vec<PathBuf> = roots
         .par_iter()
@@ -1894,7 +1896,7 @@ pub fn probe_answer_unassembled(
             )
         });
         let options = analysis_options::AnalysisOptions::for_roots(
-            &state::context_roots(&config.packages),
+            &state::context_roots(&config.packages, &config.context_roots),
             &config.pub_config,
             &config.config_dir,
         );
@@ -1906,7 +1908,12 @@ pub fn probe_answer_unassembled(
             &config.experiments,
         )
         .fingerprint();
-        let stamps = workspace_stamps(&config.packages, &options, &config.config_dir);
+        let stamps = workspace_stamps(
+            &config.packages,
+            &options,
+            &config.config_dir,
+            &config.context_roots,
+        );
         (
             header.join().expect("the header derivation cannot panic"),
             grants,

@@ -53,6 +53,56 @@ pub enum FaceFormat {
     Text,
 }
 
+/// The per-leg wall-clock breakdown of one resident ask, in milliseconds.
+/// The daemon ships it on an `Answer::Metrics` line ahead of a metrics
+/// ask's terminal answer; the client folds it into [`FaceMeta::legs`] —
+/// the official face's `--metrics-json` legs. Every leg is `0` on the
+/// arms that never paid it (a warm ask pays no spawn or roots pass; a
+/// record hit pays no analysis at all).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Legs {
+    /// The analysis-server child's spawn through `server.connected` —
+    /// `0` when the ask rode a live server.
+    #[serde(default)]
+    pub server_spawn_ms: u64,
+    /// The `analysis.setAnalysisRoots` call's own round-trip — the
+    /// request-to-response latency before the analysis settles.
+    #[serde(default)]
+    pub roots_ms: u64,
+    /// The analysis pass the ask waited on: the `setAnalysisRoots`
+    /// settle on a cold start or adoption, the incremental
+    /// `analysis.changed`/idle settle on a warm one — the "first pass"
+    /// in the sense that it is the one full analysis this ask paid.
+    #[serde(default)]
+    pub first_pass_ms: u64,
+    /// The freshness walk/check the ask paid before touching the server
+    /// (`0` on the cold arm's skip and on a record hit).
+    #[serde(default)]
+    pub freshness_ms: u64,
+    /// The face render itself — row sort plus the writer's bytes.
+    #[serde(default)]
+    pub report_ms: u64,
+    /// The answered-turn record's persist write (`0` when no record was
+    /// captured or the quiet-turn elision skipped it).
+    #[serde(default)]
+    pub record_persist_ms: u64,
+    /// The whole ask's daemon-side wall clock — request dispatch through
+    /// the reply's construction (the socket writes themselves are
+    /// microseconds and excluded).
+    #[serde(default)]
+    pub total_ms: u64,
+    /// The analyzed file count the report covered (files the server
+    /// pushed `analysis.errors` for within the aims' scope).
+    #[serde(default)]
+    pub files: u64,
+    /// The kept report rows the face rendered.
+    #[serde(default)]
+    pub diagnostics: u64,
+    /// The server process tree's sampled peak RSS over its life, bytes.
+    #[serde(default)]
+    pub max_rss_bytes: u64,
+}
+
 /// The counts the client needs to finish the run beside the rendered
 /// bytes: the severity exit ladder's inputs, the note gate's modelable
 /// count, and the unmodelable rows it prints as advisories. Sent as the
@@ -79,6 +129,11 @@ pub struct FaceMeta {
     /// `note: unparsed dart analyze output:` line.
     #[serde(default)]
     pub unparsed: Vec<String>,
+    /// The per-leg timing breakdown, present only when the ask carried
+    /// the `metrics` flag. `None` serializes as an absent member — a
+    /// metrics-less ask's header line is byte-identical to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legs: Option<Legs>,
 }
 
 /// One render's product: the client-facing counts and the stdout bytes

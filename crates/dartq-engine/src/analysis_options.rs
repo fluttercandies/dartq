@@ -117,12 +117,44 @@
 //!   resident as Dart — resolves its rows' positions through the engine's
 //!   layout fallback (`Engine::content`/`line_index` over the text +
 //!   [`LineIndex`] captured at load).
-//! - The top-level `plugins:` section reports `invalid_section_format`
-//!   (probed on the 3.13.1 oracle — the section's only CLI-observable faces
-//!   are that row plus stderr load noise) and dartq loads no plugins: any
-//!   declared section is the row, silent only when absent or null. The
-//!   3.13.7 verifier adds `plugins_in_inner_options`
-//!   (parse_model:1538-1545): an *initial* options file outside its context
+//! - The top-level `plugins:` section both parses *and runs* (source-pinned
+//!   on 3.13.7; the earlier "row + stderr noise, no execution" note was a
+//!   3.13.1 probe whose observable shape is indistinguishable from a plugin
+//!   *setup failure* — see the failure face below). Legal forms
+//!   (`_parsePluginSource`, parse_model:1636-1690): a scalar is a version
+//!   constraint; a map prefers `version`(+`hosted`), then `git` (a scalar
+//!   URL or `{url, ref, path, tag_pattern}`), then `path` (joined and
+//!   normalized against the declaring file's directory — the source enters
+//!   a synthetic pub package, so it is stored absolute). Malformed shapes
+//!   row only: a non-map section (null excepted) and a non-string/non-map
+//!   entry value are `invalid_section_format` (:1520-1538, :1787-1808),
+//!   unknown plugin-map keys and illegal `diagnostics` actions are
+//!   `unsupported_option` (:1695-1740); `dependency_overrides` is the
+//!   hosting face under the same per-entry validation (:1558-1591). The
+//!   `diagnostics:` sub-map parses through the linter's rule-config
+//!   vocabulary (`parseDiagnosticsSection`, lint/config.dart:11-64) and
+//!   gates the plugin's rules at run time — warning rules default-on, lint
+//!   rules enabled only by an entry (`RegistryMixin.enabled`,
+//!   lint/registry.dart:117-129) — with a code-level entry re-leveling the
+//!   emitted severity (`_configuredSeverity`, plugin_server.dart:624-648,
+//!   the `?? INFO` fall completing a `disable` on a code name). Execution:
+//!   `dart analyze` loads plugins by default (`--plugins`
+//!   `defaultsTo: true`, dartdev analyze.dart:104-110; `usePlugins`
+//!   :150/:209) — the watcher materializes a synthetic shared plugin
+//!   package from the merged configurations (`_addPlugins`,
+//!   plugin_watcher.dart:121-165, the pubspec written from each source's
+//!   `toYaml`) and registers it with the manager, which resolves it with
+//!   `dart pub upgrade` (`filesFor`, plugin_manager.dart:347-353). A setup
+//!   or spawn failure is `PluginException` → `reportException`
+//!   (plugin_isolate.dart:169-185) → the `server.plugin.error`
+//!   notification, which the CLI prints to **stderr only**
+//!   (dartdev analysis_server.dart:306-315) — no machine row, the plugin's
+//!   diagnostics simply never appear; that stderr noise is what the 3.13.1
+//!   probe recorded. dartq mirrors the row faces here and the spawn faces
+//!   in the `dartq-plugin` crate (the official-plugin bootstrap), with a
+//!   plugin failure surfacing as `dartq/plugin_crashed` instead of
+//!   stderr-only. The 3.13.7 verifier adds `plugins_in_inner_options`
+//!   (parse_model:1541-1547): an *initial* options file outside its context
 //!   root declaring a top-level `plugins:` map — the
 //!   [`OptionsIssue::plugins_in_inner_options`] row, anchored at the
 //!   section's value node; the emitting caller is the CLI face's

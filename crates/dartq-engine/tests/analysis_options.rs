@@ -1583,6 +1583,56 @@ fn strict_modes_flow_from_options_to_the_semantic_gate() {
     );
 }
 
+/// The nested strict face: a subtree's own options file activates
+/// `strict-raw-types` for its files while the root entry keeps governing the
+/// rest. The same trigger source sits in both subtrees, so the ON/OFF
+/// differential is by construction the resolution (`for_roots` registers the
+/// nested file at its directory — `locate_nested`; `strict_modes_for` probes
+/// the file's ancestor chain — `deepest_containing`) and not the source
+/// shape: the root entry carries an explicit `false`, so a file under the
+/// nested subtree resolves ON only if the deepest entry wins.
+#[test]
+fn nested_strict_raw_types_govern_only_their_subtree() {
+    use common::Fixture;
+
+    let source = "class C<T> {}\nC c = C();\n";
+    let fixture = Fixture::new(&[("lib/main.dart", source), ("lib/sub/raw.dart", source)]);
+    std::fs::write(
+        fixture.path("analysis_options.yaml"),
+        "analyzer:\n  language:\n    strict-raw-types: false\n",
+    )
+    .expect("root options");
+    std::fs::write(
+        fixture.path("lib/sub/analysis_options.yaml"),
+        "analyzer:\n  language:\n    strict-raw-types: true\n",
+    )
+    .expect("nested options");
+
+    let mut engine = fixture.engine();
+    engine.discover_workspace().expect("discovery");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::new())
+        .expect("analyze");
+
+    let strict_raw_rows = |relative: &str| {
+        let file = engine
+            .file_table()
+            .try_file_id(&fixture.path(relative))
+            .expect("interned");
+        diagnostics
+            .iter()
+            .any(|d| d.file == file && d.code.name == "strict_raw_type")
+    };
+    assert!(
+        strict_raw_rows("lib/sub/raw.dart"),
+        "the nested options file activates strict-raw-types for its subtree: {diagnostics:?}"
+    );
+    assert!(
+        !strict_raw_rows("lib/main.dart"),
+        "the root entry's explicit false keeps its own subtree silent: {diagnostics:?}"
+    );
+}
+
 /// The options `enable-experiment` flags reach the per-file feature gates
 /// (#936, probed on the 3.13.1 oracle): a grant-free package file at the
 /// SDK version lifts the `variance` parse gate and runs the semantic

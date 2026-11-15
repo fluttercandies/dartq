@@ -720,7 +720,10 @@ struct AnalyzeArgs {
     /// `--engine`.
     #[arg(long)]
     fast: bool,
-    /// Write one metrics JSON object to PATH at exit. Requires `--engine`.
+    /// Write one metrics JSON object to PATH at exit: the engine face's
+    /// phase split, or on `official` the resident analyzer's per-leg
+    /// timings (server spawn, roots, first pass, report, record persist,
+    /// total).
     #[arg(long)]
     metrics_json: Option<PathBuf>,
     /// Analyze PATH with the content of FILE instead of the on-disk bytes:
@@ -921,8 +924,8 @@ enum AnalyzeScope {
 /// | Class | Flags |
 /// | --- | --- |
 /// | forward — `dart analyze` takes it | the targets, `--sdk-path`, `--packages`, `--cache`, `--enable-experiment`, `--[no-]plugins`, `--[no-]use-aot-snapshot`, `--[no-]fatal-warnings`, `--fatal-infos`, `--verbose`, `--version`, `--suppress-analytics`, `--disable-telemetry`, `--[no-]analytics` |
-/// | engine-only — legal only with `--engine` | `--fast`, `--metrics-json`, `--overlay`, `--memory-limit`, `--memory-report`, `--trace-events`, `--cache-size-limit`, `--cold` |
-/// | consumed — dartq answers it, the child never sees it | `--engine`, `--format`, `--memory`, `--scope`, `--diagnostics`, `--enable-analytics`, `--disable-analytics` |
+/// | engine-only — legal only with `--engine` | `--fast`, `--overlay`, `--memory-limit`, `--memory-report`, `--trace-events`, `--cache-size-limit`, `--cold` |
+/// | consumed — dartq answers it, the child never sees it | `--engine`, `--format`, `--memory`, `--scope`, `--diagnostics`, `--metrics-json`, `--enable-analytics`, `--disable-analytics` |
 ///
 /// The child always runs the machine format, so `--format` selects dartq's
 /// re-emission and `--memory` (upstream reads it on its json format only)
@@ -936,7 +939,6 @@ impl AnalyzeArgs {
     fn engine_only_flag(&self) -> Option<&'static str> {
         [
             (self.fast, "--fast"),
-            (self.metrics_json.is_some(), "--metrics-json"),
             (!self.overlays.is_empty(), "--overlay"),
             (self.memory_limit.is_some(), "--memory-limit"),
             (self.memory_report, "--memory-report"),
@@ -1676,6 +1678,7 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
                     argv: args.official_args(),
                     resident: args.resident_request(),
                     stats: args.stats,
+                    metrics_json: args.metrics_json.clone(),
                 },
                 &args.targets,
                 args.no_queue,
@@ -1704,6 +1707,7 @@ fn check_entry(args: &CheckArgs) -> u8 {
                     argv: args.official_args(),
                     resident: None,
                     stats: false,
+                    metrics_json: None,
                 },
                 &args.paths,
                 args.no_queue,
@@ -1723,6 +1727,9 @@ struct OfficialFace {
     /// server; `None` runs `dart analyze` per run.
     resident: Option<ResidentAsk>,
     stats: bool,
+    /// `--metrics-json`'s path: legal on the official face — the resident
+    /// daemon's per-leg timings, or the per-run child's own wall clock.
+    metrics_json: Option<PathBuf>,
 }
 
 /// What the resident server needs beyond the targets: the forwarded
@@ -1759,6 +1766,7 @@ fn official_face(
     config: &Result<Option<DartqConfig>, ConfigError>,
 ) -> u8 {
     let outcome = crash_tier(|| {
+        let started = Instant::now();
         let cwd = std::env::current_dir().unwrap_or_default();
         let settings = official_settings(config);
         let yaml = config.as_ref().ok().and_then(Option::as_ref);
@@ -1829,6 +1837,7 @@ fn official_face(
                     },
                     root: root.clone(),
                 }),
+                metrics: face.metrics_json.is_some(),
             };
             match dartq_analyzer_host::analyze(&request) {
                 dartq_analyzer_host::Outcome::Report { report, sdk } => {
@@ -1840,7 +1849,13 @@ fn official_face(
                     }
                     let run =
                         OfficialRun::of_report(report, ask.fatal_warnings, ask.fatal_infos, root);
-                    return official_finish(&run, face.format, face.memory, out, err);
+                    let diagnostics = run.rows().len() as u64;
+                    let code = official_finish(&run, face.format, face.memory, out, err);
+                    return if write_face_metrics(face, None, true, started, None, 0, diagnostics) {
+                        code
+                    } else {
+                        exit::INTERNAL_ERROR
+                    };
                 }
                 dartq_analyzer_host::Outcome::Face { stdout, meta, sdk } => {
                     if face.stats {
@@ -1849,7 +1864,8 @@ fn official_face(
                             sdk.version
                         );
                     }
-                    return face_finish(
+                    let legs = meta.legs.clone();
+                    let code = face_finish(
                         &stdout,
                         &meta,
                         face,
@@ -1858,6 +1874,11 @@ fn official_face(
                         out,
                         err,
                     );
+                    return if write_face_metrics(face, legs.as_ref(), true, started, None, 0, 0) {
+                        code
+                    } else {
+                        exit::INTERNAL_ERROR
+                    };
                 }
                 dartq_analyzer_host::Outcome::Budget(message) => {
                     eprintln!("error: {message}");
@@ -1890,14 +1911,24 @@ fn official_face(
         }
         // The child's RSS budget (`analyzer.official.memory_budget_gb`,
         // unbounded unless set): the watchdog kills an over-budget tree.
+        let running = Instant::now();
         let run = official::run_with_budget(
             dart.as_deref(),
             &face.argv,
             root,
             Some(settings.memory_budget_bytes),
         );
+        let run_wall = running.elapsed();
         match run {
-            Ok(run) => official_finish(&run, face.format, face.memory, out, err),
+            Ok(run) => {
+                let diagnostics = run.rows().len() as u64;
+                let code = official_finish(&run, face.format, face.memory, out, err);
+                if write_face_metrics(face, None, false, started, Some(run_wall), 0, diagnostics) {
+                    code
+                } else {
+                    exit::INTERNAL_ERROR
+                }
+            }
             Err(error) => {
                 eprintln!("error: {error}");
                 exit::USAGE
@@ -3556,9 +3587,16 @@ fn daemon(args: &DaemonArgs) -> u8 {
         .watch
         .then(|| dartq_daemon::WatchOptions::new(args.dir.clone()));
     match dartq_daemon::run(stdin, stdout, &mut session, watch) {
-        Ok(code) => code,
+        Ok(code) => {
+            // The stdio face's process end IS the session's retirement:
+            // the per-connection tail no longer takes the plugin set, so
+            // the graceful handshake (never `Drop`'s kill-only) runs here.
+            session.shutdown_plugins();
+            code
+        }
         Err(error) => {
             eprintln!("dartq: internal error: daemon transport failed: {error}");
+            session.shutdown_plugins();
             exit::INTERNAL_ERROR
         }
     }
@@ -4293,6 +4331,109 @@ fn max_rss_bytes() -> Option<u64> {
 #[cfg(not(unix))]
 fn max_rss_bytes() -> Option<u64> {
     None
+}
+
+/// The official face's `--metrics-json` object: the engine schema's core
+/// fields with the official legs mapped on (`analyze_ms` is the analysis
+/// pass — the resident daemon's `first_pass_ms` or the per-run child's
+/// wall; `render_ms` the face render), plus the resident daemon's own
+/// per-leg timings verbatim under their `*_ms` names. `legs` is `None`
+/// on the per-run path (no daemon served the run) — every daemon leg
+/// then reads `0` and `resident` is `false`.
+fn write_official_metrics(
+    path: &Path,
+    legs: Option<&dartq_analyzer_host::Legs>,
+    resident: bool,
+    cli_total: Duration,
+    run_wall: Option<Duration>,
+    files: u64,
+    diagnostics: u64,
+) -> io::Result<()> {
+    let leg = |pick: fn(&dartq_analyzer_host::Legs) -> u64| legs.map_or(0, pick);
+    let server_spawn_ms = leg(|l| l.server_spawn_ms);
+    let roots_ms = leg(|l| l.roots_ms);
+    let first_pass_ms = leg(|l| l.first_pass_ms);
+    let freshness_ms = leg(|l| l.freshness_ms);
+    let report_ms = leg(|l| l.report_ms);
+    let record_persist_ms = leg(|l| l.record_persist_ms);
+    let daemon_total_ms = leg(|l| l.total_ms);
+    let leg_files = leg(|l| l.files);
+    let leg_diagnostics = leg(|l| l.diagnostics);
+    let leg_rss = leg(|l| l.max_rss_bytes);
+    // `analyze_ms` is the analysis pass: the daemon's first pass on the
+    // resident path, the child's whole wall on the per-run path.
+    let analyze_ms = if resident {
+        first_pass_ms
+    } else {
+        run_wall.map_or(0, |wall| elapsed_ms(wall))
+    };
+    let metrics = serde_json::json!({
+        "schema_version": dartq_commands::SCHEMA_VERSION,
+        "files": if leg_files > 0 { leg_files } else { files },
+        "loc": 0,
+        "diagnostics": if leg_diagnostics > 0 { leg_diagnostics } else { diagnostics },
+        "discovery_ms": 0,
+        "sdk_ms": 0,
+        "assembly_ms": 0,
+        "analyze_ms": analyze_ms,
+        "lints_ms": 0,
+        "render_ms": report_ms,
+        "total_ms": elapsed_ms(cli_total),
+        "libraries_analyzed": 0,
+        "libraries_from_cache": 0,
+        "max_rss_bytes": if leg_rss > 0 {
+            leg_rss
+        } else {
+            max_rss_bytes().unwrap_or(0)
+        },
+        "resident": resident,
+        "server_spawn_ms": server_spawn_ms,
+        "roots_ms": roots_ms,
+        "first_pass_ms": first_pass_ms,
+        "freshness_ms": freshness_ms,
+        "report_ms": report_ms,
+        "record_persist_ms": record_persist_ms,
+        "daemon_total_ms": daemon_total_ms,
+    });
+    let mut file = fs::File::create(path)?;
+    writeln!(file, "{metrics}")
+}
+
+/// Writes the official face's `--metrics-json` object when the flag is
+/// set. Returns `false` on a write failure — the caller escalates to the
+/// internal-error tier, matching the engine face (a run without its
+/// metrics file would corrupt benchmark data). `legs` is the resident
+/// daemon's breakdown (`None` on the per-run child path);
+/// `files`/`diagnostics` are the run's own counts where the daemon did
+/// not report them.
+#[must_use]
+fn write_face_metrics(
+    face: &OfficialFace,
+    legs: Option<&dartq_analyzer_host::Legs>,
+    resident: bool,
+    started: Instant,
+    run_wall: Option<Duration>,
+    files: u64,
+    diagnostics: u64,
+) -> bool {
+    let Some(path) = &face.metrics_json else {
+        return true;
+    };
+    match write_official_metrics(
+        path,
+        legs,
+        resident,
+        started.elapsed(),
+        run_wall,
+        files,
+        diagnostics,
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("dartq: internal error: writing metrics failed: {error}");
+            false
+        }
+    }
 }
 
 /// The `bcache` maintenance face.
@@ -5573,10 +5714,6 @@ mod tests {
         };
         for (flag, argv) in [
             ("--fast", &["analyze", "--fast", "/p"][..]),
-            (
-                "--metrics-json",
-                &["analyze", "--metrics-json", "m", "/p"][..],
-            ),
             ("--overlay", &["analyze", "--overlay", "a=b", "/p"][..]),
             (
                 "--memory-limit",
@@ -5608,6 +5745,91 @@ mod tests {
         }
         assert_eq!(analyze_face(&["analyze", "/p"]).engine_only_flag(), None);
         assert_eq!(check_args(&["check", "/p"]).engine_only_flag(), None);
+    }
+
+    /// `--metrics-json` is legal on the official analyze face (#4311): it
+    /// is no longer an engine-only flag there, while `check` keeps it
+    /// engine-only. The official metrics object carries the engine
+    /// schema's core fields plus the resident daemon's per-leg timings.
+    #[test]
+    fn metrics_json_is_legal_on_the_official_analyze_face() {
+        assert_eq!(
+            analyze_face(&["analyze", "--metrics-json", "m", "/p"]).engine_only_flag(),
+            None,
+            "--metrics-json must not trip the engine-only gate on analyze"
+        );
+        // `check` keeps the engine-only classification.
+        assert_eq!(
+            check_args(&["check", "--metrics-json", "m", "/p"]).engine_only_flag(),
+            Some("--metrics-json")
+        );
+
+        // The written object: engine-schema core fields plus the resident
+        // legs, `resident: true` with the daemon's own numbers.
+        let dir = tempfile::tempdir().expect("metrics dir");
+        let path = dir.path().join("metrics.json");
+        let legs = dartq_analyzer_host::Legs {
+            server_spawn_ms: 11,
+            roots_ms: 22,
+            first_pass_ms: 33,
+            freshness_ms: 44,
+            report_ms: 55,
+            record_persist_ms: 66,
+            total_ms: 77,
+            files: 3,
+            diagnostics: 5,
+            max_rss_bytes: 1 << 20,
+        };
+        write_official_metrics(
+            &path,
+            Some(&legs),
+            true,
+            Duration::from_millis(100),
+            None,
+            0,
+            0,
+        )
+        .expect("metrics write");
+        let text = std::fs::read_to_string(&path).expect("metrics file");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("metrics json");
+        assert_eq!(json["schema_version"], dartq_commands::SCHEMA_VERSION);
+        assert_eq!(json["resident"], true);
+        assert_eq!(json["server_spawn_ms"], 11);
+        assert_eq!(json["roots_ms"], 22);
+        assert_eq!(json["first_pass_ms"], 33);
+        assert_eq!(json["freshness_ms"], 44);
+        assert_eq!(json["report_ms"], 55);
+        assert_eq!(json["record_persist_ms"], 66);
+        assert_eq!(json["daemon_total_ms"], 77);
+        assert_eq!(json["analyze_ms"], 33, "analyze_ms maps first_pass_ms");
+        assert_eq!(json["render_ms"], 55, "render_ms maps report_ms");
+        assert_eq!(json["total_ms"], 100, "total_ms is the CLI wall clock");
+        assert_eq!(json["files"], 3);
+        assert_eq!(json["diagnostics"], 5);
+        assert_eq!(json["max_rss_bytes"], 1 << 20);
+
+        // The per-run shape: no legs, `resident: false`, zeroed daemon
+        // legs, `analyze_ms` the child's own wall.
+        write_official_metrics(
+            &path,
+            None,
+            false,
+            Duration::from_millis(250),
+            Some(Duration::from_millis(200)),
+            0,
+            7,
+        )
+        .expect("metrics write");
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("metrics file"))
+                .expect("metrics json");
+        assert_eq!(json["resident"], false);
+        assert_eq!(
+            json["analyze_ms"], 200,
+            "per-run analyze_ms is the child wall"
+        );
+        assert_eq!(json["server_spawn_ms"], 0);
+        assert_eq!(json["diagnostics"], 7);
     }
 
     /// The forward class reaches the child with the targets last; the
