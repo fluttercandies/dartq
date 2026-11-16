@@ -1971,10 +1971,7 @@ fn rendered_answer(
 ) -> Value {
     let mut stdout = Vec::new();
     let rendered = match format {
-        RenderFormat::Lon => dartq_commands::render::write_lon(
-            &mut stdout,
-            &dartq_commands::analyze::diags_document(output),
-        ),
+        RenderFormat::Lon => dartq_commands::render::write_diags_lon(&mut stdout, output),
         RenderFormat::Json => dartq_diagnostics::write_json(&mut stdout, output),
         RenderFormat::Text => {
             dartq_commands::render::write_human(&mut stdout, output.diagnostics, output.files)

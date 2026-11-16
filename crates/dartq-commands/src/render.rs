@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use dartq_analyzer_host::face::{Face, FaceFormat, FaceMeta, FaceRender};
 use dartq_analyzer_host::{Row, report};
-use dartq_diagnostics::{Diagnostic, FileLayoutProvider};
+use dartq_diagnostics::{AnalysisOutput, Diagnostic, FileLayoutProvider};
 
 use crate::analyze::severity_word;
 
@@ -51,6 +51,133 @@ pub fn lon_line(value: &Value) -> String {
 /// The `lon` face: one canonical line.
 pub fn write_lon(out: &mut impl Write, value: &Value) -> io::Result<()> {
     writeln!(out, "{}", lon_line(value))
+}
+
+/// The analyze/check `lon` document streamed row-by-row — the byte-identical
+/// twin of `write_lon(out, &diags_document(output))` that never materializes
+/// the `serde_json::Value` graph. `lon::to_string` expands the whole document
+/// into one node tree and counts every element against its 1,000,000-element
+/// budget; a whole-repo diagnostic set crosses that budget (hundreds of
+/// thousands of rows × seven fields) and the codec's `expect` guard panics —
+/// the rc=4 crash the zero-panic red line forbids. This writer emits the same
+/// `{v:1 root? diags:[…]}` bytes one row at a time through `out`, so neither a
+/// value graph nor a whole-output buffer exists and the bytes stay identical
+/// at every size.
+///
+/// The row grammar is the encoder's own record-table form (the shape
+/// [`write_lon_face`] already pins for the analyzer-host `Row` face): the
+/// `diags` array is `[code sev file line col len msg;cell …]` at ≥2 rows and
+/// the single object at 1, because every row shares one schema — the codec's
+/// `should_use_table` gate always factors a ≥2-row uniform schema (seven
+/// fields ≥ 3). The scalar spellings reuse the ported codec rules below
+/// ([`lon_string`]/[`lon_number`]); each row renders into a reused scratch
+/// buffer flushed to `out`, so peak memory is one row, not the document.
+pub fn write_diags_lon(out: &mut impl Write, output: &AnalysisOutput<'_>) -> io::Result<()> {
+    let root = output.files.analysis_root();
+    let diags = output.diagnostics;
+    // One scratch row buffer, cleared per row — the scalar helpers spell
+    // into a `Vec<u8>`, so a row's cells/members land here before the flush.
+    let mut scratch = Vec::new();
+    out.write_all(b"{v:1 ")?;
+    if let Some(root) = root.filter(|_| !diags.is_empty()) {
+        scratch.clear();
+        lon_string(&mut scratch, &root.display().to_string());
+        out.write_all(b"root:")?;
+        out.write_all(&scratch)?;
+        out.write_all(b" ")?;
+    }
+    match diags.len() {
+        0 => out.write_all(b"diags:[]}")?,
+        1 => {
+            out.write_all(b"diags:[{")?;
+            scratch.clear();
+            lon_diag_members(&mut scratch, &diags[0], output, root);
+            out.write_all(&scratch)?;
+            out.write_all(b"}]}")?;
+        }
+        _ => {
+            out.write_all(b"diags:[code sev file line col len msg")?;
+            for diag in diags {
+                scratch.clear();
+                lon_diag_cells(&mut scratch, diag, output, root);
+                out.write_all(b";")?;
+                out.write_all(&scratch)?;
+            }
+            out.write_all(b"]}")?;
+        }
+    }
+    // `write_lon`'s `writeln!` — the line is the face payload's own.
+    out.write_all(b"\n")?;
+    out.flush()
+}
+
+/// One `diags` object's member list in canonical order (object form):
+/// `key:value` pairs space-separated — `diag_row`'s field order.
+fn lon_diag_members(
+    out: &mut Vec<u8>,
+    diag: &Diagnostic,
+    output: &AnalysisOutput<'_>,
+    root: Option<&Path>,
+) {
+    out.extend_from_slice(b"code:");
+    lon_string(out, diag.code.name);
+    out.extend_from_slice(b" sev:");
+    out.extend_from_slice(severity_word(diag.severity).as_bytes());
+    out.extend_from_slice(b" file:");
+    lon_string(out, &diag_file_spelling(diag, output, root));
+    let (line, col) = diag_line_col(diag, output);
+    out.extend_from_slice(b" line:");
+    lon_number(out, u64::from(line));
+    out.extend_from_slice(b" col:");
+    lon_number(out, u64::from(col));
+    out.extend_from_slice(b" len:");
+    lon_number(out, u64::from(diag.range.length));
+    out.extend_from_slice(b" msg:");
+    lon_string(out, diag.message.as_str());
+}
+
+/// One record-table row's cell values (space-separated, the same order as
+/// [`lon_diag_members`]).
+fn lon_diag_cells(
+    out: &mut Vec<u8>,
+    diag: &Diagnostic,
+    output: &AnalysisOutput<'_>,
+    root: Option<&Path>,
+) {
+    lon_string(out, diag.code.name);
+    out.push(b' ');
+    out.extend_from_slice(severity_word(diag.severity).as_bytes());
+    out.push(b' ');
+    lon_string(out, &diag_file_spelling(diag, output, root));
+    out.push(b' ');
+    let (line, col) = diag_line_col(diag, output);
+    lon_number(out, u64::from(line));
+    out.push(b' ');
+    lon_number(out, u64::from(col));
+    out.push(b' ');
+    lon_number(out, u64::from(diag.range.length));
+    out.push(b' ');
+    lon_string(out, diag.message.as_str());
+}
+
+/// The `file` column's spelling through the one locator — `diag_row`'s
+/// `file`: relative inside `root`, absolute outside.
+fn diag_file_spelling(
+    diag: &Diagnostic,
+    output: &AnalysisOutput<'_>,
+    root: Option<&Path>,
+) -> String {
+    let path = output.files.file_path(diag.file);
+    match root {
+        Some(root) => crate::locate(root, path),
+        None => path.display().to_string(),
+    }
+}
+
+/// `diag_row`'s `(line, col)` — the provider's 1-based position of the
+/// diagnostic's UTF-16 offset.
+fn diag_line_col(diag: &Diagnostic, output: &AnalysisOutput<'_>) -> (u32, u32) {
+    output.files.line_col(diag.file, diag.range.offset)
 }
 
 /// The analyze `text` face's row spelling: `sev code line:col msg` under
@@ -227,7 +354,21 @@ fn modelable_type(kind: &str) -> Option<()> {
 #[must_use]
 pub fn render_official_face(rows: &[&Row], face: &Face) -> FaceRender {
     let (kept, meta) = face_rows(rows);
-    let mut bytes = Vec::new();
+    // Pre-size the payload buffer: the writer appends every row's fields
+    // plus syntax, so the kept rows' own text sizes bound the render's
+    // scale — a from-empty Vec would pay ~2x its final size across
+    // doublings on a 200 MB-class whole-repo face. The estimate errs on
+    // the json face's side (its envelope re-encodes fields); an
+    // undershoot costs one grow, never a wrong byte.
+    let hint = 256
+        + kept.iter().fold(0usize, |acc, diag| {
+            acc + diag.row.message.len()
+                + diag.row.code.len()
+                + diag.row.location.file.len()
+                + diag.row.location.length as usize
+                + 160
+        });
+    let mut bytes = Vec::with_capacity(hint);
     match face.format {
         FaceFormat::Lon => write_lon_face(&mut bytes, &kept, face.root.as_deref()),
         FaceFormat::Json => write_json_face(&mut bytes, &kept),
@@ -689,6 +830,8 @@ mod tests {
     use dartq_analyzer_host::Report;
     use dartq_analyzer_host::face::FaceFormat;
     use dartq_analyzer_host::report::{ContextMessage, Location};
+    use dartq_diagnostics::{CodeInfo, DiagnosticType, FileId, Severity, SourceRange};
+    use dartq_source::FileTable;
 
     use super::*;
     use crate::analyze::diags_document;
@@ -896,5 +1039,279 @@ mod tests {
         // Only the modelable row reaches the bytes.
         let text = String::from_utf8(render.bytes).expect("utf8");
         assert!(text.contains("dead_code") && !text.contains("weird"));
+    }
+
+    // -----------------------------------------------------------------------
+    // write_diags_lon — the streaming analyze/check lon document
+    // -----------------------------------------------------------------------
+
+    /// A `FileLayoutProvider` over an interned [`FileTable`], optionally
+    /// carrying an analysis root. `line_col` derives a deterministic 1-based
+    /// `(line, col)` from the UTF-16 offset so every row's position is
+    /// reproducible without a source index — the DOM path and the streaming
+    /// path read the same provider, so byte-identity holds regardless of the
+    /// concrete values.
+    struct DiagLayout {
+        table: FileTable,
+        root: Option<PathBuf>,
+    }
+
+    impl FileLayoutProvider for DiagLayout {
+        fn file_path(&self, file: FileId) -> &Path {
+            self.table.path(file).expect("interned FileId")
+        }
+
+        fn analysis_root(&self) -> Option<&Path> {
+            self.root.as_deref()
+        }
+
+        fn line_col(&self, _file: FileId, utf16_offset: u32) -> (u32, u32) {
+            (utf16_offset + 1, 7)
+        }
+    }
+
+    /// A test code descriptor; `name` is the `code` column's spelling.
+    fn test_code(name: &'static str) -> CodeInfo {
+        CodeInfo::new(name, name, DiagnosticType::CompileTimeError, false)
+    }
+
+    /// Interns `path` and builds one engine diagnostic at `offset`/`length`
+    /// with the given severity/code/message. `message` accepts a `String`
+    /// (shared) or `&'static str` (static template) — the `Into<SharedStr>`
+    /// seam picks the storage.
+    fn engine_diag(
+        table: &mut FileTable,
+        path: &str,
+        offset: u32,
+        length: u32,
+        severity: Severity,
+        code: CodeInfo,
+        message: impl Into<dartq_diagnostics::SharedStr>,
+    ) -> Diagnostic {
+        Diagnostic::new(
+            severity,
+            code,
+            message,
+            table.intern(Path::new(path)),
+            SourceRange { offset, length },
+            None,
+        )
+    }
+
+    /// The byte-identity contract on small outputs: `write_diags_lon` must
+    /// emit exactly the bytes `write_lon(diags_document(..))` produces — the
+    /// DOM path stays the reference wherever it fits under the codec's
+    /// element budget. Covers 0/1/2/N rows, root and root-less, and the
+    /// string-escaping edges (reserved tokens, quotes, unicode, edge `'`).
+    #[test]
+    fn diags_lon_stream_is_byte_identical_to_the_dom_document() {
+        let cases: Vec<(
+            Vec<(&'static str, u32, u32, Severity, &'static str, String)>,
+            Option<&'static str>,
+        )> = vec![
+            (vec![], Some("/w/pkg")),
+            (vec![], None),
+            (
+                vec![(
+                    "/w/pkg/lib/a.dart",
+                    0,
+                    1,
+                    Severity::Error,
+                    "undefined_identifier",
+                    "Expected an identifier.".into(),
+                )],
+                Some("/w/pkg"),
+            ),
+            (
+                vec![
+                    (
+                        "/w/pkg/lib/a.dart",
+                        0,
+                        1,
+                        Severity::Error,
+                        "undefined_identifier",
+                        "Expected an identifier.".into(),
+                    ),
+                    (
+                        "/w/pkg/lib/a.dart",
+                        10,
+                        2,
+                        Severity::Warning,
+                        "dead_code",
+                        "careful [brackets] {braces}".into(),
+                    ),
+                ],
+                Some("/w/pkg"),
+            ),
+            (
+                vec![
+                    (
+                        "/w/pkg/lib/a.dart",
+                        0,
+                        1,
+                        Severity::Error,
+                        "null",
+                        "boom \"quoted\" \\ slash".into(),
+                    ),
+                    (
+                        "/w/pkg/lib/é.dart",
+                        1,
+                        3,
+                        Severity::Info,
+                        "avoid_print",
+                        "á unicode \u{2028}sep \u{1F600} emoji".into(),
+                    ),
+                    (
+                        "/outside/x.dart",
+                        5,
+                        1,
+                        Severity::Error,
+                        "dead_code",
+                        "'edge quote'".into(),
+                    ),
+                ],
+                Some("/w/pkg"),
+            ),
+            (
+                vec![
+                    (
+                        "/w/pkg/lib/a.dart",
+                        0,
+                        1,
+                        Severity::Error,
+                        "yes",
+                        "first".into(),
+                    ),
+                    (
+                        "/w/pkg/lib/b.dart",
+                        20,
+                        4,
+                        Severity::Warning,
+                        "no",
+                        "second row".into(),
+                    ),
+                    (
+                        "/w/pkg/lib/c.dart",
+                        40,
+                        2,
+                        Severity::Info,
+                        "on",
+                        "third".into(),
+                    ),
+                ],
+                None,
+            ),
+        ];
+        for (rows, root) in &cases {
+            let mut table = FileTable::new();
+            let diagnostics: Vec<Diagnostic> = rows
+                .iter()
+                .map(|row| {
+                    engine_diag(
+                        &mut table,
+                        row.0,
+                        row.1,
+                        row.2,
+                        row.3,
+                        test_code(row.4),
+                        row.5.clone(),
+                    )
+                })
+                .collect();
+            let files = DiagLayout {
+                table,
+                root: root.map(PathBuf::from),
+            };
+            let output = AnalysisOutput {
+                diagnostics: &diagnostics,
+                files: &files,
+            };
+            // The DOM reference: the shared builder + the codec's own line.
+            let mut expected = Vec::new();
+            write_lon(&mut expected, &diags_document(&output)).expect("dom lon");
+            // The streaming writer under test.
+            let mut actual = Vec::new();
+            write_diags_lon(&mut actual, &output).expect("stream lon");
+            assert_eq!(
+                String::from_utf8_lossy(&actual),
+                String::from_utf8_lossy(&expected),
+                "stream != dom over {} row(s), root {root:?}",
+                diagnostics.len(),
+            );
+        }
+    }
+
+    /// The scale contract: a diagnostic set large enough that the DOM +
+    /// codec path exceeds its 1,000,000 expanded-element budget must still
+    /// render through `write_diags_lon` — no value graph, no codec limit,
+    /// no panic. Each row contributes eight counted elements (the row plus
+    /// its seven field values), so ~130k rows crosses 1M; the codec's
+    /// `to_node` budget errors on the same document while the stream emits
+    /// every byte. The expected bytes come from an independent in-test
+    /// generator over the same bare-safe rows, so the check is not
+    /// circular.
+    #[test]
+    fn diags_lon_stream_passes_the_codec_element_budget() {
+        const ROWS: usize = 130_000; // 8 elements/row → ~1.04M > 1,000,000 budget
+        let mut table = FileTable::new();
+        // One shared file keeps every row bare-safe (no quoting) so the
+        // golden generator spells cells verbatim; `offset` varies the line.
+        let file = table.intern(Path::new("/w/pkg/lib/a.dart"));
+        let code = test_code("undefined_identifier");
+        let diagnostics: Vec<Diagnostic> = (0..ROWS as u32)
+            .map(|i| {
+                Diagnostic::new(
+                    Severity::Error,
+                    code,
+                    "boom", // &'static str → SharedStr::Static, zero heap/row
+                    file,
+                    SourceRange {
+                        offset: i,
+                        length: 3,
+                    },
+                    None,
+                )
+            })
+            .collect();
+        let files = DiagLayout {
+            table,
+            root: Some(PathBuf::from("/w/pkg")),
+        };
+        let output = AnalysisOutput {
+            diagnostics: &diagnostics,
+            files: &files,
+        };
+
+        // The old path's codec budget: the same document as a Value graph
+        // exceeds 1M expanded elements and `to_string` refuses it (the
+        // `expect` in `lon_line` is what turned that refusal into rc=4).
+        let document = diags_document(&output);
+        assert!(
+            lon::to_string(&document).is_err(),
+            "the DOM document must exceed the codec's 1M element budget"
+        );
+        // Free the ~1M-element DOM before materializing the stream bytes and
+        // the golden — the test's peak stays near the output size, not the
+        // sum of both graphs.
+        drop(document);
+
+        // The streaming writer completes and matches the independent golden.
+        let mut actual = Vec::new();
+        write_diags_lon(&mut actual, &output).expect("stream lon at scale");
+        let actual = String::from_utf8(actual).expect("utf8");
+        let mut expected = String::with_capacity(actual.len());
+        expected.push_str("{v:1 root:/w/pkg diags:[code sev file line col len msg");
+        for i in 0..ROWS as u32 {
+            // line_col(offset)= (offset+1, 7); len=3; every field bare-safe.
+            expected.push_str(&format!(
+                ";undefined_identifier error lib/a.dart {} 7 3 boom",
+                i + 1
+            ));
+        }
+        expected.push_str("]}\n");
+        assert_eq!(
+            actual, expected,
+            "stream bytes diverge from the golden at scale"
+        );
     }
 }

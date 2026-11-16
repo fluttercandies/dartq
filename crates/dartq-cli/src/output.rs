@@ -30,16 +30,15 @@
 #![allow(clippy::semicolon_if_nothing_returned)]
 use clap::ValueEnum;
 
-/// The analyze/check faces' lon document — the shared builder both the CLI
-/// and the daemon's `dartq/analyze` render through (`dartq-commands`' own,
-/// #2657: no second encoder).
-pub(crate) use dartq_commands::analyze::diags_document;
 // The relocated per-format renderers (#2627/#2629): the one writer per
 // format — `dartq-commands::render` — that the cold path here and the
 // daemon's routed faces both call; re-exported so the CLI's call sites
-// keep their spelling.
+// keep their spelling. The analyze/check `lon` face prints through
+// `write_diags_lon` (the streaming row emitter — byte-identical to the
+// shared `diags_document` builder's codec line without materializing the
+// value graph that trips the codec's element budget at whole-repo scale).
 pub(crate) use dartq_commands::render::{
-    lon_line, write_human, write_json_value, write_lon, write_text_value,
+    lon_line, write_diags_lon, write_human, write_json_value, write_lon, write_text_value,
 };
 
 /// The unified `--format` axis. `lon` is the constant default; an invalid
@@ -66,6 +65,7 @@ mod tests {
     };
 
     use super::*;
+    use dartq_commands::analyze::diags_document;
 
     /// A layout over the interned paths, optionally carrying an analysis
     /// root — the provider face the lon byte pins project through.

@@ -206,7 +206,7 @@ mod session;
 mod test;
 
 pub(crate) use output::OutputFormat;
-use output::{diags_document, write_human, write_json_value, write_lon, write_text_value};
+use output::{write_diags_lon, write_human, write_json_value, write_lon, write_text_value};
 
 /// Process exit codes, pinned to the dartdev oracle (analyze.dart:719–731;
 /// usage exit dartdev.dart:209–210) plus the sysexits-style tiers the
@@ -3355,7 +3355,7 @@ fn emit_diagnostics(
     out: &mut impl Write,
 ) -> io::Result<()> {
     match format {
-        AnalyzeFormat::Lon => write_lon(out, &diags_document(output)),
+        AnalyzeFormat::Lon => write_diags_lon(out, output),
         AnalyzeFormat::Text => write_human(out, output.diagnostics, output.files),
         AnalyzeFormat::Json if memory => write_json_memory(out, output),
         AnalyzeFormat::Json => write_json(out, output),
@@ -4394,6 +4394,7 @@ fn write_official_metrics(
         "freshness_ms": freshness_ms,
         "report_ms": report_ms,
         "record_persist_ms": record_persist_ms,
+        "probe_ms": probe_ms,
         "daemon_total_ms": daemon_total_ms,
     });
     let mut file = fs::File::create(path)?;
@@ -5776,6 +5777,7 @@ mod tests {
             freshness_ms: 44,
             report_ms: 55,
             record_persist_ms: 66,
+            probe_ms: 88,
             total_ms: 77,
             files: 3,
             diagnostics: 5,
@@ -5801,6 +5803,7 @@ mod tests {
         assert_eq!(json["freshness_ms"], 44);
         assert_eq!(json["report_ms"], 55);
         assert_eq!(json["record_persist_ms"], 66);
+        assert_eq!(json["probe_ms"], 88);
         assert_eq!(json["daemon_total_ms"], 77);
         assert_eq!(json["analyze_ms"], 33, "analyze_ms maps first_pass_ms");
         assert_eq!(json["render_ms"], 55, "render_ms maps report_ms");
