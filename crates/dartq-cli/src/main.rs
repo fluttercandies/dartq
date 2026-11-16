@@ -1840,10 +1840,18 @@ fn official_face(
                 metrics: face.metrics_json.is_some(),
             };
             match dartq_analyzer_host::analyze(&request) {
-                dartq_analyzer_host::Outcome::Report { report, sdk } => {
+                dartq_analyzer_host::Outcome::Report {
+                    report,
+                    sdk,
+                    legs,
+                    drive,
+                } => {
                     if face.stats {
+                        // The drive arm ran a one-shot analysis server —
+                        // not a resident daemon — and --stats says so.
+                        let arm = if drive { "drive" } else { "resident" };
                         eprintln!(
-                            "dartq analyze: engine official (Dart {}, resident)",
+                            "dartq analyze: engine official (Dart {}, {arm})",
                             sdk.version
                         );
                     }
@@ -1851,7 +1859,15 @@ fn official_face(
                         OfficialRun::of_report(report, ask.fatal_warnings, ask.fatal_infos, root);
                     let diagnostics = run.rows().len() as u64;
                     let code = official_finish(&run, face.format, face.memory, out, err);
-                    return if write_face_metrics(face, None, true, started, None, 0, diagnostics) {
+                    return if write_face_metrics(
+                        face,
+                        legs.as_ref(),
+                        !drive,
+                        started,
+                        None,
+                        0,
+                        diagnostics,
+                    ) {
                         code
                     } else {
                         exit::INTERNAL_ERROR
@@ -4335,11 +4351,13 @@ fn max_rss_bytes() -> Option<u64> {
 
 /// The official face's `--metrics-json` object: the engine schema's core
 /// fields with the official legs mapped on (`analyze_ms` is the analysis
-/// pass — the resident daemon's `first_pass_ms` or the per-run child's
-/// wall; `render_ms` the face render), plus the resident daemon's own
-/// per-leg timings verbatim under their `*_ms` names. `legs` is `None`
-/// on the per-run path (no daemon served the run) — every daemon leg
-/// then reads `0` and `resident` is `false`.
+/// pass — the server's `first_pass_ms` when any legs rode in, the per-run
+/// child's wall otherwise; `render_ms` the face render), plus the serving
+/// side's own per-leg timings verbatim under their `*_ms` names. `legs`
+/// is `None` on the `dart analyze` child path (no server ran) — every
+/// server leg then reads `0`. `resident` is `true` only when a resident
+/// daemon served the run: the per-run direct drive ships legs with
+/// `resident: false` (a one-shot server, not a resident one).
 fn write_official_metrics(
     path: &Path,
     legs: Option<&dartq_analyzer_host::Legs>,
@@ -4361,9 +4379,10 @@ fn write_official_metrics(
     let leg_files = leg(|l| l.files);
     let leg_diagnostics = leg(|l| l.diagnostics);
     let leg_rss = leg(|l| l.max_rss_bytes);
-    // `analyze_ms` is the analysis pass: the daemon's first pass on the
-    // resident path, the child's whole wall on the per-run path.
-    let analyze_ms = if resident {
+    // `analyze_ms` is the analysis pass: the serving server's first pass
+    // whenever legs rode in (daemon or drive), the child's whole wall on
+    // the `dart analyze` path.
+    let analyze_ms = if legs.is_some() {
         first_pass_ms
     } else {
         run_wall.map_or(0, |wall| elapsed_ms(wall))
@@ -4404,10 +4423,10 @@ fn write_official_metrics(
 /// Writes the official face's `--metrics-json` object when the flag is
 /// set. Returns `false` on a write failure — the caller escalates to the
 /// internal-error tier, matching the engine face (a run without its
-/// metrics file would corrupt benchmark data). `legs` is the resident
-/// daemon's breakdown (`None` on the per-run child path);
-/// `files`/`diagnostics` are the run's own counts where the daemon did
-/// not report them.
+/// metrics file would corrupt benchmark data). `legs` is the serving
+/// side's breakdown — the resident daemon's or the per-run drive's
+/// (`None` on the `dart analyze` child path); `files`/`diagnostics` are
+/// the run's own counts where the server did not report them.
 #[must_use]
 fn write_face_metrics(
     face: &OfficialFace,
@@ -5834,6 +5853,52 @@ mod tests {
         );
         assert_eq!(json["server_spawn_ms"], 0);
         assert_eq!(json["diagnostics"], 7);
+    }
+
+    /// A drive-served run's `--metrics-json` carries the drive's own
+    /// legs (#4331): `resident: false` — a one-shot server, not a
+    /// resident daemon — while `analyze_ms` still maps the first pass
+    /// and the leg fields are the `Legs` struct's own names.
+    #[test]
+    fn metrics_json_carries_the_drives_legs() {
+        let dir = tempfile::tempdir().expect("metrics dir");
+        let path = dir.path().join("metrics.json");
+        let legs = dartq_analyzer_host::Legs {
+            server_spawn_ms: 900,
+            roots_ms: 40,
+            first_pass_ms: 5100,
+            report_ms: 7,
+            total_ms: 5200,
+            diagnostics: 12,
+            max_rss_bytes: 3 << 20,
+            ..dartq_analyzer_host::Legs::default()
+        };
+        write_official_metrics(
+            &path,
+            Some(&legs),
+            false,
+            Duration::from_millis(5400),
+            None,
+            0,
+            12,
+        )
+        .expect("metrics write");
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("metrics file"))
+                .expect("metrics json");
+        assert_eq!(json["resident"], false, "a one-shot server, not resident");
+        assert_eq!(json["server_spawn_ms"], 900);
+        assert_eq!(json["roots_ms"], 40);
+        assert_eq!(json["first_pass_ms"], 5100);
+        assert_eq!(json["report_ms"], 7);
+        assert_eq!(json["daemon_total_ms"], 5200);
+        assert_eq!(json["diagnostics"], 12);
+        assert_eq!(json["max_rss_bytes"], 3 << 20);
+        assert_eq!(
+            json["analyze_ms"], 5100,
+            "analyze_ms maps first_pass_ms when legs rode in"
+        );
+        assert_eq!(json["total_ms"], 5400, "total_ms is the CLI wall clock");
     }
 
     /// The forward class reaches the child with the targets last; the

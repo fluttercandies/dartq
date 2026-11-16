@@ -104,8 +104,18 @@ pub struct Request {
 /// The answer of the resident path.
 #[derive(Debug)]
 pub enum Outcome {
-    /// dartdev's report, with the SDK version that produced it.
-    Report { report: Report, sdk: Sdk },
+    /// dartdev's report, with the SDK version that produced it — and the
+    /// per-leg timings when the ask carried `metrics` (`None` otherwise:
+    /// the daemon ships the legs on its `Answer::Metrics` line, the
+    /// direct drive assembles its own). `drive` marks the per-run
+    /// direct-drive arm (the daemon never served this run): the caller's
+    /// `--stats` wording and metrics `resident` flag ride it.
+    Report {
+        report: Report,
+        sdk: Sdk,
+        legs: Option<crate::face::Legs>,
+        drive: bool,
+    },
     /// The daemon-rendered face: the final stdout bytes and the counts
     /// the client finishes the run with, with the SDK that produced them.
     Face {
@@ -206,7 +216,14 @@ pub fn analyze(request: &Request) -> Outcome {
                 // own daemon — started on demand, never silently a second
                 // pooled server.
                 match pool_join(&spec, &aims, face.as_ref(), metrics) {
-                    Some(PoolAnswer::Report(report)) => return Outcome::Report { report, sdk },
+                    Some(PoolAnswer::Report { report, legs }) => {
+                        return Outcome::Report {
+                            report,
+                            sdk,
+                            legs,
+                            drive: false,
+                        };
+                    }
                     Some(PoolAnswer::Face { stdout, meta }) => {
                         return Outcome::Face { stdout, meta, sdk };
                     }
@@ -225,7 +242,12 @@ pub fn analyze(request: &Request) -> Outcome {
             ask_gated(&spec, &aims, face.as_ref(), metrics)
         };
         match asked {
-            Ok(Answered::Report(report)) => Outcome::Report { report, sdk },
+            Ok(Answered::Report { report, legs }) => Outcome::Report {
+                report,
+                sdk,
+                legs,
+                drive: false,
+            },
             Ok(Answered::Face { stdout, meta }) => Outcome::Face { stdout, meta, sdk },
             Ok(Answered::Budget(message)) => Outcome::Budget(message),
             // `Yielded` is handled inside `ask_gated`'s re-queue loop; a
@@ -246,7 +268,7 @@ pub fn analyze(request: &Request) -> Outcome {
             unserved @ (Ok(Answered::Cooling) | Err(_)) => {
                 let mut own = spec.clone();
                 own.pool = false;
-                direct_drive(&own, &sdk, &aims, unserved.err())
+                direct_drive(&own, &sdk, &aims, metrics, unserved.err())
             }
         }
     }
@@ -279,15 +301,18 @@ const GATE_WAIT: Duration = Duration::from_mins(30);
 /// serve still cold-starts at the server's own wall, the dana-class cold.
 ///
 /// `daemon_fault` is why the daemon did not serve (the stderr line's first
-/// half; `None` on a silent cooldown). The drive holds the same
-/// `AnalysisServer` ledger lease a daemon server-start holds — same gate,
-/// same sizing history over the same peak key — so concurrent one-shots
-/// serialize under `memory.max_concurrent` exactly as daemon starts do.
+/// half; `None` on a silent cooldown). `metrics` carries the ask's
+/// `--metrics-json` flag: a metrics ask gets the drive's own legs on the
+/// report it returns. The drive holds the same `AnalysisServer` ledger
+/// lease a daemon server-start holds — same gate, same sizing history
+/// over the same peak key — so concurrent one-shots serialize under
+/// `memory.max_concurrent` exactly as daemon starts do.
 #[cfg(unix)]
 fn direct_drive(
     spec: &Spec,
     sdk: &Sdk,
     aims: &[crate::Aim],
+    metrics: bool,
     daemon_fault: Option<String>,
 ) -> Outcome {
     use dartq_toolchain::ledger::{self, Face};
@@ -320,6 +345,7 @@ fn direct_drive(
         }
     };
     let budget = (spec.budget > 0).then_some(spec.budget);
+    let drive_started = std::time::Instant::now();
     let started = crate::server::Server::start(&launch, &spec.roots, budget, || false);
     let server = match started {
         Ok(server) => server,
@@ -338,7 +364,10 @@ fn direct_drive(
     if let Some(lease) = lease.as_mut() {
         lease.track(server.pid());
     }
+    let rendering = std::time::Instant::now();
     let report = server.report_scoped(aims);
+    let report_ms = u64::try_from(rendering.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (server_spawn_ms, roots_ms, first_pass_ms) = server.metrics_legs();
     let peak = server.peak();
     server.shutdown();
     if let Some(mut lease) = lease {
@@ -346,8 +375,19 @@ fn direct_drive(
     }
     match report {
         Some(report) => Outcome::Report {
+            legs: metrics.then(|| crate::face::Legs {
+                server_spawn_ms,
+                roots_ms,
+                first_pass_ms,
+                report_ms,
+                total_ms: u64::try_from(drive_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                diagnostics: report.rows.len() as u64,
+                max_rss_bytes: peak,
+                ..crate::face::Legs::default()
+            }),
             report,
             sdk: sdk.clone(),
+            drive: true,
         },
         // The aims fall outside the roots' one analysis context (the
         // `NotServed` case): the child builds the file's own context root
@@ -423,7 +463,12 @@ fn up(dir: &Path) -> bool {
 
 #[cfg(unix)]
 enum Answered {
-    Report(Report),
+    /// The daemon's report, with the metrics line's legs when the ask
+    /// carried `metrics` (`None` when it did not).
+    Report {
+        report: Report,
+        legs: Option<crate::face::Legs>,
+    },
     /// The face answer's payload and counts.
     Face {
         stdout: Vec<u8>,
@@ -500,7 +545,11 @@ fn ask_gated(
 /// A pooled join's three ways out.
 #[cfg(unix)]
 enum PoolAnswer {
-    Report(Report),
+    /// The pooled daemon's report, legs as in [`Answered::Report`].
+    Report {
+        report: Report,
+        legs: Option<crate::face::Legs>,
+    },
     Face {
         stdout: Vec<u8>,
         meta: FaceMeta,
@@ -567,7 +616,12 @@ fn pool_join(
         match serde_json::from_str::<Answer>(&answer) {
             Ok(Answer::Note(note)) => eprintln!("{note}"),
             Ok(Answer::Metrics(found)) => legs = Some(found),
-            Ok(Answer::Report(report)) => return Some(PoolAnswer::Report(report)),
+            Ok(Answer::Report(report)) => {
+                return Some(PoolAnswer::Report {
+                    report,
+                    legs: legs.take(),
+                });
+            }
             Ok(Answer::Face { meta, bytes }) => {
                 let mut meta = meta;
                 meta.legs = legs.take();
@@ -644,7 +698,12 @@ fn ask(
         match serde_json::from_str::<Answer>(&answer) {
             Ok(Answer::Note(note)) => eprintln!("{note}"),
             Ok(Answer::Metrics(found)) => legs = Some(found),
-            Ok(Answer::Report(report)) => return Ok(Answered::Report(report)),
+            Ok(Answer::Report(report)) => {
+                return Ok(Answered::Report {
+                    report,
+                    legs: legs.take(),
+                });
+            }
             Ok(Answer::Face { meta, bytes }) => {
                 let mut meta = meta;
                 meta.legs = legs.take();
