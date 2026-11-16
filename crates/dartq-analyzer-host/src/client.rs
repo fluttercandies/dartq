@@ -1,7 +1,13 @@
 //! The `dartq analyze` side of the resident server: find the daemon of the
-//! request's key, start it when none is live, ask, and answer. Every
-//! failure is an [`Outcome::PerRun`]: the caller runs `dart analyze` per
-//! run, so the resident path can only make a run faster, never fail it.
+//! request's key, start it when none is live, ask, and answer. A daemon
+//! that cannot serve — a cooldown window after a hard failure, a start or
+//! transport fault — falls to the per-run direct drive below before any
+//! delegation: one analysis server, spawned and driven by this process
+//! through the same [`crate::server::Launch`] the daemon serves (no
+//! `dart`/dartdev wrapper in the chain), under the same memory gate. Only
+//! what that drive cannot serve is an [`Outcome::PerRun`]: the caller runs
+//! `dart analyze` per run, so the resident path can only make a run
+//! faster, never fail it.
 
 #![allow(clippy::semicolon_if_nothing_returned)]
 use std::path::{Path, PathBuf};
@@ -224,16 +230,24 @@ pub fn analyze(request: &Request) -> Outcome {
             Ok(Answered::Budget(message)) => Outcome::Budget(message),
             // `Yielded` is handled inside `ask_gated`'s re-queue loop; a
             // bare `ask` (the pool path) maps it to `Unavailable` there.
-            Ok(Answered::Yielded | Answered::Cooling | Answered::NotServed) => Outcome::PerRun {
+            // `NotServed` keeps the child: the aims fall outside the roots'
+            // one analysis context, and the child builds the file's own
+            // context root exactly as the oracle does — a fresh server over
+            // the same roots would not.
+            Ok(Answered::Yielded | Answered::NotServed) => Outcome::PerRun {
                 reason: None,
                 sdk: Some(sdk),
             },
-            Err(reason) => Outcome::PerRun {
-                reason: Some(format!(
-                    "dartq analyze: resident analyzer unavailable ({reason}) — running dart analyze"
-                )),
-                sdk: Some(sdk),
-            },
+            // The daemon cannot serve, but the SDK and roots it resolved
+            // are serveable facts: drive one server directly, per run —
+            // the dartdev child only if even that fails. The drive runs
+            // under the worktree's own spelling (`pool` off) so its
+            // cache-dir peak-key fallback is the own-daemon family's.
+            unserved @ (Ok(Answered::Cooling) | Err(_)) => {
+                let mut own = spec.clone();
+                own.pool = false;
+                direct_drive(&own, &sdk, &aims, unserved.err())
+            }
         }
     }
     #[cfg(not(unix))]
@@ -248,6 +262,154 @@ pub fn analyze(request: &Request) -> Outcome {
 
 fn absolute(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// How long the direct drive may wait at the memory gate: the daemon's own
+/// lease bound, so a one-shot waiter gets every honest wait a daemon-start
+/// waiter gets.
+#[cfg(unix)]
+const GATE_WAIT: Duration = Duration::from_mins(30);
+
+/// The per-run direct drive: one analysis server, spawned by this process
+/// under the same [`crate::server::Launch`] the daemon serves — the SDK's
+/// own snapshot against the resolved roots, no `dart`/dartdev wrapper in
+/// the chain — analyzed to completion, scoped to `aims`, and shut down.
+/// The dartdev cost class (`dart analyze`'s wrapper process, its envelope
+/// re-parse) is what this arm exists to skip: a run the daemon cannot
+/// serve still cold-starts at the server's own wall, the dana-class cold.
+///
+/// `daemon_fault` is why the daemon did not serve (the stderr line's first
+/// half; `None` on a silent cooldown). The drive holds the same
+/// `AnalysisServer` ledger lease a daemon server-start holds — same gate,
+/// same sizing history over the same peak key — so concurrent one-shots
+/// serialize under `memory.max_concurrent` exactly as daemon starts do.
+#[cfg(unix)]
+fn direct_drive(
+    spec: &Spec,
+    sdk: &Sdk,
+    aims: &[crate::Aim],
+    daemon_fault: Option<String>,
+) -> Outcome {
+    use dartq_toolchain::ledger::{self, Face};
+
+    let launch = crate::server::Launch {
+        sdk: sdk.clone(),
+        packages: spec.packages.clone(),
+    };
+    let peak_key = crate::daemon::repo_key(&spec.roots)
+        .unwrap_or_else(|| spec.cache_dir().display().to_string());
+    let (bytes, sized) = ledger::sizing_with_source(&peak_key, Face::AnalysisServer, None);
+    let mut lease = match ledger::acquire(
+        direct_lease_request(&peak_key, spec, bytes, sized),
+        bytes,
+        spec.max_percent,
+        std::time::Instant::now() + GATE_WAIT,
+        |text| eprintln!("{text}"),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return Outcome::PerRun {
+                reason: fallback_line(
+                    daemon_fault,
+                    Some(format!(
+                        "the direct server never got its memory lease: {error}"
+                    )),
+                ),
+                sdk: Some(sdk.clone()),
+            };
+        }
+    };
+    let budget = (spec.budget > 0).then_some(spec.budget);
+    let started = crate::server::Server::start(&launch, &spec.roots, budget, || false);
+    let server = match started {
+        Ok(server) => server,
+        // A budget kill is not retried per run: the child would need the
+        // same memory the ledger just refused — the daemon arm's own rule.
+        Err(fault @ crate::server::Fault::Budget { .. }) => {
+            return Outcome::Budget(fault.to_string());
+        }
+        Err(fault) => {
+            return Outcome::PerRun {
+                reason: fallback_line(daemon_fault, Some(fault.to_string())),
+                sdk: Some(sdk.clone()),
+            };
+        }
+    };
+    if let Some(lease) = lease.as_mut() {
+        lease.track(server.pid());
+    }
+    let report = server.report_scoped(aims);
+    let peak = server.peak();
+    server.shutdown();
+    if let Some(mut lease) = lease {
+        lease.record_peak(&peak_key, peak);
+    }
+    match report {
+        Some(report) => Outcome::Report {
+            report,
+            sdk: sdk.clone(),
+        },
+        // The aims fall outside the roots' one analysis context (the
+        // `NotServed` case): the child builds the file's own context root
+        // exactly as the oracle does — silently, as that arm always was.
+        None => Outcome::PerRun {
+            reason: None,
+            sdk: Some(sdk.clone()),
+        },
+    }
+}
+
+/// The direct drive's lease request: the `AnalysisServer` face, a slot
+/// under the run's own job cap, and the peak key the daemon's servers of
+/// the same roots book under — one gate, one sizing history, never a
+/// second ungated server per run. Pure: the bytes and `sized` legs are
+/// the caller's `sizing_with_source` answer.
+#[cfg(unix)]
+fn direct_lease_request(
+    peak_key: &str,
+    spec: &Spec,
+    bytes: u64,
+    sized: bool,
+) -> dartq_toolchain::ledger::Request {
+    dartq_toolchain::ledger::Request {
+        face: dartq_toolchain::ledger::Face::AnalysisServer,
+        label: spec
+            .roots
+            .first()
+            .map(|root| root.display().to_string())
+            .unwrap_or_default(),
+        bytes,
+        pid: None,
+        // No graceful release handle: a one-shot dies with its user, and
+        // the ledger's dead scan reaps the booking — the same posture as
+        // the `dart analyze` child it replaces, which offers none either.
+        release: None,
+        slot: true,
+        cap: dartq_toolchain::ledger::cap(spec.max_concurrent),
+        sized,
+        peak_key: Some(peak_key.to_owned()),
+        source_bytes: None,
+    }
+}
+
+/// The per-run fallback's stderr line: why the daemon did not serve, and
+/// — when the direct drive ran — why it too fell short. `None` keeps the
+/// silent fallback the cooling arm always had.
+#[cfg(unix)]
+fn fallback_line(daemon_fault: Option<String>, drive_fault: Option<String>) -> Option<String> {
+    match (daemon_fault, drive_fault) {
+        (None, None) => None,
+        (Some(daemon), None) => Some(format!(
+            "dartq analyze: resident analyzer unavailable ({daemon}) — running dart analyze"
+        )),
+        (None, Some(drive)) => Some(format!(
+            "dartq analyze: the direct analysis server failed ({drive}) — running dart analyze"
+        )),
+        (Some(daemon), Some(drive)) => Some(format!(
+            "dartq analyze: resident analyzer unavailable ({daemon}); \
+             the direct server failed too ({drive}) — running dart analyze"
+        )),
+    }
 }
 
 /// Whether the daemon of `dir` is up: its state names a live pid and its
@@ -572,9 +734,11 @@ fn start(spec: &Spec, dir: &Path, files: &Files) -> Result<std::os::unix::net::U
 #[cfg(all(test, unix))]
 mod tests {
     use std::io::Cursor;
+    use std::path::PathBuf;
 
-    use super::{MAX_FACE_BYTES, read_face, up};
+    use super::{MAX_FACE_BYTES, direct_lease_request, fallback_line, read_face, up};
     use crate::Files;
+    use crate::Spec;
 
     /// A refused worktree keeps its own daemon only while that daemon is
     /// up — a live pid in its state and its socket file present. An
@@ -621,5 +785,85 @@ mod tests {
             read_face(&mut short, 16).is_err(),
             "a short read surfaces as the io error the caller falls back on"
         );
+    }
+
+    /// The per-run fallback's stderr line: the daemon's fault, the direct
+    /// drive's, or both — and silence only when neither has a story (the
+    /// cooling arm's silent child).
+    #[test]
+    fn the_fallback_line_names_every_fault_it_carries() {
+        assert_eq!(fallback_line(None, None), None);
+        assert_eq!(
+            fallback_line(Some("the daemon never listened".into()), None).as_deref(),
+            Some(
+                "dartq analyze: resident analyzer unavailable \
+                 (the daemon never listened) — running dart analyze"
+            )
+        );
+        assert_eq!(
+            fallback_line(None, Some("cannot start the analysis server".into())).as_deref(),
+            Some(
+                "dartq analyze: the direct analysis server failed \
+                 (cannot start the analysis server) — running dart analyze"
+            )
+        );
+        let both = fallback_line(
+            Some("no answer".into()),
+            Some("the analysis server never connected".into()),
+        )
+        .expect("both faults name both");
+        assert!(
+            both.contains("resident analyzer unavailable (no answer)"),
+            "{both}"
+        );
+        assert!(
+            both.contains("the direct server failed too (the analysis server never connected)"),
+            "{both}"
+        );
+        assert!(both.ends_with("— running dart analyze"), "{both}");
+    }
+
+    /// The direct drive's lease request: the daemon server's own face,
+    /// peak-key family and slot posture — one gate and one sizing history
+    /// for a worktree's servers, never an ungated second server per run.
+    /// No release handle: a one-shot dies with its user, the dead scan
+    /// reaps the booking.
+    #[test]
+    fn the_direct_drive_books_the_daemons_gate_not_a_second_one() {
+        let spec = Spec {
+            sdk_root: PathBuf::from("/sdks/a"),
+            sdk_version: "3.13.7".to_owned(),
+            roots: vec![PathBuf::from("/w/a"), PathBuf::from("/w/b")],
+            packages: None,
+            budget: 4 << 30,
+            idle_secs: 900,
+            max_percent: 90,
+            max_concurrent: 2,
+            pool: false,
+            max_roots: 0,
+            warm: 0,
+            warm_ttl_secs: 0,
+        };
+        let request = direct_lease_request("/repo:a", &spec, 1 << 30, true);
+        assert_eq!(
+            request.face,
+            dartq_toolchain::ledger::Face::AnalysisServer,
+            "the same face the daemon's servers book under"
+        );
+        assert_eq!(request.label, "/w/a");
+        assert_eq!(request.bytes, 1 << 30);
+        assert!(request.sized);
+        assert_eq!(request.peak_key.as_deref(), Some("/repo:a"));
+        assert!(
+            request.slot,
+            "a one-shot takes the same slot a daemon server-start does"
+        );
+        assert_eq!(request.cap, dartq_toolchain::ledger::cap(2));
+        assert_eq!(request.release, None);
+        assert_eq!(
+            request.pid, None,
+            "the server pid lands on the lease only after track"
+        );
+        assert_eq!(request.source_bytes, None);
     }
 }

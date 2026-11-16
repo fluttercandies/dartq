@@ -1821,7 +1821,7 @@ fn incremental_settle_yields() -> bool {
 /// root's path relative to its worktree top, so sibling worktrees of one
 /// repo share one peak. `None` when no root's git identity is readable —
 /// the cache dir's key is the fallback.
-fn repo_key(roots: &[PathBuf]) -> Option<String> {
+pub(crate) fn repo_key(roots: &[PathBuf]) -> Option<String> {
     let mut common: Option<PathBuf> = None;
     let mut rels = Vec::with_capacity(roots.len());
     for root in roots {

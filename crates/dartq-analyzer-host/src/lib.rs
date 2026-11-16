@@ -13,7 +13,8 @@
 //! * [`snapshot`] is the request-time freshness check;
 //! * [`server`] drives one server child;
 //! * [`client`] is the `dartq analyze` side: find or start the daemon,
-//!   ask, and fall back to a per-run `dart analyze` on any failure;
+//!   ask, fall back to one directly-driven server per run when the daemon
+//!   cannot serve, and to a per-run `dart analyze` only past that;
 //! * [`daemon`] is the serving side; `disk` keeps the servers' caches
 //!   inside the machine's disk budget.
 //!

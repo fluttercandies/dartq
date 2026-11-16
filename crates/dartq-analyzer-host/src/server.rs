@@ -106,7 +106,12 @@ pub struct Launch {
 }
 
 impl Launch {
-    /// dartdev's argument list (`AnalysisServer._startProcess`).
+    /// dartdev's argument list (`AnalysisServer._startProcess`): flag
+    /// parity with the oracle's own server launch. The chain itself never
+    /// involves the `dart` tooling layer — the snapshot runs under the
+    /// SDK's own AOT runtime (the JIT runtime only where the SDK ships no
+    /// AOT build), so the dartdev wrapper process and its boot are not
+    /// paid on any arm that spawns through here, daemon or per-run.
     ///
     /// No `--cache`: dartdev leaves the flag unset, so the server picks
     /// `PhysicalResourceProvider`'s own state location — `~/.dartServer` on
