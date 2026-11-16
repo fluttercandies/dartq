@@ -4356,6 +4356,7 @@ fn write_official_metrics(
     let freshness_ms = leg(|l| l.freshness_ms);
     let report_ms = leg(|l| l.report_ms);
     let record_persist_ms = leg(|l| l.record_persist_ms);
+    let probe_ms = leg(|l| l.probe_ms);
     let daemon_total_ms = leg(|l| l.total_ms);
     let leg_files = leg(|l| l.files);
     let leg_diagnostics = leg(|l| l.diagnostics);

@@ -129,18 +129,25 @@ pub(crate) enum Answer {
     Yield,
 }
 
-/// What `analyze`/`join` hand back: a report already on the wire (the
-/// serialized `Answer::Report` line — rendered once, then reused while
-/// the error map stands, spliced from per-file fragments when it does
-/// not), a face answer's header line plus payload in one contiguous run,
-/// or a small answer that serializes at send.
+/// What `analyze`/`join` hand back: a rendered answer's wire bytes (the
+/// face's header line and payload kept apart, or one contiguous report
+/// line), or a small answer that serializes at send.
 enum Reply {
-    /// The full answer wire bytes, newline included (for `Answer::Face`,
-    /// the header line's newline plus the announced payload).
-    Line(Arc<[u8]>),
+    /// The answer's wire bytes, ready for the socket or the answered-turn
+    /// record.
+    Wire(crate::server::Wire),
     /// A non-report answer (faults, budgets, notes, the
     /// cannot-serve signal).
     Answer(Answer),
+}
+
+/// The answered-turn record a served render leaves for the deferred
+/// persist: the ask's key legs and the wire it rendered, written right
+/// after the reply (see [`Host::flush_record`]).
+struct PendingRecord {
+    aims: Vec<crate::Aim>,
+    face: Option<Face>,
+    wire: crate::server::Wire,
 }
 
 /// The `Answer::Face` header line: the meta member beside the announced
@@ -471,6 +478,15 @@ struct Host {
     /// tree rewrites the bytes already on disk, so the write is skipped
     /// until it moves.
     record_saved: Option<([u8; 16], u64)>,
+    /// The record a served render leaves for the deferred persist: set at
+    /// render time, written right after the reply — a 200 MB+-class write
+    /// on the reply's critical path costs the client the whole write
+    /// (0.24-0.43 s calm, unbounded under an I/O stall).
+    pending_record: Option<PendingRecord>,
+    /// The deferred record write's own wall clock, carried to the next
+    /// metrics ask's `record_persist_ms` leg: the persisting ask's metrics
+    /// line went out before the write ran.
+    deferred_persist_ms: Option<u64>,
     /// The in-flight ask's leg timings, reset at each `analyze`/
     /// `analyze_scoped` entry and read once the terminal answer is built
     /// — sent as [`Answer::Metrics`] ahead of it when the ask carried
@@ -547,6 +563,8 @@ impl Host {
             records: records_enabled(&spec.roots),
             record_capture: None,
             record_saved: None,
+            pending_record: None,
+            deferred_persist_ms: None,
             ask_legs: crate::face::Legs::default(),
         }
     }
@@ -789,7 +807,7 @@ impl Host {
             aims.to_vec()
         };
         if let Some(line) = self.record_probe(&owned, face) {
-            return Reply::Line(line);
+            return Reply::Wire(crate::server::Wire::Line(line));
         }
         match self.analyze_result(client) {
             Ok(()) => {
@@ -804,35 +822,29 @@ impl Host {
                         let render = (self.renderer)(&[], face);
                         self.ask_legs.report_ms =
                             u64::try_from(rendering.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        let Some(mut wire) = face_header(&render.meta, render.bytes.len()) else {
+                        let Some(header) = face_header(&render.meta, render.bytes.len()) else {
                             return Reply::Answer(Answer::NotServed);
                         };
-                        wire.extend_from_slice(&render.bytes);
-                        let line: Arc<[u8]> = wire.into();
-                        let peak = server.peak();
-                        let persisting = Instant::now();
-                        self.record_persist(&owned, Some(face), &line);
-                        self.ask_legs.record_persist_ms =
-                            u64::try_from(persisting.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        self.ask_legs.max_rss_bytes = peak;
-                        return Reply::Line(line);
+                        let wire = crate::server::Wire::Face {
+                            head: header.into(),
+                            body: render.bytes.into(),
+                        };
+                        self.ask_legs.max_rss_bytes = server.peak();
+                        self.defer_record_persist(owned, Some(face.clone()), wire.clone());
+                        return Reply::Wire(wire);
                     }
                     let rendering = Instant::now();
                     let rendered = server.render_face(&owned, face, self.renderer);
                     self.ask_legs.report_ms =
                         u64::try_from(rendering.elapsed().as_millis()).unwrap_or(u64::MAX);
                     match rendered {
-                        Some(line) => {
+                        Some(wire) => {
                             let (files, diagnostics) = server.face_counts();
-                            let peak = server.peak();
                             self.ask_legs.files = files;
                             self.ask_legs.diagnostics = diagnostics;
-                            let persisting = Instant::now();
-                            self.record_persist(&owned, Some(face), &line);
-                            self.ask_legs.record_persist_ms =
-                                u64::try_from(persisting.elapsed().as_millis()).unwrap_or(u64::MAX);
-                            self.ask_legs.max_rss_bytes = peak;
-                            Reply::Line(line)
+                            self.ask_legs.max_rss_bytes = server.peak();
+                            self.defer_record_persist(owned, Some(face.clone()), wire.clone());
+                            Reply::Wire(wire)
                         }
                         None => Reply::Answer(Answer::NotServed),
                     }
@@ -841,9 +853,9 @@ impl Host {
                         return Reply::Answer(Answer::Report(Report::default()));
                     }
                     match server.render(&owned) {
-                        Some(line) => {
-                            self.record_persist(&owned, None, &line);
-                            Reply::Line(line)
+                        Some(wire) => {
+                            self.defer_record_persist(owned, None, wire.clone());
+                            Reply::Wire(wire)
                         }
                         None => Reply::Answer(Answer::NotServed),
                     }
@@ -879,6 +891,13 @@ impl Host {
             Ok(ask) => {
                 metrics = ask.metrics;
                 self.ask_legs = crate::face::Legs::default();
+                // The deferred record write's figure rides the next
+                // metrics ask: the ask that paid it sent its metrics
+                // line before the write ran. A metrics-less ask leaves
+                // it parked for the next metrics one.
+                if metrics {
+                    self.ask_legs.record_persist_ms = self.deferred_persist_ms.take().unwrap_or(0);
+                }
                 let started = Instant::now();
                 let reply = if self.pooled {
                     self.join(&stream, ask)
@@ -900,6 +919,10 @@ impl Host {
             );
         }
         send_reply(&stream, reply);
+        // The served render's record write, parked at render time: it
+        // runs now — after the reply, still on this worker, so the next
+        // ask queues behind it exactly as it did before.
+        self.flush_record();
         if let Some(lease) = &self.lease {
             lease.touch();
         }
@@ -938,7 +961,7 @@ impl Host {
 
     fn analyze(&mut self, client: &UnixStream, aims: &[crate::Aim], face: Option<&Face>) -> Reply {
         if let Some(line) = self.record_probe(aims, face) {
-            return Reply::Line(line);
+            return Reply::Wire(crate::server::Wire::Line(line));
         }
         match self.analyze_result(client) {
             Ok(()) => {
@@ -950,26 +973,25 @@ impl Host {
                         self.ask_legs.report_ms =
                             u64::try_from(rendering.elapsed().as_millis()).unwrap_or(u64::MAX);
                         match rendered {
-                            Some(line) => {
+                            Some(wire) => {
                                 let (files, diagnostics) = server.face_counts();
-                                let peak = server.peak();
                                 self.ask_legs.files = files;
                                 self.ask_legs.diagnostics = diagnostics;
-                                let persisting = Instant::now();
-                                self.record_persist(aims, Some(face), &line);
-                                self.ask_legs.record_persist_ms =
-                                    u64::try_from(persisting.elapsed().as_millis())
-                                        .unwrap_or(u64::MAX);
-                                self.ask_legs.max_rss_bytes = peak;
-                                Reply::Line(line)
+                                self.ask_legs.max_rss_bytes = server.peak();
+                                self.defer_record_persist(
+                                    aims.to_vec(),
+                                    Some(face.clone()),
+                                    wire.clone(),
+                                );
+                                Reply::Wire(wire)
                             }
                             None => Reply::Answer(Answer::NotServed),
                         }
                     }
                     None => match server.render(aims) {
-                        Some(line) => {
-                            self.record_persist(aims, None, &line);
-                            Reply::Line(line)
+                        Some(wire) => {
+                            self.defer_record_persist(aims.to_vec(), None, wire.clone());
+                            Reply::Wire(wire)
                         }
                         None => Reply::Answer(Answer::NotServed),
                     },
@@ -1001,6 +1023,11 @@ impl Host {
         {
             return None;
         }
+        // The probe's own leg: the stamp walk plus the record read and
+        // validation, paid before any server work on the cold arm — a
+        // cold dentry walk makes it the cold start's largest
+        // unattributed cost, so it reports under its own name.
+        let probing = Instant::now();
         let roots = self.roots();
         let key = record_key(&self.spec, &roots, aims, face);
         let path = record_path(&self.spec.cache_dir(), &key);
@@ -1010,7 +1037,7 @@ impl Host {
             &self.spec.sdk_home(),
         );
         let stamps = snapshot.stamps();
-        match probe_record(&path, &stamps) {
+        let probed = match probe_record(&path, &stamps) {
             Ok(line) => {
                 self.files.event(&format!(
                     "dartq analyze: answer record hit ({} bytes)",
@@ -1026,11 +1053,43 @@ impl Host {
                 self.record_capture = Some(stamps);
                 None
             }
-        }
+        };
+        self.ask_legs.probe_ms = u64::try_from(probing.elapsed().as_millis()).unwrap_or(u64::MAX);
+        probed
+    }
+
+    /// Parks the served render's record write until the reply is on the
+    /// wire: the 200 MB+-class persist used to run inside the ask, ahead
+    /// of `send_reply`, so the client paid the whole write before its
+    /// first answer byte. The next ask still queues behind this worker —
+    /// the write is inline, just ordered after the reply it belongs to.
+    fn defer_record_persist(
+        &mut self,
+        aims: Vec<crate::Aim>,
+        face: Option<Face>,
+        wire: crate::server::Wire,
+    ) {
+        self.pending_record = Some(PendingRecord { aims, face, wire });
+    }
+
+    /// Writes the parked record right after its reply went out, on the
+    /// same worker — the simplest ordering that keeps the write off the
+    /// client's critical path (the next ask queues behind it, the
+    /// accepted tradeoff). The write's own wall clock lands in
+    /// `deferred_persist_ms` for the next metrics ask's
+    /// `record_persist_ms` leg: this ask's metrics line already left.
+    fn flush_record(&mut self) {
+        let Some(pending) = self.pending_record.take() else {
+            return;
+        };
+        let persisting = Instant::now();
+        self.record_persist(&pending.aims, pending.face.as_ref(), &pending.wire);
+        self.deferred_persist_ms =
+            Some(u64::try_from(persisting.elapsed().as_millis()).unwrap_or(u64::MAX));
     }
 
     /// Persists the answered-turn record for a served render (#4278):
-    /// the wire line beside the read-time stamp capture this ask's probe
+    /// the wire bytes beside the read-time stamp capture this ask's probe
     /// walked — the only capture that is provably pre-render, so the
     /// record pins the tree as the rendering run read it, never a
     /// post-render state an edit during the settle could fool. Only the
@@ -1043,8 +1102,13 @@ impl Host {
     /// A served render with no capture skips the persist; the
     /// quiet-turn elision skips it again while `(key, stamps digest)`
     /// stands; a failed write is a silent no-op (the accelerator
-    /// posture).
-    fn record_persist(&mut self, aims: &[crate::Aim], face: Option<&Face>, line: &Arc<[u8]>) {
+    /// posture). Runs from [`Host::flush_record`] after the reply.
+    fn record_persist(
+        &mut self,
+        aims: &[crate::Aim],
+        face: Option<&Face>,
+        wire: &crate::server::Wire,
+    ) {
         if !self.records {
             return;
         }
@@ -1064,11 +1128,19 @@ impl Host {
         {
             return;
         }
-        if write_record(&record_path(&self.spec.cache_dir(), &key), &encoded, line).is_ok() {
+        let (head, body) = wire.pieces();
+        if write_record(
+            &record_path(&self.spec.cache_dir(), &key),
+            &encoded,
+            head,
+            body,
+        )
+        .is_ok()
+        {
             self.record_saved = Some((key, digest));
             self.files.event(&format!(
                 "dartq analyze: answer record saved ({} bytes)",
-                line.len()
+                wire.len()
             ));
         }
     }
@@ -1657,7 +1729,21 @@ fn admit(
 fn send_reply(stream: &UnixStream, reply: Reply) {
     // A client that went away just misses its answer.
     let _ = match reply {
-        Reply::Line(line) => (&*stream).write_all(&line),
+        // The wire's runs ship as they are kept: the face's small header
+        // line and its 100 MB+-class payload go out as two writes, so
+        // the payload is never copied behind its header on the way to
+        // the socket. The client reads header-line then `bytes` — the
+        // concatenation is byte-identical to the old single buffer.
+        Reply::Wire(wire) => {
+            let (head, body) = wire.pieces();
+            (&*stream).write_all(head).and_then(|()| {
+                if body.is_empty() {
+                    Ok(())
+                } else {
+                    (&*stream).write_all(body)
+                }
+            })
+        }
         Reply::Answer(answer) => {
             let mut out = serde_json::to_vec(&answer).expect("an answer serializes");
             out.push(b'\n');
@@ -1819,7 +1905,7 @@ fn peak_persist_moved(
 // persist-per-shape is the exact multiplication class that lesson
 // closed). A serverless, unprimed daemon's ask probes before any server
 // starts: one full walk, set-equality against the record's stamps, a
-// hit ships the payload through `Reply::Line` with the server never
+// hit ships the payload through `Reply::Wire` with the server never
 // spawning; any miss falls through to today's path byte-identically.
 // The records are whole-file write/read — a whole-repo envelope is
 // 215.9 MB-level and never parsed on serve, and they are NOT bounded by
@@ -1944,8 +2030,12 @@ fn record_path(cache: &Path, key: &[u8; 16]) -> PathBuf {
 /// same-filesystem rename over the destination — a torn write leaves
 /// the previous record (or nothing), never a half frame the probe
 /// would trust. The header line derives from the lengths it is handed,
-/// so the frame always adds up by construction.
-fn write_record(path: &Path, stamps_line: &[u8], payload: &[u8]) -> std::io::Result<()> {
+/// so the frame always adds up by construction. The payload ships as
+/// two runs (`head` then `body`, the wire's own pieces): the frame's
+/// payload region is their concatenation — byte-identical to the old
+/// single-buffer write, without ever stitching a 200 MB-class body
+/// behind its small header.
+fn write_record(path: &Path, stamps_line: &[u8], head: &[u8], body: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     std::fs::create_dir_all(path.parent().expect("the answers dir path"))?;
     let name = path
@@ -1961,14 +2051,15 @@ fn write_record(path: &Path, stamps_line: &[u8], payload: &[u8]) -> std::io::Res
         let header = serde_json::to_vec(&RecordHeader {
             v: RECORD_VERSION,
             stamps: stamps_line.len() as u64,
-            bytes: payload.len() as u64,
+            bytes: (head.len() + body.len()) as u64,
         })
         .expect("the header serializes");
         file.write_all(&header)
             .and_then(|()| file.write_all(b"\n"))
             .and_then(|()| file.write_all(stamps_line))
             .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.write_all(payload))
+            .and_then(|()| file.write_all(head))
+            .and_then(|()| file.write_all(body))
     });
     let renamed = written.and_then(|()| std::fs::rename(&tmp, path));
     if renamed.is_err() {
@@ -1986,31 +2077,78 @@ fn write_record(path: &Path, stamps_line: &[u8], payload: &[u8]) -> std::io::Res
 /// unlink are spared); a stamps miss keeps it — the tree moved, and a
 /// revert brings the record's stamps back (the persist a fresh render
 /// then writes supersedes it either way).
+///
+/// The read is payload-scoped: the header line and the stamps JSON are
+/// small and validate first; only a stamps hit pays the payload's own
+/// byte range, straight into its final buffer — a stamps miss (every
+/// tree move) never touches the 200 MB-class payload, and a hit never
+/// materializes the frame around it.
 fn probe_record(path: &Path, stamps: &Stamps) -> Result<Arc<[u8]>, RecordMiss> {
-    let frame = std::fs::read(path).map_err(|_| RecordMiss::NoRecord)?;
-    let miss = || decode_miss(path, &frame);
-    let Some(one) = frame.iter().position(|b| *b == b'\n') else {
-        return Err(miss());
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let file = std::fs::File::open(path).map_err(|_| RecordMiss::NoRecord)?;
+    let mut reader = BufReader::new(file);
+    // The decode-miss guard judges the whole frame: on any decode miss
+    // the same open descriptor re-reads it — the fd pins the inode the
+    // probe read, so a rename landing fresh bytes mid-probe cannot
+    // alias the judged bytes onto the new record.
+    let decode = |reader: &mut BufReader<std::fs::File>| {
+        let _ = reader.seek(SeekFrom::Start(0));
+        let mut frame = Vec::new();
+        if reader.read_to_end(&mut frame).is_ok() {
+            decode_miss(path, &frame);
+        }
+        RecordMiss::Decode
     };
-    let header: RecordHeader = serde_json::from_slice(&frame[..one]).map_err(|_| miss())?;
-    if header.v != RECORD_VERSION {
-        return Err(miss());
+    // The header line is three small numbers — bounded by the same
+    // prefix the sweep judges by; a first line past it is a foreign
+    // frame, dead for this codec.
+    let mut head = Vec::with_capacity(RECORD_PREFIX_LEN + 1);
+    if (&mut reader)
+        .take((RECORD_PREFIX_LEN + 1) as u64)
+        .read_until(b'\n', &mut head)
+        .is_err()
+        || head.last() != Some(&b'\n')
+    {
+        return Err(decode(&mut reader));
     }
-    let stamps_end = (one + 1)
-        .checked_add(usize::try_from(header.stamps).unwrap_or(usize::MAX))
-        .filter(|end| frame.get(*end) == Some(&b'\n'))
-        .ok_or_else(miss)?;
-    let payload_start = stamps_end + 1;
-    let payload_end = payload_start
-        .checked_add(usize::try_from(header.bytes).unwrap_or(usize::MAX))
-        .filter(|end| *end == frame.len())
-        .ok_or_else(miss)?;
-    let recorded: Stamps =
-        serde_json::from_slice(&frame[one + 1..stamps_end]).map_err(|_| miss())?;
+    let header: RecordHeader =
+        serde_json::from_slice(&head[..head.len() - 1]).map_err(|_| decode(&mut reader))?;
+    if header.v != RECORD_VERSION {
+        return Err(decode(&mut reader));
+    }
+    // The frame's lengths must add up to the file's size before any
+    // payload-sized allocation: `head\nstamps\npayload` whole.
+    let stamps_len = usize::try_from(header.stamps).map_err(|_| decode(&mut reader))?;
+    let payload_len = usize::try_from(header.bytes).map_err(|_| decode(&mut reader))?;
+    let expected = (head.len() as u64)
+        .checked_add(header.stamps)
+        .and_then(|total| total.checked_add(1))
+        .and_then(|total| total.checked_add(header.bytes))
+        .ok_or_else(|| decode(&mut reader))?;
+    let end = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|_| decode(&mut reader))?;
+    if end != expected {
+        return Err(decode(&mut reader));
+    }
+    let _ = reader.seek(SeekFrom::Start(head.len() as u64));
+    let mut stamps_line = vec![0u8; stamps_len];
+    if reader.read_exact(&mut stamps_line).is_err() {
+        return Err(decode(&mut reader));
+    }
+    let mut separator = [0u8; 1];
+    if reader.read_exact(&mut separator).is_err() || separator[0] != b'\n' {
+        return Err(decode(&mut reader));
+    }
+    let recorded: Stamps = serde_json::from_slice(&stamps_line).map_err(|_| decode(&mut reader))?;
     if recorded != *stamps {
         return Err(RecordMiss::Stamps);
     }
-    Ok(frame[payload_start..payload_end].into())
+    let mut payload = vec![0u8; payload_len];
+    if reader.read_exact(&mut payload).is_err() {
+        return Err(decode(&mut reader));
+    }
+    Ok(payload.into())
 }
 
 /// The decode miss's verdict: the judged frame is dead weight — unlink
@@ -2915,6 +3053,7 @@ mod tests {
             &path,
             &serde_json::to_vec(&stamps).expect("stamps"),
             b"wire",
+            b"",
         );
         assert!(line.is_ok(), "{line:?}");
 
@@ -2946,6 +3085,7 @@ mod tests {
             &path,
             &serde_json::to_vec(&stamps).expect("stamps"),
             b"wire",
+            b"",
         )
         .expect("rewrite");
         let mut frame = std::fs::read(&path).expect("frame");
@@ -2968,6 +3108,130 @@ mod tests {
         ));
     }
 
+    /// The `.answer` frame's exact bytes for a tiny fixture: header line,
+    /// stamps JSON, payload — pinned before/after the payload-scoped
+    /// probe and the two-run write so the on-disk format cannot drift.
+    #[test]
+    fn the_answer_frame_bytes_are_pinned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = record_path(dir.path(), &[3; 16]);
+        let stamps: Stamps = vec![(PathBuf::from("/w/a.dart"), 1, 2, 3, 4)];
+        let stamps_line = serde_json::to_vec(&stamps).expect("stamps");
+        write_record(&path, &stamps_line, b"head-", b"body").expect("write");
+        let frame = std::fs::read(&path).expect("frame");
+        let mut expected = serde_json::to_vec(&RecordHeader {
+            v: RECORD_VERSION,
+            stamps: stamps_line.len() as u64,
+            bytes: 9,
+        })
+        .expect("header");
+        expected.push(b'\n');
+        expected.extend_from_slice(&stamps_line);
+        expected.push(b'\n');
+        expected.extend_from_slice(b"head-body");
+        assert_eq!(frame, expected, "the frame is header/stamps/payload");
+        // The two-run payload concatenates on serve: the probe returns
+        // the payload region's exact bytes.
+        let hit = probe_record(&path, &stamps).expect("hit");
+        assert_eq!(&*hit, b"head-body");
+    }
+
+    /// The payload-scoped probe's reject arms beyond the codec test's:
+    /// a stamps-region separator that is not a newline, a stamps JSON
+    /// that does not parse, and trailing bytes past the announced
+    /// payload all decode-miss — while a stamps inequality stays the
+    /// quiet `Stamps` miss that keeps the record.
+    #[test]
+    fn the_probe_rejects_malformed_frames_and_moved_trees() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = record_path(dir.path(), &[5; 16]);
+        let stamps: Stamps = vec![(PathBuf::from("/w/a.dart"), 1, 2, 3, 4)];
+        let stamps_line = serde_json::to_vec(&stamps).expect("stamps");
+        write_record(&path, &stamps_line, b"payload", b"").expect("write");
+        let frame = std::fs::read(&path).expect("frame");
+        // The stamps separator: corrupt the byte right after the stamps
+        // JSON (the newline before the payload).
+        let stamps_end = frame
+            .iter()
+            .position(|b| *b == b'\n')
+            .expect("header newline");
+        let mut corrupt = frame.clone();
+        corrupt[stamps_end + 1 + stamps_line.len()] = b' ';
+        std::fs::write(&path, &corrupt).expect("corrupt separator");
+        assert!(matches!(
+            probe_record(&path, &stamps),
+            Err(RecordMiss::Decode)
+        ));
+        assert!(!path.exists(), "the dead frame unlinks");
+
+        // Trailing bytes past the announced payload: the lengths no
+        // longer add up to the file's size.
+        write_record(&path, &stamps_line, b"payload", b"").expect("rewrite");
+        let mut trailing = std::fs::read(&path).expect("frame");
+        trailing.push(b'x');
+        std::fs::write(&path, &trailing).expect("trailing");
+        assert!(matches!(
+            probe_record(&path, &stamps),
+            Err(RecordMiss::Decode)
+        ));
+        assert!(!path.exists(), "the over-long frame unlinks");
+
+        // A stamps JSON that does not parse is dead weight too.
+        write_record(&path, b"not json", b"payload", b"").expect("rewrite");
+        // The header's `stamps` length was minted from `not json` — the
+        // frame adds up, the stamps content does not.
+        assert!(matches!(
+            probe_record(&path, &stamps),
+            Err(RecordMiss::Decode)
+        ));
+        assert!(!path.exists(), "the unparsable frame unlinks");
+
+        // A moved tree stays the quiet stamps miss: the record survives.
+        write_record(&path, &stamps_line, b"payload", b"").expect("rewrite");
+        let moved: Stamps = vec![(PathBuf::from("/w/a.dart"), 9, 9, 9, 9)];
+        assert!(matches!(
+            probe_record(&path, &moved),
+            Err(RecordMiss::Stamps)
+        ));
+        assert!(path.is_file(), "a stamps miss keeps the record");
+    }
+
+    /// The vectored emit: a face wire's header and payload go out as two
+    /// writes whose concatenation is byte-identical to the old
+    /// single-buffer line — and the report line ships as one run.
+    #[test]
+    fn the_wire_emit_is_header_then_payload_byte_identical() {
+        use std::io::Read as _;
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let head: Arc<[u8]> = Arc::from(&b"{\"Face\":{\"meta\":{},\"bytes\":7}}\n"[..]);
+        let body: Arc<[u8]> = Arc::from(&b"payload"[..]);
+        send_reply(
+            &server,
+            Reply::Wire(crate::server::Wire::Face {
+                head: head.clone(),
+                body: body.clone(),
+            }),
+        );
+        drop(server);
+        let mut out = Vec::new();
+        (&client).read_to_end(&mut out).expect("read");
+        let mut expected = head.to_vec();
+        expected.extend_from_slice(&body);
+        assert_eq!(out, expected, "the two runs concatenate verbatim");
+
+        // The report line is the one-run arm: same bytes, no split.
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let line: Arc<[u8]> = Arc::from(&b"{\"Report\":{\"rows\":[],\"priority_errors\":0}}\n"[..]);
+        send_reply(
+            &server,
+            Reply::Wire(crate::server::Wire::Line(line.clone())),
+        );
+        drop(server);
+        let mut out = Vec::new();
+        (&client).read_to_end(&mut out).expect("read");
+        assert_eq!(out, line.to_vec(), "the line ships whole");
+    }
+
     /// The startup budget pass (#4273's posture): dead records and aged
     /// write debris reclaim, a young temp and every live record stay,
     /// and the survivors LRU-cap at the budget — oldest last-persist
@@ -2981,7 +3245,7 @@ mod tests {
         let stamps_line = serde_json::to_vec(&stamps).expect("stamps");
         let mint = |key: u8| {
             let path = record_path(dir.path(), &[key; 16]);
-            write_record(&path, &stamps_line, &[0u8; 1024]).expect("mint");
+            write_record(&path, &stamps_line, &[0u8; 1024], &[]).expect("mint");
             path
         };
         let age = |path: &Path, secs: u64| {
@@ -3118,6 +3382,7 @@ mod tests {
                 &path,
                 &serde_json::to_vec(stamps).expect("stamps"),
                 b"the rendered wire line",
+                &[],
             )
             .expect("persist");
         };

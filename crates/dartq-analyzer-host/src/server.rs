@@ -181,13 +181,44 @@ struct RowSeg {
     msg16: Box<[u16]>,
 }
 
+/// A rendered answer's wire bytes, ready to ship or to persist: the
+/// compat report's one contiguous line, or a face's header line beside
+/// the payload it announces. The face's two runs stay apart through the
+/// cache, the socket write, and the answered-turn record, so a whole-repo
+/// payload (216 MB-class) is never copied behind its small header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Wire {
+    /// One contiguous answer line (the report face's `Answer::Report`).
+    Line(std::sync::Arc<[u8]>),
+    /// The `Answer::Face` header line (newline included) and its payload.
+    Face {
+        head: std::sync::Arc<[u8]>,
+        body: std::sync::Arc<[u8]>,
+    },
+}
+
+impl Wire {
+    /// The wire's runs in order: the report line as a head with no body.
+    pub(crate) fn pieces(&self) -> (&[u8], &[u8]) {
+        match self {
+            Self::Line(line) => (line, &[]),
+            Self::Face { head, body } => (head, body),
+        }
+    }
+
+    /// The wire's total byte length.
+    pub(crate) fn len(&self) -> usize {
+        let (head, body) = self.pieces();
+        head.len() + body.len()
+    }
+}
+
 /// The rendered answer of one (aims, face) shape.
 struct CachedLine {
     /// The error-map epoch the bytes were rendered at.
     epoch: u64,
-    /// The full wire bytes, ready to ship (the `Answer::Report` line, or
-    /// the `Answer::Face` header line's newline followed by the payload).
-    bytes: std::sync::Arc<[u8]>,
+    /// The answer's wire bytes, ready to ship.
+    wire: Wire,
     /// The face render's `(covered files, kept rows)` — `(0, 0)` on the
     /// report line, which has no face counts. A cache hit restores them
     /// so a metrics ask reads this shape's own numbers.
@@ -223,24 +254,24 @@ impl AnswerCache {
 
     fn insert(&mut self, key: (Vec<u8>, Vec<u8>), line: CachedLine) {
         if let Some(index) = self.entries.iter().position(|(shape, _)| *shape == key) {
-            self.bytes_total -= self.entries[index].1.bytes.len();
+            self.bytes_total -= self.entries[index].1.wire.len();
             self.entries.remove(index);
         }
         // An answer that alone exceeds the byte cap is not cacheable: it
         // is shipped once, never stored.
-        if line.bytes.len() > Self::BYTES_CAP {
+        if line.wire.len() > Self::BYTES_CAP {
             return;
         }
         while self.entries.len() >= Self::CAP
-            || self.bytes_total + line.bytes.len() > Self::BYTES_CAP
+            || self.bytes_total + line.wire.len() > Self::BYTES_CAP
         {
             if let Some((_, evicted)) = self.entries.pop_front() {
-                self.bytes_total -= evicted.bytes.len();
+                self.bytes_total -= evicted.wire.len();
             } else {
                 break;
             }
         }
-        self.bytes_total += line.bytes.len();
+        self.bytes_total += line.wire.len();
         self.entries.push_back((key, line));
     }
 }
@@ -608,12 +639,12 @@ impl Server {
     /// row fragments, so an edit re-renders only the files the push
     /// touched and re-sorts their keys — the rest of the line is reused.
     #[must_use]
-    pub fn render(&self, aims: &[crate::Aim]) -> Option<std::sync::Arc<[u8]>> {
+    pub fn render(&self, aims: &[crate::Aim]) -> Option<Wire> {
         self.shared.state.lock().render(aims)
     }
 
-    /// The `Answer::Face` wire bytes for `aims` under `face` — the meta
-    /// header line's newline followed by the rendered payload, rendered
+    /// The `Answer::Face` wire bytes for `aims` under `face` — the header
+    /// line (newline included) beside the rendered payload, rendered
     /// through `renderer` (the CLI's one writer) over the report's kept
     /// rows in dartdev order. `None` in `render`'s not-served case.
     #[cfg(unix)]
@@ -623,7 +654,7 @@ impl Server {
         aims: &[crate::Aim],
         face: &Face,
         renderer: FaceRenderer,
-    ) -> Option<std::sync::Arc<[u8]>> {
+    ) -> Option<Wire> {
         self.shared.state.lock().render_face(aims, face, renderer)
     }
 
@@ -1224,13 +1255,13 @@ pub(crate) const REPORT_FACE: &[u8] = b"report";
 impl State {
     /// The render behind [`Server::render`]: cache check, per-file
     /// fragment rebuild, sort, splice — all under the one state lock.
-    fn render(&mut self, aims: &[crate::Aim]) -> Option<std::sync::Arc<[u8]>> {
+    fn render(&mut self, aims: &[crate::Aim]) -> Option<Wire> {
         self.served(aims)?;
         let key = (aims_key(aims), REPORT_FACE.to_vec());
         if let Some(hit) = self.answers.get(&key)
             && hit.epoch == self.epoch
         {
-            return Some(std::sync::Arc::clone(&hit.bytes));
+            return Some(hit.wire.clone());
         }
         // The spliced row's sort view: keys by reference, rows by
         // reference — the sort and the join move no row data, and the
@@ -1280,16 +1311,16 @@ impl State {
         out.extend_from_slice(priority.to_string().as_bytes());
         out.extend_from_slice(b"}}");
         out.push(b'\n');
-        let bytes: std::sync::Arc<[u8]> = out.into();
+        let wire = Wire::Line(out.into());
         self.answers.insert(
             key,
             CachedLine {
                 epoch: self.epoch,
-                bytes: std::sync::Arc::clone(&bytes),
+                wire: wire.clone(),
                 counts: (0, 0),
             },
         );
-        Some(bytes)
+        Some(wire)
     }
 
     /// The render behind [`Server::render_face`]: the report's kept rows
@@ -1301,7 +1332,7 @@ impl State {
         aims: &[crate::Aim],
         face: &Face,
         renderer: FaceRenderer,
-    ) -> Option<std::sync::Arc<[u8]>> {
+    ) -> Option<Wire> {
         self.served(aims)?;
         let face_key = serde_json::to_vec(face).expect("a face serializes");
         let key = (aims_key(aims), face_key);
@@ -1312,7 +1343,7 @@ impl State {
             // cache entry — a metrics ask over a cached face still reads
             // this shape's own numbers.
             self.face_counts = Some(hit.counts);
-            return Some(std::sync::Arc::clone(&hit.bytes));
+            return Some(hit.wire.clone());
         }
         // The face's row view: `&Row` references beside the sort legs, so
         // the sort and the writer read the error map, never a clone.
@@ -1354,23 +1385,25 @@ impl State {
         let rows: Vec<&Row> = srows.iter().map(|srow| srow.row).collect();
         let render = renderer(&rows, face);
         // The wire is the header line (the `Answer::Face` meta member plus
-        // the payload length) then the raw payload — one contiguous run
-        // the client reads as header-line + `bytes`. An over-cap payload
-        // is a `NotServed`, the client's per-run fallback.
+        // the payload length) beside the raw payload the client reads as
+        // `bytes` after that line. The two runs stay separate — the header
+        // is small and the payload is 100 MB-class on a whole-repo face,
+        // and a stitched copy would move all of it. An over-cap payload is
+        // a `NotServed`, the client's per-run fallback.
         let header = crate::daemon::face_header(&render.meta, render.bytes.len())?;
-        let mut out = Vec::with_capacity(header.len() + render.bytes.len());
-        out.extend_from_slice(&header);
-        out.extend_from_slice(&render.bytes);
-        let bytes: std::sync::Arc<[u8]> = out.into();
+        let wire = Wire::Face {
+            head: header.into(),
+            body: render.bytes.into(),
+        };
         self.answers.insert(
             key,
             CachedLine {
                 epoch: self.epoch,
-                bytes: std::sync::Arc::clone(&bytes),
+                wire: wire.clone(),
                 counts,
             },
         );
-        Some(bytes)
+        Some(wire)
     }
 
     /// `render`'s not-served gate: `None` when a `.dart` file aim names no
@@ -1435,37 +1468,33 @@ fn file_seg(file: &str, rows: &[Row]) -> FileSeg {
 }
 
 #[derive(Deserialize)]
-struct Message {
+struct Message<'a> {
     id: Option<String>,
     event: Option<String>,
-    /// `RawValue` keeps the subtree as wire text — the protocol's big
-    /// notifications (`analysis.errors`) never materialize a `Value`
-    /// tree; the small arms re-parse theirs in place.
-    #[serde(default)]
-    params: Option<Box<serde_json::value::RawValue>>,
+    /// The params subtree as a borrow of the line's own text — the
+    /// protocol's big notifications (`analysis.errors`) never copy their
+    /// payload: the small arms parse their subtree in place, and the
+    /// errors arm deserializes its own params slice, never the whole line
+    /// twice.
+    #[serde(borrow, default)]
+    params: Option<&'a serde_json::value::RawValue>,
     error: Option<Value>,
 }
 
-impl Message {
+impl Message<'_> {
     /// The `params` subtree as a `Value` — the small-event arms'
     /// accessor (the `analysis.errors` arm never calls this: its payload
-    /// is worth megabytes and reads the line's own parse instead).
+    /// reads the borrowed params slice directly).
     fn params(&self) -> Value {
         self.params
-            .as_deref()
             .and_then(|raw| serde_json::from_str(raw.get()).ok())
             .unwrap_or(Value::Null)
     }
 }
 
 /// The one notification whose payload is worth megabytes: its rows
-/// deserialize straight off the wire text — never through a `Value`
+/// deserialize straight off the params slice — never through a `Value`
 /// tree, which is the reader's one big transient allocation per file.
-#[derive(Deserialize)]
-struct ErrorsNote {
-    params: ErrorsParams,
-}
-
 #[derive(Deserialize)]
 struct ErrorsParams {
     file: String,
@@ -1477,11 +1506,11 @@ fn read_messages(stdout: impl Read, shared: &Shared) {
     let reader = BufReader::new(stdout);
     for line in reader.lines() {
         let Ok(line) = line else { break };
-        let Ok(message) = serde_json::from_str::<Message>(&line) else {
+        let Ok(message) = serde_json::from_str::<Message<'_>>(&line) else {
             continue;
         };
         let mut state = shared.state.lock();
-        apply(&mut state, message, &line);
+        apply(&mut state, message);
         drop(state);
         shared.changed.notify_all();
     }
@@ -1493,7 +1522,7 @@ fn read_messages(stdout: impl Read, shared: &Shared) {
     shared.changed.notify_all();
 }
 
-fn apply(state: &mut State, message: Message, line: &str) {
+fn apply(state: &mut State, message: Message<'_>) {
     match message.event.as_deref() {
         Some("server.connected") => {
             state.connected = Some(
@@ -1514,15 +1543,18 @@ fn apply(state: &mut State, message: Message, line: &str) {
             }
         }
         Some("analysis.errors") => {
-            // Straight off the wire text: `Message`'s `params` stays
-            // `RawValue` — the `errors` array never becomes a `Value`
-            // tree, so a file's notification costs only its `Row`s.
-            match serde_json::from_str::<ErrorsNote>(line) {
-                Ok(note) => {
-                    let ErrorsParams {
-                        file,
-                        errors: mut rows,
-                    } = note.params;
+            // The borrowed params slice is the one parse of the payload
+            // text: `Message` copied nothing, the `errors` array never
+            // becomes a `Value` tree, and a file's notification costs only
+            // its `Row`s.
+            let parsed = message
+                .params
+                .map(|raw| serde_json::from_str::<ErrorsParams>(raw.get()));
+            match parsed {
+                Some(Ok(ErrorsParams {
+                    file,
+                    errors: mut rows,
+                })) => {
                     // The pushed list lives for the analysis's life:
                     // serde's growth slack is dead bytes per file, and
                     // every row's `location.file` names the one path the
@@ -1536,7 +1568,11 @@ fn apply(state: &mut State, message: Message, line: &str) {
                     state.epoch += 1;
                     state.files.insert(file, FileErrors { rows, segs: None });
                 }
-                Err(error) => {
+                other => {
+                    let error = match other {
+                        Some(Err(error)) => error.to_string(),
+                        _ => "the notification carries no params".into(),
+                    };
                     let params = message.params();
                     let file = params["file"].as_str().unwrap_or_default();
                     state.fault = Some(format!("unreadable analysis.errors for {file}: {error}"));
@@ -1578,7 +1614,7 @@ mod tests {
     use super::*;
 
     fn feed(state: &mut State, line: &str) {
-        apply(state, serde_json::from_str(line).expect("message"), line);
+        apply(state, serde_json::from_str(line).expect("message"));
     }
 
     /// The reader's state machine: per-file replacement, flushes, status
@@ -1637,6 +1673,37 @@ mod tests {
             r#"{"event":"server.error","params":{"isFatal":false,"message":"boom","stackTrace":""}}"#,
         );
         assert_eq!(state.fault.as_deref(), Some("server.error: boom"));
+    }
+
+    /// The errors arm's single parse: the borrowed params slice feeds
+    /// `ErrorsParams` directly — the same `Row`s the old whole-line
+    /// re-parse produced, in the same order, with every field intact.
+    #[test]
+    fn the_errors_arm_parses_params_once_into_identical_rows() {
+        let mut state = State::default();
+        let line = r#"{"event":"analysis.errors","params":{"file":"/p/lib/a.dart","errors":[{"severity":"ERROR","type":"COMPILE_TIME_ERROR","location":{"file":"/p/lib/a.dart","offset":7,"length":3,"startLine":2,"startColumn":5,"endLine":2,"endColumn":8},"message":"boom","code":"E1","hasFix":true},{"severity":"INFO","type":"LINT","location":{"file":"/p/lib/a.dart","offset":20,"length":1},"message":"lint me","code":"L1","hasFix":false}]}}"#;
+        feed(&mut state, line);
+        let rows = &state.files["/p/lib/a.dart"].rows;
+        assert_eq!(rows.len(), 2);
+        let first = &rows[0];
+        assert_eq!(first.severity, "ERROR");
+        assert_eq!(first.kind, "COMPILE_TIME_ERROR");
+        assert_eq!(&*first.location.file, "/p/lib/a.dart");
+        assert_eq!(first.location.offset, 7);
+        assert_eq!(first.location.length, 3);
+        assert_eq!(first.location.start_line, Some(2));
+        assert_eq!(first.location.start_column, Some(5));
+        assert_eq!(first.location.end_line, Some(2));
+        assert_eq!(first.location.end_column, Some(8));
+        assert_eq!(first.message, "boom");
+        assert_eq!(first.code, "E1");
+        assert!(first.context_messages.is_empty());
+        let second = &rows[1];
+        assert_eq!(second.severity, "INFO");
+        assert_eq!(second.kind, "LINT");
+        assert_eq!(second.location.start_line, None);
+        assert_eq!(second.message, "lint me");
+        assert_eq!(second.code, "L1");
     }
 
     #[test]
@@ -1974,11 +2041,7 @@ mod tests {
             ];
             for (file, rows) in files {
                 let line = errors(file, &rows);
-                apply(
-                    &mut state,
-                    serde_json::from_str(&line).expect("message"),
-                    &line,
-                );
+                apply(&mut state, serde_json::from_str(&line).expect("message"));
             }
             state
         }
@@ -2002,7 +2065,17 @@ mod tests {
         }
 
         fn rendered(state: &mut State, aims: &[crate::Aim]) -> Option<Vec<u8>> {
-            state.render(aims).map(|line| line.to_vec())
+            state.render(aims).map(|wire| wire_vec(&wire))
+        }
+
+        /// The wire's contiguous bytes — the test-side spelling of the
+        /// socket's two-run emit.
+        fn wire_vec(wire: &Wire) -> Vec<u8> {
+            let (head, body) = wire.pieces();
+            let mut out = Vec::with_capacity(head.len() + body.len());
+            out.extend_from_slice(head);
+            out.extend_from_slice(body);
+            out
         }
 
         #[test]
@@ -2080,7 +2153,6 @@ mod tests {
                     r#"{"event":"analysis.flushResults","params":{"files":["/p/lib/deep/b.dart"]}}"#,
                 )
                 .expect("message"),
-                r#"{"event":"analysis.flushResults","params":{"files":["/p/lib/deep/b.dart"]}}"#,
             );
             let fourth = rendered(&mut state, &aims).expect("rendered");
             assert_eq!(Some(fourth.as_slice()), scratch(&state, &aims).as_deref());
@@ -2091,7 +2163,7 @@ mod tests {
         }
 
         fn feed_lines(state: &mut State, line: &str) {
-            apply(state, serde_json::from_str(line).expect("message"), line);
+            apply(state, serde_json::from_str(line).expect("message"));
         }
 
         /// The aims cache: order-free canonicalization hits one entry,
@@ -2231,8 +2303,8 @@ mod tests {
             };
             let wire = state
                 .render_face(&aims, &face, stub_render)
-                .expect("rendered")
-                .to_vec();
+                .expect("rendered");
+            let wire = wire_vec(&wire);
             let (answer, payload) = face_parts(&wire);
             let crate::daemon::Answer::Face { meta, bytes } = answer else {
                 panic!("a face answer: {answer:?}");

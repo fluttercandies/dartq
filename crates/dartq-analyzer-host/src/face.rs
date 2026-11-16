@@ -83,9 +83,18 @@ pub struct Legs {
     #[serde(default)]
     pub report_ms: u64,
     /// The answered-turn record's persist write (`0` when no record was
-    /// captured or the quiet-turn elision skipped it).
+    /// captured or the quiet-turn elision skipped it). The write runs
+    /// after the reply that captured it, so its figure rides the next
+    /// metrics ask's line — the ask that paid it sent its metrics first.
     #[serde(default)]
     pub record_persist_ms: u64,
+    /// The answered-turn record probe: the read-time stamp walk plus the
+    /// record's own validation and payload read, paid before any server
+    /// work on the cold arm (`0` when this ask skipped the probe). The
+    /// walk is a whole-tree stat pass — a cold dentry cache makes it the
+    /// cold start's largest unattributed cost.
+    #[serde(default)]
+    pub probe_ms: u64,
     /// The whole ask's daemon-side wall clock — request dispatch through
     /// the reply's construction (the socket writes themselves are
     /// microseconds and excluded).
@@ -152,3 +161,40 @@ pub struct FaceRender {
 /// the cold in-process path calls, over the report's kept rows in dartdev
 /// order. Rows arrive as references so a render never clones row data.
 pub type FaceRenderer = fn(&[&Row], &Face) -> FaceRender;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The metrics line's leg set serializes every leg under its own
+    /// name — `probe_ms` included, so the record-probe walk's cost is
+    /// visible on the official `--metrics-json` surface.
+    #[test]
+    fn the_legs_serialize_every_leg_including_probe_ms() {
+        let legs = Legs {
+            probe_ms: 1234,
+            ..Legs::default()
+        };
+        let json = serde_json::to_value(&legs).expect("legs serialize");
+        assert_eq!(json["probe_ms"], 1234);
+        for leg in [
+            "server_spawn_ms",
+            "roots_ms",
+            "first_pass_ms",
+            "freshness_ms",
+            "report_ms",
+            "record_persist_ms",
+            "probe_ms",
+            "total_ms",
+            "files",
+            "diagnostics",
+            "max_rss_bytes",
+        ] {
+            assert!(json.get(leg).is_some(), "missing leg {leg}");
+        }
+        // A default legs line still carries the key — metrics consumers
+        // read it unconditionally.
+        let json = serde_json::to_value(Legs::default()).expect("legs serialize");
+        assert_eq!(json["probe_ms"], 0);
+    }
+}
