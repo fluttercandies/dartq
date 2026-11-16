@@ -355,7 +355,7 @@ impl SnapshotStore {
     /// A header claiming a foreign `format_version` (nothing is written),
     /// or an IO/serialization failure: the generation then loads as the
     /// last complete state, or as a miss — never as a mixture.
-    pub fn save<T: Serialize>(
+    pub fn save<T: Serialize + Sync>(
         &self,
         header: &GenerationHeader,
         tables: &RemapTables,
@@ -416,10 +416,14 @@ impl SnapshotStore {
     /// manifest claim, a torn save degrades to a miss, and capacity is
     /// throttled as in `save`.
     ///
+    /// The per-entry frames encode and write on the rayon pool (#4325):
+    /// `T: Sync` lets each entry cross the pool, exactly as [`Self::load`]'s
+    /// `T: Send` carries decoded entries back.
+    ///
     /// # Errors
     ///
     /// Exactly as [`Self::save`].
-    pub fn save_delta<T: Serialize>(
+    pub fn save_delta<T: Serialize + Sync>(
         &self,
         header: &GenerationHeader,
         tables: &RemapTables,
@@ -485,21 +489,39 @@ impl SnapshotStore {
             .retain(|&(generation_dir, stamp), _| generation_dir != dir || stamp == tables_stamp);
         let records = written.entry((dir, tables_stamp)).or_default();
         let mut written_bytes = encoded_tables.len() as u64;
-        for entry in changed {
-            let framed = entry::encode(entry, tables_stamp)?;
-            let path = entries_dir.join(format!("{}.entry", hex::encode(entry.key.id())));
-            // A byte-identical frame is already on disk — the narrowed
-            // stamp makes this the common case for an entry-set delta — so
-            // the incumbent file is left untouched instead of rewritten;
-            // reading a small framed file and comparing is strictly
-            // cheaper than the temp+rename write. `tables.json` above is
-            // never skipped: its manifest is exactly what an entry-set
-            // delta changes. Either way the frame is on disk under this
-            // stamp, so the key is recorded.
-            if !fs::read(&path).is_ok_and(|incumbent| incumbent == framed) {
-                written_bytes += framed.len() as u64;
+        // The per-entry frames fan out over rayon (#4325): each entry is an
+        // independent file — encode, incumbent read-compare, temp+rename —
+        // and the cold flush of a large workspace is bound by those
+        // metadata ops, not by the loop that used to serialize them (the
+        // L3 blob store fans its batch out over the same shape). The
+        // collected bytes keep the `changed` order — rayon's indexed
+        // collect preserves it — so the accrual below is a pure function
+        // of the input, while the records are a set and order-free. The
+        // bookkeeping lock stays held across the fan-out, so a concurrent
+        // `load`/`written_keys` observes the pre-save or post-sweep state,
+        // never the middle, exactly as the serial loop held it.
+        let landed = changed
+            .par_iter()
+            .map(|entry| {
+                let framed = entry::encode(entry, tables_stamp)?;
+                let path = entries_dir.join(format!("{}.entry", hex::encode(entry.key.id())));
+                // A byte-identical frame is already on disk — the narrowed
+                // stamp makes this the common case for an entry-set delta —
+                // so the incumbent file is left untouched instead of
+                // rewritten; reading a small framed file and comparing is
+                // strictly cheaper than the temp+rename write. `tables.json`
+                // above is never skipped: its manifest is exactly what an
+                // entry-set delta changes. Either way the frame is on disk
+                // under this stamp, so the key is recorded below.
+                if fs::read(&path).is_ok_and(|incumbent| incumbent == framed) {
+                    return Ok(None);
+                }
                 atomic_write(&path, &framed)?;
-            }
+                Ok(Some(framed.len() as u64))
+            })
+            .collect::<Result<Vec<Option<u64>>, SaveError>>()?;
+        for (entry, landed_bytes) in changed.iter().zip(landed) {
+            written_bytes += landed_bytes.unwrap_or(0);
             records.insert(entry.key.id());
         }
         // Generational sweep: the manifest claims exactly `ids`, so entry

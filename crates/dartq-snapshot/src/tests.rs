@@ -631,15 +631,11 @@ fn growing_resave_leaves_unchanged_entry_files_untouched() {
     assert_eq!(snapshot.entries.len(), 2);
 }
 
-/// A many-entry generation loads whole and in key order under the load
-/// fan-out (#4204): rayon's scheduling must not move a byte of the result
-/// — the accepted set equals the claim exactly and the entries come back
-/// sorted by key id, the same order the serial loop produced.
-#[test]
-fn wide_generation_loads_whole_under_the_fanout() {
-    let cache = TempCache::new("wide");
-    let header = test_header();
-    let saved: Vec<Entry<TestPayload>> = (0..2000u32)
+/// The wide fixture: 2000 entries with distinct keys (i % 256 bounds the
+/// content byte; the fingerprint carries the counter) — the shape whose
+/// save exercises the whole parallel write fan-out.
+fn wide_entries() -> Vec<Entry<TestPayload>> {
+    (0..2000u32)
         .map(|i| Entry {
             #[expect(
                 clippy::cast_possible_truncation,
@@ -648,11 +644,29 @@ fn wide_generation_loads_whole_under_the_fanout() {
             key: key((i % 256) as u8, u64::from(i)),
             payload: payload(&format!("unit-{i}")),
         })
-        .collect();
-    cache
-        .store(DEFAULT_CAPACITY_BYTES)
-        .save(&header, &tables(), &saved)
-        .expect("save");
+        .collect()
+}
+
+/// A many-entry generation loads whole and in key order under the load
+/// fan-out (#4204) and records every landed key under the write fan-out
+/// (#4325): rayon's scheduling must not move a byte of the result — the
+/// accepted set equals the claim exactly and the entries come back sorted
+/// by key id, the same order the serial loop produced.
+#[test]
+fn wide_generation_loads_whole_under_the_fanout() {
+    let cache = TempCache::new("wide");
+    let header = test_header();
+    let saved = wide_entries();
+    let keys: Vec<EntryKey> = saved.iter().map(|entry| entry.key).collect();
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    store.save(&header, &tables(), &saved).expect("save");
+    // The write fan-out records every key it landed: the flush face's skip
+    // set is the whole changed set, never a scheduling artifact.
+    assert_eq!(
+        store.written_keys(&header, &tables(), &keys).len(),
+        keys.len(),
+        "every landed key is recorded"
+    );
 
     let reloaded = cache
         .store(DEFAULT_CAPACITY_BYTES)
@@ -661,6 +675,53 @@ fn wide_generation_loads_whole_under_the_fanout() {
     let mut expected = saved;
     expected.sort_by_key(|entry| entry.key.id());
     assert_eq!(reloaded.entries, expected);
+}
+
+/// The idempotent re-save under the write fan-out (#4325): the same entry
+/// set saved twice re-frames every entry byte-identically, and the
+/// incumbent read-compare skips every rewrite — no entry file's mtime
+/// moves, exactly as the serial loop left them — while the generation
+/// still loads the full set.
+#[test]
+fn wide_idempotent_resave_leaves_every_entry_file_untouched() {
+    let cache = TempCache::new("wide-idempotent");
+    let header = test_header();
+    let saved = wide_entries();
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    store.save(&header, &tables(), &saved).expect("save");
+    let dir = entries_dir(&cache.path, &header);
+    // Park every file's mtime in the past: a rewrite (temp+rename) would
+    // bump it; the save's read-compare must not.
+    let parked = FileTime::from_system_time(SystemTime::now() - Duration::from_hours(1));
+    for entry in &saved {
+        set_file_mtime(
+            &dir.join(format!("{}.entry", hex::encode(entry.key.id()))),
+            parked,
+        )
+        .expect("park entry mtime");
+    }
+
+    store
+        .save(&header, &tables(), &saved)
+        .expect("idempotent re-save");
+
+    for entry in &saved {
+        let id = hex::encode(entry.key.id());
+        let path = dir.join(format!("{id}.entry"));
+        let modified = fs::metadata(&path)
+            .expect("entry metadata")
+            .modified()
+            .expect("mtime");
+        assert_eq!(
+            FileTime::from_system_time(modified),
+            parked,
+            "the unchanged entry's file is never rewritten: {id}"
+        );
+    }
+    let snapshot = store.load::<TestPayload>(&header).expect("generation");
+    let mut expected = saved;
+    expected.sort_by_key(|entry| entry.key.id());
+    assert_eq!(snapshot.entries, expected);
 }
 
 /// The stamp entry frames embed: blake3-128 over the remap-slices
