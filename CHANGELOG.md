@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-11-16
+
+### Fixed
+
+- P0: the `lon` renderer no longer panics on large outputs — the
+  diagnostics document streams row-by-row through a fixed-schema emitter
+  (`write_diags_lon`), so no serde value graph exists to trip the codec's
+  1M-element budget; 462k rows render rc=3 (oracle exit semantics)
+  instead of the rc=4 crash across resident, re-elected, and in-process
+  layers (#4322).
+- Semantic: resolved prefixed types (`p.C`) now report their full verdict
+  set (var-init, argument, field/ctor-initializer, return, generic arity,
+  receiver misses) through a single `head_container` resolution funnel;
+  unresolved `p.X` keeps the Invalid-lattice posture. The pending-prefix
+  latch is now a stack keyed on the completing token's range, fixing
+  nested `p.C<p.D>` type-argument heads (#4320).
+- Test: the panicking-answer-worker daemon test is deterministic (the
+  probe group's serving thread leaves the job queue to its spawned
+  workers — the spawn race could starve the trigger under suite
+  parallelism) (#4327).
+
+### Changed
+
+- Performance, official answer path: probe metrics leg (866 ms on the 48k
+  stamp walk, previously hidden in total), record persist deferred past
+  the client-visible reply, two-run socket emit killing the 216 MB frame
+  stitch, payload-only warm serve (one positioned read), and parse-once
+  ingest of 48k analysis.errors lines (#4324).
+- Performance, snapshots: per-entry snapshot writes fan out through
+  rayon (48k atomic writes on the engine cold path), format-preserving
+  (#4325).
+- Performance, registration: `register_file`'s element-model walk (16% of
+  diagnose worker-time at 107k files) freezes into shared per-file plans
+  replayed per library, byte-equivalent by construction (#4330).
+- The per-run fallback no longer spawns a `dart analyze` child: when the
+  daemon cannot serve, the client directly drives one analysis server
+  through the daemon's own launch machinery — the last dartdev-layer
+  surface is gone (#4329).
+
 ## [0.1.27] - 2026-11-16
 
 ### Added
