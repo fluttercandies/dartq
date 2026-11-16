@@ -10665,7 +10665,8 @@ impl<'a> Engine<'a> {
                 None
             };
             let flow_ty = rebound.or(read_at).unwrap_or(*ty);
-            let rejects = self.argument_verdict(flow_ty, formal.ty, *literal) == Some(false);
+            let arg_verdict = self.argument_verdict(flow_ty, formal.ty, *literal);
+            let rejects = arg_verdict == Some(false);
             if rejects {
                 let from_text = self.ty_display(flow_ty);
                 let to_text = self.ty_display(formal.ty);
@@ -12775,40 +12776,6 @@ impl<'a> Engine<'a> {
         Some((self.strings.intern(text), self.utf16_of(at)))
     }
 
-    /// The `(prefix, real head)` pair of a captured alias RHS written
-    /// `p.C<…>`: the capture's first leaf is the spelling's first token —
-    /// the prefix for a qualified name (`handle_type` completes on it and
-    /// the `TypeReferenceContinuation` joins no leaf, so a non-generic
-    /// `p.C` keeps only the `p` leaf). A `.`+identifier read straight off
-    /// the source after the head token splits the pair; a bare head or a
-    /// generic head whose tree names the real class already returns
-    /// `None` (the unprefixed walk handles it).
-    fn prefixed_alias_head(&self, tree: &crate::capture::TypeTree) -> Option<(StringId, StringId)> {
-        let bytes = self.source.as_bytes();
-        let mut at = self.byte_of(tree.range.offset) + self.strings.resolve(tree.head).len();
-        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
-            at += 1;
-        }
-        if at >= bytes.len() || bytes[at] != b'.' {
-            return None;
-        }
-        at += 1;
-        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
-            at += 1;
-        }
-        let start = at;
-        while at < bytes.len()
-            && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' || bytes[at] == b'$')
-        {
-            at += 1;
-        }
-        if at == start {
-            return None;
-        }
-        let real = self.source.get(start..at)?;
-        Some((tree.head, self.strings.intern(real)))
-    }
-
     /// Whether the bare creation `name(...)` can build on the alias chain:
     /// the right-hand type grounds in a container (a class creation through
     /// the alias), a dart:core primitive, or a non-alias declaration. The
@@ -12825,43 +12792,15 @@ impl<'a> Engine<'a> {
             None => self.bounds.alias_fn_shape(name).is_none(),
             Some((_, tree)) if depth < 8 => {
                 let head = tree.head;
-                // A head written behind an import prefix (`typedef Alias =
-                // shared.Foreign<Node>;`) grounds only through that
-                // prefix's namespace — the bare-name walk never sees the
-                // aliased class (`io.File` grounds, `shared.Foreign` with
-                // an empty prefix namespace does not). Two spellings the
-                // capture stores: a generic RHS keeps the real head's
-                // tree (`Foreign<Node>`) whose token a dot + identifier
-                // BEFORE it qualifies; a non-generic `p.C` keeps only the
-                // prefix leaf (`handle_type` completes on the prefix, the
-                // continuation joins no leaf) whose real head the dot +
-                // identifier AFTER it carries. The spelling decides the
-                // split either way.
-                let pair = self
-                    .written_prefix_before(tree.range.offset)
-                    .map(|(prefix, _)| (prefix, head))
-                    .or_else(|| self.prefixed_alias_head(tree));
-                if let Some((prefix, real)) = pair {
-                    return prefixed_container(
-                        self.graph,
-                        self.namespaces,
-                        self.index,
-                        self.lib,
-                        prefix,
-                        real,
-                    )
-                    .is_some();
-                }
-                if resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    self.lib,
-                    self.file,
-                    head,
-                )
-                .is_some()
-                    || self.members.primitive_ids.contains(&head)
+                // The capture stores the head's RESOLVED spelling: a
+                // prefixed RHS (`typedef Alias = shared.Foreign<Node>;`)
+                // carries the dot-joined `shared.Foreign`, so the walk
+                // rides the same funnel every written head takes — the
+                // bare scope walk first, then `resolve_joined_container`'s
+                // prefix-namespace lookup for the joined form (`io.File`
+                // grounds through `io`'s exports; `shared.Foreign` behind
+                // an empty prefix namespace misses).
+                if self.head_container(head).is_some() || self.members.primitive_ids.contains(&head)
                 {
                     return true;
                 }
@@ -15573,15 +15512,14 @@ impl<'a> Engine<'a> {
                             // `Object?`).
                             && !self.members.primitive_ids.contains(&name)
                             && !self.core_head(name)
-                                && resolve_container(
-                                    self.graph,
-                                    self.namespaces,
-                                    self.index,
-                                    self.lib,
-                                    self.file,
-                                    name,
-                                )
-                                .is_none()
+                                // The funnel (bare scope, then the
+                                // dot-joined `p.C` leg) — the raw
+                                // `resolve_container` could not see a
+                                // prefixed formal, so a RESOLVED
+                                // `p.Real` formal read as unbound and
+                                // the staged rejection never armed
+                                // (#4320).
+                                && self.head_container(name).is_none()
                         }
                         _ => false,
                     };

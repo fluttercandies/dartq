@@ -7975,3 +7975,16 @@ mod ticket_3771_invalid_production_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_3545_invalid_receiver_tests.rs"]
 mod ticket_3545_invalid_receiver_tests;
+
+/// The #4320 pins: resolved prefixed-type (`p.C`) verdict gaps — the
+/// joined `p.C` head now resolves through [`Engine::head_container`] at
+/// every head-resolution face (`named_type_is_type`'s joined leg,
+/// `container_kind_of`'s switch, the already-landed `is_invalid_ty` /
+/// `type_head_resolves` / `declared_outside_core` / `strict_subtype` /
+/// `same_head_args` reads), so the oracle's full verdict surface fires
+/// for a resolved `p.Real` while unresolved `p.X` keeps the Invalid
+/// lattice's posture. Spec: the prefix-type probe corpus's ten oracle
+/// rows.
+#[cfg(test)]
+#[path = "diagnose/ticket_4320_prefixed_verdict_tests.rs"]
+mod ticket_4320_prefixed_verdict_tests;

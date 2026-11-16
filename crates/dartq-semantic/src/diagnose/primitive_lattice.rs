@@ -15,16 +15,15 @@ use super::*;
 impl Engine<'_> {
     /// Whether `name` resolves to a class, mixin or enum declared outside
     /// the SDK — a container the core primitives' closed lattice can never
-    /// relate to.
+    /// relate to. The head reads through [`Engine::head_container`]: a
+    /// RESOLVED prefixed annotation (`p.Real`) is a real interface type
+    /// behind the import prefix, and the bare-scope walk alone would take
+    /// the miss for "unknown head" — the under-report arm that let every
+    /// primitive-against-prefixed pair (`p.Real x = "s"`, `List<p.Real> l =
+    /// <int>[]`, `void f(p.Real r) {} f(42)`) escape its decidable
+    /// negative.
     pub(crate) fn declared_outside_core(&self, name: StringId) -> bool {
-        let Some((container, owner)) = resolve_container(
-            self.graph,
-            self.namespaces,
-            self.index,
-            self.lib,
-            self.file,
-            name,
-        ) else {
+        let Some((container, owner)) = self.head_container(name) else {
             return false;
         };
         if !matches!(

@@ -7504,7 +7504,14 @@ impl<'a> Engine<'a> {
     /// primitives and the in-scope type parameters are always types. The
     /// enclosing container's own members are never types
     /// (`InstanceScope.lookup`, the same chain [`Engine::type_resolution`]
-    /// walks). The
+    /// walks). A dot-joined `p.C` spelling — the intern table's one-head
+    /// form a resolved prefixed annotation arms — resolves through the
+    /// prefix's merged table ([`Self::head_container`] for containers,
+    /// [`Namespaces::lookup_prefixed`] for the decl face), the same
+    /// visibility [`Self::is_invalid_ty`] compensates with: without it a
+    /// resolved `p.Real` read as `InvalidType` and every assignability
+    /// gate above stayed silent where the oracle reports.
+    /// The
     /// teardown re-decision of an already-staged check re-runs
     /// [`Engine::return_verdict`] directly: this gate lives at the staging
     /// site, where the frame's type parameters are still in scope.
@@ -7523,6 +7530,57 @@ impl<'a> Engine<'a> {
                 .is_some_and(|c| c.members.get(&name).is_some())
         {
             return false;
+        }
+        // The dot-joined `p.C` spelling's own leg: a Dart identifier never
+        // carries a dot, so the primitive/parameter/member-shadow checks
+        // above can never match it, and the bare-scope walk below cannot
+        // see the leaf (it lives in the prefix's merged table, not this
+        // library's scope). The container half shares
+        // [`Self::head_container`] — the funnel [`Self::is_invalid_ty`]
+        // and the subtype walk already read — so a resolved `p.Real`
+        // answers `true` here exactly as the unprefixed `Real` does. The
+        // namespace half covers what `element_face` cannot project: a
+        // typedef or other non-container declaration behind the prefix
+        // (the same `Decl`-probe shape [`Self::type_head_resolves`] runs
+        // for the bare spelling). An unresolved leaf or a dead prefix
+        // keeps `false` — the `InvalidType` face the Invalid lattice
+        // already owns, never a verdict gain.
+        if self.strings.resolve(name).contains('.') {
+            if self.head_container(name).is_some() {
+                return true;
+            }
+            let Some((prefix, leaf)) = self.strings.resolve(name).split_once('.') else {
+                return false;
+            };
+            let (prefix, leaf) = (self.strings.intern(prefix), self.strings.intern(leaf));
+            return match self
+                .namespaces
+                .lookup_prefixed(self.graph, self.lib, prefix, leaf)
+            {
+                dartq_resolution::Lookup::Found(NamespaceEntry::Decl(owner)) => self
+                    .index
+                    .get(owner)
+                    .and_then(|f| f.decl(leaf))
+                    .is_none_or(|decl| Self::decl_is_type(decl.kind)),
+                // A dead prefix, a member miss, or an ambiguous set keeps
+                // the `InvalidType` posture — the same answers the bare
+                // walk's `Prefix`/`Ambiguous`/`NotFound` arms give.
+                _ => false,
+            };
+        }
+        // A type-argument spelling carries the leaf only — the capture
+        // canonicalizes `p.Real` inside `List<…>` to the resolved leaf
+        // (`Real`), the same element the prefix's merged table holds.
+        // The bare-scope walk below cannot see it (the leaf lives in the
+        // imported library's scope, not this one), so a prefixed leaf
+        // inside a type-argument group resolves through the prefix's
+        // merged table here — the same visibility
+        // [`Self::head_container`]'s joined leg grants the top-level
+        // head. Without it `List<p.Real>` reads `Real` as an
+        // unresolvable leaf and the covariant argument walk stays
+        // silent where the oracle reports `invalid_assignment`.
+        if self.type_arg_depth > 0 && self.prefixed_type_arg_leaf_resolves(name) {
+            return true;
         }
         match lookup_scoped(
             self.graph,
@@ -7543,6 +7601,30 @@ impl<'a> Engine<'a> {
             ScopedHit::Found(NamespaceEntry::Prefix) | ScopedHit::Ambiguous(_) => false,
             ScopedHit::NotFound => false,
         }
+    }
+
+    /// Whether `name` — a type-argument leaf the capture canonicalized to
+    /// its bare spelling (`p.Real` inside `List<…>` arrives as `Real`) —
+    /// resolves through ANY import prefix of the diagnosing library. The
+    /// prefix's merged table answers the leaf exactly as the joined
+    /// `p.Real` leg above does; a leaf the prefix's table lacks keeps the
+    /// bare-scope walk's own answer.
+    fn prefixed_type_arg_leaf_resolves(&self, name: StringId) -> bool {
+        self.graph.import_edges(self.lib).iter().any(|edge| {
+            let Some(prefix) = edge.prefix else {
+                return false;
+            };
+            matches!(
+                self.namespaces
+                    .lookup_prefixed(self.graph, self.lib, prefix, name),
+                dartq_resolution::Lookup::Found(NamespaceEntry::Decl(owner))
+                    if self
+                        .index
+                        .get(owner)
+                        .and_then(|f| f.decl(name))
+                        .is_some_and(|decl| Self::decl_is_type(decl.kind))
+            )
+        })
     }
 
     /// [`Self::named_type_is_type`] resolved in a FOREIGN file's scope: the
@@ -11198,7 +11280,6 @@ impl<'a> Engine<'a> {
         if from.len() != to.len() {
             return None;
         }
-        // The head's DECLARED per-parameter variance — the model's
         // `Container::type_param_variances` column (the collector's
         // written-keyword capture). The interface-argument relation runs
         // per parameter (`_interfaceArguments`, upstream Dart SDK source,

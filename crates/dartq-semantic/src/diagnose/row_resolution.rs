@@ -15595,15 +15595,16 @@ impl<'a> Engine<'a> {
     }
 
     pub(crate) fn container_kind_of(&self, container: StringId) -> Option<ContainerKind> {
-        resolve_container(
-            self.graph,
-            self.namespaces,
-            self.index,
-            self.lib,
-            self.file,
-            container,
-        )
-        .map(|(c, _)| c.kind)
+        // The shared head-resolution funnel: a dot-joined `p.C` spelling —
+        // the intern table's one-head form a resolved prefixed annotation
+        // arms — resolves through its prefix binding
+        // ([`Self::head_container`]'s `resolve_joined_container` leg), the
+        // same visibility [`Self::is_invalid_ty`] and the subtype walk
+        // already read. The bare-scope walk alone answered `None` for it,
+        // which routed a resolved `p.Real` receiver's member miss into the
+        // unindexed-core suppression arm — silent where the oracle reports
+        // `undefined_method`/`undefined_getter`.
+        self.head_container(container).map(|(c, _)| c.kind)
     }
 
     /// The anonymous-methods experiment's receiver faces, over the

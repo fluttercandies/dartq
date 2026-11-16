@@ -4239,7 +4239,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     // completion's armed type reads this name, never the
                     // prefix token the closing `handle_type` fires at.
                     if matches!(head, TypeHead::Continuation)
-                        && let Some((_, leaf)) = engine.pending_prefixed.as_mut()
+                        && let Some((_, leaf)) = engine.pending_prefixed.last_mut()
                         && leaf.is_none()
                     {
                         *leaf = Some((name, token.range));
@@ -4249,7 +4249,7 @@ impl ParserListener for DiagnoseListener<'_> {
             C::PrefixedTypeReference => {
                 if let Some(name) = name {
                     engine.arm_type_prefix(name, token.range);
-                    engine.pending_prefixed = Some((token.range, None));
+                    engine.pending_prefixed.push((token.range, None));
                 }
             }
             // A constructor reference names a class: the guarded miss is the
@@ -5178,18 +5178,22 @@ impl ParserListener for DiagnoseListener<'_> {
         let Some(text) = engine.text_of(name) else {
             return;
         };
-        // The group-less prefixed completion (`p.C`): the official
+        // The prefixed completion (`p.C`, `p.C<T>`): the official
         // `PrefixedType.parseType` fires `handleType` at the PREFIX's
         // token, so the lexeme above names the prefix — the armed type,
         // the bound declared types, and every downstream face would read
         // a container named after the import prefix (#2523). The leaf
-        // segment's name is the type (`p.C` keeps `C`); a completion
-        // whose token is not the latched prefix segment consumes the
-        // stale stash and completes normally.
+        // segment's name is the type (`p.C` keeps `C`). Consumption keys
+        // on the completing token's own range: the arg completions inside
+        // `p.C<T>` run their `handle_type` BEFORE the prefix token's, and
+        // a nested `p.D` arg pushes (then pops) its own stack entry — an
+        // unconditional take would drop the outer latch and complete the
+        // outer head as the bare prefix lexeme.
         let prefixed_leaf = engine
             .pending_prefixed
-            .take()
-            .filter(|(prefix_range, _)| *prefix_range == name.range)
+            .iter()
+            .rposition(|(prefix_range, _)| *prefix_range == name.range)
+            .map(|index| engine.pending_prefixed.remove(index))
             .and_then(|(_, leaf)| leaf);
         let (text, leaf_id, head_id) = match prefixed_leaf {
             // The armed head spells the DOT-JOINED form (`io.File`), the
@@ -5199,8 +5203,11 @@ impl ParserListener for DiagnoseListener<'_> {
             // `FileSystemException` behind `io.FileSystemException`), and
             // every container walk on the joined spelling goes through
             // the prefix-aware lookup or misses. The bare leaf still
-            // feeds the faces keyed by the written segment (the bounds
-            // capture, the header spans).
+            // feeds the faces keyed by the written segment itself (the
+            // `Prefixed` verdict's leaf anchor, the header spans, the
+            // fn/call captures' segment name); every RESOLUTION-keyed
+            // face — the armed type and the type-tree captures below —
+            // carries `head_id`.
             Some((leaf_id, _)) => {
                 let joined = format!("{}.{}", text, engine.strings.resolve(leaf_id));
                 let head_id = engine.strings.intern(&joined);
@@ -5216,9 +5223,16 @@ impl ParserListener for DiagnoseListener<'_> {
         let leaf_offset = prefixed_leaf.map(|(_, leaf_range)| leaf_range.offset);
         // The #610 capture: every completed type head is a leaf of the open
         // window (the parser re-fires a parameterized head after its group,
-        // carrying the trailing `?` — the sink merges that completion).
+        // carrying the trailing `?` — the sink merges that completion). The
+        // trees store the head's RESOLVED spelling — `head_id`, the joined
+        // `p.C` for a prefixed completion — so `tree_ty` and the bounded
+        // faces route the type-argument heads through the same
+        // `head_container` funnel a written `p.C` head takes: a bare leaf
+        // here would drop the prefix segment and resolve a same-spelled
+        // unprefixed element (or miss entirely), folding the arg to the
+        // undecidable face the oracle's resolved `p.C` never takes.
         engine.bounds.leaf(
-            leaf_id,
+            head_id,
             question.is_some(),
             match question {
                 Some(q) => SourceRange {
@@ -5230,7 +5244,7 @@ impl ParserListener for DiagnoseListener<'_> {
         );
         // The #1351 capture: the same leaf joins the open typedef RHS.
         engine.bounds.alias_leaf(
-            leaf_id,
+            head_id,
             question.is_some(),
             match question {
                 Some(q) => SourceRange {
@@ -5242,7 +5256,7 @@ impl ParserListener for DiagnoseListener<'_> {
         );
         // The #612 capture: the same leaf joins the open header (the
         // parameterized re-fire merges through the sink's head latch).
-        engine.var_leaf(leaf_id, name.range.offset, question.is_some());
+        engine.var_leaf(head_id, name.range.offset, question.is_some());
         // The deferred modifier checks' clause-entry capture (#1289 E1): a
         // depth-0 completion inside the open header is one written entry.
         engine.note_header_type_span(name, question);
@@ -5405,7 +5419,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let mut re_fired_group = false;
         match engine.completed_group.take() {
             Some((group_head, group_offset, args))
-                if group_head == leaf_id && group_offset == name.range.offset =>
+                if group_head == head_id && group_offset == name.range.offset =>
             {
                 re_fired_group = true;
                 // The written arguments join the armed head (#611): the
@@ -5512,7 +5526,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.armed_ty = None;
         engine.armed_ty_unresolved = false;
         engine.armed_ty_span = None;
-        engine.pending_prefixed = None;
+        engine.pending_prefixed.clear();
     }
 
     fn handle_void_keyword(&mut self, token: Token) {
@@ -10882,12 +10896,21 @@ impl ParserListener for DiagnoseListener<'_> {
             } else {
                 head
             };
-        engine.bounds.begin_group(site_head, true);
+        // The type-tree captures carry the head's RESOLVED spelling — a
+        // prefixed `p.C` head stores the joined `p.C` through
+        // [`Engine::capture_head`] (the `head_id` convention `handle_type`'s
+        // leaf call follows), never the bare leaf that would resolve a
+        // same-spelled unprefixed element. `group_heads` keeps the leaf and
+        // its range for `check_prefixed_annotation_arity`'s
+        // source-anchored prefix recovery.
+        let site_head_capture = site_head.map(|(name, range)| engine.capture_head(name, range));
+        let head_capture = head.map(|(name, range)| engine.capture_head(name, range));
+        engine.bounds.begin_group(site_head_capture, true);
         // The #1351 capture: the same group nests into the open typedef
         // RHS (a no-op outside one).
-        engine.bounds.alias_begin_group(head);
+        engine.bounds.alias_begin_group(head_capture);
         // The #612 capture: the same group nests into the open header.
-        engine.var_begin_group(head);
+        engine.var_begin_group(head_capture);
         // The clause-entry capture: the group's members are argument
         // positions, not entries.
         engine.note_header_type_args_open();

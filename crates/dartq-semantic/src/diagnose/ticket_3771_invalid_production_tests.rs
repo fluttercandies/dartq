@@ -374,13 +374,13 @@ fn prefixed_member_miss_produces_invalid_declared_type() {
 /// would make `Invalid <: int` accept and the
 /// `argument_type_not_assignable` row would vanish.
 ///
-/// NOTE: the write-side prefixed surfaces carry pre-existing gaps this
-/// wave does not own — `p.Real x = "s"` (var-init) and
-/// `void h(p.Real r) {} h("s")` (param) are silent before AND after
-/// (probe: `is_invalid_ty` runs `p.Real` → `resolved_container=true` →
-/// `false`, correct; the silence is a separate prefixed-type verdict
-/// gap, not an InvalidType fold). The `h(x)` form below exercises the
-/// fold on the `from` side, where the gap does not sit.
+/// #4320 closed the pre-existing `p.C` verdict gaps this pin once
+/// documented: `h(x)` now reports `argument_type_not_assignable` (the
+/// `p.Real` head resolves to its real class shape inside `assignable`'s
+/// primitive-vs-declared arm), exactly as the same-file `Real` baseline
+/// above does. The pin's contract is unchanged — a resolved `p.C` never
+/// reports `undefined_class`/`not_a_type` — and the new verdict is the
+/// oracle's own answer for the pair.
 #[test]
 fn resolved_prefixed_type_keeps_its_verdict() {
     // Baseline: a `Real`-typed variable passed where `int` is required
@@ -407,12 +407,10 @@ fn resolved_prefixed_type_keeps_its_verdict() {
     // `h(x)` assignable ask folds `from = Ty::Named{"p.Real"}` through
     // `fold_invalid_ty` → `is_invalid_ty` → `resolve_joined_container`,
     // which probe-verified `resolved_container=true` → `false` (NO
-    // fold). The remaining silence is a pre-existing `p.C` subtype gap
-    // inside `assignable` itself (the prefixed head reads
-    // dynamic-shaped there), not the InvalidType wave — the wrong
-    // `named_type_is_type` predicate would fold `p.Real` → `Ty::Invalid`
-    // identically silently, so the probe note above is the
-    // discriminating evidence this pin carries.
+    // fold). #4320's `head_container` wiring lets `assignable`'s
+    // primitive-vs-declared arm read `p.Real` as the resolved class it
+    // is, so `h(x)` reports `argument_type_not_assignable` — the oracle's
+    // own verdict for `Real`-into-`int`, asserted by the baseline above.
     assert!(
         !codes(&report).contains(&"undefined_class"),
         "resolved `p.Real` must not report a resolution miss: {:?}",

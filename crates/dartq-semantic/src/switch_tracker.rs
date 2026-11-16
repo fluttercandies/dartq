@@ -9,7 +9,7 @@
 
 #![allow(clippy::semicolon_if_nothing_returned)]
 use crate::diagnose::Engine;
-use crate::library::{ElementIndex, resolve_container};
+use crate::library::{ElementIndex, resolve_container, resolve_joined_container};
 use crate::model::{ArgListId, Container, ContainerKind, MemberKind, RecordShapeId, Ty};
 use dartq_resolution::{LibraryGraph, LibraryId, Namespaces};
 use dartq_scanner::{Keyword, TokenKind};
@@ -3056,6 +3056,27 @@ impl<'a> NameWorld<'a> {
             self.file,
             name,
         ) {
+            return Some(hit);
+        }
+        // A dot-joined `p.C` head names an element through an import
+        // prefix — the bare-scope walk above cannot see the leaf (it is not
+        // in this library's own scope); the prefix's merged table answers
+        // instead (the oracle's `PrefixedType` element, the same lookup the
+        // engine's `head_container` compensates through). The name-level
+        // lattice then relates the RESOLVED class's real shape
+        // (`named_sub`/`decide_subtype`'s declared-edge walk) instead of
+        // reading the spelling as an unknown head. An unresolvable leaf or
+        // a dead prefix keeps the miss — today's under-report arm.
+        if self.strings.resolve(name).contains('.')
+            && let Some(hit) = resolve_joined_container(
+                scope.graph,
+                scope.namespaces,
+                self.index,
+                scope.lib,
+                self.strings,
+                name,
+            )
+        {
             return Some(hit);
         }
         let [owner_lib] = scope.graph.declaring_libraries(name) else {

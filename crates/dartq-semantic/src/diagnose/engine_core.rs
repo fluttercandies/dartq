@@ -269,7 +269,7 @@ impl<'a> Engine<'a> {
             record_literal_names: Vec::new(),
             record_ty_stack: Vec::new(),
             type_prefix: None,
-            pending_prefixed: None,
+            pending_prefixed: Vec::new(),
             non_type_pos: 0,
             is_type_pos: 0,
             ctor_pos: 0,
@@ -3934,6 +3934,80 @@ impl<'a> Engine<'a> {
             .is_subtype_of(&NameTy::from_semantic(sub), &NameTy::from_semantic(sup))
     }
 
+    /// Resolves a written type-head spelling to its container with its
+    /// declaring file: the bare-scope walk ([`resolve_container`]) first,
+    /// then — for the dot-joined `p.C` form a prefixed annotation arms —
+    /// the prefix's own merged table ([`resolve_joined_container`], the
+    /// oracle's `PrefixedType` element the bare walk cannot see, since the
+    /// leaf lives in the imported library's scope, not this one).
+    ///
+    /// The head-resolution funnel every face that must relate a RESOLVED
+    /// prefixed type routes through: [`Self::is_invalid_ty`]'s dotted leg
+    /// (the Invalid-lattice compensation), [`Self::type_head_resolves`]'s
+    /// read through `written_potentially_non_nullable`,
+    /// [`Self::declared_outside_core`]'s primitive lattice, and the subtype
+    /// walk's head reads ([`Self::strict_subtype`]'s declaration-identity
+    /// leg, [`Self::same_head_args`]'s arity). An unresolvable leaf or a
+    /// dead prefix answers `None` — the callers' own miss faces then keep
+    /// today's under-report arms, so unresolved prefixed types never gain
+    /// verdicts.
+    pub(crate) fn head_container(&self, name: StringId) -> Option<(&'a Container, FileId)> {
+        if let Some(hit) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            return Some(hit);
+        }
+        if !self.strings.resolve(name).contains('.') {
+            return None;
+        }
+        resolve_joined_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.strings,
+            name,
+        )
+    }
+
+    /// The capture-side head spelling for a just-armed type head: a
+    /// prefixed `p.C` completion carries the DOT-JOINED `p.C` (the intern
+    /// table's one-head convention — `handle_type`'s `head_id`), never the
+    /// bare leaf — a leaf stored into the bounded/alias/header trees would
+    /// resolve a same-spelled unprefixed import's or local declaration's
+    /// element where the written spelling names the prefix's own export.
+    /// The returned range is the PREFIX token's (the completed type's own
+    /// anchor — `handle_type` fires there), keeping the sinks'
+    /// re-fired-head merge on the same offset a `p.C<int>` completion
+    /// carries. Answers the input unchanged when no live prefixed
+    /// completion owns this head — the leaf latch inside
+    /// [`Self::pending_prefixed`] matches only the armed continuation's
+    /// own name, so a bare `D` inside `p.C<D<int>>` never translates.
+    pub(crate) fn capture_head(
+        &self,
+        name: StringId,
+        range: SourceRange,
+    ) -> (StringId, SourceRange) {
+        if let Some((prefix_range, Some((leaf, _)))) = self.pending_prefixed.last().copied()
+            && leaf == name
+        {
+            let start = self.byte_of(prefix_range.offset);
+            let end = self.byte_of(prefix_range.end());
+            let joined = format!(
+                "{}.{}",
+                &self.source[start..end],
+                self.strings.resolve(name)
+            );
+            return (self.intern(&joined), prefix_range);
+        }
+        (name, range)
+    }
+
     /// The resolved `InvalidType` face at the top level of a semantic
     /// type (upstream Dart SDK source,
     /// pkg/analyzer/lib/src/dart/element/subtype.dart:274-276 — the 0c
@@ -4025,17 +4099,7 @@ impl<'a> Engine<'a> {
         // library's own scope). The prefix table answers instead: a
         // spelling that reaches a container is a real interface type, not
         // the `InvalidType` an unresolved head is.
-        if self.strings.resolve(name).contains('.')
-            && resolve_joined_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.strings,
-                name,
-            )
-            .is_some()
-        {
+        if self.strings.resolve(name).contains('.') && self.head_container(name).is_some() {
             return false;
         }
         match self.type_resolution(name).0 {
@@ -4062,12 +4126,12 @@ impl<'a> Engine<'a> {
     /// only an argument misses (upstream's whole-vs-argument split: the
     /// `Named` node's head resolves once, each argument resolves on its
     /// own — `List<Unresolved>` is `List<InvalidType>`, not a whole-type
-    /// `InvalidType`). The predicate is [`Self::is_invalid_ty`] — NEVER
-    /// `named_type_is_type`: the latter returns `false` for an
-    /// ALREADY-RESOLVED `p.C` spelling too (the bare-scope walk cannot
-    /// see through an import prefix), so it would fold a resolved
-    /// `p.C` into `Invalid` and under-report; `is_invalid_ty`
-    /// compensates through `resolve_joined_container`.
+    /// `InvalidType`). The predicate is [`Self::is_invalid_ty`] — the
+    /// resolved-face question the fold asks (it reads the
+    /// `type_resolution` verdict plus the joined-container compensation
+    /// for `p.C` spellings); `named_type_is_type` answers a narrower
+    /// question ("does this head name a type element") and stays the
+    /// staging gate's own, never the fold's.
     ///
     /// The recursion carries the pool's re-intern discipline: an
     /// unchanged `Ty` keeps its identity (argument slots intern
@@ -4579,28 +4643,15 @@ impl<'a> Engine<'a> {
                 if (sub_text.contains('.') || sup_text.contains('.'))
                     && sub_text.rsplit('.').next() == sup_text.rsplit('.').next()
                 {
-                    let decl_file = |head: StringId| {
-                        if self.strings.resolve(head).contains('.') {
-                            resolve_joined_container(
-                                self.graph,
-                                self.namespaces,
-                                self.index,
-                                self.lib,
-                                self.strings,
-                                head,
-                            )
-                        } else {
-                            resolve_container(
-                                self.graph,
-                                self.namespaces,
-                                self.index,
-                                self.lib,
-                                self.file,
-                                head,
-                            )
-                        }
-                        .map(|(_, file)| file)
-                    };
+                    // The head's declaration identity resolves through the
+                    // shared funnel: a dot-joined `p.C` spelling answers its
+                    // prefix-bound container ([`Self::head_container`]), a
+                    // bare head the ordinary scope walk. Two spellings that
+                    // reach different declarations are distinct elements
+                    // (the oracle's element-identity walk), one reached
+                    // twice stays related.
+                    let decl_file =
+                        |head: StringId| self.head_container(head).map(|(_, file)| file);
                     if let (Some(sub_file), Some(sup_file)) = (decl_file(name), decl_file(sup_name))
                         && sub_file != sup_file
                     {
@@ -4745,14 +4796,10 @@ impl<'a> Engine<'a> {
         if depth >= Self::SUBTYPE_DEPTH {
             return false;
         }
-        let arity = if let Some((container, _)) = resolve_container(
-            self.graph,
-            self.namespaces,
-            self.index,
-            self.lib,
-            self.file,
-            head,
-        ) {
+        // The head's real face first (a dot-joined `p.C` spelling answers
+        // through its prefix binding — [`Self::head_container`]), so the
+        // written-argument count decides against the class's own parameters.
+        let arity = if let Some((container, _)) = self.head_container(head) {
             container.type_params as usize
         } else {
             // The head carries no element model in this unit, but a

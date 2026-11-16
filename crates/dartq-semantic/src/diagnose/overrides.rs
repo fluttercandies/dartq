@@ -2872,17 +2872,17 @@ impl<'a> Engine<'a> {
     /// `Ambiguous`/`NotFound` name, a prefix, or a non-type decl the probe
     /// cannot classify keep the `InvalidType` face — the under-report
     /// direction (`true` = nullable above).
+    ///
+    /// The container leg reads [`Self::head_container`]: a RESOLVED
+    /// prefixed annotation (`p.Real`) is a real interface type whose head
+    /// the bare-scope walk cannot see (the leaf lives behind the import
+    /// prefix), so without the joined leg the gate would read the oracle's
+    /// `InvalidType` and answer `p.Real` potentially nullable — closing
+    /// `written_potentially_non_nullable` for every prefixed declared type
+    /// (the uninitialized-non-nullable family and the default-value gate
+    /// then stay silent where the oracle reports).
     fn type_head_resolves(&self, name: StringId) -> bool {
-        if resolve_container(
-            self.graph,
-            self.namespaces,
-            self.index,
-            self.lib,
-            self.file,
-            name,
-        )
-        .is_some()
-        {
+        if self.head_container(name).is_some() {
             return true;
         }
         // The namespace probe catches what the container walk cannot: an

@@ -2454,13 +2454,18 @@ pub(crate) struct Engine<'a> {
     /// The M1 model's written-record face (F-R).
     pub(crate) record_ty_stack: Vec<RecordTyLevel>,
     pub(crate) type_prefix: Option<TypePrefix>,
-    /// A group-less prefixed type (`p.C`) awaiting its completion (#2523):
-    /// the prefix segment's token (the completing `handle_type` fires AT
-    /// the prefix token — the official `PrefixedType.parseType` protocol)
-    /// and the leaf segment's name plus span. The completion arms the
-    /// LEAF's name (`p.C` keeps `C`); the prefix's own lexeme would name
-    /// no container anywhere downstream.
-    pub(crate) pending_prefixed: Option<(SourceRange, Option<(StringId, SourceRange)>)>,
+    /// Prefixed types (`p.C`, `p.C<T>`) awaiting their completion (#2523):
+    /// each entry carries the prefix segment's token (the completing
+    /// `handle_type` fires AT the prefix token — the official
+    /// `PrefixedType.parseType` protocol) and the leaf segment's name plus
+    /// span once `TypeReferenceContinuation` latches it. A STACK, not a
+    /// slot: the arg completions inside `p.C<T>` run their own
+    /// `handle_type` (and nested `p.D` args arm their own entry) before the
+    /// outer prefix token completes — consumption keys on the completing
+    /// token's own range, so an inner `int` never eats the outer latch.
+    /// The completion arms the LEAF's name (`p.C` keeps `C`); the prefix's
+    /// own lexeme would name no container anywhere downstream.
+    pub(crate) pending_prefixed: Vec<(SourceRange, Option<(StringId, SourceRange)>)>,
     /// Suppression depth inside `is`/`as` type operands.
     pub(crate) non_type_pos: u32,
     /// Suppression depth inside `is` type operands only (the usage

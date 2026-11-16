@@ -6013,7 +6013,10 @@ impl<'a> Engine<'a> {
                         let name_text = self.strings.resolve(name);
                         let joined = format!("{prefix_text}.{name_text}");
                         let joined = self.strings.intern(&joined);
-                        let head_range = self.pending_prefixed.map_or(range, |(head, _)| head);
+                        let head_range = self
+                            .pending_prefixed
+                            .last()
+                            .map_or(range, |(head, _)| *head);
                         self.push_row(Row {
                             name: joined,
                             range: SourceRange {
@@ -6065,7 +6068,10 @@ impl<'a> Engine<'a> {
                                 ty: Ty::UNKNOWN,
                             });
                         } else {
-                            let head_range = self.pending_prefixed.map_or(range, |(head, _)| head);
+                            let head_range = self
+                                .pending_prefixed
+                                .last()
+                                .map_or(range, |(head, _)| *head);
                             let qualified = SourceRange {
                                 offset: head_range.offset,
                                 length: range.end() - head_range.offset,
