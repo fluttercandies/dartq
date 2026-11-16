@@ -914,10 +914,14 @@ pub(crate) struct FixMail {
 /// Test-only one-shot trigger for the answer-worker join degrade pin: a
 /// spawned worker's panic must escape the per-answer guard to exercise the
 /// `join` degrade, which no RPC input can conjure deterministically. Arms
-/// record the session thread's id; only a different thread (a spawned
-/// answer worker) consumes the trigger — the session thread's own drain
-/// loop must never fire it, or the panic would propagate at the group
-/// boundary instead of exercising the join. Compiled out outside `cfg(test)`.
+/// record the session thread's id; only a spawned answer worker of the
+/// armed group consumes the trigger — the session thread's own drain loop
+/// must never fire it (the panic would propagate at the group boundary
+/// instead of exercising the join), and a sibling group's workers must
+/// never steal it. The armed group's shape is pinned by the fan-out: its
+/// serving thread leaves the job queue to the spawned workers, so the armed
+/// job cannot be drained on the serving thread before any worker starts.
+/// Compiled out outside `cfg(test)`.
 #[cfg(test)]
 mod answer_worker_panic_probe {
     use std::sync::Mutex;
@@ -937,7 +941,18 @@ mod answer_worker_panic_probe {
         *ARMED.lock().expect("live probe mutex") = None;
     }
 
-    /// Fires (and consumes) on a thread other than the arming thread only.
+    /// True when the calling thread armed the trigger: the answer fan-out
+    /// running on this thread is the armed group, whose workers are the
+    /// trigger's only consumers (see the module's contract).
+    pub(super) fn armed_on_current_thread() -> bool {
+        ARMED
+            .lock()
+            .expect("live probe mutex")
+            .is_some_and(|owner| owner == std::thread::current().id())
+    }
+
+    /// Fires (and consumes) on a spawned answer worker of the armed group
+    /// only — a worker thread, never the arming thread.
     pub(super) fn take() -> bool {
         let mut armed = ARMED.lock().expect("live probe mutex");
         match *armed {
@@ -4510,7 +4525,9 @@ impl Session {
         // Dynamic work distribution: every worker drains the same queue
         // (query costs vary; static chunking would let one heavy face
         // dominate a chunk), and the session thread participates — at most
-        // `workers - 1` threads spawn per group.
+        // `workers - 1` threads spawn per group. A test-only exception (the
+        // armed panic probe's group) leaves the queue to the spawned
+        // workers: see below.
         if parallel.len() >= 2 {
             let workers = parallel.len().min(MAX_ANSWER_WORKERS);
             let (sender, receiver) = unbounded::<(usize, Request)>();
@@ -4522,13 +4539,42 @@ impl Session {
             }
             drop(sender);
             let (results, worker_panicked) = thread::scope(|scope| {
+                // Test-only arming posture (the probe module's contract): the
+                // armed group's serving thread stays out of the job queue, so
+                // its spawned workers certainly claim the armed job — the
+                // serving thread could otherwise drain the whole queue before
+                // any worker starts, and the trigger never fires on the
+                // serving thread anyway. Every other group keeps the
+                // production shape.
+                #[cfg(test)]
+                let armed_probe = answer_worker_panic_probe::armed_on_current_thread();
                 let handles: Vec<_> = (1..workers)
                     .map(|_| {
                         let receiver = receiver.clone();
-                        scope.spawn(move || Self::drain_jobs(&receiver, drain))
+                        scope.spawn(move || {
+                            Self::drain_jobs(
+                                &receiver,
+                                drain,
+                                #[cfg(test)]
+                                armed_probe,
+                            )
+                        })
                     })
                     .collect();
-                let mut results = Self::drain_jobs(&receiver, drain);
+                #[cfg(test)]
+                let drain_here = !armed_probe;
+                #[cfg(not(test))]
+                let drain_here = true;
+                let mut results = if drain_here {
+                    Self::drain_jobs(
+                        &receiver,
+                        drain,
+                        #[cfg(test)]
+                        false,
+                    )
+                } else {
+                    Vec::new()
+                };
                 // A panic escapes the per-answer guard only outside it (the
                 // receive loop itself). The join degrades instead of
                 // propagating: the dead worker's claimed jobs stay unfilled
@@ -4575,18 +4621,23 @@ impl Session {
     /// One answer worker: pulls jobs until the phase's queue empties, each
     /// answer panic-contained (a failed query answers `INTERNAL_ERROR` and
     /// the worker moves on — the shared view cannot have been corrupted by
-    /// a `&`-read).
+    /// a `&`-read). `armed_probe_member` (tests only) marks a worker of the
+    /// group the panic probe was armed for: only such workers consume the
+    /// trigger, so a sibling group's fan-out can never fire (or steal) it.
     fn drain_jobs(
         receiver: &Receiver<(usize, Request)>,
         drain: &commands::Drain<'_>,
+        #[cfg(test)] armed_probe_member: bool,
     ) -> Vec<(usize, Result<serde_json::Value, SessionError>)> {
         let mut results = Vec::new();
         for (index, request) in receiver {
             #[cfg(test)]
-            assert!(
-                !answer_worker_panic_probe::take(),
-                "test-armed answer worker panic"
-            );
+            if armed_probe_member {
+                assert!(
+                    !answer_worker_panic_probe::take(),
+                    "test-armed answer worker panic"
+                );
+            }
             let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 commands::answer(drain, &request)
             }))
@@ -8400,6 +8451,11 @@ mod tests {
         // fan-out engages the worker threads (one job per request). The
         // armed trigger fires in a spawned worker between the job receive
         // and its contained answer: that job's request is the error row.
+        // The armed group's fan-out leaves the queue to the spawned workers
+        // (the probe module's contract), which pins this shape: the serving
+        // thread cannot drain the queue before the workers start, so the
+        // armed job always reaches a spawned worker — exactly one dies on
+        // its first claimed job.
         let ids: Vec<i64> = (2..10).collect();
         answer_worker_panic_probe::arm();
         for &id in &ids {
@@ -8441,13 +8497,14 @@ mod tests {
                 Err(other) => panic!("request {id:?} answers an unexpected error: {other:?}"),
             }
         }
-        assert!(
-            ok_answers >= 1,
+        assert_eq!(
+            ok_answers,
+            ids.len() - 1,
             "the unclaimed jobs still answer Ok (the old code errored the whole group)"
         );
-        assert!(
-            error_answers >= 1,
-            "the dead worker's claimed job yields an error row"
+        assert_eq!(
+            error_answers, 1,
+            "the dead worker's claimed job yields exactly its error row"
         );
 
         // The session is alive: the next request answers normally.
