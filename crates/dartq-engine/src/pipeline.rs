@@ -442,7 +442,18 @@ pub(crate) fn analyze(
     // O(workspace) once, the inline scan costs O(closure reach) per
     // library, so small incremental turns keep the inline path and a
     // cold or bulk analyze shares the table.
-    let closure_edges: Option<dartq_semantic::ClosureEdges> = if order.len() >= 64
+    //
+    // The shared registration-plan table (#4330) rides the same gate and
+    // the same parallel precompute: `register_file`'s element-model walk
+    // is a pure function of the file's model plus the graph census, so the
+    // table freezes it once per file and every library that registers the
+    // file replays compact rows instead of re-walking the model per
+    // (library, file) pair (~10k registrations per file at the 107k
+    // corpus). Files the table misses keep the inline walk.
+    let (closure_edges, register_plans): (
+        Option<dartq_semantic::ClosureEdges>,
+        Option<dartq_semantic::RegisterPlans>,
+    ) = if order.len() >= 64
         && let (Some(graph), Some(namespaces), Some(index), Some(clauses)) =
             (fold_graph, seam, index.as_ref(), clauses.as_ref())
     {
@@ -464,9 +475,18 @@ pub(crate) fn analyze(
             })
             .collect();
         let out = dartq_semantic::ClosureEdges::from_map(table);
-        Some(out)
+        let files = dartq_semantic::RegisterPlans::files(&graph.graph);
+        let plans: FxHashMap<_, _> = files
+            .par_iter()
+            .filter_map(|&file| {
+                dartq_semantic::RegisterPlans::compute(&graph.graph, index, file)
+                    .map(|plan| (file, plan))
+            })
+            .collect();
+        let plans = dartq_semantic::RegisterPlans::from_map(plans);
+        (Some(out), Some(plans))
     } else {
-        None
+        (None, None)
     };
 
     // Each job also rebuilds its library's symbol-index surface: the build
@@ -506,6 +526,7 @@ pub(crate) fn analyze(
                 class_modifiers.as_ref(),
                 clauses.as_ref(),
                 closure_edges.as_ref(),
+                register_plans.as_ref(),
                 *library,
                 &mut member_refs,
                 cancel,
@@ -947,6 +968,7 @@ fn diagnose_library(
     class_modifiers: Option<&LibraryClassModifiers>,
     clauses: Option<&dartq_semantic::ClauseTrees>,
     closure_edges: Option<&dartq_semantic::ClosureEdges>,
+    register_plans: Option<&dartq_semantic::RegisterPlans>,
     library: LibraryId,
     member_refs: &mut Vec<(FileId, std::sync::Arc<[dartq_semantic::MemberRef]>)>,
     cancel: &CancellationToken,
@@ -1149,25 +1171,16 @@ fn diagnose_library(
         // residency's element index, built once per library beside the
         // shared index and shared by every member fold through the flow
         // layer's `TypeOps` seam.
-        let types = match closure_edges {
-            Some(edges) => dartq_semantic::LibraryTypes::build_with_edges(
-                &resolved.graph,
-                namespaces,
-                index,
-                &state.strings,
-                resolved.graph_ids[&library],
-                clause_trees,
-                edges,
-            ),
-            None => dartq_semantic::LibraryTypes::build_with_clauses(
-                &resolved.graph,
-                namespaces,
-                index,
-                &state.strings,
-                resolved.graph_ids[&library],
-                clause_trees,
-            ),
-        };
+        let types = dartq_semantic::LibraryTypes::build_with_tables(
+            &resolved.graph,
+            namespaces,
+            index,
+            &state.strings,
+            resolved.graph_ids[&library],
+            clause_trees,
+            closure_edges,
+            register_plans,
+        );
         let view = LibraryView {
             library,
             files: &members,

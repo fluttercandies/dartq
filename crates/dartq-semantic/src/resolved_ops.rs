@@ -601,7 +601,7 @@ impl LibraryTypes {
         lib: LibraryId,
         clauses: &ClauseTrees,
     ) -> Self {
-        Self::build_impl(graph, namespaces, index, strings, lib, clauses, None)
+        Self::build_impl(graph, namespaces, index, strings, lib, clauses, None, None)
     }
 
     /// The shared-closure variant (#4283): `edges` carries the per-analyze
@@ -619,7 +619,38 @@ impl LibraryTypes {
         clauses: &ClauseTrees,
         edges: &ClosureEdges,
     ) -> Self {
-        Self::build_impl(graph, namespaces, index, strings, lib, clauses, Some(edges))
+        Self::build_impl(
+            graph,
+            namespaces,
+            index,
+            strings,
+            lib,
+            clauses,
+            Some(edges),
+            None,
+        )
+    }
+
+    /// The fully-shared variant (#4283 + #4330): beside the closure edge
+    /// replay, `plans` carries the per-analyze [`RegisterPlans`] table —
+    /// each file's registration walk precomputed once (parallel, before
+    /// the fan-out) and replayed by every library that registers it.
+    /// Either table may be `None` independently; a file the plan table
+    /// does not hold keeps the inline [`Registry::register_file`] walk —
+    /// outcomes are identical either way.
+    pub fn build_with_tables(
+        graph: &LibraryGraph,
+        namespaces: &Namespaces,
+        index: &ElementIndex,
+        strings: &StringTable,
+        lib: LibraryId,
+        clauses: &ClauseTrees,
+        edges: Option<&ClosureEdges>,
+        plans: Option<&RegisterPlans>,
+    ) -> Self {
+        Self::build_impl(
+            graph, namespaces, index, strings, lib, clauses, edges, plans,
+        )
     }
 
     fn build_impl(
@@ -630,6 +661,7 @@ impl LibraryTypes {
         lib: LibraryId,
         clauses: &ClauseTrees,
         closure_edges: Option<&ClosureEdges>,
+        register_plans: Option<&RegisterPlans>,
     ) -> Self {
         let table = TypeTable::new();
         let object = TypeDeclId::from_raw(OBJECT_RAW);
@@ -770,7 +802,7 @@ impl LibraryTypes {
         };
         let mut actions: Vec<DeclAction> = Vec::new();
         for &file in graph.unit_files(lib) {
-            registry.register_file(index, file, lib, &mut actions);
+            registry.register(index, register_plans, file, lib, &mut actions);
             for action in actions.drain(..) {
                 builder = action.apply(builder, &table, core_enum);
             }
@@ -813,7 +845,7 @@ impl LibraryTypes {
                 }
                 match index.get(entry.file).map(|els| els.container(name)) {
                     Some(Some(_)) => {
-                        registry.register_file(index, entry.file, target, &mut actions);
+                        registry.register(index, register_plans, entry.file, target, &mut actions);
                         for action in actions.drain(..) {
                             builder = action.apply(builder, &table, core_enum);
                         }
@@ -870,7 +902,13 @@ impl LibraryTypes {
                 {
                     match index.get(entry.file).map(|els| els.container(name)) {
                         Some(Some(_)) => {
-                            registry.register_file(index, entry.file, target, &mut actions);
+                            registry.register(
+                                index,
+                                register_plans,
+                                entry.file,
+                                target,
+                                &mut actions,
+                            );
                             for action in actions.drain(..) {
                                 builder = action.apply(builder, &table, core_enum);
                             }
@@ -954,7 +992,13 @@ impl LibraryTypes {
                             continue;
                         }
                         let target_lib = graph.library_of_file(target_file).unwrap_or(owner);
-                        registry.register_file(index, target_file, target_lib, &mut actions);
+                        registry.register(
+                            index,
+                            register_plans,
+                            target_file,
+                            target_lib,
+                            &mut actions,
+                        );
                         for action in actions.drain(..) {
                             builder = action.apply(builder, &table, core_enum);
                         }
@@ -998,7 +1042,7 @@ impl LibraryTypes {
                         continue;
                     }
                     let target_lib = graph.library_of_file(target_file).unwrap_or(owner);
-                    registry.register_file(index, target_file, target_lib, &mut actions);
+                    registry.register(index, register_plans, target_file, target_lib, &mut actions);
                     for action in actions.drain(..) {
                         builder = action.apply(builder, &table, core_enum);
                     }
@@ -1674,6 +1718,294 @@ impl ClosureEdges {
     }
 }
 
+/// The shared registration-plan table (#4330): `register_file`'s element-
+/// model walk is a pure function of the file's [`FileElements`] plus the
+/// graph's declaration census (the multi-declared probe), while every id
+/// mint, registry membership check, and first-writer-wins outcome stays
+/// per-library. A [`FilePlan`] encodes the walk's yield once — the
+/// container rows in `container_order`, the bound-merge rows in the exact
+/// order `record_param_bounds` would merge them, the member names and
+/// property-type heads, and each top-level declaration's replay data — so
+/// a library's registration replays compact rows instead of re-walking the
+/// element model per (library, file) pair. At the 107k corpus a file is
+/// registered by ~10k libraries; the walk ran once per registration.
+///
+/// The one state that cannot ride the table is the analyzed library
+/// itself: the multi-declared ambiguity probe resolves the spelling in
+/// `self.lib`'s scope, so the plan stores only the `len() > 1` census bit
+/// and the lookup stays inline at replay (it runs only for spellings
+/// several libraries declare — rare in practice). Files the table does
+/// not hold keep the inline walk through [`Registry::register`]'s
+/// fallback — correct, just unshared.
+#[derive(Default)]
+pub struct RegisterPlans(FxHashMap<FileId, FilePlan>);
+
+/// One file's precomputed registration yield (see [`RegisterPlans`]).
+pub struct FilePlan {
+    /// The unconditional bound merges of the extension faces — each
+    /// face's own group, then its members' groups, in face order.
+    ext_merges: Box<[(StringId, Option<StringId>)]>,
+    /// The container rows in `container_order`.
+    containers: Box<[ContainerPlan]>,
+    /// The top-level declaration rows in `declarations()` order
+    /// (ascending `StringId` — the `NameMap`'s own iteration order, which
+    /// the inline walk also follows).
+    decls: Box<[DeclPlan]>,
+}
+
+/// One named container's replay row: the facts `register_file` reads off
+/// the [`Container`] model, plus the conditional payload the registry arm
+/// applies only when the name still stands unclaimed at replay time.
+struct ContainerPlan {
+    name: StringId,
+    /// `graph.declaring_libraries(name).len() > 1` — the probe gating the
+    /// analyzed-scope ambiguity lookup at replay.
+    multi_declared: bool,
+    type_params: u16,
+    type_param_names: Box<[StringId]>,
+    /// The container's own group merges followed by every member's merges
+    /// — the exact sequence the inline walk's `record_param_bounds` calls
+    /// would merge (member order = the `NameMap`'s ascending-id order).
+    merges: Box<[(StringId, Option<StringId>)]>,
+    /// Every member's lookup spelling, in member order — the
+    /// `invokable_members` extend.
+    invokable: Box<[StringId]>,
+    /// The `(member, head)` rows `property_ty_heads` collects: non-setter
+    /// members whose declared field/return type is a bare `Ty::Named`.
+    property_heads: Box<[(StringId, StringId)]>,
+    sealed: bool,
+    /// An extension type's named representation head (the
+    /// `extension_erasures` entry), precomputed.
+    ext_rep_head: Option<StringId>,
+    /// `Some(constants)` for an enum — the `enumeration` action's count.
+    enum_constants: Option<u16>,
+}
+
+/// One top-level declaration's replay row: the unconditional prefix
+/// (bound merges + the spelling-poison extension) runs for every row; the
+/// `effect` arms the conditional tail after the registry-membership
+/// check, which the replay still runs per library.
+struct DeclPlan {
+    name: StringId,
+    /// The declaration's own group merges — `record_param_bounds` over
+    /// its `type_param_names`/`type_param_bounds`.
+    merges: Box<[(StringId, Option<StringId>)]>,
+    /// The `spelling_bound_unknown` contribution: the declaration's
+    /// parameter spellings when its kind is not a container family.
+    unknown_spellings: Box<[StringId]>,
+    effect: DeclEffect,
+}
+
+/// The conditional tail of a declaration row — every arm except
+/// [`DeclEffect::ContainerLike`] runs only when the replay's
+/// `registry.contains_key(name)` check passes, exactly as the inline
+/// walk's `continue` orders it.
+enum DeclEffect {
+    /// A container-family kind (class/enum/mixin/extension): no tail —
+    /// the registry check is the whole arm.
+    ContainerLike,
+    /// A type parameter: mint-or-reuse its shared id, then record the
+    /// `(file, name)` scope membership.
+    TypeParam,
+    /// A non-container top-level declaration: `non_containers` plus the
+    /// optional worklist/table entries its shape earns.
+    NonContainer {
+        /// `TopLevelFn` with a captured signature → `top_fns.push`.
+        top_fn: bool,
+        /// `TypeAlias` → `aliases.push`.
+        alias: bool,
+        /// A bare `typedef A = B;` → `typedef_targets.insert(name,
+        /// (rhs_head, nullable))`.
+        typedef_target: Option<(StringId, bool)>,
+    },
+}
+
+impl RegisterPlans {
+    /// The sequential one-shot build (tests and single-library callers);
+    /// the engine builds the same table in parallel over [`Self::files`]
+    /// and [`Self::compute`].
+    pub fn build(graph: &LibraryGraph, index: &ElementIndex) -> Self {
+        let table = Self::files(graph)
+            .into_iter()
+            .filter_map(|file| Self::compute(graph, index, file).map(|plan| (file, plan)))
+            .collect();
+        Self::from_map(table)
+    }
+
+    /// Every file a registration can meet for the given graph: each
+    /// library's own units plus each library's export scope (the same
+    /// coverage [`ClosureEdges::pairs`] enumerates — a closure target a
+    /// namespace lookup names is always some library's unit or export).
+    /// Files outside the set (a dep-unit face, an SDK names-only file)
+    /// keep the inline walk through the replay's `None` fallback.
+    #[must_use]
+    pub fn files(graph: &LibraryGraph) -> Vec<FileId> {
+        let mut files: FxHashSet<FileId> = FxHashSet::default();
+        for lib in graph.libraries() {
+            files.extend(graph.unit_files(lib).iter().copied());
+            for (_, entry) in graph.export_scope(lib) {
+                files.insert(entry.file);
+            }
+        }
+        files.into_iter().collect()
+    }
+
+    /// One file's plan: the element-model walk `register_file` performs,
+    /// frozen into replay rows. `None` for a file with no element model
+    /// (the inline walk returns early on the same probe).
+    pub fn compute(graph: &LibraryGraph, index: &ElementIndex, file: FileId) -> Option<FilePlan> {
+        let elements = index.get(file)?;
+        let mut ext_merges = Vec::new();
+        for face in elements.extension_faces() {
+            collect_bound_merges(
+                &face.type_param_names,
+                &face.type_param_bounds,
+                &mut ext_merges,
+            );
+            for (_, entry) in &face.members {
+                collect_bound_merges(
+                    &entry.type_param_names,
+                    &entry.type_param_bounds,
+                    &mut ext_merges,
+                );
+            }
+        }
+        let mut containers = Vec::with_capacity(elements.container_order().len());
+        for &name in elements.container_order() {
+            let Some(container) = elements.container(name) else {
+                continue;
+            };
+            let mut merges = Vec::new();
+            collect_bound_merges(
+                &container.type_param_names,
+                &container.type_param_bounds,
+                &mut merges,
+            );
+            let mut invokable = Vec::with_capacity(container.members.len());
+            let mut property_heads = Vec::new();
+            for (member, entry) in &container.members {
+                invokable.push(*member);
+                collect_bound_merges(
+                    &entry.type_param_names,
+                    &entry.type_param_bounds,
+                    &mut merges,
+                );
+                let ty = match entry.kind {
+                    MemberKind::Field => entry.var_ty,
+                    MemberKind::Getter | MemberKind::Method => entry.return_ty,
+                    MemberKind::Setter => continue,
+                };
+                if let Ty::Named { name: head, .. } = ty {
+                    property_heads.push((*member, head));
+                }
+            }
+            let ext_rep_head = if container.kind == ContainerKind::ExtensionType {
+                container.primary_formals.first().and_then(|rep| {
+                    if let Ty::Named { name: head, .. } = rep.formal.ty {
+                        Some(head)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            containers.push(ContainerPlan {
+                name,
+                multi_declared: graph.declaring_libraries(name).len() > 1,
+                type_params: container.type_params,
+                type_param_names: container.type_param_names.clone(),
+                merges: merges.into_boxed_slice(),
+                invokable: invokable.into_boxed_slice(),
+                property_heads: property_heads.into_boxed_slice(),
+                sealed: container.sealed,
+                ext_rep_head,
+                enum_constants: (container.kind == ContainerKind::Enum)
+                    .then(|| u16::try_from(container.enum_constants.len()).unwrap_or(u16::MAX)),
+            });
+        }
+        let mut decls = Vec::new();
+        for (name, decl) in elements.declarations() {
+            let mut merges = Vec::new();
+            collect_bound_merges(&decl.type_param_names, &decl.type_param_bounds, &mut merges);
+            let unknown_spellings: Box<[StringId]> = if matches!(
+                decl.kind,
+                MicroKind::Class | MicroKind::Enum | MicroKind::Mixin | MicroKind::Extension
+            ) {
+                Box::default()
+            } else {
+                decl.type_param_names.iter().copied().collect()
+            };
+            let effect = if decl.kind == MicroKind::TypeParam {
+                DeclEffect::TypeParam
+            } else if matches!(
+                decl.kind,
+                MicroKind::Class | MicroKind::Enum | MicroKind::Mixin | MicroKind::Extension
+            ) {
+                DeclEffect::ContainerLike
+            } else {
+                let typedef_target = if decl.kind == MicroKind::TypeAlias && decl.type_params == 0 {
+                    if let crate::model::Ty::Named {
+                        name: rhs_name,
+                        nullable: rhs_nullable,
+                        args,
+                    } = decl.var_ty
+                        && args == crate::model::ArgListId::EMPTY
+                    {
+                        Some((rhs_name, rhs_nullable))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                DeclEffect::NonContainer {
+                    top_fn: decl.kind == MicroKind::TopLevelFn && decl.formals.is_some(),
+                    alias: decl.kind == MicroKind::TypeAlias,
+                    typedef_target,
+                }
+            };
+            decls.push(DeclPlan {
+                name,
+                merges: merges.into_boxed_slice(),
+                unknown_spellings,
+                effect,
+            });
+        }
+        Some(FilePlan {
+            ext_merges: ext_merges.into_boxed_slice(),
+            containers: containers.into_boxed_slice(),
+            decls: decls.into_boxed_slice(),
+        })
+    }
+
+    /// Assembles a table from precomputed per-file plans — the engine
+    /// builds this in parallel before the fan-out.
+    #[must_use]
+    pub fn from_map(map: FxHashMap<FileId, FilePlan>) -> Self {
+        Self(map)
+    }
+
+    /// One file's plan, when the table holds it.
+    #[must_use]
+    pub fn get(&self, file: FileId) -> Option<&FilePlan> {
+        self.0.get(&file)
+    }
+}
+
+/// The bound-merge rows of one declaration group — `record_param_bounds`'s
+/// own iteration: each spelling paired with its written bound's head (or
+/// the unbounded poison), in parameter order.
+fn collect_bound_merges(
+    names: &[StringId],
+    bounds: &[Ty],
+    out: &mut Vec<(StringId, Option<StringId>)>,
+) {
+    for (position, &name) in names.iter().enumerate() {
+        out.push((name, bounds.get(position).and_then(bound_head)));
+    }
+}
+
 /// One hierarchy declaration step `register_file` emits — the move-only
 /// `TypeHierarchyBuilder` applies them in order after each file's names
 /// are registered (the builder's `decl`/`sealed`/`enumeration` calls
@@ -1895,6 +2227,138 @@ impl Registry<'_> {
             Lookup::Found(NamespaceEntry::Decl(file)) if Some(file) == slot_file => None,
             Lookup::Found(NamespaceEntry::Decl(_)) => Some(HeadCollision::Foreign),
             _ => Some(HeadCollision::Unattributable),
+        }
+    }
+
+    /// The shared-table registration entry (#4330): `plans` carries the
+    /// per-analyze [`RegisterPlans`] table — this file's element-model walk
+    /// precomputed once — and the replay applies its rows through the same
+    /// state mutations the inline walk performs. A file the table does not
+    /// hold falls back to [`Self::register_file`]; outcomes are identical
+    /// either way.
+    fn register(
+        &mut self,
+        index: &ElementIndex,
+        plans: Option<&RegisterPlans>,
+        file: FileId,
+        owner: LibraryId,
+        actions: &mut Vec<DeclAction>,
+    ) {
+        match plans.and_then(|table| table.get(file)) {
+            Some(plan) => self.replay_file(plan, file, owner, actions),
+            None => self.register_file(index, file, owner, actions),
+        }
+    }
+
+    /// Replays one file's [`FilePlan`] — every state mutation
+    /// [`Self::register_file`] would perform, in the same order, reading the
+    /// precomputed rows instead of walking the element model again. The
+    /// analyzed library's own scope still arbitrates multi-declared
+    /// spellings inline (the plan table cannot carry `self.lib`'s verdict).
+    fn replay_file(
+        &mut self,
+        plan: &FilePlan,
+        file: FileId,
+        owner: LibraryId,
+        actions: &mut Vec<DeclAction>,
+    ) {
+        for &(name, head) in &plan.ext_merges {
+            self.merge_param_bound(file, name, head);
+        }
+        for row in &plan.containers {
+            let name = row.name;
+            if self.registry.contains_key(&name) {
+                self.note_claim(name, file);
+                continue;
+            }
+            // The analyzed-library-scope ambiguity verdict — the one
+            // lookup the plan cannot precompute (see [`RegisterPlans`]).
+            if row.multi_declared
+                && let Lookup::Found(NamespaceEntry::Decl(visible)) =
+                    self.namespaces.lookup(self.graph, self.lib, name)
+                && visible != file
+            {
+                self.ambiguous_names.insert(name);
+            }
+            let decl = TypeDeclId::from_raw(self.next_decl);
+            self.next_decl += 1;
+            let mut param_ids = Vec::with_capacity(usize::from(row.type_params));
+            for position in 0..usize::from(row.type_params) {
+                let id = TypeParamId::from_raw(self.next_param);
+                self.next_param += 1;
+                param_ids.push(id);
+                if let Some(&spelling) = row.type_param_names.get(position) {
+                    self.param_names.insert(id, spelling);
+                }
+                self.facts.set(
+                    id,
+                    ParamFacts {
+                        variance: Variance::Covariant,
+                        bound: None,
+                    },
+                );
+            }
+            self.registry.insert(name, decl);
+            self.decl_params.insert(decl, param_ids.clone());
+            self.decl_owner.insert(decl, (file, owner));
+            for &(spelling, head) in &row.merges {
+                self.merge_param_bound(file, spelling, head);
+            }
+            self.invokable_members.extend(row.invokable.iter().copied());
+            self.property_ty_heads.extend(
+                row.property_heads
+                    .iter()
+                    .map(|&(member, head)| (name, member, head)),
+            );
+            actions.push(DeclAction::Decl(decl, param_ids));
+            if row.sealed {
+                actions.push(DeclAction::Sealed(decl));
+            }
+            if let Some(head) = row.ext_rep_head {
+                self.extension_erasures.insert(decl, head);
+            }
+            if let Some(constants) = row.enum_constants {
+                actions.push(DeclAction::Enum(decl, constants));
+            }
+        }
+        for row in &plan.decls {
+            let name = row.name;
+            for &(spelling, head) in &row.merges {
+                self.merge_param_bound(file, spelling, head);
+            }
+            self.spelling_bound_unknown
+                .extend(row.unknown_spellings.iter().copied());
+            if self.registry.contains_key(&name) {
+                continue;
+            }
+            match row.effect {
+                DeclEffect::TypeParam => {
+                    if !self.type_params.contains_key(&name) {
+                        let param = TypeParamId::from_raw(self.next_param);
+                        self.next_param += 1;
+                        self.facts.set(param, ParamFacts::LEGACY);
+                        self.type_params.insert(name, param);
+                    }
+                    self.type_param_scope.insert((file, name));
+                }
+                DeclEffect::ContainerLike => {}
+                DeclEffect::NonContainer {
+                    top_fn,
+                    alias,
+                    typedef_target,
+                } => {
+                    self.non_containers.insert(name);
+                    if top_fn {
+                        self.top_fns.push((name, file));
+                    }
+                    if let Some((rhs_name, rhs_nullable)) = typedef_target {
+                        self.typedef_targets.insert(name, (rhs_name, rhs_nullable));
+                    }
+                    if alias {
+                        self.aliases.push((name, file));
+                    }
+                }
+            }
         }
     }
 
