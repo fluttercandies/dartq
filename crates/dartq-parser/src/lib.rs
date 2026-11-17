@@ -162,6 +162,12 @@ mod ticket_3938_tests;
 #[cfg(test)]
 mod ticket_3985_tests;
 
+#[cfg(test)]
+mod ticket_4338_tests;
+
+#[cfg(test)]
+mod ticket_4342_tests;
+
 pub use cursor::TokenCursor;
 pub use features::ParserFeatures;
 pub use listener::{

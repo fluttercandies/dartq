@@ -65,7 +65,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let has_type_arguments = self.peek_kind() == TokenKind::Lt;
         let type_param = self.compute_type_param_or_arg_on_lt(false);
         let group_parsed = !matches!(type_param, crate::type_args::TypeParamOrArg::None);
-        let type_args_end = type_param.parse_arguments(self);
+        type_param.parse_arguments(self);
         // `generic-metadata` (`enabledIn: 2.14`): type arguments on an
         // annotation report `experiment_not_enabled` at the group's `<`
         // below the boundary (`endMetadata`, ast_builder.dart:2423).
@@ -85,29 +85,31 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let prev_span = self.last_consumed_span();
         if has_type_arguments && self.peek_kind() != TokenKind::OpenParen {
             // Official `reportRecoverableError(token, …)`
-            // (parser_impl.dart:1430): `token` is parseArguments' returned
-            // group end — the real `>`-family closer for a committed group
-            // (`@A<int> x;` anchors on the `>`), or the name itself when the
+            // (parser_impl.dart:1424): `token` is the last consumed token of
+            // the annotation's name chain — the constructor-selector
+            // continuation when the period branch ran (`@p<A>.B` anchors on
+            // the `B`, `@GenericClass<int, String>.new` on the `new`), else
+            // parseArguments' group end (the real `>`-family closer for a
+            // committed group, `@A<int> x;`), else the name itself when the
             // group scan abandoned (`noTypeParamOrArg.parseArguments`
             // returns `token` unchanged, `@A<int;` anchors on the `A`). A
-            // recovered group's zero-width synthetic end carries the
+            // zero-width synthetic in that slot (a recovered group's
+            // synthesized `>`, a spliced continuation name) carries the
             // analyzer translation's zero-length law — length 1 at the
             // synthetic's own offset (translate_error_token.dart:28
             // `atOffset(offset: charOffset, length: 1)`, the same law
             // recovery.rs `report_unmatched_row` encodes) — so `@A<int,;`
             // anchors on the synthetic `>` parked at the `;`.
-            let anchor = if !group_parsed {
-                prev_span
-            } else if type_args_end.range.length == 0 {
+            let anchor = if prev_span.range.length == 0 {
                 TokenSpan::new(
-                    type_args_end.id,
+                    prev_span.id,
                     dartq_source::SourceRange {
-                        offset: type_args_end.range.offset,
+                        offset: prev_span.range.offset,
                         length: 1,
                     },
                 )
             } else {
-                type_args_end
+                prev_span
             };
             self.report(msg::annotation_with_type_arguments_uninstantiated(), anchor);
         }

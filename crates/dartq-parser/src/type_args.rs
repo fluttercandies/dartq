@@ -651,7 +651,19 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let mut recovered = false;
         let mut scan = lt_offset + 1;
         loop {
-            if self.kind_at(scan) == TokenKind::At {
+            // A slot headed by `@` always fails the member probe, so the
+            // official noType branch's inner loop (type_info_impl.dart
+            // :1359-1362) skips CONSECUTIVE annotations before the no-type
+            // break — each skip re-probes (`<@Foo int>` stops skipping at
+            // `int`, `<@Foo @Bar() }` consumes both annotations and ends
+            // the group on the last one). A single-skip `if` left the
+            // second annotation as the group's follower, the
+            // optional-position veto (`looksLikeNameOrEndOfBlock`) read the
+            // `@` as a non-name, and the whole member fell to the
+            // method-shape arm (`C<@Foo @Bar() }` parsed as a constructor
+            // with type variables instead of upstream's recovered field
+            // `C<...>` with a synthetic name).
+            while self.kind_at(scan) == TokenKind::At {
                 let metadata_len = self.metadata_skip_len(scan);
                 if metadata_len == 0 {
                     return None;
