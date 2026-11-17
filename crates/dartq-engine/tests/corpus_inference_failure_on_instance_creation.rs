@@ -30,7 +30,6 @@
 mod corpus_common;
 
 #[test]
-#[ignore = "red: the strict-inference `inference_failure_on_instance_creation` emitter is not implemented (8 cases)"]
 fn inference_failure_on_instance_creation_slice() {
     corpus_common::run_family("diagnostics/inference_failure_on_instance_creation");
 }
