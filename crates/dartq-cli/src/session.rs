@@ -186,6 +186,47 @@ fn print_row(format: OutputFormat, row: &Value, text: Option<String>) {
     }
 }
 
+/// The SDK's own version as a row leg: the `version` file's first line,
+/// trimmed — the same fact `analyze --stats` prints as `Dart <version>`.
+/// The path and the version are two facts of one SDK: an fvm layout's
+/// path names the Flutter release it embeds (`…/fvm/versions/3.47.9/bin/
+/// cache/dart-sdk` whose `version` file says `3.13.7`), and reading the
+/// path's directory as a Dart version made the session identity look
+/// like a second, conflicting SDK next to `--stats` (#4341). A missing
+/// `version` file is the triple's fact of that SDK: empty, never guessed.
+fn sdk_version_of(triple: &SessionTriple) -> &str {
+    triple.sdk_version.lines().next().unwrap_or_default().trim()
+}
+
+/// The `session` row the start face prints of one live state.
+fn state_row(state: &SessionState, attached: bool) -> Value {
+    json!({
+        "type": "session",
+        "attached": attached,
+        "root": state.triple.root.display().to_string(),
+        "pid": state.pid,
+        "sdk": state.triple.sdk_root.display().to_string(),
+        "sdk_version": sdk_version_of(&state.triple),
+        "binary": state.triple.binary_stamp,
+        "socket": Layout::new(&state.triple.root).socket.display().to_string(),
+    })
+}
+
+/// The `session` row the status listing prints: the same identity legs
+/// plus the status-only age and binary-generation facts.
+fn status_row(state: &SessionState, age_s: u128, stale_binary: bool) -> Value {
+    json!({
+        "type": "session",
+        "root": state.triple.root.display().to_string(),
+        "pid": state.pid,
+        "sdk": state.triple.sdk_root.display().to_string(),
+        "sdk_version": sdk_version_of(&state.triple),
+        "binary": state.triple.binary_stamp,
+        "age_s": age_s,
+        "stale_binary": stale_binary,
+    })
+}
+
 /// The text identity line of a `session` row.
 fn session_text(row: &Value) -> String {
     format!(
@@ -295,15 +336,11 @@ fn session_status(args: &StatusArgs) -> u8 {
     }
     for record in live {
         let age_s = SessionState::now_ms().saturating_sub(record.state.heartbeat_ms) / 1000;
-        let row = json!({
-            "type": "session",
-            "root": record.state.triple.root.display().to_string(),
-            "pid": record.state.pid,
-            "sdk": record.state.triple.sdk_root.display().to_string(),
-            "binary": record.state.triple.binary_stamp,
-            "age_s": age_s,
-            "stale_binary": record.state.triple.binary_stamp != binary,
-        });
+        let row = status_row(
+            &record.state,
+            age_s,
+            record.state.triple.binary_stamp != binary,
+        );
         print_row(args.format, &row, Some(session_text(&row)));
     }
     exit::CLEAN
@@ -367,15 +404,7 @@ fn wait_gone(pid: u32) -> bool {
 }
 
 fn print_state(format: OutputFormat, state: &SessionState, attached: bool) {
-    let row = json!({
-        "type": "session",
-        "attached": attached,
-        "root": state.triple.root.display().to_string(),
-        "pid": state.pid,
-        "sdk": state.triple.sdk_root.display().to_string(),
-        "binary": state.triple.binary_stamp,
-        "socket": Layout::new(&state.triple.root).socket.display().to_string(),
-    });
+    let row = state_row(state, attached);
     let text = if attached {
         Some(format!(
             "attached session pid {} at {}",
@@ -2207,6 +2236,98 @@ pub(crate) mod tests {
             error,
             "no Dart SDK root (pass --sdk PATH, set DART_SDK, declare `sdk:` in dartq.yaml, \
              or put dart on PATH)"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #4341: a session row carries the SDK's own version beside its
+    /// path. The two identity faces disagreed in the #4311 bench only
+    /// because the session row stated the SDK by path alone: an fvm
+    /// layout's path names the Flutter release it embeds (`versions/
+    /// 3.47.9` carrying Dart 3.13.7's SDK), which read as a second,
+    /// conflicting SDK next to `--stats`'s `Dart 3.13.7`. Both rows now
+    /// print both legs — the path (the triple's identity key) and the
+    /// `version` file's first line (the fact `--stats` reports) — so the
+    /// directory name can never masquerade as the Dart version.
+    #[test]
+    fn session_rows_carry_the_sdks_own_version_beside_its_path() {
+        let home = std::env::temp_dir().join(format!("dqs-sdkid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("w");
+        std::fs::create_dir_all(&root).expect("root dir");
+        // The fvm shape: the version directory is the Flutter release;
+        // the Dart SDK embedded in it names a different version.
+        let sdk = home
+            .join("fvm")
+            .join("versions")
+            .join("3.47.9")
+            .join("bin")
+            .join("cache")
+            .join("dart-sdk");
+        std::fs::create_dir_all(&sdk).expect("sdk dir");
+        std::fs::write(sdk.join("version"), "3.13.7\n").expect("version file");
+        let state = SessionState {
+            pid: 4242,
+            heartbeat_ms: SessionState::now_ms(),
+            triple: SessionTriple::compute(&root, &sdk),
+            debug_sessions: 0,
+            used_ms: 0,
+        };
+        let start = state_row(&state, true);
+        let canonical_sdk = sdk.canonicalize().expect("canonical sdk");
+        assert_eq!(
+            start["sdk"].as_str(),
+            Some(canonical_sdk.display().to_string().as_str()),
+            "the path leg stays the triple's resolved root"
+        );
+        assert_eq!(
+            start["sdk_version"].as_str(),
+            Some("3.13.7"),
+            "the version leg is the version file, not the path's directory"
+        );
+        let status = status_row(&state, 7, false);
+        assert_eq!(
+            status["sdk"], start["sdk"],
+            "the listing states the same path"
+        );
+        assert_eq!(
+            status["sdk_version"].as_str(),
+            Some("3.13.7"),
+            "the listing states the same version"
+        );
+
+        // The normalization rules: a multi-line `version` file keeps its
+        // first line, and a missing one (the triple's fact of that SDK,
+        // keyed empty) prints empty — never a guess off the path.
+        std::fs::write(sdk.join("version"), "3.13.7 (stable)\nchannel stable\n")
+            .expect("multiline version file");
+        let multiline = SessionTriple::compute(&root, &sdk);
+        let state = SessionState {
+            pid: 4242,
+            heartbeat_ms: SessionState::now_ms(),
+            triple: multiline,
+            debug_sessions: 0,
+            used_ms: 0,
+        };
+        assert_eq!(
+            state_row(&state, true)["sdk_version"].as_str(),
+            Some("3.13.7 (stable)"),
+            "the first line, trimmed"
+        );
+        let bare = home.join("bare-sdk");
+        std::fs::create_dir_all(&bare).expect("bare dir");
+        let state = SessionState {
+            pid: 4242,
+            heartbeat_ms: SessionState::now_ms(),
+            triple: SessionTriple::compute(&root, &bare),
+            debug_sessions: 0,
+            used_ms: 0,
+        };
+        assert_eq!(
+            state_row(&state, true)["sdk_version"].as_str(),
+            Some(""),
+            "a missing version file is an empty leg, not a guess"
         );
 
         std::fs::remove_dir_all(&home).ok();
