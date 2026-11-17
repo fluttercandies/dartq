@@ -2384,7 +2384,7 @@ impl<'a> Engine<'a> {
         if self
             .index
             .get(self.file)
-            .is_some_and(|f| f.has_extension_member(name))
+            .is_some_and(|f| f.has_extension_instance_member(name))
         {
             return (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque);
         }

@@ -23960,6 +23960,14 @@ mod ticket_3933_tests;
 #[path = "ticket_3934_tests.rs"]
 mod ticket_3934_tests;
 
+// —— #3937 (the annotation-family faces: head-metadata scope snapshot,
+// —— parameter/directive/pattern drains, extension-static bare split,
+// —— representation-ctor const aggregate, alias owner-library scope,
+// —— multiply-defined fall-through, mixin static-getter arm) ——
+#[cfg(test)]
+#[path = "ticket_3937_tests.rs"]
+mod ticket_3937_tests;
+
 // —— #3861 (the written-`dynamic` creation face of the `written_ty_invalid`
 // —— gate, landed dynamic-only; the written-`void` posture frozen silent) ——
 #[cfg(test)]
@@ -24291,6 +24299,24 @@ mod ticket_4133_tests;
 #[path = "ticket_4132_tests.rs"]
 mod ticket_4132_tests;
 
+// —— #4149 (the constant-context tearoff face of
+// —— const_with_type_parameters: `f<U>` function references and
+// —— `A<T>.new` constructor references in const locals, default values,
+// —— and const-constructor-class field initializers) ——
+#[cfg(test)]
+#[path = "ticket_4149_tests.rs"]
+mod ticket_4149_tests;
+
+// —— #4335 (the could_not_infer generic-function-typing cluster's free
+// —— seam: the pre-generic-metadata list-literal element face — a
+// —— contextless `[f]` over a generic tear-off under a pre-2.13 `@dart`
+// —— override reports the "Inferred candidate type … has type
+// —— parameters …" row at the literal; the cluster's remaining rows root
+// —— in the sibling-owned invocation-inference seam) ——
+#[cfg(test)]
+#[path = "ticket_4335_tests.rs"]
+mod ticket_4335_tests;
+
 // —— #4265 (cross-version engine row-set drift triage: the false-positive
 // —— families the 0.1.23 face added on cockpit-cas-b, pinned against the
 // —— dart analyze oracle's silence) ——
@@ -24362,3 +24388,81 @@ mod ticket_4294_tests;
 #[cfg(test)]
 #[path = "ticket_4304_tests.rs"]
 mod ticket_4304_tests;
+
+// —— #4333/#4334 (the ten surviving const_with_type_parameters rows: the
+// —— applied-instantiation family at formal default values — bare
+// —— generic-function references, A.new constructor tearoffs, and
+// —— constructor field formals — plus the is/as written-operand leaves,
+// —— the function-type bound leaf, the const list's cast-element
+// —— assignability face, and the non-const-field const-constructor row) ——
+#[cfg(test)]
+#[path = "ticket_4333_tests.rs"]
+mod ticket_4333_tests;
+
+// —— #4336 (the could_not_infer invocation-seam cluster: the generic
+// —— tear-off argument's instantiated decision face — bare, prefixed,
+// —— and instance — plus the alias-formal creation gather, the
+// —— mutual-bounds window's duplicate tanb, the receiver-seeded method
+// —— bound, and the bare creation's dynamic-only solution) ——
+#[cfg(test)]
+#[path = "ticket_4336_tests.rs"]
+mod ticket_4336_tests;
+
+// —— #4339 (the creation_with_non_type invocation-seam cluster: the
+// —— generic named-constructor head over an unresolved class, the
+// —— shadowed-prefix head's dead-end shadow arm, the function head behind
+// —— the creation syntax, and the unresolved prefix's segment span) ——
+#[cfg(test)]
+#[path = "ticket_4339_tests.rs"]
+mod ticket_4339_tests;
+
+// —— #4340 (the annotation-metadata engine seams on the frozen parser
+// —— contracts: the type-variable group's metadata drain at the group
+// —— close with the whole-group scope, the failed-declaration-head death
+// —— of undrained annotations with their staged argument/type-argument
+// —— rows, the unclosed-argument-group leftover sweep at the unit end,
+// —— and the nameless `<unnamed>` synthetic's own-span anchor) ——
+#[cfg(test)]
+#[path = "ticket_4340_tests.rs"]
+mod ticket_4340_tests;
+
+// —— #4332 (strict-inference's inference_failure_on_instance_creation:
+// —— the creation-solver's unconstrained fallback reports at the written
+// —— constructor-name chain — bare, prefixed, named-selector, extension
+// —— type, and the metadata spelling's whole-`@…(…)` anchor — while
+// —— explicit type arguments, a downward context, an upward-binding
+// —— formal, `@optionalTypeArgs`, a pre-generic-metadata library, and a
+// —— type-alias head all stay silent) ——
+#[cfg(test)]
+#[path = "ticket_4332_tests.rs"]
+mod ticket_4332_tests;
+
+// —— #4337 (the could_not_infer generic-metadata under-report envelope
+// —— around #4335's list-literal face: multi-name element folds through
+// —— the function LUB — first element's parameter spelling, numeric
+// —— return joins, count/bounds/plain rejections silent — set/map
+// —— literals' reporter-less silence, and the 2.14 version boundary on
+// —— the engine's settled feature flag) ——
+#[cfg(test)]
+#[path = "ticket_4337_tests.rs"]
+mod ticket_4337_tests;
+
+// —— #4343 (the could_not_infer pre-generic-metadata CALL face — #4337's
+// —— edge-3 handoff: a generic tear-off argument solving a call parameter
+// —— reports at the callee NAME, one row per solved parameter, the joined
+// —— full-type candidate with first-contributor parameter names and spelled
+// —— bounds, join/competitor/context-fixed silence, and both-rows order on
+// —— a bounded call parameter) ——
+#[cfg(test)]
+#[path = "ticket_4343_tests.rs"]
+mod ticket_4343_tests;
+
+// —— #4344 (the nameless recovery field's not-initialized obligation:
+// the constructor-head `<` group's field recovery stages its synthetic
+// declarator — the `''` row at the zero-width name — with the
+// initializer gate read off the token stream: pattern-variable faces
+// keep their `=`, and the next member's modifier/metadata heads bound
+// the scan) ——
+#[cfg(test)]
+#[path = "ticket_4344_tests.rs"]
+mod ticket_4344_tests;

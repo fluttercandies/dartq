@@ -133,6 +133,17 @@ pub(crate) struct SwitchTracker {
     /// no keyword anchor, so the root's own head is the one start every
     /// clause form shares.
     pub(crate) root_begin: u32,
+    /// The local names the #4011 pattern-binder bind typed (scrutinee /
+    /// container lattice / record slots). The shared-case-scope join
+    /// (`switch_member_head_done`) reads the head binders' declared types
+    /// and was calibrated over untyped heads; the parse-time lattice faces
+    /// are promotion-blind, so feeding them there perturbs the join in
+    /// both directions. Membership restores the pre-bind view for that
+    /// face alone — the operand reads (`v is int`) still see the bind.
+    /// The set is per-HEAD: `switch_member_head_begin` clears it, so a
+    /// same-name binder in a later head never inherits an earlier head's
+    /// mask.
+    pub(crate) bound_binder_names: std::collections::HashSet<StringId>,
 }
 
 impl SwitchTracker {
@@ -148,6 +159,7 @@ impl SwitchTracker {
             pending_const: None,
             switch_kw_latch: None,
             root_begin: 0,
+            bound_binder_names: std::collections::HashSet::new(),
         }
     }
 
@@ -1059,6 +1071,51 @@ pub(crate) struct SwitchCtx {
     pub(crate) legacy_cases: Vec<LegacyCase>,
 }
 
+/// The bracket's face for the pattern-binder matched-type walk (#4011):
+/// which container — or transparent wrapper — a frame is, latched at
+/// `begin_pattern` off the frame's own first token (upstream knows the
+/// AST node kind; the name level re-derives it from the token stream).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PatternFrameKind {
+    /// `[...]` / `<T>[...]`.
+    List,
+    /// `{...}` / `<K, V>{...}`.
+    Map,
+    /// `(...)` with a depth-0 `,`/`:` field separator inside the pair
+    /// (including `()` — the parser reports the empty pair as a record).
+    Record,
+    /// A parenthesized wrapper: transparent for matched types, the value
+    /// flows through to the inner pattern.
+    Paren,
+    /// Everything else (variable, wildcard, constant, object,
+    /// relational): a direct binder's matched type here is only the
+    /// scrutinee at the root, never a computable column.
+    Other,
+}
+
+/// One collected type-free binder (#4011): the bound name, its
+/// declaration span, whether the innermost frame's `var_types` slot
+/// already carried a non-`Unknown` type at the binder event (an earlier
+/// same-window binder's write or an outer same-name local — the first
+/// writer wins, the close never overwrites it), the field ordinal the
+/// binder's field occupies inside a record bracket (the
+/// `handle_pattern_field` boundary fires AFTER its sub-pattern, so
+/// `fields.len()` at the binder event names the field the binder belongs
+/// to), whether the binder sits in a colon-marked field position (an
+/// object-pattern field, a record named field, a map value — its matched
+/// value is the field's column, never the scrutinee), and whether it is
+/// the RIGHT operand of a logical-and (its matched type is the left
+/// operand's promoted face, a flow-integrated fact the parse-time lattice
+/// cannot see — the binder stays unbound, the under-report posture).
+pub(crate) struct PatternBinder {
+    pub(crate) name: StringId,
+    pub(crate) span: SourceRange,
+    pub(crate) slot_pre_typed: bool,
+    pub(crate) field: usize,
+    pub(crate) field_pos: bool,
+    pub(crate) and_rhs: bool,
+}
+
 /// One open `begin_pattern`..`end_pattern` bracket: the leaf restrictions
 /// collected inside it, whether `||` joined any of them (an `||` union
 /// keeps its alternatives apart; everything else intersects), and the
@@ -1082,6 +1139,19 @@ pub(crate) struct PatternFrame {
     /// cannot arm the wildcard's own check — see
     /// [`Engine::check_pending_wildcards`]). Cleared once checked.
     pub(crate) wildcards: Vec<(SourceRange, Option<Ty>)>,
+    /// The bracket's face (latched at `begin_pattern`).
+    pub(crate) kind: PatternFrameKind,
+    /// The DIRECT type-free binders collected inside this bracket (#4011),
+    /// bound at the container's close (list element / map value / record
+    /// slot) or re-attached upward through transparent brackets to the
+    /// root's scrutinee bind. A binder's own event fires inside its own
+    /// child bracket, so the collection target is always this frame.
+    pub(crate) binders: Vec<PatternBinder>,
+    /// The `...` rest marker's offset inside this bracket (latched at
+    /// `handle_rest_pattern` when the rest carries a sub-pattern):
+    /// collected binders at or after it are the rest's own binder — the
+    /// list face binds those to `List<E>`, never `E` itself.
+    pub(crate) rest_after: Option<u32>,
 }
 
 /// One object-pattern field's drained sub-restrictions (empty for a

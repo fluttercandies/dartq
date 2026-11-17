@@ -3188,7 +3188,12 @@ impl ConstCapture {
         }
     }
 
-    fn top_is_non_const_dup(&self) -> bool {
+    /// Whether a non-const duplicate-check window (a plain set/map
+    /// literal's element evaluation, never opened inside a const window)
+    /// is innermost — the position is not a constant context (shared with
+    /// the const-reference gate).
+    #[must_use]
+    pub fn top_is_non_const_dup(&self) -> bool {
         self.windows
             .last()
             .is_some_and(|w| w.kind == WindowKind::NonConstDup)

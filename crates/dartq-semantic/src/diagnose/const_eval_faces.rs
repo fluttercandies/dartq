@@ -169,11 +169,8 @@ fn preceded_by_keyword(bytes: &[u8], i: usize, kw: &[u8]) -> bool {
 /// Collects the byte spans of every leaf identifier inside the
 /// `<...>` type-argument group `(open, close)` that spells an in-scope
 /// type parameter — the recursive-leaf face of the oracle's
-/// `_checkForConstWithTypeParameters` walk. A nested `<...>` group a
-/// `Function` keyword opens is that function type's OWN parameter list
-/// (its idents are exempt `allowedTypeParameters` upstream), so the scan
-/// steps over it; any other nested group's interior is recursed so a
-/// parameterized argument's inner `T` leaf reports at its own span.
+/// `_checkForConstWithTypeParameters` walk (see
+/// [`scan_param_leaves`]).
 fn param_leaf_spans(
     bytes: &[u8],
     source: &str,
@@ -183,29 +180,232 @@ fn param_leaf_spans(
     params: &[StringId],
     spans: &mut Vec<(usize, usize)>,
 ) {
-    let mut j = open + 1;
-    while j < close.saturating_sub(1) {
+    scan_param_leaves(
+        bytes,
+        source,
+        strings,
+        open + 1,
+        close.saturating_sub(1),
+        params,
+        &[],
+        spans,
+    );
+}
+
+/// Raw-range form of [`param_leaf_spans`]: scans `[start, end)` for leaf
+/// identifiers spelling an in-scope type parameter, threading `exempt` —
+/// names shadowed by an enclosing function type's own type parameters
+/// (upstream `allowedTypeParameters`, constant_verifier.dart's
+/// GenericFunctionType visit folding its own parameter names in before
+/// walking). A nested `<...>` group a `Function` keyword opens is that
+/// function type's own parameter list — handled by
+/// [`scan_function_own_type_params`]; any other nested group's interior
+/// is recursed so a parameterized argument's inner `T` leaf reports at
+/// its own span.
+fn scan_param_leaves(
+    bytes: &[u8],
+    source: &str,
+    strings: &StringTable,
+    start: usize,
+    end: usize,
+    params: &[StringId],
+    exempt: &[&str],
+    spans: &mut Vec<(usize, usize)>,
+) {
+    let mut j = start;
+    while j < end {
         match bytes[j] {
             b'<' => {
                 let inner_end = skip_balanced(bytes, j, b'<');
                 if inner_end == j {
                     break;
                 }
-                if !preceded_by_keyword(bytes, j, b"Function") {
-                    param_leaf_spans(bytes, source, strings, j, inner_end, params, spans);
-                }
-                j = inner_end;
+                let next = if preceded_by_keyword(bytes, j, b"Function") {
+                    scan_function_own_type_params(
+                        bytes, source, strings, j, inner_end, end, params, exempt, spans,
+                    )
+                } else {
+                    scan_param_leaves(
+                        bytes,
+                        source,
+                        strings,
+                        j + 1,
+                        inner_end - 1,
+                        params,
+                        exempt,
+                        spans,
+                    );
+                    inner_end
+                };
+                j = next;
             }
             b if b.is_ascii_alphabetic() || b == b'_' || b == b'$' => {
-                let end = ident_end(bytes, j);
-                let text = &source[j..end];
-                if params.iter().any(|p| strings.resolve(*p) == text) {
-                    spans.push((j, end));
+                let lexeme_end = ident_end(bytes, j);
+                let text = &source[j..lexeme_end];
+                if params.iter().any(|p| strings.resolve(*p) == text) && !exempt.contains(&text) {
+                    spans.push((j, lexeme_end));
                 }
-                j = end;
+                j = lexeme_end;
             }
             _ => j += 1,
         }
+    }
+}
+
+/// The own type-parameter group of a function type — the `<...>` that
+/// follows its `Function` keyword. Upstream folds the declared names
+/// into `allowedTypeParameters` and then walks each declaration's
+/// `extends` bound (a bound leaf like `U extends T` reports at its own
+/// span, while the declarations and parameter-list uses of the shadowed
+/// names stay silent); the parameter list `(...)` that follows the group
+/// is walked under the same shadow. Returns the scan position past the
+/// handled region (the `<...>` group and, when present, its `(...)`
+/// list).
+fn scan_function_own_type_params(
+    bytes: &[u8],
+    source: &str,
+    strings: &StringTable,
+    open: usize,
+    close: usize,
+    end: usize,
+    params: &[StringId],
+    exempt: &[&str],
+    spans: &mut Vec<(usize, usize)>,
+) -> usize {
+    // Depth-0 comma segments of the declaration list.
+    let interior_end = close - 1;
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = open + 1;
+    let mut depth = 0usize;
+    let mut k = open + 1;
+    while k < interior_end {
+        match bytes[k] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                segments.push((seg_start, k));
+                seg_start = k + 1;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    segments.push((seg_start, interior_end));
+
+    // Each segment declares one name (`Name extends Bound`); the bound
+    // region — the only visited part — is the text past the `extends`
+    // keyword.
+    let mut declared: Vec<&str> = Vec::new();
+    let mut bounds: Vec<(usize, usize)> = Vec::new();
+    for &(s, e) in &segments {
+        let n = ws_skip(bytes, s);
+        if n < e {
+            let lexeme_end = ident_end(bytes, n);
+            if lexeme_end > n {
+                declared.push(&source[n..lexeme_end]);
+            }
+        }
+        let mut m = s;
+        while m < e {
+            if bytes[m].is_ascii_alphabetic() || bytes[m] == b'_' || bytes[m] == b'$' {
+                let lexeme_end = ident_end(bytes, m);
+                if &source[m..lexeme_end] == "extends" {
+                    bounds.push((lexeme_end, e));
+                    break;
+                }
+                m = lexeme_end;
+            } else {
+                m += 1;
+            }
+        }
+    }
+    let mut shadowed: Vec<&str> = exempt.to_vec();
+    shadowed.extend(declared.iter().copied());
+    for (s, e) in bounds {
+        scan_param_leaves(bytes, source, strings, s, e, params, &shadowed, spans);
+    }
+
+    // The parameter list that follows the group walks under the same
+    // shadow (`void Function<Q>(Q)` stays silent on the parameter-list
+    // `Q`).
+    let paren = ws_skip(bytes, close);
+    if paren < end && bytes[paren] == b'(' {
+        let paren_end = skip_balanced(bytes, paren, b'(');
+        if paren_end > paren {
+            scan_param_leaves(
+                bytes,
+                source,
+                strings,
+                paren + 1,
+                paren_end - 1,
+                params,
+                &shadowed,
+                spans,
+            );
+            return paren_end;
+        }
+    }
+    close
+}
+
+/// When `ty` is a bare non-nullable reference to one of `params` (the
+/// written type-parameter spelling of a declaration's own group), that
+/// parameter's name — the binding site the instantiation face reads.
+fn bare_param_of(ty: Ty, params: &[StringId]) -> Option<StringId> {
+    match ty {
+        Ty::Named {
+            name,
+            nullable: false,
+            args: ArgListId::EMPTY,
+        } if params.contains(&name) => Some(name),
+        _ => None,
+    }
+}
+
+/// Collects the spans of every `is`/`is!`/`as` operator node in a
+/// captured const tree — the nodes whose written type operand
+/// [`Engine::check_const_is_as_type_params`] scans.
+fn collect_is_as_nodes(node: &crate::const_eval::Node, out: &mut Vec<SourceRange>) {
+    fn parts(nodes: &[crate::const_eval::Node], out: &mut Vec<SourceRange>) {
+        for node in nodes {
+            collect_is_as_nodes(node, out);
+        }
+    }
+    match &node.expr {
+        Expr::Unary { op, operand } => {
+            if matches!(op, UnOp::Is(_) | UnOp::IsNot(_) | UnOp::As(_)) {
+                out.push(node.span);
+            }
+            collect_is_as_nodes(operand, out);
+        }
+        Expr::Member { recv, .. } => collect_is_as_nodes(recv, out),
+        Expr::Binary { left, right, .. } => {
+            collect_is_as_nodes(left, out);
+            collect_is_as_nodes(right, out);
+        }
+        Expr::Cond { cond, then, els } => {
+            collect_is_as_nodes(cond, out);
+            collect_is_as_nodes(then, out);
+            collect_is_as_nodes(els, out);
+        }
+        Expr::Interp { parts: items } | Expr::Adjacent(items) => parts(items, out),
+        Expr::List(items) | Expr::Set(items) | Expr::Map(items) | Expr::Record(items) => {
+            parts(items, out);
+        }
+        Expr::Call { args, .. } => parts(args, out),
+        Expr::Entry(key, value) => {
+            collect_is_as_nodes(key, out);
+            collect_is_as_nodes(value, out);
+        }
+        Expr::IfElement { cond, then, els } => {
+            collect_is_as_nodes(cond, out);
+            collect_is_as_nodes(then, out);
+            if let Some(els) = els {
+                collect_is_as_nodes(els, out);
+            }
+        }
+        Expr::Spread { operand, .. } => collect_is_as_nodes(operand, out),
+        _ => {}
     }
 }
 
@@ -677,6 +877,125 @@ impl<'a> Engine<'a> {
         self.const_group_cursor = 0;
     }
 
+    /// `const_constructor_with_field_initialized_by_non_const`
+    /// (`_validateFieldInitializers`, constant_verifier.dart:910-951): a
+    /// non-const INSTANCE field initializer carrying a
+    /// `const_with_type_parameters` row (an applied type-parameter
+    /// tearoff is never a valid constant) reports once per const
+    /// constructor of the same container, anchored at the constructor's
+    /// `const` keyword. Fires at the field initializer's close; a const
+    /// constructor declared after the field reports only on a later
+    /// close — the in-order under-report edge the const-ctor target gate
+    /// shares.
+    fn check_nonconst_field_const_ctor_face(&mut self) {
+        // The field-initializer close signature: the routing discriminated
+        // the shape before calling the close (a local's close keeps
+        // `field_group_open` false), and `in_initializer` is already
+        // restored by then — the group flags carry the decision.
+        if self.open_member_static
+            || !self.field_group_open
+            || self.init_frame_depth != self.field_group_depth
+        {
+            return;
+        }
+        let Some((container, _)) = self.container_context() else {
+            return;
+        };
+        // The field whose initializer just closed: the latest instance
+        // field site of this container.
+        let Some((field_name, field_end)) =
+            self.decl_sites
+                .iter()
+                .rev()
+                .find_map(|site| match site.kind {
+                    DeclKind::Member {
+                        kind: MemberKind::Field,
+                        is_static: false,
+                        container: member_container,
+                    } if member_container == container => Some((site.name, site.range.end())),
+                    _ => None,
+                })
+        else {
+            return;
+        };
+        // A FUNCTION-tearoff row inside the initializer region (past the
+        // field's own name) is the tearoff that made it non-constant —
+        // the shared wire name covers all three const-with variants, but
+        // only the function-tearoff face's evaluation faults upstream (a
+        // constructor tearoff stays a constant value, so its row never
+        // cascades — the message is the site discriminator).
+        let tearoff_face = SemanticCode::ConstWithTypeParameters.code_info().name;
+        if !self.report.diagnostics.iter().any(|d| {
+            d.code.name == tearoff_face
+                && d.message.starts_with("A constant function tearoff")
+                && d.range.offset > field_end
+        }) {
+            return;
+        }
+        // Every const constructor of the container reports, anchored at
+        // the five `const` bytes behind its head token.
+        let bytes = self.source.as_bytes();
+        let ctor_heads: Vec<u32> = self
+            .decl_sites
+            .iter()
+            .enumerate()
+            .filter_map(|(index, site)| match site.kind {
+                DeclKind::Constructor {
+                    container: ctor_container,
+                } if ctor_container == container
+                    && site.const_ctor
+                    && !site.is_factory
+                    && !site.is_augment =>
+                {
+                    Some(
+                        self.ctor_head_anchors
+                            .get(&index)
+                            .map_or(site.range.offset, |range| range.offset),
+                    )
+                }
+                _ => None,
+            })
+            .collect();
+        let info = SemanticCode::ConstConstructorWithFieldInitializedByNonConst.code_info();
+        let field_text = self.strings.resolve(field_name);
+        for head in ctor_heads {
+            let mut cursor = self.byte_of(head);
+            while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+                cursor -= 1;
+            }
+            if cursor < 5 || &bytes[cursor - 5..cursor] != b"const" {
+                continue;
+            }
+            // An identifier ending in `const` (`xconst`) is not the
+            // keyword — its left boundary must break the lexeme.
+            let lexeme_left = cursor > 5
+                && (bytes[cursor - 6].is_ascii_alphanumeric()
+                    || bytes[cursor - 6] == b'_'
+                    || bytes[cursor - 6] == b'$');
+            if lexeme_left {
+                continue;
+            }
+            let span = SourceRange {
+                offset: self.utf16_of(cursor - 5),
+                length: self.utf16_of(cursor) - self.utf16_of(cursor - 5),
+            };
+            if self
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.range == span && d.code == info)
+            {
+                continue;
+            }
+            self.emit(
+                SemanticCode::ConstConstructorWithFieldInitializedByNonConst,
+                span,
+                field_text,
+                "",
+            );
+        }
+    }
+
     /// A const initializer window opens: the group's next name marks
     /// in-progress (a self-reference inside is the cycle fault).
     pub fn open_const_initializer(&mut self) {
@@ -732,6 +1051,14 @@ impl<'a> Engine<'a> {
         // carries it (#3433).
         self.resolve_decl_shorthands();
         let Some(keyed) = self.pending_init_names.pop() else {
+            // A non-const instance field's initializer inside a container
+            // that declares a const constructor: a type-parameter row
+            // inside it marks the initializer as a non-constant value,
+            // which every const constructor of the container reports at
+            // its `const` keyword.
+            if !local {
+                self.check_nonconst_field_const_ctor_face();
+            }
             return;
         };
         // The pending slot carries the site-keyed id (`{name}\u{1}…` —
@@ -752,6 +1079,9 @@ impl<'a> Engine<'a> {
         // shorthand — see [`Self::report_root_shorthand`].
         if let Some(node) = &root {
             self.report_root_shorthand(node);
+            // The is/as type-parameter face rides the const-initializer
+            // context too (`const c = e is T;` reports the `T` leaf).
+            self.check_const_is_as_type_params(std::slice::from_ref(node));
         }
         let verdict = root
             .as_ref()
@@ -1762,9 +2092,506 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether the current position is one of the oracle's constant
+    /// contexts for a bare tearoff reference — the upstream gate is the
+    /// AST node's `inConstantContext || inConstantExpression`
+    /// (`visitConstructorReference` / `visitFunctionReference`,
+    /// constant_verifier.dart:202-264): a const initializer window (a
+    /// `const` variable, a const constructor's initializer list), a
+    /// `const C(...)` argument, an explicit const literal's element, an
+    /// enum element, a constant pattern or map-pattern key, or a formal's
+    /// default value. The non-const candidate windows (a `@literal`
+    /// creation's arguments, a non-const set/map's duplicate evaluation)
+    /// never carry the bit.
+    ///
+    /// The one non-window site: an INSTANCE field's initializer inside a
+    /// container that declares a const constructor — the field's value
+    /// folds into every const creation of the container, so the oracle
+    /// evaluates it as a constant (`final` and `var` fields alike; a
+    /// `static` member never joins the instance state and stays out —
+    /// its type-parameter reads report `type_parameter_referenced_by_
+    /// static` instead).
+    pub(crate) fn in_const_reference_context(&self) -> bool {
+        if self.default_value_depth > 0 {
+            return true;
+        }
+        if self.const_capture.open()
+            && !self.const_capture.top_is_literal_ctor()
+            && !self.const_capture.top_is_non_const_dup()
+        {
+            return true;
+        }
+        self.in_initializer
+            && !self
+                .frames
+                .iter()
+                .any(|f| matches!(f.kind, FrameKind::Executable { .. }))
+            && !self.open_member_static
+            && self
+                .container_context()
+                .is_some_and(|(name, _)| self.const_ctor_target(name))
+    }
+
+    /// The tearoff face of [`Self::emit_const_type_param_args`]: an
+    /// applied type-argument group with no call — `f<U>` (a function
+    /// reference) or `A<T>` before a `.new`/`.named` selector (a
+    /// constructor reference) — in a constant context reports each
+    /// type-parameter leaf of the WRITTEN group with the site-specific
+    /// message (`_checkForConstWithTypeParameters` over the reference's
+    /// type/arguments). `range` is the group's own `<...>` span.
+    pub(crate) fn emit_const_tearoff_type_params(&mut self, range: SourceRange, ctor: bool) {
+        let code = if ctor {
+            SemanticCode::ConstWithTypeParametersCtorTearoff
+        } else {
+            SemanticCode::ConstWithTypeParametersFnTearoff
+        };
+        let params: Vec<StringId> = self
+            .type_params
+            .iter()
+            .chain(self.pending_type_params.iter())
+            .copied()
+            .collect();
+        if params.is_empty() {
+            return;
+        }
+        let open = self.byte_of(range.offset);
+        let close = self.byte_of(range.end());
+        let bytes = self.source.as_bytes();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        param_leaf_spans(
+            bytes,
+            self.source,
+            self.strings,
+            open,
+            close,
+            &params,
+            &mut spans,
+        );
+        for (start, end) in spans {
+            self.emit(
+                code,
+                SourceRange {
+                    offset: self.utf16_of(start),
+                    length: self.utf16_of(end) - self.utf16_of(start),
+                },
+                "",
+                "",
+            );
+        }
+    }
+
+    /// The applied-instantiation face of `const_with_type_parameters` at
+    /// a formal's default value: a BARE function reference `f` in the
+    /// constant context whose context type (the formal's declared
+    /// function type) instantiates the function's own type parameters
+    /// with types mentioning an in-scope type parameter — the INFERRED
+    /// instantiation the oracle's `visitFunctionReference` checks
+    /// (evaluation.dart:955-983, `typeArgumentTypes` folded from the
+    /// context; the row anchors at the whole reference, the bare `f`)
+    /// with the function-tearoff message.
+    ///
+    /// The binding analysis mirrors the inference: a declaration formal
+    /// whose type IS one of the function's own bare parameters binds that
+    /// parameter to the context's slot at the same position (return
+    /// position and same-named named formals bind alike); a slot that
+    /// mentions an in-scope parameter reports once at the reference.
+    pub(crate) fn check_default_const_type_param_faces(&mut self, to: Ty) {
+        let scope: Vec<StringId> = self
+            .type_params
+            .iter()
+            .chain(self.pending_type_params.iter())
+            .copied()
+            .collect();
+        if scope.is_empty() {
+            return;
+        }
+        let Some(rhs_row) = self.rows.iter().rev().find(|row| {
+            !matches!(row.shape, RowShape::TypeUse(..))
+                && !self.interpolation_child_rows.contains(&row.range.offset)
+        }) else {
+            return;
+        };
+        let rhs_row = rhs_row.clone();
+        if !rhs_row.qualified {
+            self.check_default_fn_tearoff_instantiation(rhs_row, to, &scope);
+            return;
+        }
+        // `A.new` in the same position: the constructor tear-off
+        // instantiates the container's parameters at their implicit
+        // `dynamic` bounds — a context type mentioning an in-scope
+        // parameter can never be satisfied (`A<dynamic> Function()` vs
+        // `A<T> Function()`), so the assignment verdict is decided and
+        // the row reports at the whole reference. The qualified `new`
+        // row carries its container receiver in the row itself.
+        if self.strings.resolve(rhs_row.name) != "new" || rhs_row.intent != Intent::Read {
+            return;
+        }
+        let container = match &rhs_row.shape {
+            RowShape::Member {
+                recv: Receiver::Container { name, .. },
+            } => *name,
+            _ => return,
+        };
+        let folded = self.fold_alias_ty(to);
+        if !self.ty_deep_mentions(folded, &scope, &[]) {
+            return;
+        }
+        let ret = self
+            .boundary
+            .args
+            .borrow_mut()
+            .named(container, false, &[Ty::Dynamic]);
+        let from =
+            self.boundary
+                .args
+                .borrow_mut()
+                .function_generic_required(&[], 0, ret, &[], &[], false);
+        let from_text = self.ty_display(from);
+        let to_text = self.ty_display(folded);
+        let range = self
+            .invocation_span(rhs_row.range)
+            .or_else(|| self.property_access_span(rhs_row.range))
+            .unwrap_or(rhs_row.range);
+        self.emit(SemanticCode::InvalidAssignment, range, &from_text, &to_text);
+    }
+
+    /// The bare-reference arm of
+    /// [`Self::check_default_const_type_param_faces`]: `rhs_row` names a
+    /// top-level generic function whose parameters the context type
+    /// `to` binds to type-parameter-mentioning slots.
+    fn check_default_fn_tearoff_instantiation(&mut self, rhs_row: Row, to: Ty, scope: &[StringId]) {
+        if rhs_row.intent != Intent::Read
+            || !matches!(
+                rhs_row.shape,
+                RowShape::Bare(BareInfo::Plain { .. } | BareInfo::Missing { .. })
+            )
+        {
+            return;
+        }
+        // A frame local or shadowed read is the local's own value, never
+        // the function's tear-off (the same refusal `tear_off_sig`
+        // applies).
+        if self.frames.iter().any(|f| f.locals.contains(&rhs_row.name))
+            || self.shadowed_bare_rows.contains(&rhs_row.range.offset)
+        {
+            return;
+        }
+        // A WRITTEN `<...>` group is the #4149 face's own (each leaf of
+        // the written group reports there, once); the inferred face owns
+        // BARE references only.
+        let bytes = self.source.as_bytes();
+        let after = ws_skip(bytes, self.byte_of(rhs_row.range.end()));
+        if bytes.get(after) == Some(&b'<') {
+            return;
+        }
+        let Some(decl) = self.top_level_decl(rhs_row.name) else {
+            return;
+        };
+        let Some(decl_formals) = decl.formals.as_deref() else {
+            return;
+        };
+        if !matches!(decl.kind, MicroKind::TopLevelFn) || decl.type_param_names.is_empty() {
+            return;
+        }
+        let folded = self.fold_alias_ty(to);
+        if self.fn_instantiation_mentions(
+            &decl.type_param_names,
+            decl.return_ty,
+            decl_formals,
+            folded,
+            scope,
+        ) {
+            self.emit(
+                SemanticCode::ConstWithTypeParametersFnTearoff,
+                rhs_row.range,
+                "",
+                "",
+            );
+        }
+    }
+
+    /// The binding analysis both applied-instantiation faces share: a
+    /// generic function declaration (its own parameter spellings, return
+    /// type, and formals) against a context function type — `true` when
+    /// inference binds one of the declaration's parameters to a context
+    /// slot that mentions an in-scope type parameter (positional by
+    /// index, return by position, named by name).
+    fn fn_instantiation_mentions(
+        &self,
+        type_param_names: &[StringId],
+        return_ty: Ty,
+        formals: &Formals,
+        context: Ty,
+        scope: &[StringId],
+    ) -> bool {
+        let Ty::Function { shape, .. } = context else {
+            return false;
+        };
+        let (context_positional, context_named, context_return) = {
+            let pool = self.boundary.args.borrow();
+            let shape = pool.function_shape(shape);
+            (
+                shape.positional.to_vec(),
+                shape.named.to_vec(),
+                shape.return_ty,
+            )
+        };
+        // Positional bindings: declaration formal `i` typed as one of the
+        // function's own bare parameters binds against the context slot
+        // at `i`.
+        for (index, formal) in formals.positional.iter().enumerate() {
+            if bare_param_of(formal.ty, type_param_names).is_some()
+                && context_positional
+                    .get(index)
+                    .is_some_and(|slot| self.ty_deep_mentions(*slot, scope, &[]))
+            {
+                return true;
+            }
+        }
+        // Return-position and same-named named bindings.
+        if bare_param_of(return_ty, type_param_names).is_some()
+            && self.ty_deep_mentions(context_return, scope, &[])
+        {
+            return true;
+        }
+        context_named.iter().any(|(name, slot)| {
+            formals.named.iter().any(|formal| {
+                formal.name == *name && bare_param_of(formal.ty, type_param_names).is_some()
+            }) && self.ty_deep_mentions(*slot, scope, &[])
+        })
+    }
+
+    /// The constructor field-formal arm of the applied-instantiation
+    /// face: `this.p = f` in a constructor's formal list is a constant
+    /// context whose context type is the FIELD's declared type (the
+    /// field formal writes no name of its own, so the plain default-value
+    /// check never sees it). Same binding analysis as the bare arm of
+    /// [`Self::check_default_const_type_param_faces`]; the row anchors at
+    /// the value identifier. The constructor's super-formal drains fire
+    /// per close event — the repeat check keeps one row.
+    pub(crate) fn check_ctor_field_formal_tearoffs(&mut self, owner: usize) {
+        let Some(site) = self.decl_sites.get(owner) else {
+            return;
+        };
+        let DeclKind::Constructor { container } = site.kind else {
+            return;
+        };
+        if site.is_factory || site.is_augment {
+            return;
+        }
+        let head_end = self
+            .ctor_head_anchors
+            .get(&owner)
+            .map_or(site.range.end(), |range| range.end());
+        let scope: Vec<StringId> = self
+            .type_params
+            .iter()
+            .chain(self.pending_type_params.iter())
+            .copied()
+            .collect();
+        if scope.is_empty() {
+            return;
+        }
+        // The formal list: the balanced `(...)` group that follows the
+        // constructor head (an optional `.named` selector first).
+        let bytes = self.source.as_bytes();
+        let mut i = ws_skip(bytes, self.byte_of(head_end));
+        if bytes.get(i) == Some(&b'.') {
+            i = ws_skip(bytes, i + 1);
+            i = ident_end(bytes, i);
+            i = ws_skip(bytes, i);
+        }
+        if bytes.get(i) != Some(&b'(') {
+            return;
+        }
+        let group_end = skip_balanced(bytes, i, b'(');
+        if group_end == i {
+            return;
+        }
+        // Depth-0 comma segments of the formal list.
+        let interior_end = group_end - 1;
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let mut seg_start = i + 1;
+        let mut depth = 0usize;
+        let mut k = i + 1;
+        while k < interior_end {
+            match bytes[k] {
+                b'\'' | b'"' => {
+                    let quote = bytes[k];
+                    k += 1;
+                    while k < interior_end {
+                        match bytes[k] {
+                            b'\\' => k += 2,
+                            b if b == quote => {
+                                k += 1;
+                                break;
+                            }
+                            _ => k += 1,
+                        }
+                    }
+                }
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    k += 1;
+                }
+                b')' | b']' | b'}' => {
+                    depth = depth.saturating_sub(1);
+                    k += 1;
+                }
+                b',' if depth == 0 => {
+                    segments.push((seg_start, k));
+                    seg_start = k + 1;
+                    k += 1;
+                }
+                _ => k += 1,
+            }
+        }
+        segments.push((seg_start, interior_end));
+        for (seg_start, seg_end) in segments {
+            let mut k = ws_skip(bytes, seg_start);
+            // A named-formal group's braces wrap the first/last segment
+            // (`{a = 1, this.p = f}`) — strip the one brace each side.
+            if matches!(bytes.get(k), Some(b'{') | Some(b'}')) {
+                k = ws_skip(bytes, k + 1);
+            }
+            let mut bound = seg_end;
+            while bound > k && bytes[bound - 1].is_ascii_whitespace() {
+                bound -= 1;
+            }
+            if bound > k && matches!(bytes[bound - 1], b'{' | b'}') {
+                bound -= 1;
+            }
+            // A `required` modifier may precede the field formal.
+            let lexeme_end = ident_end(bytes, k);
+            if k < bound && lexeme_end <= bound && &self.source[k..lexeme_end] == "required" {
+                k = ws_skip(bytes, lexeme_end);
+            }
+            // `this` `.` field `=` value, the value a bare identifier.
+            let this_end = ident_end(bytes, k);
+            if this_end > bound || &self.source[k..this_end] != "this" {
+                continue;
+            }
+            k = ws_skip(bytes, this_end);
+            if bytes.get(k) != Some(&b'.') {
+                continue;
+            }
+            k = ws_skip(bytes, k + 1);
+            let field_end = ident_end(bytes, k);
+            if field_end == k || field_end > bound {
+                continue;
+            }
+            let field_name = self.intern(&self.source[k..field_end]);
+            k = ws_skip(bytes, field_end);
+            if bytes.get(k) != Some(&b'=') || k >= bound {
+                continue;
+            }
+            k = ws_skip(bytes, k + 1);
+            let value_end = ident_end(bytes, k);
+            if value_end == k || value_end > bound || ws_skip(bytes, value_end) != bound {
+                continue;
+            }
+            let value_name = self.intern(&self.source[k..value_end]);
+            let span = SourceRange {
+                offset: self.utf16_of(k),
+                length: self.utf16_of(value_end) - self.utf16_of(k),
+            };
+            let info = SemanticCode::ConstWithTypeParametersFnTearoff.code_info();
+            if self
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.range == span && d.code == info)
+            {
+                continue;
+            }
+            if self.frames.iter().any(|f| f.locals.contains(&value_name)) {
+                continue;
+            }
+            let field_ty = match self.walk_members(container, field_name) {
+                Walk::Found(entry) if entry.kind == MemberKind::Field => entry.var_ty,
+                _ => continue,
+            };
+            let Some(decl) = self.top_level_decl(value_name) else {
+                continue;
+            };
+            let Some(decl_formals) = decl.formals.as_deref() else {
+                continue;
+            };
+            if !matches!(decl.kind, MicroKind::TopLevelFn) || decl.type_param_names.is_empty() {
+                continue;
+            }
+            let folded = self.fold_alias_ty(field_ty);
+            if self.fn_instantiation_mentions(
+                &decl.type_param_names,
+                decl.return_ty,
+                decl_formals,
+                folded,
+                &scope,
+            ) {
+                self.emit(SemanticCode::ConstWithTypeParametersFnTearoff, span, "", "");
+            }
+        }
+    }
+
+    /// Whether `ty` mentions any `params` name — the instantiation face's
+    /// "bound to a type parameter" test. `exempt` names (an inner
+    /// function type's own parameters — the scan's
+    /// `allowedTypeParameters` threading) never match.
+    fn ty_deep_mentions(&self, ty: Ty, params: &[StringId], exempt: &[StringId]) -> bool {
+        match ty {
+            Ty::Named { name, args, .. } => {
+                (params.contains(&name) && !exempt.contains(&name))
+                    || self
+                        .boundary
+                        .args
+                        .borrow()
+                        .get(args)
+                        .iter()
+                        .any(|arg| self.ty_deep_mentions(*arg, params, exempt))
+            }
+            Ty::Function { shape, .. } => {
+                let (return_ty, positional, named, own) = {
+                    let pool = self.boundary.args.borrow();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                        shape
+                            .type_params_named
+                            .iter()
+                            .map(|(name, _)| *name)
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let mut shadowed = exempt.to_vec();
+                shadowed.extend(own);
+                self.ty_deep_mentions(return_ty, params, &shadowed)
+                    || positional
+                        .into_iter()
+                        .any(|slot| self.ty_deep_mentions(slot, params, &shadowed))
+                    || named
+                        .into_iter()
+                        .any(|(_, slot)| self.ty_deep_mentions(slot, params, &shadowed))
+            }
+            Ty::Record { shape, .. } => {
+                let (positional, named) = {
+                    let pool = self.boundary.args.borrow();
+                    let shape = pool.record_shape(shape);
+                    (shape.positional.to_vec(), shape.named.to_vec())
+                };
+                positional
+                    .into_iter()
+                    .chain(named.into_iter().map(|(_, slot)| slot))
+                    .any(|slot| self.ty_deep_mentions(slot, params, exempt))
+            }
+            _ => false,
+        }
+    }
+
     /// The callee classification a closed bare-identifier call resolves
     /// to (`evaluation.dart` `_invalidConstantForMethodInvocation`). The
-    /// `&mut` receiver stages the `C.named(` implicit-const creation the
+    /// `&mut` receiver stages the `C.name(` implicit-const creation the
     /// qualified-selector split detects — the tail pass needs the
     /// whole-file const-ctor set before it can verdict.
     pub(crate) fn classify_call(&mut self, name: StringId) -> CallClass {
@@ -3230,6 +4057,181 @@ impl<'a> Engine<'a> {
     /// const-init default); `Verdict::NotConstant`/`Unresolved` is a
     /// plain element failure pushed as a non-constant leaf. `None` means
     /// every element folded clean.
+    /// The is/as face of `const_with_type_parameters`: in a constant
+    /// context, `visitIsExpression`/`visitAsExpression` run
+    /// `_checkForConstWithTypeParameters` over the WRITTEN type operand
+    /// (constant_verifier.dart:264-273) — each in-scope type-parameter
+    /// leaf of `e is T`/`e as T` reports at its own span. The operand's
+    /// bytes are scanned (a parameter leaf carries no row of its own),
+    /// bounded by the node's span with the LAST `is`/`as` identifier
+    /// splitting operand from type — the operand sits left of the node's
+    /// own operator, so the last keyword inside the span is it.
+    pub(crate) fn check_const_is_as_type_params(&mut self, nodes: &[crate::const_eval::Node]) {
+        let params: Vec<StringId> = self
+            .type_params
+            .iter()
+            .chain(self.pending_type_params.iter())
+            .copied()
+            .collect();
+        if params.is_empty() {
+            return;
+        }
+        let mut op_spans: Vec<SourceRange> = Vec::new();
+        for node in nodes {
+            collect_is_as_nodes(node, &mut op_spans);
+        }
+        if op_spans.is_empty() {
+            return;
+        }
+        let bytes = self.source.as_bytes();
+        let mut leaves: Vec<(usize, usize)> = Vec::new();
+        for span in op_spans {
+            let start = self.byte_of(span.offset);
+            let end = self.byte_of(span.end());
+            let mut type_start = None;
+            let mut i = start;
+            while i < end {
+                if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'$' {
+                    let lexeme_end = ident_end(bytes, i);
+                    let text = &self.source[i..lexeme_end];
+                    if text == "is" || text == "as" {
+                        type_start = Some(lexeme_end);
+                    }
+                    i = lexeme_end;
+                } else {
+                    i += 1;
+                }
+            }
+            if let Some(type_start) = type_start {
+                scan_param_leaves(
+                    bytes,
+                    self.source,
+                    self.strings,
+                    type_start,
+                    end,
+                    &params,
+                    &[],
+                    &mut leaves,
+                );
+            }
+        }
+        leaves.sort_unstable();
+        leaves.dedup();
+        for (start, end) in leaves {
+            let span = SourceRange {
+                offset: self.utf16_of(start),
+                length: self.utf16_of(end) - self.utf16_of(start),
+            };
+            // Nested operator nodes (`a as T as U`) rescan disjoint
+            // regions, but an overlapping walk (a root tree plus a
+            // literal's element parts) may reach one leaf twice — the
+            // repeat check keeps one row per span.
+            let info = SemanticCode::ConstWithTypeParameters.code_info();
+            if self
+                .report
+                .diagnostics
+                .iter()
+                .rev()
+                .any(|d| d.range == span && d.code == info)
+            {
+                continue;
+            }
+            self.emit(SemanticCode::ConstWithTypeParameters, span, "", "");
+        }
+    }
+
+    /// The cast-element face of the const list check
+    /// (`_validateListExpression`, constant_verifier.dart:1367-1395): a
+    /// const list element `f as T` whose evaluated value — a function
+    /// tear-off — is not assignable to the list's element type (the
+    /// element's static type, the cast target) reports
+    /// `list_element_type_not_assignable` at the whole `as` expression.
+    /// Only a decided not-assignable verdict reports (`runtimeTypeMatch`
+    /// upstream; an unknown pair stays silent — the under-report
+    /// direction).
+    pub(crate) fn check_const_as_element_types(
+        &mut self,
+        code: SemanticCode,
+        parts: &[crate::const_eval::Node],
+    ) {
+        if code != SemanticCode::NonConstantListElement {
+            return;
+        }
+        for part in parts {
+            let (target, name) = match &part.expr {
+                Expr::Unary {
+                    op: UnOp::As(target),
+                    operand,
+                } => match &operand.expr {
+                    Expr::Ident(name) => (*target, *name),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let Some(value_ty) = self.function_tearoff_ty(name) else {
+                continue;
+            };
+            if self.assignable(value_ty, target, false) != Some(false) {
+                continue;
+            }
+            let value_text = self.ty_display(value_ty);
+            let target_text = self.ty_display(target);
+            self.emit(
+                SemanticCode::ListElementTypeNotAssignable,
+                part.span,
+                &value_text,
+                &target_text,
+            );
+        }
+    }
+
+    /// A bare function name's tear-off type: a declared local function's
+    /// own signature, or a top-level function's declaration with its own
+    /// type parameters materialized (the same fill
+    /// `tear_off_sig_binder` applies — the value face renders
+    /// `void Function<T>(T)`, parameters included). A shadowed spelling
+    /// or a non-function declaration answers `None`.
+    fn function_tearoff_ty(&self, name: StringId) -> Option<Ty> {
+        if let Some(sig) = self.local_fn_sig(name) {
+            return Some(self.fn_sig_ty(&sig));
+        }
+        if self.frames.iter().any(|f| f.locals.contains(&name)) {
+            return None;
+        }
+        let decl = self.top_level_decl(name)?;
+        if !matches!(decl.kind, MicroKind::TopLevelFn) {
+            return None;
+        }
+        // A top-level getter shares the tag but captures no formal group
+        // (a zero-parameter function captures an empty one) — the same
+        // refusal `tear_off_sig` applies.
+        let formals = decl.formals.as_deref()?;
+        let required = formals
+            .positional
+            .iter()
+            .filter(|formal| formal.required)
+            .count();
+        let params: Box<[(StringId, Option<Ty>)]> = decl
+            .type_param_names
+            .iter()
+            .copied()
+            .zip(decl.type_param_bounds.iter().copied())
+            .map(|(name, bound)| (name, (bound != Ty::Dynamic).then_some(bound)))
+            .collect();
+        let sig = FnVarSig {
+            params,
+            positional: formals.positional.iter().map(|formal| formal.ty).collect(),
+            required_positional: u16::try_from(required).unwrap_or(u16::MAX),
+            named: formals
+                .named
+                .iter()
+                .map(|formal| (formal.name, formal.ty, formal.required))
+                .collect(),
+            return_ty: decl.return_ty,
+        };
+        Some(self.fn_sig_ty(&sig))
+    }
+
     pub fn check_const_elements(
         &mut self,
         code: SemanticCode,
@@ -3251,6 +4253,13 @@ impl<'a> Engine<'a> {
         {
             return None;
         }
+        // The is/as type-parameter face and the cast-element list face run
+        // beside the element verdicts (upstream visitIsExpression/
+        // visitAsExpression/:1367-1395) — inside this(...) / super(...)
+        // argument lists the literal is never const, so the gate above
+        // already returned.
+        self.check_const_is_as_type_params(parts);
+        self.check_const_as_element_types(code, parts);
         // The const constructor's own initializer list is the
         // potentially-constant context (upstream Dart SDK source,
         // pkg/analyzer/lib/src/dart/constant/constant_verifier.dart

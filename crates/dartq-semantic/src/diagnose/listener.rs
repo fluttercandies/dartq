@@ -294,6 +294,194 @@ fn member_formal_kind(kind: dartq_parser::MemberKind) -> bool {
 /// `UnsafeSingle` verdict. The row anchors at the operator token, its
 /// length the lexeme's own width.
 impl DiagnoseListener<'_> {
+    /// Stages one close-bound pattern binder's face into the flow's
+    /// inferred-local seam (#4011): the name-level `Named` face spelled as
+    /// the flow lattice's name base — the same seam the and-staged and
+    /// null-check binders ride. Faces the lattice cannot spell (records,
+    /// `dynamic`) bind at the name level only.
+    fn stage_pattern_binder_flow(&mut self, span: SourceRange, name: StringId, nullable: bool) {
+        let lexeme = self.engine.strings.resolve(name).to_string();
+        let base = self.flow().intern_name(&lexeme);
+        self.flow().stage_inferred_local(
+            span.offset,
+            FlowTy {
+                base: FlowBase::Name(base),
+                nullable,
+            },
+            Vec::new(),
+        );
+    }
+
+    /// The container close's binder bind (#4011): every type-free binder
+    /// collected directly inside the closing bracket takes the bracket's
+    /// element (list) or value (map) type — the written type argument
+    /// first, else the scrutinee's own container instantiation, else
+    /// `dynamic` for a dynamic matched value, else `Object?` (the co19
+    /// `type_inference_A28/A29` lattice, `analyzeListPattern`/
+    /// `analyzeMapPattern`, upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/type_inference/
+    /// type_analyzer.dart:985-1001). A list rest's own binder (at/after
+    /// the `...`) binds `List<E>`; the map face leaves its rest unbound
+    /// (no pinned row — the under-report posture). The bind only runs
+    /// when the bracket's matched value IS the scrutinee — every bracket
+    /// strictly between it and the root transparent (a logical-or/and
+    /// operand, a parenthesized wrapper) — and a case window is open: a
+    /// bracket nested inside another container reads that container's
+    /// column, which only the outer close could name, and stays unbound.
+    fn bind_element_binders(&mut self, left: Token, map: bool) {
+        let mut staged: Vec<(SourceRange, StringId, bool)> = Vec::new();
+        {
+            let engine = &mut self.engine;
+            let Some((binders, rest_after)) = engine
+                .switch
+                .pattern_stack
+                .last_mut()
+                .map(|frame| (std::mem::take(&mut frame.binders), frame.rest_after))
+            else {
+                return;
+            };
+            if binders.is_empty() {
+                return;
+            }
+            let chain_transparent = engine
+                .switch
+                .pattern_stack
+                .iter()
+                .skip(1)
+                .all(|frame| frame.binary.is_some());
+            if !(chain_transparent
+                && (engine.switch.case_sink_open || engine.switch.if_case_window))
+            {
+                return;
+            }
+            let matched = engine
+                .switch
+                .switches
+                .last()
+                .map_or(Ty::Unknown, |c| c.scrutinee);
+            let value = if map {
+                super::pattern_faces::map_value_ty(engine, matched, left)
+            } else {
+                super::pattern_faces::list_element_ty(engine, matched, left)
+            };
+            let Some(value) = value else {
+                return;
+            };
+            let list_head = engine.intern("List");
+            for binder in binders {
+                if binder.slot_pre_typed || binder.and_rhs {
+                    continue;
+                }
+                let rest = rest_after.is_some_and(|at| binder.span.offset >= at);
+                let ty = if rest && map {
+                    continue;
+                } else if rest {
+                    engine
+                        .boundary
+                        .args
+                        .borrow_mut()
+                        .named(list_head, false, &[value])
+                } else {
+                    super::pattern_faces::binder_initializer_ty(value)
+                };
+                engine.bind_var_type(binder.name, ty);
+                engine.switch.bound_binder_names.insert(binder.name);
+                if let Ty::Named { name, nullable, .. } = ty {
+                    staged.push((binder.span, name, nullable));
+                }
+            }
+        }
+        for (span, name, nullable) in staged {
+            self.stage_pattern_binder_flow(span, name, nullable);
+        }
+    }
+
+    /// The record close's binder bind (#4011): each collected type-free
+    /// binder takes its FIELD's slot type off the scrutinee's record shape
+    /// — the positional ordinal (the count of positional fields before the
+    /// binder's field) or the named field's own slot. A scrutinee that is
+    /// no record, or a slot the shape lacks, leaves the binder unbound
+    /// (the under-report posture; the oracle's `analyzeRecordPattern`
+    /// reads the context record type's schema).
+    fn bind_record_binders(&mut self) {
+        let mut staged: Vec<(SourceRange, StringId, bool)> = Vec::new();
+        {
+            let engine = &mut self.engine;
+            let Some(binders) = engine
+                .switch
+                .pattern_stack
+                .last_mut()
+                .map(|frame| std::mem::take(&mut frame.binders))
+            else {
+                return;
+            };
+            if binders.is_empty() {
+                return;
+            }
+            let chain_transparent = engine
+                .switch
+                .pattern_stack
+                .iter()
+                .skip(1)
+                .all(|frame| frame.binary.is_some());
+            if !(chain_transparent
+                && (engine.switch.case_sink_open || engine.switch.if_case_window))
+            {
+                return;
+            }
+            let matched = engine
+                .switch
+                .switches
+                .last()
+                .map_or(Ty::Unknown, |c| c.scrutinee);
+            let Ty::Record { shape, .. } = engine.fold_alias_ty(matched) else {
+                return;
+            };
+            // The shape's field lists copy out before the bind loop — the
+            // pool borrow must not span the `bind_var_type` writes.
+            let (positional, named): (Vec<Ty>, Vec<(StringId, Ty)>) = {
+                let pool = engine.boundary.pool();
+                let record = pool.record_shape(shape);
+                (record.positional.to_vec(), record.named.to_vec())
+            };
+            let fields: Vec<Option<StringId>> = engine
+                .switch
+                .pattern_stack
+                .last()
+                .map(|frame| frame.fields.iter().map(|field| field.name).collect())
+                .unwrap_or_default();
+            for binder in binders {
+                if binder.slot_pre_typed || binder.and_rhs {
+                    continue;
+                }
+                let Some(field) = fields.get(binder.field) else {
+                    continue;
+                };
+                let slot = match field {
+                    Some(name) => named.iter().find(|(n, _)| *n == *name).map(|(_, ty)| *ty),
+                    None => {
+                        let ordinal = fields[..binder.field]
+                            .iter()
+                            .filter(|name| name.is_none())
+                            .count();
+                        positional.get(ordinal).copied()
+                    }
+                };
+                let Some(ty) = slot else {
+                    continue;
+                };
+                engine.bind_var_type(binder.name, ty);
+                engine.switch.bound_binder_names.insert(binder.name);
+                if let Ty::Named { name, nullable, .. } = ty {
+                    staged.push((binder.span, name, nullable));
+                }
+            }
+        }
+        for (span, name, nullable) in staged {
+            self.stage_pattern_binder_flow(span, name, nullable);
+        }
+    }
+
     /// The live read-latch bridge (the #3914 design's segment 2): the read
     /// event drains the flow recorder's published facts into
     /// [`Engine::read_types`], so an in-fold promotion consult
@@ -1433,6 +1621,14 @@ impl ParserListener for DiagnoseListener<'_> {
             .begin_extension_declaration(augment, extension_keyword, name);
         let engine = &mut self.engine;
         engine.note_container_type_variables(name, false, false);
+        // The extension's head metadata drains here — before the
+        // extension's own scope opens, the same head posture every other
+        // container's `note_decl_site` drain gives (`@foo extension E on
+        // int {}` reports the annotation face). A bare drain, NOT a
+        // `note_decl_site`: the site registration is the unused-element
+        // world's extension bookkeeping (22 corpus pins over-report the
+        // moment a plain extension owns a decl site).
+        engine.drain_local_annotations(extension_keyword.range.offset);
         let name = name.and_then(|token| engine.name_of(token));
         engine.push_container_frame(ContainerKind::Extension, name);
     }
@@ -2016,6 +2212,16 @@ impl ParserListener for DiagnoseListener<'_> {
             // section; the group events re-arm it.
             engine.fn_formal_named_section = false;
             engine.super_formal_positional_index = 0;
+            // The constructor/factory's OWN formal list ends the head
+            // window (#4340): every later group (a function-typed
+            // formal's, a body local's, an initializer lambda's) is a
+            // legal type-parameter scope and drains normally. A group
+            // already open (window > 1 — a bound's function-type brackets
+            // inside the head's `<...>`) keeps the window: its formal list
+            // at depth 0 is the GFT's own, not the member's.
+            if engine.ctor_pending.is_some() && engine.ctor_head_tv_window == 1 {
+                engine.ctor_head_tv_window = 0;
+            }
         }
         engine.formal_list_depth += 1;
         // The catch group's re-parse opens its ordinal window: the list's
@@ -2488,6 +2694,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // and a braced closure inside an initializer cannot open it.
         engine.ctor_frame_len = engine.frames.len();
         engine.ctor_body_open = false;
+        // The HEAD type-variable window opens (#4340): a `<...>` group
+        // before the ctor's own formals is the illegal constructor type
+        // parameters — upstream's recovery never resolves its metadata.
+        engine.ctor_head_tv_window = 1;
     }
 
     fn end_constructor(
@@ -2552,6 +2762,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // the `unused_element_parameter` face (its given-matching needs
         // factory-invocation rows).
         engine.ctor_pending = engine.container_context().map(|(c, _)| (c, None));
+        // The HEAD type-variable window opens with the ctor latch (#4340):
+        // a factory name's `<...>` group is the same illegal head shape.
+        engine.ctor_head_tv_window = 1;
         // The name event latches the container as the factory's return type
         // (`error_verifier.dart` checks an `=>` body against the
         // constructor's return type — the class itself), including the
@@ -2631,7 +2844,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // unconditional, the event exists only for local functions. Runs
         // before `note_local_function` binds the declared name so the
         // annotation's own scope lookup is undisturbed.
-        engine.drain_local_annotations();
+        engine.drain_local_annotations(token.range.offset);
         engine.push_executable_frame(instance);
     }
 
@@ -2998,6 +3211,16 @@ impl ParserListener for DiagnoseListener<'_> {
                 }
             }
             engine.pattern_group_open = None;
+            // The pattern head's metadata consumes here — after the head's
+            // binders noted (`for (@a var (a) in x)`: the binder shadows an
+            // outer same-named constant for the annotation's lookup, so the
+            // drain must not fire at the group's `var` keyword where a plain
+            // loop variable's does).
+            engine.drain_local_annotations(
+                pattern_keyword
+                    .map(|t| t.range.offset)
+                    .unwrap_or(for_kw.range.offset),
+            );
         }
 
         // No frame opens here: the loop variable's declaration events fire
@@ -3249,7 +3472,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // `''` local the recovery registers never answers the annotation's
         // own scope lookup.
         if !engine.field_group_open && !engine.frames.is_empty() {
-            engine.drain_local_annotations();
+            engine.drain_local_annotations(token.range.offset);
         }
     }
 
@@ -3802,6 +4025,19 @@ impl ParserListener for DiagnoseListener<'_> {
         // parked parameters at frame open).
         engine.pending_rows_mark = engine.rows.len();
         engine.pending_type_params.clear();
+        // The group's own metadata base (#4340): every entry latched from
+        // here on belongs to a variable of THIS group and drains at the
+        // group's close (`end_type_variables`) — the enclosing
+        // declaration's site already drained its own star before the group
+        // opened.
+        engine.tv_annotation_mark = engine.pending_annotations.len();
+        // A group opening inside the live HEAD window stays inside it
+        // (#4340): the constructor's own `<...>` brackets doom every group
+        // they nest (a bound's function-type brackets included) — upstream
+        // resolves none of that metadata.
+        if engine.ctor_pending.is_some() && engine.ctor_head_tv_window > 0 {
+            engine.ctor_head_tv_window += 1;
+        }
         // The header's bound counts open with it.
         engine.open_type_variables();
         engine.bounds.begin_type_variables();
@@ -3897,6 +4133,22 @@ impl ParserListener for DiagnoseListener<'_> {
         // the committed boundaries themselves survive).
         self.flow().end_type_variables(begin, end);
         let engine = &mut self.engine;
+        // The group's annotations drain at the group's close (#4340):
+        // upstream's `withTypeParameterScope` wraps the WHOLE list
+        // (scope_context.dart:60-62), so a type variable's metadata
+        // resolves with every parameter of its group in scope — the
+        // annotated variable itself and the later siblings included
+        // (`f<@E E>` falls through the resolver cascade to
+        // `invalid_annotation`, never `undefined_annotation`). Draining
+        // after the last `begin_type_variable` registered the group's
+        // names (`push_type_parameter`) is the only point that sees them
+        // all; per-variable drains would answer a forward sibling
+        // reference as missing.
+        let group_mark = engine.tv_annotation_mark;
+        engine.drain_type_variable_annotations(group_mark);
+        if engine.ctor_head_tv_window > 1 {
+            engine.ctor_head_tv_window -= 1;
+        }
         engine.close_type_variables(end);
         engine.bounds.end_type_variables();
         engine.var_close_bounds();
@@ -4640,11 +4892,18 @@ impl ParserListener for DiagnoseListener<'_> {
                 if let Some(name) = name {
                     // The annotated-declaration exemption latch (the
                     // pragma/JS entry-point gates' superset) plus the
-                    // annotation-arity check.
+                    // annotation-arity check. The container context rides
+                    // the entry at the metadata's own scope: the verdict
+                    // drains at the declaration — after a container head
+                    // pushed its frame — and head metadata must not see
+                    // the declared container's own members (the
+                    // `test_useLibraryScope` face).
                     engine.pending_annotations.push(PendingAnnotation {
                         name,
                         unless: None,
                         node: None,
+                        container: engine.container_context(),
+                        row_mark: engine.rows.len(),
                     });
                     engine.check_annotation(name, token.range);
                 }
@@ -4694,10 +4953,16 @@ impl ParserListener for DiagnoseListener<'_> {
                 } else {
                     // The nameless recovery face (`name ?? '<unnamed>'`):
                     // the declaration joins under the empty name at the
-                    // anchor chain; the exec windows stay closed.
+                    // synthetic name token's own span — the parser splices
+                    // the `<unnamed>` identifier at the splice point (the
+                    // `(` of `@p.A.ctor<B>() class C {}`, zero width), and
+                    // upstream anchors `unused_element` on the element's
+                    // name node (`_reportDiagnosticForElement`), never on
+                    // the enclosing container or the file start (#4340;
+                    // the corpus's test_typeArguments_after_constructorName
+                    // oracle row 2:13|0).
                     let empty = engine.intern("");
-                    let anchor = engine.nameless_site_range();
-                    engine.note_decl_site(empty, anchor, DeclKind::TopLevelFn);
+                    engine.note_decl_site(empty, token.range, DeclKind::TopLevelFn);
                 }
             }
             C::MethodDeclaration => {
@@ -5103,6 +5368,73 @@ impl ParserListener for DiagnoseListener<'_> {
                     // (element.dart:2179's `isPrivate` maps a null name
                     // private, so the unused-field gate owns it); at top
                     // level the same face keeps the `<unnamed>` anchor.
+                    //
+                    // The not-initialized obligation survives the recovery
+                    // (#4344): upstream's declaration walk iterates
+                    // `variableList.variables`, the recovered synthetic
+                    // included — `variable.name.lexeme` renders '' and the
+                    // row anchors `.at(variable.name)`, the zero-width
+                    // synthetic token (error_verifier.dart:6658-6687 —
+                    // corpus ErrorParserTest/test_constructorPartial's
+                    // `not_initialized_non_nullable_instance_field ''`).
+                    // The gates mirror the written-name arm above: the
+                    // armed slot carries the recovered annotation (the
+                    // group head's type parse precedes the name event) and
+                    // the group bits own the const/final/late exemptions.
+                    // The initializer reads the token stream, never the
+                    // `begin_variable_initializer` flip — the
+                    // pattern-variable recovery face diet-skips its `=
+                    // (0, 1)` where upstream's `dropRange` keeps it
+                    // parseable (parser_impl.dart:5343-5345), so the flip
+                    // alone would report those as uninitialized.
+                    let ty = engine
+                        .pending_decl_ty
+                        .or(engine.armed_ty)
+                        .unwrap_or(Ty::UNKNOWN);
+                    let ty_unresolved = if engine.pending_decl_ty.is_some() {
+                        engine.pending_decl_ty_unresolved
+                    } else {
+                        engine.armed_ty_unresolved
+                    };
+                    let final_gate = engine.group_final && !engine.group_late;
+                    let non_nullable_gate = !engine.group_const
+                        && !engine.group_final
+                        && !engine.group_late
+                        && !ty_unresolved
+                        && engine.written_potentially_non_nullable(ty);
+                    let augment_exempt = engine.group_augment
+                        && (group_head_exempts_init(engine, token.range.offset)
+                            || (!engine.open_member_static
+                                && matches!(
+                                    engine.container_context(),
+                                    Some((_, ContainerKind::ExtensionType))
+                                )));
+                    if (final_gate || non_nullable_gate) && !augment_exempt {
+                        let initialized =
+                            synthetic_field_has_initializer(engine, token.range.end());
+                        if context == C::FieldDeclaration {
+                            let is_static = engine.open_member_static;
+                            if let Some((container, _)) = engine.container_context() {
+                                engine.pending_init_variables.push(PendingInitVariable {
+                                    name,
+                                    range: token.range,
+                                    container: Some(container),
+                                    is_static,
+                                    initialized,
+                                    is_final: final_gate,
+                                });
+                            }
+                        } else {
+                            engine.pending_init_variables.push(PendingInitVariable {
+                                name,
+                                range: token.range,
+                                container: None,
+                                is_static: false,
+                                initialized,
+                                is_final: final_gate,
+                            });
+                        }
+                    }
                     if context == C::FieldDeclaration {
                         if let Some((container, _)) = engine.container_context() {
                             let is_static = engine.open_member_static;
@@ -9043,6 +9375,13 @@ impl ParserListener for DiagnoseListener<'_> {
         for bracket in staged {
             self.engine.check_index_argument(bracket, None);
         }
+        // The leftover sweep (#4340): an annotation still holding the latch
+        // at the unit end attached to nothing — most commonly an unclosed
+        // argument group that swallowed the rest of the file and ended with
+        // no head-failure row (`f() { @a( switch (x) {} }`). Upstream
+        // resolves such metadata never (the translation keeps members
+        // only), so the entries and their staged argument rows retract.
+        self.engine.retract_doomed_annotations();
         let _ = (count, token);
     }
 
@@ -9109,12 +9448,19 @@ impl ParserListener for DiagnoseListener<'_> {
             }
         }
         let binary = std::mem::take(&mut engine.pending_binary_operand);
+        // The bracket's own face (#4011): the binder matched-type walk
+        // reads it at the container closes and at the transparent-chain
+        // gate.
+        let kind = super::pattern_faces::pattern_frame_kind(engine, token);
         engine.switch.pattern_stack.push(PatternFrame {
             leaves: Vec::new(),
             or_ops: 0,
             fields: Vec::new(),
             binary,
             wildcards: Vec::new(),
+            kind,
+            binders: Vec::new(),
+            rest_after: None,
         });
         // The `||` binder ledger (variable_bindings.dart:24-30) lives on the
         // root state: a root pattern opens with one base scope; a nested
@@ -9161,7 +9507,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 parent.last_pop_begin = state.begin_token;
             }
         }
-        let Some(frame) = popped else {
+        let Some(mut frame) = popped else {
             return;
         };
         if engine.switch.pattern_stack.is_empty() {
@@ -9173,11 +9519,69 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.last_pattern_variable = None;
         }
         let merged = SwitchTracker::collapse(&engine.name_world(), frame.leaves, frame.or_ops);
+        // A transparent bracket's collected binders (#4011) re-attach to
+        // its parent at the pop: a logical-or/and operand and a
+        // parenthesized wrapper both pass their matched value through, so
+        // the binders ride upward to the bracket that actually owns the
+        // column — or to the root close below.
+        if !engine.switch.pattern_stack.is_empty()
+            && (frame.binary.is_some() || frame.kind == PatternFrameKind::Paren)
+            && let Some(parent) = engine.switch.pattern_stack.last_mut()
+        {
+            parent.binders.append(&mut frame.binders);
+        }
         // The whole-pattern null-check binder stagings (bound inside the
         // engine borrow below, staged into the flow's inferred-local seam
         // after it ends).
         let mut staged_null_check: Vec<(String, SourceRange)> = Vec::new();
+        // The root-scrutinee binder stagings (#4011), same seam.
+        let mut staged_scrutinee: Vec<(SourceRange, StringId, bool)> = Vec::new();
         if engine.switch.pattern_stack.is_empty() {
+            // The root-collected type-free binders (#4011): a case or
+            // if-case root's matched value is the scrutinee, so every
+            // binder still collected on the root frame (a bare `case var
+            // v`, one behind only transparent brackets) binds the
+            // scrutinee's static type demoted through the initializer
+            // lattice — BEFORE the null-check staging below, whose
+            // non-null projection overwrite must keep winning. Statement
+            // declaration roots carry no case window: their binders stay
+            // for `destructure_record`'s initializer path.
+            if (engine.switch.case_sink_open || engine.switch.if_case_window)
+                && !frame.binders.is_empty()
+            {
+                let scrutinee = engine
+                    .switch
+                    .switches
+                    .last()
+                    .map_or(Ty::Unknown, |c| c.scrutinee);
+                if !matches!(scrutinee, Ty::Unknown | Ty::Invalid) {
+                    for binder in &frame.binders {
+                        if binder.slot_pre_typed {
+                            continue;
+                        }
+                        // An object-pattern field's binder (`C(t: var t)`)
+                        // never takes the scrutinee: its matched value is
+                        // the field's getter column (the object-inference
+                        // face, out of the #4011 scope — the under-report
+                        // posture). A record/map root never reaches this
+                        // walk — its container close drains the binders
+                        // into the slot/value pairing first. A logical-and
+                        // right operand's matched type is the left
+                        // operand's PROMOTED face — a flow-integrated fact
+                        // the parse-time lattice cannot see, so it stays
+                        // unbound here too.
+                        if binder.field_pos || binder.and_rhs {
+                            continue;
+                        }
+                        let ty = super::pattern_faces::binder_initializer_ty(scrutinee);
+                        engine.bind_var_type(binder.name, ty);
+                        engine.switch.bound_binder_names.insert(binder.name);
+                        if let Ty::Named { name, nullable, .. } = ty {
+                            staged_scrutinee.push((binder.span, name, nullable));
+                        }
+                    }
+                }
+            }
             // The whole-pattern null-check binders take their face here:
             // the matched type's non-null projection — the open switch
             // context's scrutinee face, read before an if-case window
@@ -9260,6 +9664,9 @@ impl ParserListener for DiagnoseListener<'_> {
                 },
                 Vec::new(),
             );
+        }
+        for (span, name, nullable) in staged_scrutinee {
+            self.stage_pattern_binder_flow(span, name, nullable);
         }
     }
 
@@ -9461,6 +9868,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // — not modeled at name level (documented under-report).
         self.engine.pattern_leaf(Restriction::Unknown);
         self.engine.pattern_bind_dirty = true;
+        // The element binders' close (#4011): the bracket is still on the
+        // pattern stack here, its collected type-free binders complete.
+        self.bind_element_binders(left, false);
     }
 
     fn handle_map_pattern(&mut self, count: usize, left: Token, right: Token) {
@@ -9548,6 +9958,8 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.last_pattern_variable = None;
         self.engine.pattern_leaf(Restriction::Unknown);
         self.engine.pattern_bind_dirty = true;
+        // The value binders' close (#4011), the list arm's twin.
+        self.bind_element_binders(left, true);
     }
 
     fn begin_map_pattern_key(&mut self) {
@@ -9637,6 +10049,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // flat `final (a, b) = pair()` binds read exactly one; nested
         // records close more and gate the destructure bind off.
         self.engine.pattern_bind_records = self.engine.pattern_bind_records.saturating_add(1);
+        // The slot binders' close (#4011): the bracket is still on the
+        // pattern stack, its field list and collected binders complete.
+        self.bind_record_binders();
     }
 
     fn begin_constant_pattern(&mut self, const_keyword: Option<Token>) {
@@ -10350,6 +10765,58 @@ impl ParserListener for DiagnoseListener<'_> {
                         {
                             engine.bind_var_type(name, Ty::named(head));
                             staged_and = Some((head, variable.range));
+                        }
+                        // A type-free binder collects onto its DIRECT
+                        // container's frame (#4011): the container's close
+                        // binds the element/value/slot type (a list/map/
+                        // record bracket), a transparent bracket (a `||`/
+                        // `&&` operand, a parenthesized wrapper) re-attaches
+                        // it upward at its own close, and the root close
+                        // binds the scrutinee's static type — the oracle's
+                        // `staticType = variableTypeFromInitializerType(
+                        // matchedValueType)` for a written-type-less
+                        // variable pattern (type_analyzer.dart:588-590). The
+                        // slot snapshot keeps the first writer: an already
+                        // typed slot (an earlier same-window binder, the
+                        // and-staging above, an outer same-name local in the
+                        // shared frame) is never overwritten at the close.
+                        if staged_and.is_none() {
+                            let slot_pre_typed = engine
+                                .local_declared_ty(name)
+                                .is_some_and(|slot| slot != Ty::UNKNOWN);
+                            // The field ordinal is the CONTAINER's field
+                            // count at collection time (the binder's own
+                            // frame is the freshly-pushed variable bracket,
+                            // whose field list is always empty — a record
+                            // registers each field boundary only AFTER its
+                            // sub-pattern completes, so the count here is
+                            // the binder's slot among the fields seen so
+                            // far).
+                            let and_rhs = engine
+                                .switch
+                                .pattern_stack
+                                .last()
+                                .is_some_and(|frame| frame.binary == Some(false));
+                            let field_pos = super::pattern_faces::binder_in_field_position(
+                                engine,
+                                variable.range,
+                            );
+                            let container_index = engine.switch.pattern_stack.len().checked_sub(2);
+                            let container = match container_index {
+                                Some(i) => engine.switch.pattern_stack.get_mut(i),
+                                None => engine.switch.pattern_stack.last_mut(),
+                            };
+                            if let Some(container) = container {
+                                let field = container.fields.len();
+                                container.binders.push(PatternBinder {
+                                    name,
+                                    span: variable.range,
+                                    slot_pre_typed,
+                                    field,
+                                    field_pos,
+                                    and_rhs,
+                                });
+                            }
                         }
                         // A bare pattern variable (`(a, b)`'s `a`): its type
                         // is the scrutinee record's slot — recorded for the
@@ -12119,8 +12586,16 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.begin_import_site(import_keyword);
     }
 
-    fn end_import(&mut self, _import_keyword: Token, _semicolon: Option<Token>) {
+    fn end_import(&mut self, import_keyword: Token, _semicolon: Option<Token>) {
         self.engine.in_import = false;
+        // An import directive consumes its metadata
+        // (`visitImportDirective` → `node.visitChildrenWithHooks` visits
+        // the metadata — `visitAnnotation` resolves it whatever the URI's
+        // fate): no `DeclKind` exists for directives, so the latch drains
+        // at the directive's close (the corpus's `@B import 'foo.dart';`
+        // reports `undefined_annotation` beside `uri_does_not_exist`).
+        self.engine
+            .drain_local_annotations(import_keyword.range.offset);
     }
 
     fn begin_export(&mut self, export_keyword: Token) {
@@ -12150,6 +12625,10 @@ impl ParserListener for DiagnoseListener<'_> {
     fn end_export(&mut self, export_keyword: Token, semicolon: Token) {
         let engine = &mut self.engine;
         engine.in_export = false;
+        // The export directive's metadata consumes at its close, exactly
+        // like the import's (`super.visitExportDirective` visits the
+        // metadata node).
+        engine.drain_local_annotations(export_keyword.range.offset);
         // Latch the whole-directive anchor: `export` keyword start → `;`
         // end (the upstream `usageRange: node.sourceRange` face — the
         // oracle reports the deprecated-SDK row over the ExportDirective,
@@ -12160,6 +12639,32 @@ impl ParserListener for DiagnoseListener<'_> {
                 length: semicolon.range.end() - export_keyword.range.offset,
             };
         }
+    }
+
+    fn end_library_name(&mut self, library_keyword: Token, _semicolon: Token, _has_name: bool) {
+        // The library directive's metadata consumes at its close
+        // (`visitLibraryDirective` → `super` visits the metadata): the
+        // corpus's `@A library l;` reports `undefined_annotation`.
+        self.engine
+            .drain_local_annotations(library_keyword.range.offset);
+    }
+
+    fn end_part(&mut self, part_keyword: Token, _semicolon: Token) {
+        // `super.visitPartDirective` visits the metadata whatever the
+        // part-include's resolution fate.
+        self.engine
+            .drain_local_annotations(part_keyword.range.offset);
+    }
+
+    fn end_part_of(
+        &mut self,
+        part_keyword: Token,
+        _of_kw: Token,
+        _semicolon: Token,
+        _has_name: bool,
+    ) {
+        self.engine
+            .drain_local_annotations(part_keyword.range.offset);
     }
 
     fn begin_show(&mut self, _token: Token) {
@@ -12971,6 +13476,16 @@ impl ParserListener for DiagnoseListener<'_> {
         kind: FormalParameterKind,
         member_kind: dartq_parser::MemberKind,
     ) {
+        // A formal parameter is an `AnnotatedNode` upstream
+        // (`visitFormalParameter` → `metadata.accept` →
+        // `annotation_resolver._resolve`): it owns no `DeclKind`/
+        // `note_decl_site`, so the `pending_annotations` latch drains here
+        // — the parameter node just closed, consuming exactly its own
+        // metadata before the next parameter's opens (the corpus's
+        // `T f(@A a, @B(2) Foo b, …)` reports each annotation separately,
+        // and a nameless recovery parameter's metadata consumes the same
+        // way — `void f(@a) {}` reports `undefined_annotation`).
+        self.engine.drain_local_annotations(name.range.offset);
         // The member face's FormalParameter node span closes here
         // (upstream anchors the contravariant-position row at the whole
         // parameter node — `required Contra<T> x` spans the keyword
@@ -14154,6 +14669,12 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         self.flow()
             .handle_for_initializer_pattern_variable_assignment(pattern_keyword, equals);
+        // The C-`for` pattern head consumes its metadata after the pattern
+        // parsed (`for (@a var (a) = (0); …)` — the loop scope's binders
+        // shadow the outer name for the metadata's lookup, the corpus's
+        // `test_metadata_shadowing` face).
+        self.engine
+            .drain_local_annotations(pattern_keyword.range.offset);
     }
 
     fn handle_for_updaters_end(&mut self, updaters_last: Token) {
@@ -14295,6 +14816,14 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow()
             .handle_pattern_variable_declaration_statement(keyword, equals, semicolon);
 
+        // A pattern variable declaration is an `AnnotatedNode` upstream
+        // (`visitPatternVariableDeclaration` visits the metadata before the
+        // pattern): no `DeclKind`/`note_decl_site` exists for it, so the
+        // latch drains here — after the pattern's binders noted, so a
+        // binder shadowing an outer name answers the annotation's lookup
+        // the way the oracle's loop scope does (the corpus's
+        // `@annotation final C(f: a) = x;` reports `undefined_annotation`).
+        self.engine.drain_local_annotations(keyword.range.offset);
         // `PatternVariableDeclaration` is in the official used set (the
         // event fires after the initializer parsed).
         self.engine.ur_seal_used();
@@ -14372,6 +14901,17 @@ impl ParserListener for DiagnoseListener<'_> {
             range,
             p0.correction.clone(),
         ));
+        // A failed declaration head is a metadata death point (#4340): the
+        // metadata that preceded the unit belonged to THAT unit, and when
+        // the head fails (`expected_executable` at the `.` of
+        // `@p<A>.B.ctor()`, `expected_class_member` at a class-body `@a }`)
+        // the fasta→analyzer translation drops the unit with its metadata —
+        // the entries must not survive to the NEXT declaration's site drain
+        // (which would misattribute the oracle-suppressed verdicts), and
+        // their staged argument/type-argument rows die with them.
+        if p0.code.name == "expected_executable" || p0.code.name == "expected_class_member" {
+            self.engine.retract_doomed_annotations();
+        }
         self.flow().handle_recoverable_error(p0, p1, p2);
     }
 
@@ -14516,6 +15056,14 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.pattern_leaf(Restriction::RestMark {
             had_sub: has_sub_pattern,
         });
+        // The rest's own binder splits from the element binders at the
+        // close (#4011): the container frame is the innermost open bracket
+        // (the rest's sub-pattern brackets already closed), and every
+        // binder at or after the `...` binds the collected face, never the
+        // element face (`List<E>` — type_analyzer.dart:1024-1033).
+        if has_sub_pattern && let Some(frame) = self.engine.switch.pattern_stack.last_mut() {
+            frame.rest_after = Some(dots.range.offset);
+        }
     }
 
     /// The object pattern's field-group close (`parseObjectPatternRest`'s
@@ -15050,6 +15598,52 @@ fn group_head_exempts_init(engine: &Engine<'_>, name_offset: u32) -> bool {
                 )
             )
         })
+}
+
+/// Whether the tokens after a recovered declarator's synthetic name reach
+/// its `=` before the group's boundary — upstream's
+/// `variable.initializer != null` gate (error_verifier.dart:6659) read off
+/// the stream, because the recovery faces never all replay the
+/// initializer's events: the pattern-variable face diet-skips the `=
+/// (0, 1)` that upstream's `dropRange` keeps parseable
+/// (parser_impl.dart:5343-5345), so the `begin_variable_initializer` flip
+/// alone would report those as uninitialized. The boundary is the
+/// group's own `;`/`}`/EOF plus the next member's provable heads: the
+/// `isModifier` keep-set (abstract/augment/const/covariant/external/
+/// final/late/required/static/var — the `FieldDeclarationIdentifierContext`
+/// recovery arm's next-member face) and a metadata `@`
+/// (`int f3 = -1, @annotation f4 = -1;` — the synthetic declarator owns
+/// no initializer, the `= -1` belongs to the NEXT member's `f4`, corpus
+/// variable_declaration_metadata_test_08). An identifier-headed junk
+/// member boundary is invisible here (a `=` under one would read as this
+/// declarator's) — an under-report edge upstream splits by AST shape.
+fn synthetic_field_has_initializer(engine: &Engine<'_>, name_end: u32) -> bool {
+    let tokens = engine.tokens.as_slice();
+    let mut at = tokens.partition_point(|token| token.utf16_offset < name_end);
+    while let Some(token) = tokens.get(at) {
+        match token.kind {
+            dartq_scanner::TokenKind::Eq => return true,
+            dartq_scanner::TokenKind::Semicolon
+            | dartq_scanner::TokenKind::CloseCurly
+            | dartq_scanner::TokenKind::Eof
+            | dartq_scanner::TokenKind::At
+            | dartq_scanner::TokenKind::Keyword(
+                dartq_scanner::Keyword::Abstract
+                | dartq_scanner::Keyword::Augment
+                | dartq_scanner::Keyword::Const
+                | dartq_scanner::Keyword::Covariant
+                | dartq_scanner::Keyword::External
+                | dartq_scanner::Keyword::Final
+                | dartq_scanner::Keyword::Late
+                | dartq_scanner::Keyword::Required
+                | dartq_scanner::Keyword::Static
+                | dartq_scanner::Keyword::Var,
+            ) => return false,
+            _ => {}
+        }
+        at += 1;
+    }
+    false
 }
 
 /// The written-argument tree a staged assignment RHS type carries (#2364):

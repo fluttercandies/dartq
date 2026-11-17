@@ -233,11 +233,25 @@ impl Ty {
                     text.push('>');
                 }
                 text.push('(');
+                // Optional positionals render in their written `[...]`
+                // group (`display_string_builder.dart` `openGroup`): the
+                // required segment first, then the bracketed optional
+                // segment — `void Function<T>(T, [int])`, `([int])` when
+                // no required formal precedes. The required-positional
+                // split is type identity ([`FnShape::required_positional`]),
+                // so the display reads it, never the positional count.
+                let required = usize::from(shape.required_positional);
                 for (index, ty) in shape.positional.iter().enumerate() {
                     if index > 0 {
                         text.push_str(", ");
                     }
+                    if index == required {
+                        text.push('[');
+                    }
                     text.push_str(&render_slot(*ty, strings, args));
+                }
+                if shape.positional.len() > required {
+                    text.push(']');
                 }
                 if !shape.named.is_empty() {
                     if !shape.positional.is_empty() {
@@ -2660,6 +2674,24 @@ impl FileElements {
         self.extension_faces
             .iter()
             .any(|face| face.members.contains_key(&name))
+    }
+
+    /// [`Self::has_extension_member`] minus the statics: an extension's
+    /// STATIC members are never reachable by a simple name — only the
+    /// qualified `E.member` is, and the extension's own body sees them
+    /// through the container member face this fallback never runs for.
+    /// A static-only match must not suppress a bare-name miss (the
+    /// annotation-argument face of #3937: `@Annotation(foo)` beside
+    /// `extension E on int { static void foo() {} }` reports
+    /// `undefined_identifier` — upstream resolves metadata arguments in
+    /// the metadata's scope, where extension statics never live).
+    #[must_use]
+    pub fn has_extension_instance_member(&self, name: StringId) -> bool {
+        self.extension_faces.iter().any(|face| {
+            face.members
+                .get(&name)
+                .is_some_and(|entry| !entry.is_static)
+        })
     }
 
     /// Every top-level declaration with its name, in arbitrary order.

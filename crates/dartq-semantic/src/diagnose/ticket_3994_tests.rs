@@ -92,6 +92,7 @@ fn with_clause_args(
         false,
         features.patterns_enabled,
         features.triple_shift_enabled,
+        features.generic_metadata_enabled,
         StrictModes::default(),
         &class_modifiers,
         None,

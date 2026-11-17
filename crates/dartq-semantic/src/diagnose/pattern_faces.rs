@@ -176,6 +176,37 @@ fn judge_record_field_rows(listener: &mut DiagnoseListener<'_>) {
     }
 }
 
+/// Whether the type-free binder whose identifier sits at `name_range` is
+/// in a field position: the token before its `var`/`final` keyword is a
+/// colon — an object-pattern field (`C(a: var x)`), a record named field,
+/// or a map value. Only the root bind consults this (#4011): a field
+/// binder's matched value is its field's column, never the scrutinee,
+/// while the container closes (record/map) own their field binders
+/// through the slot/value pairing and bypass the flag.
+pub(super) fn binder_in_field_position(engine: &Engine<'_>, name_range: SourceRange) -> bool {
+    let toks = engine.tokens.as_slice();
+    let idx = toks.partition_point(|t| t.utf16_offset < name_range.offset);
+    let Some(tok) = toks.get(idx) else {
+        return false;
+    };
+    if tok.utf16_offset != name_range.offset {
+        return false;
+    }
+    // Walk back over the `var`/`final` keyword to the position marker.
+    let mut i = idx;
+    while i > 0 {
+        i -= 1;
+        if matches!(
+            toks[i].kind,
+            TokenKind::Keyword(dartq_scanner::Keyword::Var | dartq_scanner::Keyword::Final)
+        ) {
+            continue;
+        }
+        return toks[i].kind == TokenKind::Colon;
+    }
+    false
+}
+
 /// The shared field faces of `buildSharedPatternFields` +
 /// `duplicateRecordPatternField`: `must_be_named` is the object-pattern
 /// arm (`true`) vs the record-pattern arm (`false`), and `end` is the
@@ -929,4 +960,158 @@ fn count_depth0_commas(toks: &[ScannedToken], lt: usize, gt: usize) -> usize {
         }
     }
     commas + 1
+}
+
+/// The bracket face one pattern's first token opens (#4011): `[` a list,
+/// `{` a map, `(` a record when a depth-0 `,`/`:` separates fields inside
+/// the pair (a bare pair is the parser's zero-field record; anything with
+/// a separator or `()` closes as `handle_record_pattern`), `(` without a
+/// separator a transparent parenthesized wrapper, and a leading `<` skips
+/// its type-argument group to the bracket that follows. Everything else
+/// is a leaf face.
+pub(super) fn pattern_frame_kind(engine: &Engine<'_>, begin: Token) -> PatternFrameKind {
+    let toks = engine.tokens.as_slice();
+    let Ok(mut idx) = toks.binary_search_by(|t| t.utf16_offset.cmp(&begin.range.offset)) else {
+        return PatternFrameKind::Other;
+    };
+    // A written `<...>` group ahead of the bracket: skip to its follower.
+    if toks[idx].kind == TokenKind::Lt {
+        let mut depth = 0i32;
+        while let Some(t) = toks.get(idx) {
+            depth += match t.kind {
+                TokenKind::Lt => 1,
+                TokenKind::Gt => -1,
+                TokenKind::GtGt => -2,
+                TokenKind::GtGtGt => -3,
+                _ => 0,
+            };
+            idx += 1;
+            if depth <= 0 {
+                break;
+            }
+        }
+    }
+    match toks.get(idx).map(|t| t.kind) {
+        Some(TokenKind::OpenSquare | TokenKind::Index) => PatternFrameKind::List,
+        Some(TokenKind::OpenCurly) => PatternFrameKind::Map,
+        Some(TokenKind::OpenParen) => {
+            let Some(close) = engine.tokens.matching_end(idx) else {
+                return PatternFrameKind::Record;
+            };
+            if close == idx + 1 {
+                // `()`: the parser's zero-field record.
+                return PatternFrameKind::Record;
+            }
+            let mut depth = 0i32;
+            for t in &toks[idx + 1..close] {
+                depth += match t.kind {
+                    TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => 1,
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => -1,
+                    _ => 0,
+                };
+                if depth == 0 && matches!(t.kind, TokenKind::Comma | TokenKind::Colon) {
+                    return PatternFrameKind::Record;
+                }
+            }
+            PatternFrameKind::Paren
+        }
+        _ => PatternFrameKind::Other,
+    }
+}
+
+/// The binder's own static type from its initializer (matched) type
+/// (`variableTypeFromInitializerType`, upstream Dart SDK source,
+/// pkg/analyzer/lib/src/generated/resolver.dart:1862-1869): a `Null`
+/// matched type widens to `dynamic`, everything else demotes — and
+/// `demoteType` only strips type-parameter promotions, which the name
+/// level's static `Ty` never carries, so the demote is the identity here.
+pub(super) fn binder_initializer_ty(ty: Ty) -> Ty {
+    if ty == Ty::Null { Ty::Dynamic } else { ty }
+}
+
+/// The k-th written type argument of the `<...>` group immediately before
+/// the `left` bracket (`None` when no group sits there or the argument
+/// slice fails to parse as a type).
+fn written_type_arg(engine: &Engine<'_>, left: Token, index: usize) -> Option<Ty> {
+    let toks = engine.tokens.as_slice();
+    let left_idx = toks.partition_point(|t| t.utf16_offset < left.range.offset);
+    let (lt, gt) = angle_group_before(toks, left_idx)?;
+    let mut depth = 0i32;
+    let mut arg = 0usize;
+    let mut start = lt + 1;
+    let mut end = None;
+    for i in lt + 1..gt {
+        depth += match toks[i].kind {
+            TokenKind::Lt => 1,
+            TokenKind::Gt => -1,
+            TokenKind::GtGt => -2,
+            TokenKind::GtGtGt => -3,
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => -1,
+            _ => 0,
+        };
+        if depth == 0 && toks[i].kind == TokenKind::Comma {
+            if arg == index {
+                end = Some(i);
+                break;
+            }
+            arg += 1;
+            start = i + 1;
+        }
+    }
+    let end = end.unwrap_or(gt);
+    if start >= end {
+        return None;
+    }
+    let first = toks[start].byte_range();
+    let last = toks[end - 1].byte_range();
+    let text = &engine.source[first.start..last.end];
+    engine.parse_annotation_ty(text)
+}
+
+/// The container lattice's shared tail (#4011): the written type argument
+/// first, else the matched value's own container instantiation argument,
+/// else `dynamic` for a `dynamic` matched value, else `Object?`. `None` is
+/// the invalid matched value — no bind (the under-report posture).
+fn container_element_ty(
+    engine: &Engine<'_>,
+    matched: Ty,
+    left: Token,
+    head: &str,
+    arg_index: usize,
+) -> Option<Ty> {
+    if let Some(arg) = written_type_arg(engine, left, arg_index) {
+        return Some(arg);
+    }
+    match engine.fold_alias_ty(matched) {
+        Ty::Named { name, args, .. } if name == engine.intern(head) && args != ArgListId::EMPTY => {
+            Some(
+                engine
+                    .boundary
+                    .pool()
+                    .get(args)
+                    .get(arg_index)
+                    .copied()
+                    .unwrap_or(Ty::Dynamic),
+            )
+        }
+        Ty::Dynamic => Some(Ty::Dynamic),
+        Ty::Unknown | Ty::Invalid => None,
+        _ => Some(Engine::nullable_form(Ty::named(engine.intern("Object")))),
+    }
+}
+
+/// The list-pattern element type E (`analyzeListPattern`, upstream Dart
+/// SDK source, pkg/_fe_analyzer_shared/lib/src/type_inference/
+/// type_analyzer.dart:985-1001).
+pub(super) fn list_element_ty(engine: &Engine<'_>, matched: Ty, left: Token) -> Option<Ty> {
+    container_element_ty(engine, matched, left, "List", 0)
+}
+
+/// The map-pattern value type V (`analyzeMapPattern`, same lattice).
+pub(super) fn map_value_ty(engine: &Engine<'_>, matched: Ty, left: Token) -> Option<Ty> {
+    container_element_ty(engine, matched, left, "Map", 1)
 }

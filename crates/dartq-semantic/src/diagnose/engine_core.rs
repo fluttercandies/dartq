@@ -173,6 +173,7 @@ impl<'a> Engine<'a> {
         field_promotion_enabled: bool,
         patterns_enabled: bool,
         triple_shift_enabled: bool,
+        generic_metadata_enabled: bool,
         strict: StrictModes,
         class_modifiers: &'a LibraryClassModifiers,
         ops: Option<&'a crate::resolved_ops::ResolvedTypeOps<'a>>,
@@ -406,6 +407,7 @@ impl<'a> Engine<'a> {
             variance_enabled,
             patterns_enabled,
             triple_shift_enabled,
+            generic_metadata_enabled,
             field_promotion_enabled,
             var_tv_window: Vec::new(),
             var_name_stack: Vec::new(),
@@ -452,6 +454,8 @@ impl<'a> Engine<'a> {
             open_member_face: None,
             member_face_spans: Vec::new(),
             pending_annotations: Vec::new(),
+            tv_annotation_mark: 0,
+            ctor_head_tv_window: 0,
             ur_pending: Vec::new(),
             ur_used: FxHashSet::default(),
             ur_spans: FxHashMap::default(),
@@ -15647,7 +15651,7 @@ pub(crate) fn flatten_ty(strings: &StringTable, args: &crate::model::ArgPool, ty
 /// comment desyncs the depth) — every consumer's corruption direction
 /// is the under-report one (a wrong opener's byte mismatches the leaf
 /// rows and the scan answers `dynamic`), never a more specific type.
-fn matching_bracket_back(bytes: &[u8], cursor: usize) -> Option<usize> {
+pub(super) fn matching_bracket_back(bytes: &[u8], cursor: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = cursor;
     loop {
@@ -15673,7 +15677,7 @@ fn matching_bracket_back(bytes: &[u8], cursor: usize) -> Option<usize> {
 /// empty square literal's window, whose row/key rides the `[` itself
 /// (the parser hands the empty list's right as its own `[`). Bounded by
 /// the file extent: an unmatched walk is no window (`None`).
-fn matching_bracket_fwd(bytes: &[u8], cursor: usize) -> Option<usize> {
+pub(super) fn matching_bracket_fwd(bytes: &[u8], cursor: usize) -> Option<usize> {
     let (open_b, close_b) = match bytes.get(cursor)? {
         b'[' => (b'[', b']'),
         b'{' => (b'{', b'}'),
@@ -15699,7 +15703,7 @@ fn matching_bracket_fwd(bytes: &[u8], cursor: usize) -> Option<usize> {
 /// element census walks). A corrupted split (a comma spelled inside an
 /// unbalanced string) desyncs segments into rowless leaves — the
 /// `dynamic` under-report direction [`Engine::least_leaf_ty`] takes.
-fn value_comma_segments(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, usize)> {
+pub(super) fn value_comma_segments(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, usize)> {
     let end = end.min(bytes.len());
     let mut segments = Vec::new();
     let mut seg_start = start;
@@ -15778,7 +15782,7 @@ fn ident_byte(b: u8) -> bool {
 
 /// The first top-level `:` in `[start, end)`, string contents skipped —
 /// the map-entry leaf's key/value split.
-fn value_top_level_colon(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+pub(super) fn value_top_level_colon(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
     let end = end.min(bytes.len());
     let mut i = start;
     let mut depth = 0usize;
@@ -15833,7 +15837,7 @@ fn value_default_cut(bytes: &[u8], start: usize, end: usize) -> usize {
 }
 
 /// The first significant byte at or after `start`.
-fn trim_value_ws(bytes: &[u8], start: usize, end: usize) -> usize {
+pub(super) fn trim_value_ws(bytes: &[u8], start: usize, end: usize) -> usize {
     let end = end.min(bytes.len());
     let mut start = start.min(end);
     while start < end && bytes[start].is_ascii_whitespace() {

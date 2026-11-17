@@ -1740,6 +1740,25 @@ pub(crate) struct PendingAnnotation {
     /// The whole Annotation node span; `None` until `end_metadata`
     /// latches it (the name event pushes the entry first).
     pub(crate) node: Option<SourceRange>,
+    /// The container context at the metadata's own scope (upstream Dart
+    /// SDK source, pkg/analyzer/lib/src/summary2/metadata_resolver.dart:
+    /// member metadata resolves inside the container's body scope while
+    /// HEAD metadata resolves before that scope opens). The verdict runs
+    /// at the declaration's drain — after the container frame pushed —
+    /// so this snapshot, not the live frame stack, answers the
+    /// own-member face for head metadata (`@foo class A { static const
+    /// foo }` reports `undefined_annotation`, the corpus's
+    /// test_useLibraryScope).
+    pub(crate) container: Option<(StringId, crate::model::ContainerKind)>,
+    /// The `rows` length at the entry's push — the base of the window the
+    /// annotation's argument/type-argument faces staged into. An entry that
+    /// dies undrained (its declaration failed, or an unclosed argument
+    /// group swallowed the rest of the file) retracts everything from its
+    /// mark: upstream resolves an annotation's subtree only when a
+    /// surviving declaration consumes the metadata (the fasta→analyzer
+    /// translation keeps members only), so the staged rows die with the
+    /// entry ([`Engine::retract_doomed_annotations`], #4340).
+    pub(crate) row_mark: usize,
 }
 
 /// One primary-constructor formal that declares a field: the name token's
@@ -3057,6 +3076,14 @@ pub(crate) struct Engine<'a> {
     /// `operator >>>` + use: `unused_element` names it `<unnamed>` and the
     /// use reports the miss).
     pub(crate) triple_shift_enabled: bool,
+    /// The `generic-metadata` grant (`definingLibrary.featureSet
+    /// .isEnabled(Feature.generic_metadata)`, resolver.dart:355 — the
+    /// library's settled language version, the same fold the parser's
+    /// feature carrier applies): the strict-inference creation row's
+    /// annotation spelling reports only where generic metadata is
+    /// enabled (upstream `_reportInferenceFailure`'s Annotation arm,
+    /// generic_inferrer.dart:610-624).
+    pub(crate) generic_metadata_enabled: bool,
     /// The open type-variables window's captured parameters `(name,
     /// declared keyword, name range)` — the container-begin event adopts
     /// them ([`Engine::note_container_type_variables`]).
@@ -3536,6 +3563,28 @@ pub(crate) struct Engine<'a> {
     /// official pragma/JS gates' under-report superset — and its
     /// [`DeclSite::use_result`] face).
     pub(crate) pending_annotations: Vec<PendingAnnotation>,
+    /// The latch length at `begin_type_variables` — the base the group's
+    /// own metadata drains from at `end_type_variables` (upstream's
+    /// `withTypeParameterScope` wraps the whole variable list, so the
+    /// group's annotations resolve with every parameter in scope — the
+    /// entries latched since the group opened belong to its variables,
+    /// never to the enclosing declaration whose site already drained,
+    /// #4340).
+    pub(crate) tv_annotation_mark: usize,
+    /// The constructor/factory HEAD type-variable window (#4340): `1`
+    /// from the head's `begin_constructor`/`begin_factory` until the
+    /// head's own formal list opens (or the member ends — every read is
+    /// gated on `ctor_pending`, so a stale window is inert). Type-variable
+    /// groups opening while the window is live and no formal list has
+    /// opened belong to the head's own `<...>` — a shape upstream never
+    /// parses as type parameters: a constructor's `<` takes the
+    /// constructor-reference recovery, where the bracket's metadata is
+    /// skipped (`skipMetadata` + `annotation_on_type_argument`,
+    /// type_info_impl.dart:1439-1449) and never resolves, so the entries
+    /// retract at the drain instead of publishing. A group begin bumps
+    /// the window (nested groups — a bound's function-type brackets —
+    /// stay inside the doomed head), its end drops it back.
+    pub(crate) ctor_head_tv_window: u32,
     /// The discarded-value machine (the `_isUsed` parent-chain mirror,
     /// `use_result_verifier.dart`): completed UseResult-candidate
     /// expressions awaiting a sealing context event, keyed by their name

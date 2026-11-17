@@ -4596,12 +4596,21 @@ impl<'a> Engine<'a> {
                         && (shadowed || !top_level_used.contains(&bare))
                         && !(is_setter_site && top_level_setter_writes.contains(&bare))
                     {
-                        // A nameless recovery declaration anchors at the file
-                        // start — the spliced synthetic name never reaches
-                        // the written source, so its splice offset is not
-                        // the oracle's row anchor (`<unnamed>` at 1:1, the
-                        // corpus nameless-declaration capture).
-                        let range = if self.is_nameless(site.name) {
+                        // A nameless FUNCTION anchors on the spliced
+                        // synthetic's own span — fasta splices the
+                        // `<unnamed>` identifier at the recovery point and
+                        // the element's name node carries it (the corpus's
+                        // `@p.A.ctor<B>()` oracle row 2:13|0 = the `(`;
+                        // `sync*() {}` anchors on its own `()`). A nameless
+                        // VARIABLE or TYPE ALIAS keeps the file-start law:
+                        // the null-name alias fragment maps to offset 0
+                        // however late the declaration sits (the corpus's
+                        // FragmentOffsetTest missing-name typedefs pin
+                        // `<unnamed>` at 1:1 beside a line-4 declaration,
+                        // the test's own "isn't at offset 0" note).
+                        let range = if self.is_nameless(site.name)
+                            && !matches!(site.kind, DeclKind::TopLevelFn)
+                        {
                             self.nameless_site_range()
                         } else {
                             site.range
@@ -8663,8 +8672,37 @@ impl<'a> Engine<'a> {
     /// declaration site, each with its captured `UseResult.unless` face
     /// (the `@override`-family gates compare names; non-empty marks the
     /// pragma/JS exemption gates' under-report superset).
-    pub(crate) fn take_annotations(&mut self) -> Vec<PendingAnnotation> {
-        std::mem::take(&mut self.pending_annotations)
+    ///
+    /// `consumer` is the consuming declaration's own start offset. Two
+    /// structural laws of the grammar decide the drain (#4340):
+    ///
+    /// * Annotations PRECEDE the declaration they annotate, so a completed
+    ///   entry starting after the consumer is recovery content an
+    ///   unclosed-argument annotation's parse swallowed (upstream keeps it
+    ///   in the annotation's subtree, where it dies with the annotation) —
+    ///   the orphaned head retracts whole, staged rows and deferred faces
+    ///   with it, before this drain can publish it.
+    /// * A still-open entry — `node` latches only at `end_metadata` — is
+    ///   mid-construction; a declaration event firing inside its window is
+    ///   again swallow content, so the head stays latched (only the
+    ///   completed suffix before the consumer drains; the unit-end sweep
+    ///   retracts whatever never completes).
+    pub(crate) fn take_annotations(&mut self, consumer: u32) -> Vec<PendingAnnotation> {
+        let takeable = |entry: &PendingAnnotation| entry.node.is_some_and(|n| n.offset <= consumer);
+        let take_from = self
+            .pending_annotations
+            .iter()
+            .rposition(|entry| !takeable(entry))
+            .map_or(0, |at| at + 1);
+        let taken = self.pending_annotations.split_off(take_from);
+        if self
+            .pending_annotations
+            .last()
+            .is_some_and(|entry| entry.node.is_some_and(|n| n.offset > consumer))
+        {
+            self.retract_doomed_annotations();
+        }
+        taken
     }
 
     /// Drains the pending annotation latch for a LOCAL declaration — the
@@ -8683,8 +8721,10 @@ impl<'a> Engine<'a> {
     /// own resolution saw. Callers place it before the declared name binds
     /// (`note_local` / `note_local_function`), so a nameless `''` local the
     /// recovery registers does not answer the annotation name lookup.
-    pub(crate) fn drain_local_annotations(&mut self) {
-        let pending = self.take_annotations();
+    /// `consumer` is the local declaration's own start offset (the
+    /// [`Engine::take_annotations`] orphan law).
+    pub(crate) fn drain_local_annotations(&mut self, consumer: u32) {
+        let pending = self.take_annotations(consumer);
         for pending_annotation in &pending {
             self.emit_pending_annotation(pending_annotation);
         }
@@ -8698,7 +8738,7 @@ impl<'a> Engine<'a> {
         range: SourceRange,
         kind: DeclKind,
     ) -> usize {
-        let pending = self.take_annotations();
+        let pending = self.take_annotations(range.offset);
         let annotated = !pending.is_empty();
         // The `@UseResult` face (`isUseResult`, element.dart:2014-2019):
         // the meta getter (`@useResult`) or the class face (`@UseResult`,

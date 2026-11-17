@@ -3508,9 +3508,37 @@ impl<'a> Bounds<'a> {
                 if let ScopeKind::Window(map) = kind
                     && let Some(bound_tree) = map.get(&arg.head)
                 {
-                    let Some(tree) = bound_tree else {
-                        return Some(None);
+                    let mut tree: &TypeTree = match bound_tree.as_ref() {
+                        Some(tree) => tree,
+                        None => return Some(None),
                     };
+                    // A parameter whose bound spells another window
+                    // parameter (`X extends Y, Y extends A<X>`) rides the
+                    // chain: the honest bound is the followed tree's — a
+                    // one-step read stops at the bare `Y`, whose
+                    // undecidable pair keeps the row the call-site's
+                    // instantiate-to-bounds already reports as
+                    // couldNotInfer. A cycle or an unbounded link keeps
+                    // the implicit `Object?` face.
+                    let mut visited: Vec<StringId> = vec![arg.head];
+                    loop {
+                        let bare_param = !tree.nullable
+                            && tree.args.is_empty()
+                            && tree.record.is_none()
+                            && tree.function.is_none()
+                            && map.contains_key(&tree.head);
+                        if !bare_param {
+                            break;
+                        }
+                        if visited.contains(&tree.head) {
+                            return Some(None);
+                        }
+                        visited.push(tree.head);
+                        match map.get(&tree.head) {
+                            Some(Some(next)) => tree = next,
+                            _ => return Some(None),
+                        }
+                    }
                     return match ctx.map_tree(tree, scope) {
                         Some(bound) if snapshot.type_is_safe(bound) => Some(Some(bound)),
                         _ => None,

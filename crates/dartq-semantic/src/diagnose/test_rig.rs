@@ -224,6 +224,32 @@ pub(super) fn report_ops_strict(source: &str, strict: StrictModes) -> FileReport
     )
 }
 
+/// [`report_ops_imports`] with the language-strictness modes set (the
+/// prefixed strict-inference creation fixtures — #4332).
+pub(super) fn report_ops_imports_strict(
+    source: &str,
+    imports: &[RigImport<'_>],
+    strict: StrictModes,
+) -> FileReport {
+    report_ops_env_strict(
+        &format!("{CORE_PRELUDE}{source}"),
+        imports,
+        None,
+        &[],
+        &[],
+        strict,
+    )
+}
+
+/// [`report_ops_bare`] with the language-strictness modes set and NO
+/// prelude — a fixture pinning its own `// @dart=x.y` header keeps the
+/// header the file's first line, so the rig's language-version fold
+/// reads it (the pre-generic-metadata strict-inference fixtures,
+/// #4332).
+pub(super) fn report_ops_bare_strict(source: &str, strict: StrictModes) -> FileReport {
+    report_ops_env_strict(source, &[], None, &[], &[], strict)
+}
+
 /// The SDK container heads [`report_ops_core_ctor`] additionally mounts
 /// in the names-only `dart:core` stub posture: a fixture naming them
 /// sees the CLI's unindexed-SDK grade (the names resolve into a

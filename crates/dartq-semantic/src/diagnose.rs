@@ -363,8 +363,9 @@ use crate::model::{
     Formal, Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
 };
 use crate::switch_tracker::{
-    NameCase, NameScope, NameTy, NameWorld, ObjectField, PatternFrame, Restriction, SwitchTracker,
-    case_space, is_always_exhaustive, restriction_is_constant, restriction_is_null_only,
+    NameCase, NameScope, NameTy, NameWorld, ObjectField, PatternBinder, PatternFrame,
+    PatternFrameKind, Restriction, SwitchTracker, case_space, is_always_exhaustive,
+    restriction_is_constant, restriction_is_null_only,
 };
 // The tests construct a `NameWorld` over the engine's interned core chain;
 // the lib build's only consumer is `MemberFace::new`, so this import is
@@ -470,11 +471,19 @@ mod ticket_2216_tests;
 mod ticket_3057_tests;
 
 /// The #1351 faces pinned end-to-end: the function-type-alias boundedness
-/// gate, the const-eval deferred-creation walk, the formals' reach into
-/// the argument check, and the flow-fact joins (the nullable-condition
+/// gate, the const-eval deferred-creation walk, the formals' reach into the
+/// argument check, and the flow-fact joins (the nullable-condition
 /// verdict and the matched-type re-decision).
 #[cfg(test)]
 mod ticket_1351_tests;
+
+/// The #4011 pins: the type-free pattern binder's static type — the
+/// scrutinee bind at a case root, the container lattice's element/value/
+/// slot binds at a root list/map/record close, the rest binder's
+/// `List<E>` face, and the under-report guards (nested containers,
+/// statement destructure, dynamic/Null demotes).
+#[cfg(test)]
+mod ticket_4011_tests;
 
 /// The undefined-name/resolution differential pins: constructor-reference
 /// prefix heads (`fb.RuleState.stable()`), record `on`-type field getters,
@@ -1430,6 +1439,7 @@ pub fn fold_unit_with_ops<'t>(
             field_promotion_enabled,
             features.patterns_enabled,
             features.triple_shift_enabled,
+            features.generic_metadata_enabled,
             strict,
             class_modifiers,
             ops,
@@ -2584,7 +2594,13 @@ pub fn fold_unit_with_ops<'t>(
             // same early-outs `report_switch` applies hold: an unknown or
             // invalid scrutinee gated the whole pass off at parse time,
             // and there is nothing to re-decide.
-            if ctx.scrutinee == Ty::Unknown || ctx.has_invalid_type {
+            // The same whole-check suppression the parse-time verdict
+            // applies (constant_verifier.dart:1095's `hasInvalidType`
+            // gates the entire pass): an `Invalid` scrutinee — an
+            // undefined-identifier read typed whole `InvalidType` —
+            // reports no exhaustiveness row either (#4340).
+            if ctx.scrutinee == Ty::Unknown || ctx.scrutinee == Ty::Invalid || ctx.has_invalid_type
+            {
                 continue;
             }
             let Some(first) = ctx.cases.first() else {

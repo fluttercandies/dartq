@@ -1,3 +1,7 @@
+use super::engine_core::{
+    matching_bracket_back, matching_bracket_fwd, trim_value_ws, value_comma_segments,
+    value_top_level_colon,
+};
 use super::ffi::matching_close;
 use super::scopes_bodies::SchemaSlot;
 use super::*;
@@ -154,6 +158,21 @@ struct InferConstraint {
     lower: Ty,
     upper: Ty,
     origin: usize,
+}
+
+/// The pre-generic-metadata call face's per-parameter candidate (#4343):
+/// a generic tear-off argument's static type — which KEEPS its own
+/// `<...>` group (`void Function<X>()`) — folded through the official
+/// function LUB as contributors arrive. `infer_invocation`'s argument
+/// round fills one slot per solved parameter; its final loop's
+/// generic-metadata gate reads the fold.
+#[derive(Clone, Copy)]
+enum TearCandidate {
+    /// The joined candidate so far — FIRST contributor's parameter names
+    /// win (the official LUB's fresh copies come from the first list).
+    Live(Ty),
+    /// A contributor the join rejected — the silent posture.
+    Dead,
 }
 
 /// The chain-root static type behind a receiver classification: the
@@ -3222,6 +3241,13 @@ impl<'a> Engine<'a> {
     /// target lives in the primary-constructor body's `this : super.x()`
     /// initializer, parsed after the class header).
     pub(crate) fn drain_super_formals(&mut self, owner: Option<usize>, target: Option<StringId>) {
+        // The field-formal applied-instantiation face rides the
+        // constructor's close events (a `this.p = f` default is a constant
+        // context the plain default-value check never sees); the face
+        // dedups against its own emitted rows.
+        if let Some(owner) = owner {
+            self.check_ctor_field_formal_tearoffs(owner);
+        }
         if self
             .pending_super_formals
             .iter()
@@ -3740,6 +3766,424 @@ impl<'a> Engine<'a> {
             unnamed_head: bare_head.filter(|&(_, range)| self.unnamed_creation_head(range)),
             named_head: bare_head.filter(|&(_, range)| self.creation_class_before(range).is_some()),
         });
+        // #4339: the reference head's row repairs before the close consumes
+        // it — the latch-armed (callee-dropped) shape and the implicit
+        // spellings whose unmerged selector placeholder linked as the
+        // callee both enter; the repair's own shape guards decide.
+        let repair_face = bare_head.or_else(|| {
+            callee
+                .and_then(|index| self.rows.get(index))
+                .map(|row| (row.name, row.range))
+        });
+        if let Some((selector, selector_range)) = repair_face {
+            self.repair_ctor_reference_head(selector, selector_range);
+        }
+    }
+
+    /// #4339 — the generic/prefixed named-constructor reference's head-row
+    /// repair, run at the argument group's open (after the reference-end
+    /// requalify re-skinned the head, before the close's faces consume it).
+    /// The parser resolves a `head<args>.selector(` / `head.class<args>.
+    /// selector(` chain's head as a type use, and an unresolved or
+    /// function-valued head reaches the `PrefixHead` span face or the armed
+    /// creation miss — both wrong for three corpus-pinned shapes:
+    ///
+    /// - `C<int>.named(` over an UNRESOLVED class (const/new/implicit
+    ///   alike): the oracle reports `creation_with_non_type` at the bare
+    ///   head segment — `_getErrorRange` ends at `node.name.end`, never the
+    ///   folded `<...>` group (named_type_resolver.dart:584-593).
+    /// - `unresolved.Class<int>.named(` (implicit): the oracle keeps the
+    ///   member chain — `undefined_identifier` at the PREFIX segment alone
+    ///   (`ast_rewrite` leaves the chain a plain invocation when the prefix
+    ///   cannot resolve); the const/new spellings and the `.new` selector
+    ///   keep the span face (`reportNewWithNonType`'s undefinedIdentifier
+    ///   arm) — `new` is reserved, so no member-chain recovery exists for
+    ///   the selector and the implicit-creation shape survives to the
+    ///   unresolved-importPrefix arm, which reports `undefined_identifier`
+    ///   naming the prefix over `importPrefix.offset .. node.name.end`
+    ///   (named_type_resolver.dart:301-310).
+    /// - a head resolving to a top-level FUNCTION (`fn<int>.named(` /
+    ///   `fn.Class<int>.named(`, implicit): no creation at all — the
+    ///   reference demotes to the member chain on the function value:
+    ///   `undefined_method` for `Function` at the selector (the failed
+    ///   reference's fallback type), or `undefined_getter` for the
+    ///   function's declared type at the class segment. The const/new
+    ///   spellings dead-end at the shadow arm and report nothing
+    ///   (named_type_resolver.dart:113-128).
+    ///
+    /// The outer guards keep every passing shape out: a `.` selector must
+    /// follow the head row (the unnamed `C<int>(` and the two-segment
+    /// `C.named(` — whose row already ends at the selector — never match),
+    /// and only type-use head rows enter (a plain `fn.selector(` method
+    /// call pushes value rows, never a type use).
+    fn repair_ctor_reference_head(&mut self, selector: StringId, selector_range: SourceRange) {
+        let Some(top) = self.rows.len().checked_sub(1) else {
+            return;
+        };
+        // #4339: the implicit PREFIXED function head (`p.fn<int>.named(` /
+        // `p.fn.named(`) carries no type-use row — the prefixed head's
+        // verdict ran at the reference end (`resolve_ctor_prefix_class`),
+        // which the const/new spellings own. The implicit chain demotes
+        // instead: the failed constructor reference types the receiver
+        // `Function` and the selector resolves as its method — the creation
+        // face never reports. The reference end's pre-emitted creation row
+        // is retracted here; the keyword guard keeps every const/new
+        // spelling on its own face.
+        if self.repair_prefixed_fn_head(selector, selector_range) {
+            return;
+        }
+        // The implicit spellings stack the unmerged selector placeholder
+        // (a qualified member/plain row) above the head row; the head sits
+        // directly below it.
+        let (head_index, verdict, range) =
+            match self.rows.get(top).map(|row| (&row.shape, row.qualified)) {
+                Some((RowShape::TypeUse(verdict, _), _)) => (top, *verdict, self.rows[top].range),
+                _ => match top
+                    .checked_sub(1)
+                    .and_then(|index| self.rows.get(index))
+                    .filter(|_| self.rows[top].qualified)
+                {
+                    Some(head)
+                        if matches!(head.shape, RowShape::TypeUse(..))
+                            && matches!(
+                                self.rows[top].shape,
+                                RowShape::Member { .. } | RowShape::Bare(BareInfo::Plain { .. })
+                            ) =>
+                    {
+                        let RowShape::TypeUse(verdict, _) = head.shape else {
+                            return;
+                        };
+                        (top - 1, verdict, head.range)
+                    }
+                    _ => return,
+                },
+            };
+        // A `.` selector must follow the head row's end (trivia aside,
+        // across a balanced `<...>` type-argument group when one rides the
+        // head) — the chain's own selector dot.
+        let bytes = self.source.as_bytes();
+        let skip_ws = |at: &mut usize| {
+            while *at < bytes.len() && bytes[*at].is_ascii_whitespace() {
+                *at += 1;
+            }
+        };
+        let mut after_span = self.byte_of(range.end());
+        skip_ws(&mut after_span);
+        if after_span < bytes.len() && bytes[after_span] == b'<' {
+            let mut depth = 0usize;
+            while after_span < bytes.len() {
+                match bytes[after_span] {
+                    b'<' => depth += 1,
+                    b'>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            after_span += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                after_span += 1;
+            }
+            skip_ws(&mut after_span);
+        }
+        if after_span >= bytes.len() || bytes[after_span] != b'.' {
+            return;
+        }
+        // The head segment: the leading identifier run of the row's span.
+        let start = self.byte_of(range.offset);
+        let end = self.byte_of(range.end());
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        let mut run = start;
+        while run < end && is_ident(bytes[run]) {
+            run += 1;
+        }
+        if run == start {
+            return;
+        }
+        let mut after_run = run;
+        while after_run < end && bytes[after_run].is_ascii_whitespace() {
+            after_run += 1;
+        }
+        let head_span = SourceRange {
+            offset: range.offset,
+            length: self.utf16_of(run) - range.offset,
+        };
+        let head_name = self.intern(&self.source[start..run]);
+        match verdict {
+            TypeVerdict::PrefixHead => {
+                if after_run < end && bytes[after_run] == b'<' && bytes[end - 1] == b'>' {
+                    // `C<int>.named(` — the span face folded the group into
+                    // the head; the creation face reports at the bare head
+                    // segment in every spelling.
+                    let text = self.strings.resolve(head_name).to_string();
+                    self.emit(SemanticCode::CreationWithNonType, head_span, &text, "");
+                    self.quiet_ctor_head(head_index, head_span);
+                } else if after_run < end
+                    && bytes[after_run] == b'.'
+                    && selector != self.intern("new")
+                    && matches!(self.resolve_bare(head_name).0, BareInfo::Missing { .. })
+                    && !self.keyword_creation_head(range.offset)
+                {
+                    // `unresolved.Class<int>.named(` — the implicit chain
+                    // reports at the prefix segment alone.
+                    let text = self.strings.resolve(head_name).to_string();
+                    self.emit(SemanticCode::UndefinedIdentifier, head_span, &text, "");
+                    self.quiet_ctor_head(head_index, head_span);
+                }
+                // A resolved prefix head, the const/new prefixed spellings,
+                // and the `.new` selector keep the requalified span face.
+            }
+            TypeVerdict::Missing | TypeVerdict::Prefixed { .. } => {
+                // The function head — implicit chains only (the const/new
+                // spellings dead-end at the shadow arm). The function
+                // candidate is the span's own name: the leading segment of
+                // a bare head, the trailing (class) segment of a prefixed
+                // one.
+                if self.keyword_creation_head(range.offset) {
+                    return;
+                }
+                let candidate = if after_run < end && bytes[after_run] == b'.' {
+                    let mut tail = end;
+                    while tail > after_run && !is_ident(bytes[tail - 1]) {
+                        tail -= 1;
+                    }
+                    let tail_start = tail;
+                    while tail > after_run && is_ident(bytes[tail - 1]) {
+                        tail -= 1;
+                    }
+                    if tail == tail_start {
+                        return;
+                    }
+                    self.intern(&self.source[tail..tail_start])
+                } else {
+                    head_name
+                };
+                let fn_decl = self
+                    .top_level_decl(candidate)
+                    .filter(|decl| decl.kind == MicroKind::TopLevelFn);
+                let Some(decl) = fn_decl else {
+                    return;
+                };
+                let ret = decl.return_ty;
+                let params = decl.formals.as_ref().map(|f| {
+                    f.positional
+                        .iter()
+                        .map(|formal| formal.ty)
+                        .collect::<Vec<_>>()
+                });
+                // The armed creation miss dies with the row's quieting —
+                // no creation face for a function head.
+                self.creation_miss_rows
+                    .retain(|(offset, _)| !(range.offset <= *offset && *offset < range.end()));
+                self.quiet_ctor_head(head_index, range);
+                // The segment after the head row's dot, when it is NOT the
+                // chain's own selector, is a class-position segment
+                // (`fn.Class<int>.named(`) — a getter on the function
+                // value; otherwise the selector itself is the member
+                // (`fn<int>.named(`, `p.fn.named(`) — a method on the
+                // failed reference's `Function` fallback type.
+                let mut class_face: Option<SourceRange> = None;
+                if bytes[after_span] == b'.' {
+                    let mut seg = after_span + 1;
+                    skip_ws(&mut seg);
+                    let seg_start = seg;
+                    while seg < bytes.len() && is_ident(bytes[seg]) {
+                        seg += 1;
+                    }
+                    if seg > seg_start {
+                        let span = SourceRange {
+                            offset: self.utf16_of(seg_start),
+                            length: self.utf16_of(seg) - self.utf16_of(seg_start),
+                        };
+                        if span != selector_range {
+                            class_face = Some(span);
+                        }
+                    }
+                }
+                if let Some(span) = class_face {
+                    let text = self.source[self.byte_of(span.offset)..self.byte_of(span.end())]
+                        .to_string();
+                    let recv = format!(
+                        "{} Function({})",
+                        self.ty_display(ret),
+                        params
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|&ty| self.ty_display(ty))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    self.emit(SemanticCode::UndefinedGetter, span, &text, &recv);
+                } else {
+                    let text = self.strings.resolve(selector).to_string();
+                    self.emit(
+                        SemanticCode::UndefinedMethod,
+                        selector_range,
+                        &text,
+                        "Function",
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// #4339 — the implicit prefixed FUNCTION head's chain face
+    /// (`p.fn<int>.named(` / `p.fn.named(` over a top-level `fn`). The
+    /// reference end already reported the prefixed head's creation verdict
+    /// (`resolve_ctor_prefix_class`, the const/new spellings' own face);
+    /// the implicit chain demotes to the member chain on the failed
+    /// reference's `Function` fallback type instead — the creation row is
+    /// retracted and the selector reports `undefined_method` for
+    /// `Function`. Source-derived: this shape pushes no type-use row (the
+    /// named selector links a plain/member row at most), so the walk reads
+    /// the chain backward from the selector — `prefix.fn[<args>].selector(`
+    /// — and every other shape (the invoked name itself, a bare head, a
+    /// class-typed head, a const/new keyword, a non-prefix first segment)
+    /// falls through to the row-driven repair unchanged.
+    fn repair_prefixed_fn_head(&mut self, selector: StringId, selector_range: SourceRange) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut at = self.byte_of(selector_range.offset);
+        let skip_ws_back = |at: &mut usize| {
+            while *at > 0 && bytes[*at - 1].is_ascii_whitespace() {
+                *at -= 1;
+            }
+        };
+        // The selector's own dot.
+        skip_ws_back(&mut at);
+        if at == 0 || bytes[at - 1] != b'.' {
+            return false;
+        }
+        at -= 1;
+        skip_ws_back(&mut at);
+        // The head's trailing type-argument group, when one rides it.
+        if at > 0 && bytes[at - 1] == b'>' {
+            let mut depth = 0usize;
+            loop {
+                if at == 0 {
+                    return false;
+                }
+                at -= 1;
+                match bytes[at] {
+                    b'>' => depth += 1,
+                    b'<' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            skip_ws_back(&mut at);
+        }
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        // The class segment — never the invoked name itself (`p.fn(`).
+        let class_end = at;
+        while at > 0 && is_ident(bytes[at - 1]) {
+            at -= 1;
+        }
+        if at == class_end {
+            return false;
+        }
+        let class_span = SourceRange {
+            offset: self.utf16_of(at),
+            length: self.utf16_of(class_end) - self.utf16_of(at),
+        };
+        if class_span == selector_range {
+            return false;
+        }
+        let class_name = self.intern(&self.source[at..class_end]);
+        // The prefix segment — a bare head stays the row-driven repair's.
+        skip_ws_back(&mut at);
+        if at == 0 || bytes[at - 1] != b'.' {
+            return false;
+        }
+        at -= 1;
+        skip_ws_back(&mut at);
+        let prefix_end = at;
+        while at > 0 && is_ident(bytes[at - 1]) {
+            at -= 1;
+        }
+        if at == prefix_end {
+            return false;
+        }
+        let prefix_name = self.intern(&self.source[at..prefix_end]);
+        let prefix_span = SourceRange {
+            offset: self.utf16_of(at),
+            length: self.utf16_of(prefix_end) - self.utf16_of(at),
+        };
+        // Implicit chains only — the const/new spellings keep the
+        // reference end's creation face.
+        if self.keyword_creation_head(prefix_span.offset) {
+            return false;
+        }
+        // The head resolves through the prefix to a top-level FUNCTION
+        // (`lookup_prefixed` answers `NotFound` for a non-prefix first
+        // segment — the shadowed-prefix and unresolved-prefix chains stay
+        // the row-driven repair's; a class-typed head keeps its own
+        // creation faces).
+        let decl_file =
+            match self
+                .namespaces
+                .lookup_prefixed(self.graph, self.lib, prefix_name, class_name)
+            {
+                Lookup::Found(NamespaceEntry::Decl(file)) => file,
+                _ => return false,
+            };
+        let is_fn = self
+            .index
+            .get(decl_file)
+            .and_then(|file| file.decl(class_name))
+            .is_some_and(|decl| decl.kind == MicroKind::TopLevelFn);
+        if !is_fn {
+            return false;
+        }
+        self.report
+            .diagnostics
+            .retain(|d| !(d.code.name == "creation_with_non_type" && d.range == class_span));
+        self.creation_miss_rows
+            .retain(|(offset, _)| !(class_span.offset <= *offset && *offset < class_span.end()));
+        let text = self.strings.resolve(selector).to_string();
+        self.emit(
+            SemanticCode::UndefinedMethod,
+            selector_range,
+            &text,
+            "Function",
+        );
+        // The prefixed access DID resolve through the import's scope —
+        // record the member read so the unused-import pass credits the
+        // prefix's edge (the retracted creation row used to gate that pass
+        // shut; the demoted chain keeps the import legitimately used).
+        self.member_reads.push(MemberRead {
+            offset: class_span.offset,
+            name: class_name,
+            recv: Receiver::Prefix { name: prefix_name },
+            recv_span: prefix_span,
+        });
+        true
+    }
+
+    /// face reports nothing (the repair already emitted the chain's own
+    /// verdict; the `PrefixHead` arm reads no suppression flag, so the
+    /// verdict itself converts to the guarded `Missing` one), and the
+    /// row's span re-anchors at the bare head segment (the extent the
+    /// remaining faces read).
+    /// Silence a repaired constructor-reference head row: the pass-2 type
+    /// face reports nothing (the repair already emitted the chain's own
+    /// verdict; the `PrefixHead` arm reads no suppression flag, so the
+    /// verdict itself converts to the guarded `Missing` one), and the
+    /// row's span re-anchors at the bare head segment (the extent the
+    /// remaining faces read).
+    fn quiet_ctor_head(&mut self, index: usize, span: SourceRange) {
+        if let Some(row) = self.rows.get_mut(index)
+            && matches!(row.shape, RowShape::TypeUse(..))
+        {
+            row.shape = RowShape::TypeUse(TypeVerdict::Missing, true);
+            row.range = span;
+        }
     }
 
     /// Closes an argument group; its callee awaits the send event. The
@@ -3925,8 +4369,10 @@ impl<'a> Engine<'a> {
                         name: class,
                         kind: ContainerKind::Class,
                         // #3398: the creation's resolved `ty` rides along —
-                        // populated by #3394 (`ty: Some(ty)`).
-                        ty: None,
+                        // the receiver's own member faces (the container
+                        // parameter seeds of `member_send_params`, #4336)
+                        // read the written instantiation here.
+                        ty: Some(ty),
                     }),
                     intent: Intent::Read,
                     write_op: None,
@@ -4429,9 +4875,11 @@ impl<'a> Engine<'a> {
             shape: RowShape::Receiver(Receiver::Created {
                 name: head,
                 kind,
-                // #3398: the creation's resolved `ty` rides along —
-                // populated by #3394 (`ty: Some(ty)`).
-                ty: None,
+                // #3398: the creation's resolved `ty` rides along — the
+                // receiver's own member faces (the container parameter
+                // seeds of `member_send_params`, #4336) read the written
+                // instantiation here.
+                ty: Some(ty),
             }),
             intent: Intent::Read,
             write_op: None,
@@ -5706,7 +6154,10 @@ impl<'a> Engine<'a> {
     /// function's own signature as its type-as-a-value (the row's `Ty`
     /// stays `Unknown` — the model has no function variant; the signature
     /// is the structural face). Getters carry no formals and synthesize
-    /// nothing; member and prefixed tear-offs stay untyped (under-report).
+    /// nothing; the qualified GENERIC faces (a prefixed function, an
+    /// instance method behind a created receiver) answer through
+    /// [`Self::qualified_tear_off_face`], every other qualified read
+    /// stays untyped (under-report).
     /// Only a value READ
     /// qualifies: a completed send's callee row keeps its bare shape (the
     /// send flips `intent` to [`Intent::Invoke`] alone), so an ungated
@@ -5714,7 +6165,36 @@ impl<'a> Engine<'a> {
     /// and the non-function-formal face co-reports a spurious
     /// `argument_type_not_assignable` (oracle 3.13.1 is silent there).
     pub(crate) fn tear_off_sig(&self, row: &Row) -> Option<Box<FnVarSig>> {
-        if row.qualified || row.intent != Intent::Read {
+        if row.intent != Intent::Read {
+            return None;
+        }
+        // The qualified GENERIC tear-off (`g(a.f)`, `g(C().m)`): the same
+        // instantiation face the bare read carries, keyed by the resolved
+        // declaration instead of the bare-scope one — the shadow checks
+        // below are bare-scope facts and never apply to a dotted read.
+        // Only a generic face answers; a qualified non-generic read keeps
+        // its prior untyped posture (the under-report direction,
+        // unchanged).
+        if row.qualified
+            && let Some((formals, return_ty, params)) = self.qualified_tear_off_face(row)
+            && !params.is_empty()
+        {
+            return Some(Box::new(FnVarSig {
+                params: Box::default(),
+                positional: formals.positional.iter().map(|f| f.ty).collect(),
+                required_positional: u16::try_from(
+                    formals.positional.iter().filter(|f| f.required).count(),
+                )
+                .unwrap_or(u16::MAX),
+                named: formals
+                    .named
+                    .iter()
+                    .map(|f| (f.name, f.ty, f.required))
+                    .collect(),
+                return_ty,
+            }));
+        }
+        if row.qualified {
             return None;
         }
         // A declared local FUNCTION's own value IS the tear-off (#2842):
@@ -5807,6 +6287,123 @@ impl<'a> Engine<'a> {
         None
     }
 
+    /// The qualified tear-off's declaration face: a prefixed top-level
+    /// function (`a.f` — the prefix's target declaration, projected
+    /// through the boundary) or an instance method behind a created
+    /// receiver (`C().m` — the member walk's non-static method). Answers
+    /// the declaration's formals, its return type, and its own
+    /// `(name, bound)` parameter pairs — the same facts the bare face
+    /// reads off [`Self::top_level_decl`] plus [`Self::own_exec_window`].
+    /// The prefixed arm's bounds project through [`Boundary::ty`] here
+    /// (the top-level projection maps no bound column; the foreign
+    /// generic's pattern, `creation_args`' receiver-declaration face).
+    fn qualified_tear_off_face(
+        &self,
+        row: &Row,
+    ) -> Option<(Formals, Ty, Box<[(StringId, Option<Ty>)]>)> {
+        match &row.shape {
+            RowShape::Member {
+                recv: Receiver::Prefix { name: prefix },
+            } => {
+                let dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(file)) =
+                    self.namespaces
+                        .lookup_prefixed(self.graph, self.lib, *prefix, row.name)
+                else {
+                    return None;
+                };
+                let decl = self.index.get(file).and_then(|f| f.decl(row.name))?;
+                if decl.kind != MicroKind::TopLevelFn {
+                    return None;
+                }
+                let projected = self.boundary.top(file, row.name, decl);
+                let foreign = !matches!(projected, Projected::Own(_));
+                let decl = match &projected {
+                    Projected::Own(decl) => &**decl,
+                    Projected::Foreign(decl) => decl.as_ref(),
+                };
+                let formals = decl.formals.clone()?;
+                let params = decl
+                    .type_param_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        let bound = decl
+                            .type_param_bounds
+                            .get(index)
+                            .copied()
+                            .filter(|b| *b != Ty::Dynamic);
+                        // The projected copy keeps the bound column in the
+                        // owner's pool — re-intern it into the diagnosing
+                        // one before any gather gate reads it.
+                        let bound = if foreign {
+                            bound.map(|b| self.boundary.ty(file, b))
+                        } else {
+                            bound
+                        };
+                        (*name, bound)
+                    })
+                    .collect();
+                Some((*formals, decl.return_ty, params))
+            }
+            RowShape::Member {
+                recv: Receiver::Created { name, kind, .. },
+            } if *kind != ContainerKind::Extension => {
+                let Walk::Found(entry) = self.walk_members(*name, row.name) else {
+                    return None;
+                };
+                if entry.kind != MemberKind::Method || entry.is_static {
+                    return None;
+                }
+                let formals = match &entry {
+                    Projected::Own(e) => e.formals.as_deref()?.clone(),
+                    Projected::Foreign(e) => e.formals.as_deref()?.to_owned(),
+                };
+                let params = entry
+                    .type_param_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        (
+                            *name,
+                            entry
+                                .type_param_bounds
+                                .get(index)
+                                .copied()
+                                .filter(|b| *b != Ty::Dynamic),
+                        )
+                    })
+                    .collect();
+                Some((formals, entry.return_ty, params))
+            }
+            _ => None,
+        }
+    }
+
+    /// An instantiated function type as the argument walk's [`FnVarSig`]:
+    /// [`Self::infer_tear_off`] hands back the parameter-free shape with
+    /// the solve's choices substituted, and the per-argument decision face
+    /// (`fn_sig_subtype` + display) reads exactly that — the round-trip
+    /// twin of [`Self::fn_sig_ty`] (the pool shape's named column drops
+    /// the required bit; the display never reads it).
+    fn fn_var_sig_of_ty(&self, ty: Ty) -> Option<Box<FnVarSig>> {
+        let Ty::Function { shape, .. } = ty else {
+            return None;
+        };
+        let pool = self.boundary.pool();
+        let shape = pool.function_shape(shape);
+        Some(Box::new(FnVarSig {
+            params: Box::default(),
+            positional: shape.positional.to_vec().into_boxed_slice(),
+            required_positional: shape.required_positional,
+            named: shape
+                .named
+                .iter()
+                .map(|(name, ty)| (*name, *ty, false))
+                .collect(),
+            return_ty: shape.return_ty,
+        }))
+    }
+
     /// A captured [`FnVarSig`] as a pool `Ty::Function` — the inference
     /// face's argument-type materialization: a tear-off or closure literal
     /// constrains the call's type parameters through its signature
@@ -5830,6 +6427,35 @@ impl<'a> Engine<'a> {
             &positional,
             &named,
             false,
+        )
+    }
+
+    /// `ty` with a function type's `<...>` group erased — the
+    /// parameter-free shadow the pre-generic-metadata call gate (#4343)
+    /// compares on both sides: the engine's own function LUB drops the
+    /// group when joining differently named tear-off shapes (identical
+    /// pairs keep theirs via the equality shortcut), so the gate keys on
+    /// the join's shape authority, never on either spelling's names.
+    /// Non-function types pass through untouched.
+    fn strip_fn_params(&self, ty: Ty) -> Ty {
+        let Ty::Function { shape, nullable } = ty else {
+            return ty;
+        };
+        let (return_ty, positional, named) = {
+            let pool = self.boundary.pool();
+            let shape = pool.function_shape(shape);
+            (
+                shape.return_ty,
+                shape.positional.to_vec(),
+                shape.named.to_vec(),
+            )
+        };
+        self.boundary.args.borrow_mut().function_generic(
+            &[],
+            return_ty,
+            &positional,
+            &named,
+            nullable,
         )
     }
 
@@ -6356,6 +6982,7 @@ impl<'a> Engine<'a> {
         params: &[(StringId, Option<Ty>)],
         left_schema: bool,
         round: &mut Vec<(usize, Ty, Ty)>,
+        gate_fails_match: bool,
     ) -> bool {
         let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
         let push = |round: &mut Vec<(usize, Ty, Ty)>, index: usize, lower: Ty, upper: Ty| {
@@ -6378,6 +7005,15 @@ impl<'a> Engine<'a> {
             return true;
         }
         // Q is an inference parameter → `P <: Q` lower, with the bound gate.
+        // A gate failure DROPS the lower silently (the constrainArgument
+        // posture — the parameter stays unconstrained, the round's other
+        // constraints land); `gate_fails_match` flips it to the upstream
+        // match FAILURE (type_analyzer_operations.dart:2237-2256 — the
+        // failed `when` falls through to the declaration climb's `null`
+        // and the whole match rewinds), the tear-off instantiation's
+        // posture: the context contributed nothing at all and the solve
+        // settles at the declared bound (`g(f)` over Object parameters
+        // reads `T := num`, never the return's upper).
         if let Ty::Named {
             name,
             nullable: false,
@@ -6395,6 +7031,8 @@ impl<'a> Engine<'a> {
             };
             if gate_passes {
                 push(round, index, p, Ty::Unknown);
+            } else if gate_fails_match {
+                return false;
             }
             return true;
         }
@@ -6474,14 +7112,39 @@ impl<'a> Engine<'a> {
                             .copied()
                             .flatten()
                         {
-                            Some(Variance::Contravariant) => {
-                                self.infer_gather(qa, pa, params, left_schema, round)
-                            }
+                            Some(Variance::Contravariant) => self.infer_gather(
+                                qa,
+                                pa,
+                                params,
+                                left_schema,
+                                round,
+                                gate_fails_match,
+                            ),
                             Some(Variance::Invariant) => {
-                                self.infer_gather(pa, qa, params, left_schema, round)
-                                    && self.infer_gather(qa, pa, params, left_schema, round)
+                                self.infer_gather(
+                                    pa,
+                                    qa,
+                                    params,
+                                    left_schema,
+                                    round,
+                                    gate_fails_match,
+                                ) && self.infer_gather(
+                                    qa,
+                                    pa,
+                                    params,
+                                    left_schema,
+                                    round,
+                                    gate_fails_match,
+                                )
                             }
-                            _ => self.infer_gather(pa, qa, params, left_schema, round),
+                            _ => self.infer_gather(
+                                pa,
+                                qa,
+                                params,
+                                left_schema,
+                                round,
+                                gate_fails_match,
+                            ),
                         };
                         if !ok {
                             return false;
@@ -6506,7 +7169,8 @@ impl<'a> Engine<'a> {
                 // family's silence).
                 if p_args.is_empty() {
                     for (&ia, &qa) in inst.iter().zip(q_args.iter()) {
-                        if !self.infer_gather(ia, qa, params, left_schema, round) {
+                        if !self.infer_gather(ia, qa, params, left_schema, round, gate_fails_match)
+                        {
                             return false;
                         }
                     }
@@ -6531,7 +7195,7 @@ impl<'a> Engine<'a> {
                     .map(|&arg| self.subst_params(arg, &map).unwrap_or(arg))
                     .collect();
                 for (&pa, &qa) in p_inst_args.iter().zip(q_args.iter()) {
-                    if !self.infer_gather(pa, qa, params, left_schema, round) {
+                    if !self.infer_gather(pa, qa, params, left_schema, round, gate_fails_match) {
                         return false;
                     }
                 }
@@ -6552,12 +7216,13 @@ impl<'a> Engine<'a> {
                     params,
                     left_schema,
                     round,
+                    gate_fails_match,
                 ) {
                     return false;
                 }
                 // Positional formals contravariant: `Q.arg <: P.arg`.
                 for (&qa, &pa) in q_shape.positional.iter().zip(p_shape.positional.iter()) {
-                    if !self.infer_gather(qa, pa, params, !left_schema, round) {
+                    if !self.infer_gather(qa, pa, params, !left_schema, round, gate_fails_match) {
                         return false;
                     }
                 }
@@ -6566,7 +7231,7 @@ impl<'a> Engine<'a> {
                     let Some(&(_, pt)) = p_shape.named.iter().find(|&&(pn, _)| pn == qn) else {
                         return false;
                     };
-                    if !self.infer_gather(qt, pt, params, !left_schema, round) {
+                    if !self.infer_gather(qt, pt, params, !left_schema, round, gate_fails_match) {
                         return false;
                     }
                 }
@@ -6581,7 +7246,7 @@ impl<'a> Engine<'a> {
                     )
                 };
                 for (&pa, &qa) in p_shape.positional.iter().zip(q_shape.positional.iter()) {
-                    if !self.infer_gather(pa, qa, params, left_schema, round) {
+                    if !self.infer_gather(pa, qa, params, left_schema, round, gate_fails_match) {
                         return false;
                     }
                 }
@@ -6589,7 +7254,7 @@ impl<'a> Engine<'a> {
                     let Some(&(_, pt)) = p_shape.named.iter().find(|&&(pn, _)| pn == qn) else {
                         return false;
                     };
-                    if !self.infer_gather(pt, qt, params, left_schema, round) {
+                    if !self.infer_gather(pt, qt, params, left_schema, round, gate_fails_match) {
                         return false;
                     }
                 }
@@ -7288,6 +7953,14 @@ impl<'a> Engine<'a> {
         let mut origins: Vec<InferOrigin> = Vec::new();
         let mut fixed: Vec<bool> = vec![false; params.len()];
         let mut inferred_so_far: Vec<Ty> = vec![Ty::Unknown; params.len()];
+        // The pre-generic-metadata call face's candidate fold (#4343),
+        // filled by the argument round below and read by the final
+        // loop's generic-metadata gate. `tear_polluted` marks a parameter
+        // any non-tear-off (or partial) contribution lowered — the
+        // solution is then not the plain tear-off and the face stays
+        // silent (the oracle's LUB answer for a competing contributor).
+        let mut tear_candidates: Vec<Option<TearCandidate>> = vec![None; params.len()];
+        let mut tear_polluted: Vec<bool> = vec![false; params.len()];
 
         // Round 0 — the downward context (`constrainReturnType`, origin
         // ReturnType). The declared face folds its aliases first — the
@@ -7301,7 +7974,7 @@ impl<'a> Engine<'a> {
                 let origin = origins.len();
                 origins.push(InferOrigin::ReturnType { declared, context });
                 let mut raw = Vec::new();
-                self.infer_gather(declared, context, params, true, &mut raw);
+                self.infer_gather(declared, context, params, true, &mut raw, false);
                 self.infer_merge_round(params, &raw, origin, &mut constraints, &fixed);
             }
         }
@@ -7439,11 +8112,20 @@ impl<'a> Engine<'a> {
                 });
                 if let Some(instantiated) = self.infer_tear_off(&sig, formal.ty, *range) {
                     let mut raw = Vec::new();
-                    self.infer_gather(instantiated, formal.ty, params, false, &mut raw);
+                    self.infer_gather(instantiated, formal.ty, params, false, &mut raw, false);
                     self.infer_merge_round(params, &raw, origin, &mut constraints, &fixed);
                 }
                 continue;
             }
+            // #4343 — a generic tear-off argument against a NON-function
+            // formal keeps its own `<...>` group in its static type
+            // (upstream's tear-off type; this model's argument types
+            // carry the group too). The solve below runs on that type
+            // unchanged (unchanged verdict posture); the fold after the
+            // merge tracks it for the final loop's pre-generic-metadata
+            // gate.
+            let tear_arg = tear_params.as_deref().is_some_and(|p| !p.is_empty())
+                && matches!(arg_ty, Ty::Function { .. });
             let origin = origins.len();
             origins.push(InferOrigin::Argument {
                 parameter: formal.name,
@@ -7451,7 +8133,18 @@ impl<'a> Engine<'a> {
                 argument: arg_ty,
             });
             let mut raw = Vec::new();
-            let gathered = self.infer_gather(arg_ty, formal.ty, params, false, &mut raw);
+            // The alias formal decides on its unfolded right-hand side
+            // (`C(F<T> f)` gathers against `T Function()`, never the
+            // alias head — the parameter's lower rides the Function arm's
+            // bound gate, `NotA` never reaching `T extends A`).
+            let gathered = self.infer_gather(
+                arg_ty,
+                self.fold_alias_ty(formal.ty),
+                params,
+                false,
+                &mut raw,
+                false,
+            );
             if !gathered {
                 // A ground subtype failure rewinds the whole round
                 // (`_tryMatchSubtypeOf`'s `success` gate): the oracle's
@@ -7471,6 +8164,35 @@ impl<'a> Engine<'a> {
                 continue;
             }
             self.infer_merge_round(params, &raw, origin, &mut constraints, &fixed);
+            // #4343 — fold the candidate into every parameter this
+            // argument's WHOLE type lowered: the oracle's gate keys on
+            // the joined candidate (first contributor's parameter names
+            // win, the official function LUB's fresh-copy side — the join
+            // itself is the shape gate). A contributor the join rejects,
+            // a non-tear-off or partial competitor, or a context-fixed
+            // parameter keeps the silent posture — probed 3.13.7:
+            // `g2(f, h2)` reports `void Function<X>()`, `g2(f, 1)`,
+            // `g2(f<X>(X), h2<Y>())` and the generic-plus-erased pair
+            // stay clean.
+            for &(index, lower, _) in &raw {
+                if fixed[index] {
+                    continue;
+                }
+                if !tear_arg || lower != arg_ty {
+                    tear_polluted[index] = true;
+                    continue;
+                }
+                tear_candidates[index] = match tear_candidates[index].take() {
+                    None => Some(TearCandidate::Live(arg_ty)),
+                    Some(TearCandidate::Live(acc)) => {
+                        match self.join_generic_candidates(acc, arg_ty) {
+                            Some(joined) => Some(TearCandidate::Live(joined)),
+                            None => Some(TearCandidate::Dead),
+                        }
+                    }
+                    Some(dead @ TearCandidate::Dead) => Some(dead),
+                };
+            }
         }
 
         // Final choose (`tryChooseFinalTypes`): the same per-parameter
@@ -7553,6 +8275,70 @@ impl<'a> Engine<'a> {
                     inferred_ty,
                     &constraints[index],
                     &origins,
+                );
+                let parameter = self.strings.resolve(params[index].0).to_string();
+                let message = SemanticCode::CouldNotInfer.message(&parameter, &detail);
+                self.emit_message_with_correction(
+                    SemanticCode::CouldNotInfer,
+                    callee_range,
+                    message,
+                );
+                reported = true;
+            }
+            // #4343 — the pre-generic-metadata CALL face: upstream's
+            // independent generic-metadata arm (generic_inferrer.dart's
+            // `_reportErrors`, the `_genericMetadataIsEnabled` gate fed
+            // by `invocation_inference_helper.dart:74-75`'s
+            // defining-library feature set — the settled
+            // `generic_metadata_enabled` flag, `enabledIn 2.14` in the
+            // vendored registry, never a comment re-parse) fires when a
+            // solved parameter's inferred type still carries its own
+            // type parameters while the unit keeps the feature off —
+            // the generic tear-off argument's whole type as the
+            // parameter's solution, reported at the callee NAME
+            // (`errorEntity` is `node.function`, never the whole send).
+            // The comparison erases the `<...>` group on both sides:
+            // the engine's own function LUB drops the group when it
+            // joins two differently named tear-off shapes while
+            // identical pairs keep theirs, and the fold's join is the
+            // shape authority either way. A polluted parameter (any
+            // non-tear-off or partial contributor lowered it) never
+            // fires — the oracle's LUB answer there is not the tear-off.
+            // Independent of the `!success` arm above — a bounded
+            // parameter reports BOTH rows in this order (probed 3.13.7);
+            // sets `reported` the way upstream's `hasErrorReported`
+            // gates the bounds twin.
+            if !seam_reported
+                && !self.generic_metadata_enabled
+                && !tear_polluted[index]
+                && let Some(TearCandidate::Live(full)) = tear_candidates[index]
+                && self.strip_fn_params(inferred_ty) == self.strip_fn_params(full)
+                && let Ty::Function {
+                    shape: full_shape, ..
+                } = full
+            {
+                let params_named: Vec<(StringId, Option<Ty>)> = {
+                    let pool = self.boundary.pool();
+                    pool.function_shape(full_shape).type_params_named.to_vec()
+                };
+                let names: Vec<String> = params_named
+                    .iter()
+                    .map(|(name, bound)| match bound {
+                        None => self.strings.resolve(*name).to_string(),
+                        Some(bound) => {
+                            format!(
+                                "{} extends {}",
+                                self.strings.resolve(*name),
+                                self.ty_display(*bound)
+                            )
+                        }
+                    })
+                    .collect();
+                let candidate_text = self.ty_display(full);
+                let detail = format!(
+                    " Inferred candidate type {candidate_text} has type parameters [{}], \
+                     but a function with type parameters cannot be used as a type argument.",
+                    names.join(", ")
                 );
                 let parameter = self.strings.resolve(params[index].0).to_string();
                 let message = SemanticCode::CouldNotInfer.message(&parameter, &detail);
@@ -7657,7 +8443,7 @@ impl<'a> Engine<'a> {
             let mut raw = Vec::new();
             // The bound's OWN spelling matches against the lower — the
             // raw declared face (`T1 Function(T1)`), not the closure.
-            self.infer_gather(lower, raw_bound, params, true, &mut raw);
+            self.infer_gather(lower, raw_bound, params, true, &mut raw, false);
             let mut lower_new = Ty::Unknown;
             let mut upper_new = Ty::Unknown;
             for &(target, l, u) in &raw {
@@ -7830,7 +8616,6 @@ impl<'a> Engine<'a> {
             function: fn_ty,
             context,
         }];
-        let mut raw = Vec::new();
         let infer_fn = {
             let pool_shape = {
                 let pool = self.boundary.pool();
@@ -7853,8 +8638,15 @@ impl<'a> Engine<'a> {
         };
         // `fnType <: contextType` covariant — the fn type's pieces are
         // the schema (`leftSchema: true` keeps `P`-side upper arms live
-        // for the signature's own parameters).
-        self.infer_gather(infer_fn, context, &params, true, &mut raw);
+        // for the signature's own parameters). A bound-gate failure fails
+        // the match whole (`gate_fails_match` — the tear-off instantiation
+        // runs `_tryMatchSubtypeOf`'s rewind semantics, so a failed
+        // context contributes NOTHING: no lower, no return upper; the
+        // solve then settles at the declared bound, `T := num`).
+        let mut raw = Vec::new();
+        if !self.infer_gather(infer_fn, context, &params, true, &mut raw, true) {
+            raw.clear();
+        }
         let fixed = vec![false; params.len()];
         self.infer_merge_round(&params, &raw, 0, &mut constraints, &fixed);
         let mut inferred: Vec<Ty> = Vec::with_capacity(params.len());
@@ -8212,6 +9004,13 @@ impl<'a> Engine<'a> {
     /// `FunctionContext` origin spells.
     fn tear_off_arg_params(&self, offset: u32) -> Option<Box<[(StringId, Option<Ty>)]>> {
         let row = self.rows.iter().find(|row| row.range.offset == offset)?;
+        // The qualified faces answer through their own declaration lookup
+        // (`a.f`, `C().m`); the window capture below is a same-file
+        // bare-callee fact.
+        if row.qualified {
+            let (_, _, params) = self.qualified_tear_off_face(row)?;
+            return Some(params);
+        }
         let decl = self.top_level_decl(row.name)?;
         if decl.type_param_names.is_empty() {
             return None;
@@ -8478,15 +9277,16 @@ impl<'a> Engine<'a> {
             // instance face — the constructor-argument membership check
             // walks the superclass chain like a declaration-typed receiver,
             // and the generic method's own parameters solve upward from
-            // the arguments (`m<T>(T x)` binds `T := int`). The created
-            // receiver carries no written instantiation, so the declaring
-            // container's parameters join unseeded — `new Box().get()`
-            // stays unsolved where `box.get()` read `int`
-            // (generic_inferrer.dart's upward constraint arm; a `C<int>()`
-            // creation's explicit arguments live on the callee row, not
-            // this receiver — under-report over a wrong binding).
-            Receiver::Created { name, kind, .. } if kind != ContainerKind::Extension => {
-                (name, kind, None)
+            // the arguments (`m<T>(T x)` binds `T := int`). A resolved
+            // instance type seeds the declaring container's parameters the
+            // way a declaration-typed receiver's written type does
+            // (`new Foo<String>().m(42)` binds the container's `T :=
+            // String`, #4336); an unresolved creation leaves them
+            // unseeded — `new Box().get()` stays unsolved where
+            // `box.get()` read `int` (generic_inferrer.dart's upward
+            // constraint arm; under-report over a wrong binding).
+            Receiver::Created { name, kind, ty } if kind != ContainerKind::Extension => {
+                (name, kind, ty)
             }
             _ => return None,
         };
@@ -8573,12 +9373,6 @@ impl<'a> Engine<'a> {
         // never a bound source — while the declared bounds are the facts
         // `check_call_type_arg_bounds` needs.
         let declared = decl_bounds(&entry);
-        let mut params: Vec<(StringId, Option<Ty>)> = entry
-            .type_param_names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| (*name, own_bound(index)))
-            .collect();
         // The declaring container's parameters join only for the
         // receiver's own member: an inherited member's formals spell the
         // SUPERTYPE's parameter names, which happen to collide with the
@@ -8625,6 +9419,44 @@ impl<'a> Engine<'a> {
                 seeds.push((*param, Ty::named(*param)));
             }
         }
+        // The method's own parameters, seeded by `own_bound`'s
+        // context-free corner; a receiver instantiation's seeds otherwise
+        // substitute the declared bound (`Foo<String>` grounds the
+        // method's `U extends T` to `U extends String`) — the face the
+        // gather's bound gate and the extends fallback read (the
+        // oracle's substituted extendsConstraint; a gate failure drops
+        // the argument's lower, the failAtError-silent recovery settles
+        // the slot at the bound — ATNA only, never couldNotInfer). Only a
+        // fully grounded bound answers; one still spelling a container
+        // or method parameter keeps the prior boundless face
+        // (under-report).
+        let mut params: Vec<(StringId, Option<Ty>)> = entry
+            .type_param_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let bound = own_bound(index).or_else(|| {
+                    let bound = entry
+                        .type_param_bounds
+                        .get(index)
+                        .copied()
+                        .filter(|b| *b != Ty::Dynamic)?;
+                    if seeds.is_empty() {
+                        return None;
+                    }
+                    let substituted = self.subst_params(bound, &seeds).unwrap_or(bound);
+                    let mentions_param = seeds
+                        .iter()
+                        .any(|(param, _)| self.formal_mentions_param(substituted, *param))
+                        || entry
+                            .type_param_names
+                            .iter()
+                            .any(|param| self.formal_mentions_param(substituted, *param));
+                    (!mentions_param).then_some(substituted)
+                });
+                (*name, bound)
+            })
+            .collect();
         params.extend(
             container_params
                 .iter()
@@ -9320,6 +10152,559 @@ impl<'a> Engine<'a> {
             }
         };
         self.check_creation_inference_at(container, range)
+    }
+
+    /// #4332 — `strict-inference`'s `inference_failure_on_instance_creation`
+    /// (upstream Dart SDK source, pkg/analyzer/lib/src/dart/element/
+    /// generic_inferrer.dart:411-421 and `_reportInferenceFailure`'s
+    /// ConstructorName arm :597-609): a constructible generic head invoked
+    /// with implicit type arguments whose parameters neither a context nor
+    /// an argument constrained — the instantiate-to-bounds fallback the
+    /// creation faces already take — reports at the written
+    /// constructor-name chain (`c.HashMap.from`, prefix segment through
+    /// selector), keyed by the same spelling. The gates mirror upstream:
+    /// a written `<...>` group outranks inference (the explicit face),
+    /// `@optionalTypeArgs` on the head exempts (:598-601), the annotation
+    /// spelling reports only under `generic-metadata` (:610-624,
+    /// enabledIn 2.13 — the library feature-set grant the parser's
+    /// feature carrier folds, package version and `// @dart` override
+    /// alike), and
+    /// a type-alias head stays silent (a non-generic alias fixes its
+    /// parameters at its own declaration — no call-site inference runs;
+    /// the generic-alias spelling keeps the under-report residual). The
+    /// `as`-cast exception (:589-596) is a residual too.
+    fn check_strict_creation_inference(
+        &mut self,
+        callee: usize,
+        args: &[(Option<StringId>, Ty, bool, SourceRange)],
+        close: SourceRange,
+    ) {
+        if !self.strict.inference {
+            return;
+        }
+        // The constructor-name chain at the callee: `class(` /
+        // `prefix.class(` / `class.selector(` / `prefix.class.selector(` —
+        // recovered from the callee row and the qualified links below it.
+        let constructible = |kind: ContainerKind| {
+            matches!(
+                kind,
+                ContainerKind::Class
+                    | ContainerKind::Enum
+                    | ContainerKind::Extension
+                    | ContainerKind::ExtensionType
+            )
+        };
+        let Some(row) = self.rows.get(callee) else {
+            return;
+        };
+        let (class_index, selector) = match &row.shape {
+            // `class(` — the callee row is the bare class head itself.
+            RowShape::Bare(BareInfo::Container { .. }) if !row.qualified => (callee, None),
+            RowShape::Bare(BareInfo::Plain { .. }) | RowShape::Member { .. } if row.qualified => {
+                let below = callee.checked_sub(1).and_then(|index| self.rows.get(index));
+                match below.map(|link| &link.shape) {
+                    // `prefix.class(` — the callee row itself is the
+                    // prefixed class head.
+                    Some(RowShape::Bare(BareInfo::Prefix { .. })) => (callee, None),
+                    // `class.selector(` / `prefix.class.selector(` — the
+                    // class head sits directly below.
+                    _ => (
+                        callee.checked_sub(1).unwrap_or(usize::MAX),
+                        Some((row.name, row.range)),
+                    ),
+                }
+            }
+            _ => return,
+        };
+        let Some(class_row) = self.rows.get(class_index) else {
+            return;
+        };
+        let (class, class_span, prefix) = match &class_row.shape {
+            RowShape::Bare(BareInfo::Container { name, kind })
+                if !class_row.qualified && constructible(*kind) =>
+            {
+                (*name, class_row.range, None)
+            }
+            // The prefixed class head: a qualified plain row over a Prefix
+            // row, or a member row whose receiver resolved a prefix.
+            RowShape::Bare(BareInfo::Plain { .. }) if class_row.qualified => {
+                let below = class_index
+                    .checked_sub(1)
+                    .and_then(|index| self.rows.get(index));
+                match below.map(|link| &link.shape) {
+                    Some(RowShape::Bare(BareInfo::Prefix { name })) => {
+                        (class_row.name, class_row.range, Some(*name))
+                    }
+                    _ => return,
+                }
+            }
+            RowShape::Member {
+                recv: Receiver::Prefix { name },
+            } => (class_row.name, class_row.range, Some(*name)),
+            _ => return,
+        };
+        // The zero-parameter alias-to-class callee reshapes its row's
+        // SHAPE to the aliased class at the argument open
+        // (`open_arguments`' alias fold) while `class_row.name` keeps
+        // the alias spelling — the oracle runs no call-site inference
+        // through the alias (a non-generic alias fixes its parameters
+        // at its own declaration), so the folded shape stays silent
+        // exactly like the un-folded one.
+        if self.bounds.alias_params(class_row.name).is_some() {
+            return;
+        }
+        self.strict_creation_row(class, class_span, prefix, selector, args, close, false);
+    }
+
+    /// The shared tail of the strict-inference creation row's two
+    /// spellings — the send's constructor-name chain above and the
+    /// metadata group's annotation below. Every gate that passes leaves
+    /// the head's parameters to the instantiate-to-bounds fallback, the
+    /// inference failure the strict mode reports once; the annotation
+    /// spelling anchors the whole `@…(…)` node (upstream's
+    /// whole-Annotation `at`, generic_inferrer.dart:617-624), every
+    /// other spelling the chain itself.
+    fn strict_creation_row(
+        &mut self,
+        class: StringId,
+        class_span: SourceRange,
+        prefix: Option<StringId>,
+        selector: Option<(StringId, SourceRange)>,
+        args: &[(Option<StringId>, Ty, bool, SourceRange)],
+        close: SourceRange,
+        annotation: bool,
+    ) {
+        // A written `<...>` group after the class segment outranks
+        // inference — the explicit face owns the instantiation.
+        let bytes = self.source.as_bytes();
+        let mut at = self.byte_of(class_span.end());
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at < bytes.len() && bytes[at] == b'<' {
+            return;
+        }
+        // The head's parameters: this-file bounds capture, the prefixed
+        // file's container, or the foreign element model. An alias head
+        // stays silent — its parameters were fixed at its own
+        // instantiation.
+        let params: Vec<(StringId, Option<Ty>)> = if let Some(prefix) = prefix {
+            let Lookup::Found(NamespaceEntry::Decl(file)) = self
+                .namespaces
+                .lookup_prefixed(self.graph, self.lib, prefix, class)
+            else {
+                return;
+            };
+            let Some(unit) = self.index.get(file) else {
+                return;
+            };
+            match unit.decl(class).map(|decl| decl.kind) {
+                Some(kind)
+                    if kind == MicroKind::Class
+                        || kind == MicroKind::Enum
+                        || kind == MicroKind::Extension => {}
+                _ => return,
+            }
+            let Some(container) = unit.container(class) else {
+                return;
+            };
+            container
+                .type_param_names
+                .iter()
+                .map(|&param| (param, None))
+                .collect()
+        } else if self.bounds.alias_params(class).is_some() {
+            return;
+        } else if let Some(capture) = self.bounds.container_params(class) {
+            capture
+                .into_iter()
+                .map(|(param, bound, _)| (param, bound.as_ref().map(|tree| self.tree_ty(tree))))
+                .collect()
+        } else if let Some(names) = self.foreign_container_params(class) {
+            names.into_iter().map(|param| (param, None)).collect()
+        } else {
+            return;
+        };
+        if params.is_empty() {
+            return;
+        }
+        // `@optionalTypeArgs` on the head exempts (upstream reads the
+        // element's metadata; the token walk behind the annotation's
+        // `class`-keyword run answers the same names).
+        if prefix.is_none() && self.optional_type_args_heads().contains(&class) {
+            return;
+        }
+        // The annotation spelling reports only under `generic-metadata`
+        // (`_genericMetadataIsEnabled` — the library's settled language
+        // version, the parser feature carrier's own fold).
+        if annotation && !self.generic_metadata_enabled {
+            return;
+        }
+        // The written chain span: the class head's own extent, grown back
+        // over the `.prefix` link and forward through the selector — the
+        // ConstructorName node the oracle anchors.
+        let mut start = self.byte_of(class_span.offset);
+        if prefix.is_some() {
+            let mut back = start;
+            while back > 0 && bytes[back - 1].is_ascii_whitespace() {
+                back -= 1;
+            }
+            if back == 0 || bytes[back - 1] != b'.' {
+                return;
+            }
+            back -= 1;
+            while back > 0 && bytes[back - 1].is_ascii_whitespace() {
+                back -= 1;
+            }
+            let end = back;
+            let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+            while back > 0 && is_ident(bytes[back - 1]) {
+                back -= 1;
+            }
+            if back == end {
+                return;
+            }
+            start = back;
+        }
+        let chain_end = selector
+            .map(|(_, span)| span.end())
+            .unwrap_or_else(|| class_span.end());
+        let chain = SourceRange {
+            offset: self.utf16_of(start),
+            length: chain_end - self.utf16_of(start),
+        };
+        // A context type that names the head (or a supertype spelling of
+        // it) constrains the parameters — the downward face.
+        if let Some(seed) = self.creation_context_seed(class, chain.offset, params.len())
+            && seed
+                .iter()
+                .any(|ty| !matches!(ty, Ty::Dynamic | Ty::Unknown))
+        {
+            return;
+        }
+        // An argument whose formal mentions a parameter constrains it —
+        // the upward face (`HashMap.of({…})` binds its pair; the raw
+        // `Map` formal of `.from` binds nothing). The formal table
+        // consults the same lane the argument walk takes: the plain
+        // constructor table, the forwarded mixin-application table, and
+        // the factory-only table (`HashMap.of`/`.from` are factories —
+        // the generative table holds nothing for them).
+        if let Some(formals) = self
+            .ctor_schema_formals(class, selector.map(|(name, _)| name).unwrap_or(class))
+            .or_else(|| {
+                self.forwarded_ctor_formals(class, selector.map(|(name, _)| name).unwrap_or(class))
+            })
+            .or_else(|| {
+                self.factory_ctor_formals(class, selector.map(|(name, _)| name).unwrap_or(class))
+            })
+        {
+            let mut constrained: Vec<(StringId, Ty)> = Vec::new();
+            let mut positional = 0usize;
+            for (index, (name, ty, _, range)) in args.iter().enumerate() {
+                let formal = if let Some(name) = name {
+                    self.named_formal_for(&formals, *name)
+                } else {
+                    let formal = formals.positional.get(positional);
+                    positional += 1;
+                    formal
+                };
+                let Some(formal) = formal else {
+                    continue;
+                };
+                // A literal argument's close-time row type can still be
+                // the pass-2 sentinel; read the span the sibling
+                // argument faces read, then the literal's own leaf-LUB
+                // face, before the unify decides. A multi-row literal
+                // (the untyped `{1: 1}` keeps its element rows live on
+                // the stack) enters as the unknown zero-span sentinel —
+                // the single-row window face refuses it — and its own
+                // segment of the parenthesized interior carries the
+                // bracket pair instead.
+                let ty = self
+                    .rebound_read_face(*range)
+                    .or_else(|| self.read_type_at(*range))
+                    .or_else(|| self.strict_arg_literal_ty(*range))
+                    .or_else(|| {
+                        (*ty == Ty::UNKNOWN && range.offset == 0 && range.length == 0)
+                            .then(|| self.strict_arg_window_literal(index, close))
+                            .flatten()
+                    })
+                    .unwrap_or(*ty);
+                if ty != Ty::UNKNOWN {
+                    self.unify_ctor_upward(formal.ty, ty, &params, &mut constrained);
+                }
+            }
+            if !constrained.is_empty() {
+                return;
+            }
+        }
+        // The annotation anchor is the whole Annotation node (`@C()` —
+        // `@` through the group's `)`); every other spelling anchors the
+        // chain itself.
+        let anchor = if annotation {
+            let bytes = self.source.as_bytes();
+            let mut back = self.byte_of(chain.offset);
+            while back > 0 && bytes[back - 1].is_ascii_whitespace() {
+                back -= 1;
+            }
+            if back > 0 && bytes[back - 1] == b'@' {
+                let offset = self.utf16_of(back - 1);
+                SourceRange {
+                    offset,
+                    length: close.end() - offset,
+                }
+            } else {
+                chain
+            }
+        } else {
+            chain
+        };
+        let text = self.source[start..self.byte_of(chain_end)].to_string();
+        let correction = SemanticCode::InferenceFailureOnInstanceCreation.correction_message(&text);
+        self.report.diagnostics.push(Diagnostic::new(
+            SemanticCode::InferenceFailureOnInstanceCreation.severity(),
+            SemanticCode::InferenceFailureOnInstanceCreation.code_info(),
+            SemanticCode::InferenceFailureOnInstanceCreation.message(&text, ""),
+            self.file,
+            anchor,
+            correction,
+        ));
+    }
+
+    /// The untyped collection literal's own type for the strict-inference
+    /// upward walk: the literal's argument row sits at its close bracket
+    /// carrying the unknown sentinel, so [`Engine::collection_literal_ty`]
+    /// — the same on-demand leaf-LUB face the assignment face prints —
+    /// answers it (`HashMap.of({1: 1})` binds its pair through the
+    /// `Map<K, V>` factory formal).
+    fn strict_arg_literal_ty(&self, range: SourceRange) -> Option<Ty> {
+        let kind = *self.untyped_literals.get(&range.offset)?;
+        let family = match kind {
+            UntypedLiteral::List => self.collection_heads[0],
+            UntypedLiteral::SetElements => self.collection_heads[1],
+            // An empty `{}`'s side is the context's call; either reading
+            // constrains the parameters to `dynamic` (the seed the
+            // instantiate-to-bounds fallback would take anyway), and a
+            // decided map's leaves answer below.
+            UntypedLiteral::EmptyBraces | UntypedLiteral::MapEntries => self.collection_heads[2],
+        };
+        let operand = Row {
+            name: self.intern(""),
+            range,
+            qualified: false,
+            shape: RowShape::Value,
+            intent: Intent::Read,
+            write_op: None,
+            ty: Ty::UNKNOWN,
+        };
+        self.collection_literal_ty(&operand, family)
+    }
+
+    /// The unknown zero-span entry's own argument window as an untyped
+    /// collection literal: every argument — named or positional, claimed
+    /// or unclaimed — owns exactly one entry and one top-level segment
+    /// of the call's parenthesized interior (written order, a trailing
+    /// comma's empty tail included in neither), so the i-th entry reads
+    /// the i-th segment. A segment that IS a bare literal — its trimmed
+    /// extent exactly one bracket group, a named segment's value past
+    /// its label colon — asks [`Self::strict_arg_literal_ty`] at the
+    /// group's close bracket, then at its open bracket (the empty
+    /// `[]`'s own key seat). Any other segment answers nothing (the
+    /// sentinel's own unknown posture stands).
+    fn strict_arg_window_literal(&self, index: usize, close: SourceRange) -> Option<Ty> {
+        let bytes = self.source.as_bytes();
+        let close_b = self.byte_of(close.offset);
+        let open = matching_bracket_back(bytes, close_b)?;
+        let mut segments = value_comma_segments(bytes, open + 1, close_b);
+        // A trailing comma's empty tail is no argument — the same
+        // boundary the row model's own argument flush takes.
+        if segments
+            .last()
+            .is_some_and(|&(start, end)| trim_value_ws(bytes, start, end) >= end)
+        {
+            segments.pop();
+        }
+        let &(start, end) = segments.get(index)?;
+        // A named segment's value sits past its label colon — but a
+        // ternary's colon is top-level too, so only a bare-identifier
+        // label (`m: {1: 1}`) trims; `a ? b : c` keeps its whole extent.
+        let label_start = trim_value_ws(bytes, start, end);
+        let named_colon = value_top_level_colon(bytes, start, end).filter(|&colon| {
+            let label = bytes[label_start..colon].trim_ascii_end();
+            !label.is_empty()
+                && label
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+        });
+        let start = named_colon.map_or(label_start, |colon| trim_value_ws(bytes, colon + 1, end));
+        let end = start + bytes[start..end].trim_ascii_end().len();
+        if !matches!(bytes.get(start), Some(b'{') | Some(b'[')) {
+            return None;
+        }
+        // A bare literal's bracket group closes exactly at the
+        // segment's end — a trailing selector (`{1: 1}.length`) is not
+        // the literal's own window.
+        let bracket = matching_bracket_fwd(bytes, start)?;
+        if bracket + 1 != end {
+            return None;
+        }
+        [bracket, start].into_iter().find_map(|byte| {
+            self.strict_arg_literal_ty(SourceRange {
+                offset: self.utf16_of(byte),
+                length: 1,
+            })
+        })
+    }
+
+    /// The head names an `@optionalTypeArgs` annotation declares: the
+    /// token walk over each `@optionalTypeArgs` site's following
+    /// header-keyword run (`@optionalTypeArgs class C`, modifiers
+    /// included) to the head identifier. Upstream's element-metadata read
+    /// covers any declaring file; this face answers this-file spellings
+    /// (the foreign element model carries no annotation column).
+    fn optional_type_args_heads(&self) -> FxHashSet<StringId> {
+        let spelling = |token: &dartq_scanner::Token| -> &str {
+            let at = token.byte_offset as usize;
+            &self.source[at..at + token.byte_len as usize]
+        };
+        let mut heads = FxHashSet::default();
+        let tokens = self.tokens.as_slice();
+        let mut index = 0;
+        while let Some(token) = tokens.get(index) {
+            if token.kind == dartq_scanner::TokenKind::At
+                && tokens
+                    .get(index + 1)
+                    .is_some_and(|next| next.kind == dartq_scanner::TokenKind::Identifier)
+                && spelling(tokens.get(index + 1).expect("peeked")) == "optionalTypeArgs"
+            {
+                let mut scan = index + 2;
+                while matches!(
+                    tokens.get(scan).map(|next| next.kind),
+                    Some(dartq_scanner::TokenKind::Keyword(_))
+                ) {
+                    scan += 1;
+                }
+                if let Some(head) = tokens.get(scan)
+                    && head.kind == dartq_scanner::TokenKind::Identifier
+                {
+                    heads.insert(self.intern(spelling(head)));
+                }
+            }
+            index += 1;
+        }
+        heads
+    }
+
+    /// #4332 — the metadata spelling of the strict-inference creation
+    /// row: a metadata argument group carries no callee link (the
+    /// generic open's invoke slot is `None` and the head pushed no row),
+    /// so the send walk's seam never fires for it. The written chain the
+    /// source spells before the group carries the same facts the row
+    /// entry recovers — the pending entry's joined name resolves the
+    /// head (`p.C`, `p.C.named`) — and the shared tail's gates decide.
+    /// Upstream's Annotation arm (generic_inferrer.dart:610-624) keys
+    /// the class element and its `@optionalTypeArgs` metadata, reports
+    /// the whole `@…(…)` node, and stays silent wherever generic
+    /// metadata is not enabled.
+    fn check_strict_annotation_inference(
+        &mut self,
+        args: &[(Option<StringId>, Ty, bool, SourceRange)],
+        close: SourceRange,
+    ) {
+        if !self.strict.inference {
+            return;
+        }
+        if self.pending_annotations.is_empty() {
+            return;
+        }
+        // Walk back from the first argument (or the empty group's close
+        // paren) over trivia to the `(`, then over the dotted identifier
+        // chain, and require the `@` that heads the annotation. A
+        // written `<…>` group between the head and the group needs no
+        // walk of its own: the tail's `<` gate reads it off the class
+        // segment directly.
+        let bytes = self.source.as_bytes();
+        let base = args
+            .first()
+            .map(|(.., range)| range.offset)
+            .unwrap_or(close.offset);
+        let mut cursor = self.byte_of(base);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || bytes[cursor - 1] != b'(' {
+            return;
+        }
+        cursor -= 1;
+        let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+        // The chain's segments, innermost-first: adjacent identifier
+        // runs joined by plain `.` links (the metadata parse accepted
+        // this chain, so no trivia-tolerant scan is needed).
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        loop {
+            let mut back = cursor;
+            while back > 0 && is_ident(bytes[back - 1]) {
+                back -= 1;
+            }
+            if back == cursor {
+                return;
+            }
+            segments.push((back, cursor));
+            if back > 0 && bytes[back - 1] == b'.' {
+                cursor = back - 1;
+            } else {
+                cursor = back;
+                break;
+            }
+        }
+        let mut at = cursor;
+        while at > 0 && bytes[at - 1].is_ascii_whitespace() {
+            at -= 1;
+        }
+        if at == 0 || bytes[at - 1] != b'@' {
+            return;
+        }
+        segments.reverse();
+        if segments.len() > 3 {
+            return;
+        }
+        let texts: Vec<StringId> = segments
+            .iter()
+            .map(|&(start, end)| self.intern(&self.source[start..end]))
+            .collect();
+        // The prefixed head (`p.C`, `p.C.named`) resolves its first
+        // segment as an import prefix; every other spelling takes the
+        // first segment as the class and a trailing one as the
+        // constructor selector (`C.named`).
+        let (class, class_index, prefix, selector) = if texts.len() >= 2
+            && matches!(
+                self.namespaces
+                    .lookup_prefixed(self.graph, self.lib, texts[0], texts[1]),
+                Lookup::Found(_)
+            ) {
+            (texts[1], 1, Some(texts[0]), texts.get(2).copied())
+        } else {
+            (texts[0], 0, None, texts.get(1).copied())
+        };
+        let (start, end) = segments[class_index];
+        let class_span = SourceRange {
+            offset: self.utf16_of(start),
+            length: self.utf16_of(end) - self.utf16_of(start),
+        };
+        // The selector's extent is the chain's last segment when one
+        // rides (a `p.C.named` chain's `named`; a `p.C` chain's `C` is
+        // the class, never the selector).
+        let selector = selector.map(|name| {
+            let (start, end) = segments[segments.len() - 1];
+            (
+                name,
+                SourceRange {
+                    offset: self.utf16_of(start),
+                    length: self.utf16_of(end) - self.utf16_of(start),
+                },
+            )
+        });
+        self.strict_creation_row(class, class_span, prefix, selector, args, close, true);
     }
 
     /// #2841 — the alias-callee route's inference half: a bare
@@ -10482,8 +11867,14 @@ impl<'a> Engine<'a> {
                             continue;
                         };
                         let mut raw = Vec::new();
-                        let gathered =
-                            self.infer_gather(*ty, formal.ty, &gather_params, false, &mut raw);
+                        let gathered = self.infer_gather(
+                            *ty,
+                            formal.ty,
+                            &gather_params,
+                            false,
+                            &mut raw,
+                            false,
+                        );
                         if gathered {
                             self.infer_merge_round(&params, &raw, 0, &mut constraints, &no_fixed);
                         }
@@ -13170,6 +14561,14 @@ impl<'a> Engine<'a> {
             }
         }
         let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
+            // #4332 — the metadata group's own spelling: the group
+            // carries no callee link (the head pushed no row), so the
+            // seam beside `check_creation_inference` below never fires
+            // for it; the pending entry and this level's arguments carry
+            // the same facts (upstream's Annotation arm).
+            if !self.pending_annotations.is_empty() {
+                self.check_strict_annotation_inference(&level.args, close);
+            }
             // A dot-preceded latch head is a named selector (`C.named(`),
             // not an unnamed head — the latch also arms for the
             // named-selector creation fold, whose class-segment
@@ -13906,6 +15305,13 @@ impl<'a> Engine<'a> {
                     .and_then(|f| f.container(*name))
                     .and_then(|c| c.ctor_formals.get(name))
                     .map(|f| (**f).clone())
+                    // The unnamed FACTORY's own written formals (the
+                    // factory-only table, #4336): `class C<P extends num>
+                    // { factory C(Iterable<P> p) ... }` pairs `C([])`
+                    // against `Iterable<P>` — the unnamed generative
+                    // table holds nothing when every unnamed constructor
+                    // is a factory.
+                    .or_else(|| self.factory_ctor_formals(*name, *name))
                     .or_else(|| self.forwarded_ctor_formals(*name, *name))
                     .or_else(|| {
                         self.declared_extends_unresolved(*name)
@@ -13987,6 +15393,12 @@ impl<'a> Engine<'a> {
         // statement creations). The engine-side wrapper owns the shape,
         // context, and explicit-argument guards and emits both rows.
         let seam_reported = self.check_creation_inference(callee);
+        // #4332 — the strict-inference creation row rides the same seam:
+        // the argument group's close is where the implicit-argument
+        // fallback is already settled (the callee row links, the context
+        // stands), so the unconstrained-parameters verdict reads here.
+        self.check_strict_creation_inference(callee, &level.args, close);
+
         // #2869 — the creation bounds face rides the same seam: a send
         // whose head has no formals returns below, and its written type
         // arguments still check against the head's substituted bounds
@@ -14009,6 +15421,41 @@ impl<'a> Engine<'a> {
                 .filter(|row| !row.qualified)
                 .and_then(|row| self.fn_var_sigs.get(&row.name))
                 .map(|sig| sig.formals(self.intern("")))
+        });
+        let formals = formals.or_else(|| {
+            // #4336: the bare creation's head row is still the Plain
+            // identifier at the argument close (the unnamed-creation fold
+            // runs at the send close, after this check) — a head that
+            // names a class with an unnamed constructor answers the
+            // creation's formals here, so `C([])` pairs against
+            // `Iterable<P>` exactly like the keyworded spellings do
+            // (`resolveArgumentsToParameters`). A local that shadows the
+            // class stays out (its read hits `local_hits`).
+            let row = self.rows.get(callee)?;
+            if row.qualified
+                || !matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+                || self.local_hits.contains_key(&row.range.offset)
+            {
+                return None;
+            }
+            let (decl, owner) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                row.name,
+            )?;
+            let mut formals = decl
+                .ctor_formals
+                .get(&row.name)
+                .or_else(|| decl.factory_formals.get(&row.name))
+                .map(|f| (**f).clone())?;
+            self.project_formals(owner, &mut formals);
+            if owner == self.file {
+                self.patch_field_formals(row.name, &mut formals);
+            }
+            Some(formals)
         });
         let Some(formals) = formals else {
             // #3495 — the EXTENSION-member send's bounds face. A member the
@@ -14136,12 +15583,15 @@ impl<'a> Engine<'a> {
                     creation_head = Some(below.range.offset);
                 }
                 let container = match recv {
-                    Receiver::Created {
-                        name,
-                        kind: ContainerKind::Class,
-                        ..
-                    }
-                    | Receiver::Container {
+                    // A CREATED receiver's send is the member face, never
+                    // the creation's: `new Foo<String>().method(42)` owns
+                    // its inference through `member_send_params` (the
+                    // receiver's written instantiation seeds the declaring
+                    // container's parameters and the method's own bound
+                    // substitutes through them, #4336) — mapping Created
+                    // here would arm the container-params creation path
+                    // below and starve the member's own parameters.
+                    Receiver::Container {
                         name,
                         kind: ContainerKind::Class,
                     } => Some(name),
@@ -14226,6 +15676,33 @@ impl<'a> Engine<'a> {
             RowShape::Member { .. } => (None, Some(self.callee_return_ty(row))),
             _ => (None, None),
         };
+        // #4336: the bare creation's head row is still the Plain
+        // identifier at the argument close (the unnamed-creation fold
+        // runs at the send close, after this check) — a head that names
+        // a class with an unnamed constructor takes the creation faces
+        // here, so `C([])` solves its container parameters and pairs the
+        // arguments against the substituted formals like the folded
+        // Container row does. A local that shadows the class stays out
+        // (its read hits `local_hits`).
+        let creation_container = creation_container.or_else(|| {
+            let row = self.rows.get(callee)?;
+            (!row.qualified
+                && matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+                && !self.local_hits.contains_key(&row.range.offset)
+                && resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    row.name,
+                )
+                .is_some_and(|(decl, _)| {
+                    decl.ctor_formals.contains_key(&row.name)
+                        || decl.factory_formals.contains_key(&row.name)
+                }))
+            .then_some(row.name)
+        });
         // The implicit-`call` face's return: the call method's declared
         // return is the send's return face, whatever spelling the callee
         // row carries (a bare `body(...)`'s top-level lookup answered
@@ -15039,7 +16516,18 @@ impl<'a> Engine<'a> {
                     }
                     let mut sig = (*sig).clone();
                     sig.params = tear_params;
-                    let _ = self.infer_tear_off(&sig, formal.ty, *range);
+                    // The solve's answer IS the argument's type: upstream's
+                    // `inferTearOff` return feeds the outer
+                    // `constrainArgument` round, and the per-argument walk
+                    // below decides and displays the INSTANTIATED
+                    // signature — `g(f)` reports `num Function(num, num)`
+                    // against the formal, never the written
+                    // `T Function<T extends num>(T, T)`.
+                    if let Some(instantiated) = self.infer_tear_off(&sig, formal.ty, *range)
+                        && let Some(instantiated_sig) = self.fn_var_sig_of_ty(instantiated)
+                    {
+                        self.arg_sigs.insert(range.offset, instantiated_sig);
+                    }
                 }
             }
         }
@@ -15066,6 +16554,22 @@ impl<'a> Engine<'a> {
                         _ if self.infer_poisoned_params.contains(param) => Ty::UNKNOWN,
                         (Some(ty), _) if explicit_fixed.contains(&index) => *ty,
                         (Some(ty), None) => *ty,
+                        // A creation's dynamic-only solution is the
+                        // no-constraint posture (an empty-list literal
+                        // typed without its formal context — `C([])` over
+                        // `Iterable<P>` reads `List<dynamic>`, whose
+                        // element passes any bound gate): the oracle
+                        // constrains nothing and instantiate-to-bounds
+                        // settles `P` at its bound, so the effective
+                        // formal reads `Iterable<num>` and the ATNA row
+                        // fires against the bound, never `dynamic`
+                        // (#4336; a non-creation send keeps its dynamic
+                        // answer — those faces are pinned elsewhere).
+                        (Some(Ty::Dynamic), Some(bound))
+                            if unnamed_creation || creation_container.is_some() =>
+                        {
+                            *bound
+                        }
                         (Some(ty), Some(bound))
                             if self.assignable(*ty, *bound, false) != Some(false) =>
                         {
@@ -15078,8 +16582,95 @@ impl<'a> Engine<'a> {
                 .collect(),
         };
 
+        // #4336: an empty list literal pushes no row, so an argument
+        // window holding only `[]` closes empty and the flush drops it —
+        // `C([])` pairs nothing against `Iterable<P>`. Recover each
+        // unclaimed `[]` that sits at a TOP-LEVEL argument slot of this
+        // list (the non-whitespace bytes around it are the list's own
+        // punctuation — `(`/`,` before, `,`/`)` after; a nested
+        // `[].length` operand or a named `a: []` value reads `.` or `:`
+        // and stays out) as `List<dynamic>` (the oracle's upward
+        // staticType of `[]` — `visitListLiteral` with no context keys
+        // the element at `dynamic`), re-inserted in offset order so the
+        // positional pairing keeps source order. The scan reads the
+        // source bytes directly — the empty literal's own close event
+        // lands AFTER this list's close on the `[]`-token split path, so
+        // no parse-time side table answers here. Only the empty LIST
+        // answers; the empty map/set spellings keep the under-report
+        // posture.
+        let mut args: Vec<(Option<StringId>, Ty, bool, SourceRange)> = level.args.clone();
+        {
+            let list_open = self.rows.get(callee).map_or(0, |row| row.range.end());
+            let bytes = self.source.as_bytes();
+            let from = self.byte_of(list_open).min(bytes.len());
+            let to = self.byte_of(close.offset).min(bytes.len());
+            let top_level_slot = |open: usize, end: usize| -> bool {
+                let mut before = open;
+                while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+                    before -= 1;
+                }
+                let mut after = end;
+                while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+                before > 0
+                    && matches!(bytes[before - 1], b'(' | b',')
+                    && matches!(bytes.get(after), Some(b',' | b')'))
+            };
+            let mut hits: Vec<(u32, u32)> = Vec::new();
+            let mut cursor = from;
+            while cursor + 1 < to {
+                if bytes[cursor] == b'['
+                    && bytes[cursor + 1] == b']'
+                    && let (open, end) = (self.utf16_of(cursor), self.utf16_of(cursor + 2))
+                    && top_level_slot(cursor, cursor + 2)
+                {
+                    hits.push((open, end));
+                }
+                cursor += 1;
+            }
+            // An overlapping entry the flush typed `Unknown` is the same
+            // vanishing literal's fallback face (its anchor is the
+            // window's last row, not the argument's span): the literal's
+            // own type and extent REPLACE it, keeping the slot's order;
+            // an extent no entry claims is a wholly dropped argument and
+            // is added in offset order.
+            let list_dynamic =
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .named(self.intern("List"), false, &[Ty::Dynamic]);
+            for (open, end) in hits {
+                let span = SourceRange {
+                    offset: open,
+                    length: end - open,
+                };
+                let overlap = args
+                    .iter()
+                    .position(|(.., span)| span.offset < end && open < span.end());
+                match overlap {
+                    // An overlapping entry the flush typed `Unknown` is
+                    // the same vanishing literal's fallback face (its
+                    // anchor is the window's last row, not the
+                    // argument's span): the literal's own type and
+                    // extent REPLACE it, keeping the slot's order.
+                    Some(index) if args[index].0.is_none() && args[index].1 == Ty::Unknown => {
+                        args[index].1 = list_dynamic;
+                        args[index].3 = span;
+                    }
+                    // A REAL entry over the extent is a nested operand
+                    // (`[x].length`): the bytes were never a dropped
+                    // argument — skip.
+                    Some(_) => {}
+                    None => args.push((None, list_dynamic, false, span)),
+                }
+            }
+            if !args.is_empty() {
+                args.sort_by_key(|(.., span)| span.offset);
+            }
+        }
         let mut positional_index = 0usize;
-        for (name, ty, literal, range) in &level.args {
+        for (name, ty, literal, range) in &args {
             let mut positional_slot = None;
             let formal = if let Some(n) = name {
                 self.named_formal_for(&formals, *n)
@@ -15268,6 +16859,24 @@ impl<'a> Engine<'a> {
                 None
             };
             let arg_sig = tear_off_sig.or(closure_sig.clone());
+            // The argument node's own extent — upstream anchors an
+            // argument's diagnostics at the whole argument expression
+            // (error_detection_helpers.dart's `.at(node)` over the
+            // argument), so a QUALIFIED tear-off (`a.f`, `C().m`) reports
+            // over the receiver-joined span while the walk's rows keep
+            // the member segment (the merge never extends a member row
+            // over its receiver). `member_reads` carries the receiver's
+            // full span (the merge's popped row).
+            let report_range = self
+                .member_reads
+                .iter()
+                .find(|read| read.offset == range.offset)
+                .filter(|read| read.recv_span.length > 0 && read.recv_span.end() <= range.offset)
+                .map_or(*range, |read| SourceRange {
+                    offset: read.recv_span.offset,
+                    length: range.end() - read.recv_span.offset,
+                });
+            let mut tear_off_undecided = false;
             if let Some(arg_sig) = arg_sig {
                 if let Some(formal_sig) = formal_sig {
                     // The literal's downward face runs BEFORE the ask: a
@@ -15303,11 +16912,11 @@ impl<'a> Engine<'a> {
                             // through the context-wired argument check
                             // (error_detection_helpers.dart:359-365).
                             let index = self.report.diagnostics.len();
-                            self.emit_message_with_correction(code, *range, message);
+                            self.emit_message_with_correction(code, report_range, message);
                             self.pending_non_promotion.push((index, range.offset));
                             continue;
                         }
-                        None => {}
+                        None => tear_off_undecided = closure_sig.is_none(),
                     }
                 } else {
                     // A function-type alias formal (`typedef Pred = bool
@@ -15350,11 +16959,11 @@ impl<'a> Engine<'a> {
                                 let to_text = self.ty_display(formal_ty);
                                 let message = code.message3(&from_text, &to_text, "");
                                 let index = self.report.diagnostics.len();
-                                self.emit_message_with_correction(code, *range, message);
+                                self.emit_message_with_correction(code, report_range, message);
                                 self.pending_non_promotion.push((index, range.offset));
                                 continue;
                             }
-                            None => {}
+                            None => tear_off_undecided = closure_sig.is_none(),
                         }
                     }
                     // A tear-off against a formal with no written function
@@ -15403,7 +17012,7 @@ impl<'a> Engine<'a> {
                         let to_text = self.ty_display(formal_ty);
                         let message = code.message3(&from_text, &to_text, "");
                         let index = self.report.diagnostics.len();
-                        self.emit_message_with_correction(code, *range, message);
+                        self.emit_message_with_correction(code, report_range, message);
                         self.pending_non_promotion.push((index, range.offset));
                         continue;
                     }
@@ -15458,7 +17067,7 @@ impl<'a> Engine<'a> {
                                 let to_text = self.ty_display(formal_ty);
                                 let message = code.message3(&from_text, &to_text, "");
                                 let index = self.report.diagnostics.len();
-                                self.emit_message_with_correction(code, *range, message);
+                                self.emit_message_with_correction(code, report_range, message);
                                 self.pending_non_promotion.push((index, range.offset));
                                 continue;
                             }
@@ -15466,6 +17075,18 @@ impl<'a> Engine<'a> {
                         }
                     }
                 }
+            }
+            // A tear-off whose INSTANTIATED signature stayed undecidable
+            // keeps the under-report silence: the oracle checks only the
+            // instantiated type at the argument (the raw generic function
+            // spelling is never the argument's staticType there), so an
+            // undecided pair is the engine's abstention face — falling
+            // through would stage the raw spelling against the formal and
+            // fabricate a row the oracle never writes (`f` under
+            // `Object cb(int, int)` rests on an `int <: Object` edge the
+            // unindexed closure abstains on; #4336).
+            if tear_off_undecided {
+                continue;
             }
             if self.argument_verdict(*ty, formal_ty, *literal) == Some(false) {
                 // The raw-generic face (#2172's `_base.equals(e1, e2)`): a
@@ -16987,9 +18608,10 @@ impl<'a> Engine<'a> {
                         name,
                         kind,
                         // #3398: the creation's resolved `ty` rides along —
-                        // populated by #3394 (`ty: Some(solved)` when
-                        // `solved != Ty::UNKNOWN`).
-                        ty: None,
+                        // `Some(solved)` when the close solve answered
+                        // (`solved != Ty::UNKNOWN`), the raw head
+                        // otherwise.
+                        ty: (solved != Ty::UNKNOWN).then_some(solved),
                     }),
                     intent: Intent::Read,
                     write_op: None,
@@ -17497,6 +19119,34 @@ impl<'a> Engine<'a> {
         // group anchored: the bounds faces consume them (#2890), every other
         // arm drops them (no call follows to ground the latch).
         let latched_args = self.call_args_for(row_index);
+        // The const tearoff faces run before the row's shape borrow opens
+        // (the arms' `return`s would skip a tail emit): a constant-context
+        // reference with no call reports each type-parameter leaf of the
+        // written group — `A<T>` before a `.`-follower is a constructor
+        // reference (`visitConstructorReference`,
+        // constant_verifier.dart:202-211 — the bare `A<int>` type literal
+        // is never visited upstream and stays silent), a plain value head
+        // is a function reference (`visitFunctionReference`,
+        // constant_verifier.dart:247-264 — a type-alias head is a type
+        // literal, never a `FunctionReference` node).
+        if self.in_const_reference_context()
+            && let Some(row) = self.rows.get(row_index)
+            && !row.qualified
+        {
+            let tearoff = match &row.shape {
+                RowShape::Bare(BareInfo::Container { .. }) => {
+                    Some(self.dot_follows_range_end(range))
+                }
+                RowShape::Bare(BareInfo::Plain { .. }) => (!self
+                    .top_level_decl(row.name)
+                    .is_some_and(|d| d.kind == MicroKind::TypeAlias))
+                .then_some(false),
+                _ => None,
+            };
+            if let Some(ctor) = tearoff {
+                self.emit_const_tearoff_type_params(range, ctor);
+            }
+        }
         let Some(row) = self.rows.get(row_index) else {
             return;
         };
@@ -18566,7 +20216,16 @@ impl<'a> Engine<'a> {
                     } else {
                         self.check_prefixed_annotation_arity(ctor, ctor_range, count, range);
                     }
-                } else if !matches!(self.resolve_bare(class).0, BareInfo::Missing { .. }) {
+                } else if !matches!(
+                    self.resolve_bare(class).0,
+                    // A head resolving to a NON-TYPE value (a top-level
+                    // function shadowing the prefix position,
+                    // `const nonPrefix.Class<int>()`) dead-ends at the
+                    // NamedType shadow arm — `_buildTypeArguments` never
+                    // runs, so no constructor-arity face follows
+                    // (named_type_resolver.dart:113-128; #4339).
+                    BareInfo::Missing { .. } | BareInfo::Plain { .. }
+                ) {
                     let class = self.strings.resolve(class).to_string();
                     let ctor = self.strings.resolve(ctor).to_string();
                     self.emit3(

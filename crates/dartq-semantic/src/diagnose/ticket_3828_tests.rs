@@ -128,6 +128,7 @@ fn probe_bounds_face(
         false,
         features.patterns_enabled,
         features.triple_shift_enabled,
+        features.generic_metadata_enabled,
         StrictModes::default(),
         &posture,
         None,

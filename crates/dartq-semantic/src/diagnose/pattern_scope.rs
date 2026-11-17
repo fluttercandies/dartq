@@ -73,6 +73,12 @@ impl Engine<'_> {
     /// unless the top scope is this switch's member mid-head-group
     /// (shared-body `case A: case B:` heads run back to back).
     pub(crate) fn switch_member_head_begin(&mut self) {
+        // The #4011 binder-bind mask is per-HEAD: the previous head's
+        // snapshot (its `switch_member_head_done`) already read it, and a
+        // same-name binder in THIS head (a written `Object a` under an
+        // earlier head's bound `var a`) must not inherit the earlier
+        // head's mask.
+        self.switch.bound_binder_names.clear();
         let depth = self.switch.switches.len();
         if self
             .switch_arm_scopes
@@ -118,14 +124,22 @@ impl Engine<'_> {
         };
         // `head_mark` is the locals watermark the head opened over; the
         // rows it added are this head's declared set (the official
-        // `_SharedCaseScope.addAll` input triples).
+        // `_SharedCaseScope.addAll` input triples). A name the #4011
+        // pattern-binder bind typed joins as UNTYPED: the parse-time
+        // lattice faces (scrutinee, container columns, record slots) are
+        // promotion-blind against the oracle's flow-integrated per-head
+        // static types, and this face was calibrated over untyped heads.
         let vars: Vec<(StringId, Option<Ty>, bool)> = self.locals[mark.min(self.locals.len())..]
             .iter()
             .filter(|decl| matches!(decl.kind, LocalKind::PatternVariable))
             .map(|decl| {
                 (
                     decl.name,
-                    self.local_declared_ty(decl.name),
+                    if self.switch.bound_binder_names.contains(&decl.name) {
+                        None
+                    } else {
+                        self.local_declared_ty(decl.name)
+                    },
                     self.pattern_var_is_final(decl.range.offset),
                 )
             })

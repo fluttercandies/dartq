@@ -486,6 +486,23 @@ pub enum SemanticCode {
     /// type-parameter leaf, checked before the constructor's own
     /// resolution).
     ConstWithTypeParameters,
+    /// `A constant constructor tearoff can't use a type parameter as a type
+    /// argument.` — a `C<T>.new` constructor reference applied in a
+    /// constant context (`visitConstructorReference`,
+    /// constant_verifier.dart:202-211 — the same wire code as the creation
+    /// face; only the site message differs).
+    ConstWithTypeParametersCtorTearoff,
+    /// `A constant function tearoff can't use a type parameter as a type
+    /// argument.` — an `f<T>` function reference applied in a constant
+    /// context (`visitFunctionReference`, constant_verifier.dart:247-264 —
+    /// the same wire code as the creation face).
+    ConstWithTypeParametersFnTearoff,
+    /// `Can't define the 'const' constructor because the field '{0}' is
+    /// initialized with a non-constant value.` — a const constructor whose
+    /// instance field carries an initializer that is not a valid constant
+    /// (`_validateFieldInitializers`, constant_verifier.dart:910-951 — the
+    /// row anchors at the constructor's `const` keyword).
+    ConstConstructorWithFieldInitializedByNonConst,
     /// `The values in a const list literal must be constants.`
     NonConstantListElement,
     /// `The values in a const set literal must be constants.`
@@ -1143,6 +1160,18 @@ pub enum SemanticCode {
     /// and local functions follow their oracle exemptions
     /// (the local-function visit is an upstream TODO there).
     InferenceFailureOnFunctionReturnType,
+    /// `The type argument(s) of the constructor '{0}' can't be inferred.`
+    /// — the `strict-inference` mode's instance-creation row
+    /// (`generic_inferrer.dart:411-421`'s unknown-formal report,
+    /// `_reportInferenceFailure`'s ConstructorName arm :597-609): a
+    /// generic class's constructor invoked with no written type
+    /// arguments whose parameters no context and no argument constrained
+    /// (the instantiate-to-bounds fallback), keyed by the written
+    /// constructor name (`c.HashMap.from` prefix through selector) and
+    /// anchored at the ConstructorName chain; `@optionalTypeArgs` on the
+    /// class and the pre-generic-metadata annotation spelling stay
+    /// exempt.
+    InferenceFailureOnInstanceCreation,
     // —— #612: the variance family (the `variance` experiment only; all
     //    `COMPILE_TIME_ERROR`) ————————————————————————————————————————————
     /// `The '{0}' type parameter '{1}' can't be used in an '{2}' position.`
@@ -2723,9 +2752,15 @@ impl SemanticCode {
                 "CONST_WITH_NON_CONSTANT_ARGUMENT",
             ),
             Self::ConstWithNonConst => ("const_with_non_const", "CONST_WITH_NON_CONST"),
-            Self::ConstWithTypeParameters => {
+            Self::ConstWithTypeParameters
+            | Self::ConstWithTypeParametersCtorTearoff
+            | Self::ConstWithTypeParametersFnTearoff => {
                 ("const_with_type_parameters", "CONST_WITH_TYPE_PARAMETERS")
             }
+            Self::ConstConstructorWithFieldInitializedByNonConst => (
+                "const_constructor_with_field_initialized_by_non_const",
+                "CONST_CONSTRUCTOR_WITH_FIELD_INITIALIZED_BY_NON_CONST",
+            ),
             Self::NonConstantListElement => {
                 ("non_constant_list_element", "NON_CONSTANT_LIST_ELEMENT")
             }
@@ -3063,6 +3098,10 @@ impl SemanticCode {
             Self::InferenceFailureOnFunctionReturnType => (
                 "inference_failure_on_function_return_type",
                 "INFERENCE_FAILURE_ON_FUNCTION_RETURN_TYPE",
+            ),
+            Self::InferenceFailureOnInstanceCreation => (
+                "inference_failure_on_instance_creation",
+                "INFERENCE_FAILURE_ON_INSTANCE_CREATION",
             ),
             // The #612 variance family (diagnostic.g.dart:18498-18519,
             // :18771-18783, :18809-18825).
@@ -3883,6 +3922,7 @@ impl SemanticCode {
             // :8110).
             | Self::StrictRawType
             | Self::InferenceFailureOnFunctionReturnType
+            | Self::InferenceFailureOnInstanceCreation
             // The W6 @sealed contract rows are `STATIC_WARNING`
             // (diagnostic.g.dart:11584 and :15866).
             | Self::MixinOnSealedClass
@@ -4196,6 +4236,9 @@ impl SemanticCode {
             Self::InferenceFailureOnFunctionReturnType => {
                 format!("The return type of '{a0}' can't be inferred.")
             }
+            Self::InferenceFailureOnInstanceCreation => {
+                format!("The type argument(s) of the constructor '{a0}' can't be inferred.")
+            }
             // The #610 bounds rows: the enum face carries no arguments
             // (diagnostic.g.dart:4913-4914).
             Self::EnumInstantiatedToBoundsIsNotWellBounded => {
@@ -4368,6 +4411,18 @@ impl SemanticCode {
                 "A constant creation can't use a type parameter as a type argument."
                     .to_string()
             }
+            Self::ConstWithTypeParametersCtorTearoff => {
+                "A constant constructor tearoff can't use a type parameter as a type argument."
+                    .to_string()
+            }
+            Self::ConstWithTypeParametersFnTearoff => {
+                "A constant function tearoff can't use a type parameter as a type argument."
+                    .to_string()
+            }
+            Self::ConstConstructorWithFieldInitializedByNonConst => format!(
+                "Can't define the 'const' constructor because the field '{a0}' is initialized \
+                 with a non-constant value."
+            ),
             Self::NonConstantListElement => {
                 "The values in a const list literal must be constants.".to_string()
             }
@@ -5925,6 +5980,9 @@ impl SemanticCode {
             Self::InferenceFailureOnFunctionReturnType => {
                 Some(format!("Declare the return type of '{a2}'."))
             }
+            Self::InferenceFailureOnInstanceCreation => {
+                Some(format!("Use explicit type argument(s) for '{a2}'."))
+            }
             // The #314 residue family's corrections (diagnostic.g.dart
             // :11045-11092/:13806-13855); `mustCallSuper` and the
             // concrete-implementation pair carry none.
@@ -6632,6 +6690,7 @@ mod tests {
             // #702 @sealed contract.
             SemanticCode::StrictRawType,
             SemanticCode::InferenceFailureOnFunctionReturnType,
+            SemanticCode::InferenceFailureOnInstanceCreation,
             SemanticCode::WrongTypeParameterVariancePosition,
             SemanticCode::WrongExplicitTypeParameterVarianceInSuperinterface,
             SemanticCode::WrongTypeParameterVarianceInSuperinterface,
@@ -7575,6 +7634,9 @@ mod tests {
             | SemanticCode::ConstWithNonConst
             | SemanticCode::ConstWithNonConstantArgument
             | SemanticCode::ConstWithTypeParameters
+            | SemanticCode::ConstWithTypeParametersCtorTearoff
+            | SemanticCode::ConstWithTypeParametersFnTearoff
+            | SemanticCode::ConstConstructorWithFieldInitializedByNonConst
             | SemanticCode::ConstantPatternNeverMatchesValueType
             | SemanticCode::ConstantPatternWithNonConstantExpression
             | SemanticCode::EqualKeysInMapPattern
@@ -7620,6 +7682,7 @@ mod tests {
             | SemanticCode::InconsistentInheritance
             | SemanticCode::InconsistentInheritanceGetterAndMethod
             | SemanticCode::InferenceFailureOnFunctionReturnType
+            | SemanticCode::InferenceFailureOnInstanceCreation
             | SemanticCode::InheritsAbstractMemberFivePlus
             | SemanticCode::InheritsAbstractMemberFour
             | SemanticCode::InheritsAbstractMemberOne
@@ -7984,6 +8047,9 @@ mod tests {
             SemanticCode::ConstWithNonConst,
             SemanticCode::ConstWithNonConstantArgument,
             SemanticCode::ConstWithTypeParameters,
+            SemanticCode::ConstWithTypeParametersCtorTearoff,
+            SemanticCode::ConstWithTypeParametersFnTearoff,
+            SemanticCode::ConstConstructorWithFieldInitializedByNonConst,
             SemanticCode::ConstantPatternNeverMatchesValueType,
             SemanticCode::ConstantPatternWithNonConstantExpression,
             SemanticCode::EqualKeysInMapPattern,
@@ -8022,6 +8088,7 @@ mod tests {
             SemanticCode::InconsistentInheritance,
             SemanticCode::InconsistentInheritanceGetterAndMethod,
             SemanticCode::InferenceFailureOnFunctionReturnType,
+            SemanticCode::InferenceFailureOnInstanceCreation,
             SemanticCode::InheritsAbstractMemberFivePlus,
             SemanticCode::InheritsAbstractMemberFour,
             SemanticCode::InheritsAbstractMemberOne,

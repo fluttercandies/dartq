@@ -676,8 +676,11 @@ impl<'a> Engine<'a> {
             // effective return — whose element argument is the declared
             // face each element answers (`typed_literal_resolver.dart`
             // `_fromContextType`). A position carrying no context keeps
-            // the opaque posture.
+            // the opaque posture, except the pre-generic-metadata upward
+            // face below (`[f]` over a generic tear-off under
+            // `// @dart=2.12`).
             let Some(declared) = self.list_literal_ctx_element(left) else {
+                self.check_pre_generic_metadata_element(left, right);
                 return;
             };
             declared
@@ -984,6 +987,386 @@ impl<'a> Engine<'a> {
                     &a0,
                     &a1,
                 );
+            }
+        }
+    }
+
+    /// The pre-generic-metadata list-literal element face (#4335, envelope
+    /// #4337): a contextless untyped list literal infers its element
+    /// parameter UPWARD from the elements, and a candidate that is itself
+    /// a generic function type is not a legal type argument while the
+    /// unit's settled feature set keeps `generic-metadata` off — the
+    /// element inferrer reports `could_not_infer` at the literal with the
+    /// "Inferred candidate type … has type parameters …" detail (upstream
+    /// Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/generic_inferrer.dart:379-407,
+    /// the `_genericMetadataIsEnabled` gate fed by
+    /// `invocation_inference_helper.dart:74-75`'s
+    /// `definingLibrary.featureSet.isEnabled(Feature.generic_metadata)` —
+    /// the settled flag this engine already carries, threshold
+    /// `enabledIn 2.14` in the vendored registry; a pre-2.14 PACKAGE
+    /// default with no `// @dart` comment opts out exactly like the
+    /// comment override, 3.13.7-oracle-probed).
+    ///
+    /// The candidate face folds every element — each a bare top-level
+    /// generic function reference (`[f]`, `[f, f]`, `[f, g]`) — through
+    /// [`Self::join_generic_candidates`], the official function LUB's
+    /// same-count/same-bounds shape join. Non-identifier operands,
+    /// non-generic or unresolvable candidates, and joins the shape gate
+    /// rejects (count, bounds, formal-kind mismatches — the oracle's own
+    /// silent rows) keep the silent posture (the under-report direction);
+    /// a position carrying context never reaches this face at all (the
+    /// declared arm of [`Self::check_list_literal_elements`] owns it).
+    /// Set/map literals never reach this face either: their element
+    /// inferers are constructed WITHOUT the diagnostic reporter upstream
+    /// (`typed_literal_resolver.dart` `_inferSetTypeDownwards` :640-661 /
+    /// `_inferMapTypeDownwards` :525-549 pass no `diagnosticReporter`,
+    /// only `_inferListTypeDownwards` :463-484 does), so the
+    /// generic-metadata report is structurally silent on them — probed
+    /// 3.13.7: `{f}`, `{f, f}`, `{1: f}`, `{f: 1}` all stay clean.
+    fn check_pre_generic_metadata_element(&mut self, left: Token, right: Token) {
+        if self.generic_metadata_enabled {
+            return;
+        }
+        let bytes = self.source.as_bytes();
+        let start = self.byte_of(left.range.end());
+        let end = self.byte_of(right.range.offset);
+        if start >= end {
+            return;
+        }
+        // Top-level element segments — the declared walk's segmentation
+        // (depth-0 commas outside strings).
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let mut seg = start;
+        let mut depth = 0usize;
+        let mut i = start;
+        while i < end {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    segments.push((seg, i));
+                    seg = i + 1;
+                }
+                b'\'' | b'"' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < end && bytes[i] != quote {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        segments.push((seg, end));
+        // Every element must be a bare identifier naming a top-level
+        // generic function — the tear-off candidate its static type is.
+        // The fold joins the candidates pairwise (source order, the same
+        // order the inferrer accumulates its constraints); a join the
+        // shape gate rejects keeps the silent posture.
+        let mut folded: Option<Ty> = None;
+        for &(lo, hi) in &segments {
+            let (mut lo, mut hi) = (lo, hi);
+            while lo < hi && bytes[lo].is_ascii_whitespace() {
+                lo += 1;
+            }
+            while hi > lo && bytes[hi - 1].is_ascii_whitespace() {
+                hi -= 1;
+            }
+            if lo >= hi {
+                return;
+            }
+            let spelling = &self.source[lo..hi];
+            let identifier = spelling
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'$')
+                && spelling
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$');
+            if !identifier {
+                return;
+            }
+            let name = self.intern(spelling);
+            let Some(ty) = self.generic_tear_off_candidate(name) else {
+                return;
+            };
+            folded = Some(match folded {
+                None => ty,
+                Some(acc) => match self.join_generic_candidates(acc, ty) {
+                    Some(joined) => joined,
+                    None => return,
+                },
+            });
+        }
+        let Some(ty) = folded else {
+            return;
+        };
+        let names: Vec<String> = match ty {
+            Ty::Function { shape, .. } => {
+                let pool = self.boundary.pool();
+                pool.function_shape(shape)
+                    .type_params_named
+                    .iter()
+                    .map(|(name, _)| self.strings.resolve(*name).to_string())
+                    .collect()
+            }
+            _ => return,
+        };
+        let candidate_text = self.ty_display(ty);
+        let detail = format!(
+            " Inferred candidate type {candidate_text} has type parameters [{}], \
+             but a function with type parameters cannot be used as a type argument.",
+            names.join(", ")
+        );
+        let message = SemanticCode::CouldNotInfer.message("E", &detail);
+        let range = SourceRange {
+            offset: left.range.offset,
+            length: right.range.end() - left.range.offset,
+        };
+        self.emit_message_with_correction(SemanticCode::CouldNotInfer, range, message);
+    }
+
+    /// The full function type of a bare top-level generic function
+    /// reference — return, formals, and the declaration's own `<...>`
+    /// group with its written bounds — the tear-off candidate the
+    /// pre-generic-metadata element face adopts as its upward constraint.
+    /// `None` for every other shape: non-function kinds, non-generic
+    /// functions, getters/setters (no formal group), or an unresolvable
+    /// name.
+    fn generic_tear_off_candidate(&self, name: StringId) -> Option<Ty> {
+        let decl = self.top_level_decl(name)?;
+        if !matches!(decl.kind, MicroKind::TopLevelFn) || decl.type_params == 0 {
+            return None;
+        }
+        let formals = decl.formals.as_deref()?;
+        let positional: Vec<Ty> = formals.positional.iter().map(|f| f.ty).collect();
+        let named: Vec<(StringId, Ty)> = formals.named.iter().map(|f| (f.name, f.ty)).collect();
+        let required = formals.positional.iter().filter(|f| f.required).count();
+        let type_params: Vec<(StringId, Option<Ty>)> = decl
+            .type_param_names
+            .iter()
+            .zip(decl.type_param_bounds.iter())
+            .map(|(name, bound)| (*name, (*bound != Ty::Dynamic).then_some(*bound)))
+            .collect();
+        Some(self.boundary.args.borrow_mut().function_generic_required(
+            &type_params,
+            u16::try_from(required).unwrap_or(u16::MAX),
+            decl.return_ty,
+            &positional,
+            &named,
+            false,
+        ))
+    }
+
+    /// The element-candidate join of [`Self::check_pre_generic_metadata_element`]
+    /// — the official function-type LUB gate (upstream
+    /// `_functionType`, least_upper_bound.dart:663-779, with
+    /// `relateTypeParameters`' bounds equality, type_system.dart:1581-1633):
+    ///
+    /// - the type-parameter COUNTS must agree, else `None` (upstream
+    ///   answers the bare `Function` interface, on which the
+    ///   generic-metadata report cannot fire — probed 3.13.7: `[f<X, Y>,
+    ///   g<Z>]` stays clean);
+    /// - the written bounds must agree pairwise (`None` is the implicit
+    ///   `dynamic` bound), else `None` — probed: `[f<X extends num>, g<Y>]`
+    ///   stays clean. A bound mentioning its own parameter (an F-bound)
+    ///   spells differently across the two declarations and reads unequal
+    ///   here — upstream alpha-substitutes before comparing; the residual
+    ///   is under-report only;
+    /// - the required-positional counts must agree and the paired
+    ///   positional prefix (the `min` length) must cover them; surplus
+    ///   optional positionals drop exactly as upstream's leftover walk
+    ///   skips them (:757-769);
+    /// - the named-formal NAME SETS must agree; each matched name and
+    ///   each paired positional takes the greatest lower bound
+    ///   ([`Self::candidate_formal_glb`]);
+    /// - the return slot takes the LUB ([:771]) via
+    ///   [`Self::join_operand_ty`] — `int`/`double` returns join `num`,
+    ///   probed: `[int f<X>(), double g<Y>()]` reports
+    ///   `num Function<X>()`.
+    ///
+    /// The joined shape keeps the LEFT (first-seen) element's written
+    /// type-parameter names and bounds — upstream's fresh copies come
+    /// from the first list (`typeParameters1[index].freshCopy()`), so
+    /// `[g, f]` reports `void Function<Y>()`, probed. `None` keeps the
+    /// literal's silent posture for every shape the gate rejects.
+    pub(crate) fn join_generic_candidates(&self, left: Ty, right: Ty) -> Option<Ty> {
+        let (Ty::Function { shape: l, .. }, Ty::Function { shape: r, .. }) = (left, right) else {
+            return None;
+        };
+        let (first_params, left_required, returns, positional, named, left_names, right_names) = {
+            let pool = self.boundary.pool();
+            let a = pool.function_shape(l);
+            let b = pool.function_shape(r);
+            if a.type_params != b.type_params {
+                return None;
+            }
+            let bounds_equal = a
+                .type_params_named
+                .iter()
+                .zip(b.type_params_named.iter())
+                .all(|((_, a_bound), (_, b_bound))| a_bound == b_bound);
+            if !bounds_equal {
+                return None;
+            }
+            if a.required_positional != b.required_positional {
+                return None;
+            }
+            let paired = a.positional.len().min(b.positional.len());
+            if paired < a.required_positional as usize {
+                return None;
+            }
+            if a.named.len() != b.named.len() {
+                return None;
+            }
+            (
+                a.type_params_named.to_vec(),
+                a.required_positional,
+                (a.return_ty, b.return_ty),
+                (
+                    a.positional[..paired].to_vec(),
+                    b.positional[..paired].to_vec(),
+                ),
+                (a.named.to_vec(), b.named.to_vec()),
+                a.type_params_named
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>(),
+                b.type_params_named
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // Upstream instantiates BOTH sides with the shared fresh parameter
+        // set before pairing (`substitution2.substituteType` after
+        // `relateTypeParameters`) — `T Function<T>(T)` and
+        // `U Function<U>(U)` pair T against T, never T against U. The
+        // closed-face mirror renames the right side's own BARE parameter
+        // references onto the left's names; a deeper generic mention
+        // (`List<U>`) the shallow rename cannot spell stays itself and
+        // fails the GLB below — the under-report direction.
+        let alpha = |ty: Ty| -> Ty {
+            if let Ty::Named {
+                name,
+                nullable,
+                args,
+            } = ty
+                && args == ArgListId::EMPTY
+                && let Some(index) = right_names.iter().position(|n| *n == name)
+            {
+                Ty::Named {
+                    name: left_names[index],
+                    nullable,
+                    args,
+                }
+            } else {
+                ty
+            }
+        };
+        // The return slot's LUB always answers, so a return still carrying
+        // a parameter mention the shallow rename cannot spell (`List<U>`
+        // beside `List<T>`) would render a wrong candidate text — the
+        // join falls silent there rather than invent one. Identical
+        // returns (the common shape) and fully closed returns
+        // (`int`/`double` → `num`) are the faces the message spells.
+        if returns.0 != alpha(returns.1)
+            && (self.join_return_mentions_param(returns.0, &left_names)
+                || self.join_return_mentions_param(returns.1, &right_names))
+        {
+            return None;
+        }
+        let return_ty = self.join_operand_ty(returns.0, alpha(returns.1), false);
+        let mut joined = Vec::with_capacity(positional.0.len());
+        for (x, y) in positional.0.iter().zip(positional.1.iter()) {
+            joined.push(self.candidate_formal_glb(*x, alpha(*y))?);
+        }
+        let mut joined_named = Vec::with_capacity(named.0.len());
+        for (name, x) in &named.0 {
+            let Some((_, y)) = named.1.iter().find(|(other, _)| other == name) else {
+                return None;
+            };
+            joined_named.push((*name, self.candidate_formal_glb(*x, alpha(*y))?));
+        }
+        Some(self.boundary.args.borrow_mut().function_generic_required(
+            &first_params,
+            left_required,
+            return_ty,
+            &joined,
+            &joined_named,
+            false,
+        ))
+    }
+
+    /// The two-type greatest lower bound a joined FORMAL takes (upstream
+    /// `getGreatestLowerBound`): equality, the `Never` bottom, the
+    /// `dynamic` faces, and the subtype pair decide; everything else
+    /// answers `None`, which keeps the whole join silent — the same
+    /// under-report posture the engine-core GLB documents (an undecided
+    /// formal never fabricates a `Never` the message would then spell).
+    fn candidate_formal_glb(&self, left: Ty, right: Ty) -> Option<Ty> {
+        if left == right {
+            return Some(left);
+        }
+        if left == Ty::Never || right == Ty::Never {
+            return Some(Ty::Never);
+        }
+        if matches!(left, Ty::Dynamic) {
+            return Some(right);
+        }
+        if matches!(right, Ty::Dynamic) {
+            return Some(left);
+        }
+        if self.name_subtype(left, right) {
+            return Some(left);
+        }
+        if self.name_subtype(right, left) {
+            return Some(right);
+        }
+        None
+    }
+
+    /// Whether `ty` mentions any of `names` — a bare parameter reference
+    /// or one nested in arguments, record fields, or a function shape
+    /// ([`Self::join_generic_candidates`]'s return-slot guard: a
+    /// post-rename mismatch still carrying a mention cannot be spelled
+    /// honestly, so the join stays silent instead of mis-rendering the
+    /// candidate text).
+    fn join_return_mentions_param(&self, ty: Ty, names: &[StringId]) -> bool {
+        match ty {
+            Ty::Invalid | Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Never | Ty::Void => false,
+            Ty::Named { name, args, .. } => {
+                names.contains(&name)
+                    || (args != ArgListId::EMPTY && {
+                        let pool = self.boundary.pool();
+                        pool.get(args)
+                            .iter()
+                            .any(|arg| self.join_return_mentions_param(*arg, names))
+                    })
+            }
+            Ty::Record { shape, .. } => {
+                let pool = self.boundary.pool();
+                let data = pool.record_shape(shape);
+                data.positional
+                    .iter()
+                    .chain(data.named.iter().map(|(_, ty)| ty))
+                    .any(|ty| self.join_return_mentions_param(*ty, names))
+            }
+            Ty::Function { shape, .. } => {
+                let pool = self.boundary.pool();
+                let data = pool.function_shape(shape);
+                data.type_params_named
+                    .iter()
+                    .filter_map(|(_, bound)| *bound)
+                    .chain([data.return_ty])
+                    .chain(data.positional.iter().copied())
+                    .chain(data.named.iter().map(|(_, ty)| *ty))
+                    .any(|ty| self.join_return_mentions_param(ty, names))
             }
         }
     }
@@ -6401,6 +6784,11 @@ impl<'a> Engine<'a> {
         {
             return;
         }
+        // The applied-instantiation const faces (a bare generic-function
+        // reference or an `A.new` constructor tear-off whose context type
+        // binds parameters to in-scope type parameters) run beside the
+        // assignment verdict — upstream reports both rows for one site.
+        self.check_default_const_type_param_faces(to);
         let Some(rhs_row) = self
             .rows
             .iter()
@@ -8806,8 +9194,13 @@ impl<'a> Engine<'a> {
         // drop every case row and false-positive the covering gap. (The
         // push-time latch leaves `Unknown` exactly here: no row, or a row
         // whose declared type never resolved — the "complex scrutinee"
-        // blind spot, now a clean whole-check suppression.)
-        if ctx.scrutinee == Ty::Unknown || ctx.has_invalid_type {
+        // blind spot, now a clean whole-check suppression.) An `Invalid`
+        // scrutinee is the same production's resolved face — an
+        // undefined-identifier read types whole `InvalidType`, and the
+        // oracle never prints an exhaustiveness row over it (every
+        // `leftParen_switch` corpus case carries the identifier row and
+        // no verdict, #4340).
+        if ctx.scrutinee == Ty::Unknown || ctx.scrutinee == Ty::Invalid || ctx.has_invalid_type {
             return;
         }
         // A record- or function-typed scrutinee joins the name-level
@@ -12031,6 +12424,18 @@ impl<'a> Engine<'a> {
     /// 3.13.1 oracle), so `@internal` over a superclass
     /// `static const internal` reports `undefined_annotation`.
     fn annotation_name_missing(&self, name: StringId) -> bool {
+        self.annotation_name_missing_in(name, self.container_context())
+    }
+
+    /// [`Self::annotation_name_missing`] against an explicit container
+    /// context: the live frames at the metadata's own scope (the
+    /// `PendingAnnotation::container` snapshot) or the live one for
+    /// in-window checks.
+    fn annotation_name_missing_in(
+        &self,
+        name: StringId,
+        container_ctx: Option<(StringId, ContainerKind)>,
+    ) -> bool {
         if self.frames.iter().rev().any(|f| f.locals.contains(&name))
             || self.initializer_locals.contains(&name)
             || self.type_params.contains(&name)
@@ -12038,7 +12443,7 @@ impl<'a> Engine<'a> {
         {
             return false;
         }
-        if let Some((container, kind)) = self.container_context() {
+        if let Some((container, kind)) = container_ctx {
             if kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&name) {
                 return false;
             }
@@ -12131,7 +12536,7 @@ impl<'a> Engine<'a> {
             return;
         }
         let has_args = self.annotation_has_args(node);
-        match self.annotation_verdict(pending.name, has_args) {
+        match self.annotation_verdict_in(pending.name, has_args, pending.container) {
             AnnotationVerdict::Silent => {}
             AnnotationVerdict::Undefined(name) => {
                 let spelling = self.strings.resolve(name);
@@ -12168,21 +12573,29 @@ impl<'a> Engine<'a> {
     }
 
     /// The name/element verdict for one consumed annotation —
-    /// `annotation_resolver.dart`'s `_resolve` decision tree at name level:
-    /// head misses the scope → `undefined_annotation` on the head spelling;
-    /// resolved → the kind's arm (constructor creation, getter, variable,
-    /// extension, prefix-subtree, fall-through `invalid_annotation`). The
-    /// joined spelling splits at the FIRST dot (`p.C`, `C.named`,
-    /// `p.C.named`); the head and the leaf segments re-intern for the
-    /// scope lookups, the rest stays a name for the constructor/member
-    /// probes.
-    fn annotation_verdict(&self, name: StringId, has_args: bool) -> AnnotationVerdict {
+    /// `annotation_resolver.dart`'s `_resolve` decision tree at name level,
+    /// against the metadata-time container context the pending entry
+    /// latched: head metadata resolves before the container's scope
+    /// opens, so the declared container's own members must not answer a
+    /// head annotation's name (`useLibraryScope`). Head misses the scope
+    /// → `undefined_annotation` on the head spelling; resolved → the
+    /// kind's arm (constructor creation, getter, variable, extension,
+    /// prefix-subtree, fall-through `invalid_annotation`). The joined
+    /// spelling splits at the FIRST dot (`p.C`, `C.named`, `p.C.named`);
+    /// the head and the leaf segments re-intern for the scope lookups,
+    /// the rest stays a name for the constructor/member probes.
+    fn annotation_verdict_in(
+        &self,
+        name: StringId,
+        has_args: bool,
+        container: Option<(StringId, ContainerKind)>,
+    ) -> AnnotationVerdict {
         let joined = self.strings.resolve(name);
         let (head, rest) = match joined.split_once('.') {
             Some((h, r)) => (self.strings.intern(h), Some(r)),
             None => (name, None),
         };
-        if self.annotation_name_missing(head) {
+        if self.annotation_name_missing_in(head, container) {
             return AnnotationVerdict::Undefined(head);
         }
         // A scoped type parameter of the enclosing declaration resolves to
@@ -12232,9 +12645,13 @@ impl<'a> Engine<'a> {
                 self.annotation_prefix_verdict(head, rest, has_args)
             }
             // `Ambiguous` already carries its own `ambiguous_import` row;
-            // `NotFound` is unreachable — `annotation_verdict` guards the
-            // head's miss before it ever reaches here.
-            ScopedHit::Ambiguous(_) | ScopedHit::NotFound => AnnotationVerdict::Silent,
+            // upstream's `element1` is then a multiply-defined element that
+            // matches NONE of the resolver cascade's concrete element kinds,
+            // so the cascade falls through to `invalidAnnotation` on top of
+            // it. `NotFound` is unreachable — `annotation_verdict` guards
+            // the head's miss before it ever reaches here.
+            ScopedHit::Ambiguous(_) => AnnotationVerdict::Invalid,
+            ScopedHit::NotFound => AnnotationVerdict::Silent,
         }
     }
 
@@ -12251,9 +12668,12 @@ impl<'a> Engine<'a> {
     ) -> AnnotationVerdict {
         match decl.kind {
             // `InterfaceElementImpl` upstream (class and enum only reach
-            // `_classGetter`/`_classConstructorInvocation`; a mixin's and
-            // extension type's faces fall through to `invalidAnnotation`).
-            MicroKind::Class | MicroKind::Enum => {
+            // `_classGetter`/`_classConstructorInvocation`; a mixin's
+            // constructor face falls through to `invalidAnnotation`, but
+            // its no-argument `@M.g` resolves the full dotted name to the
+            // static accessor itself — the const-variable question, never
+            // the class arms).
+            MicroKind::Class | MicroKind::Enum | MicroKind::Mixin => {
                 let (sel, ctor_sel) = self.annotation_selector(rest);
                 let Some((container, owner)) = resolve_container(
                     self.graph,
@@ -12267,7 +12687,33 @@ impl<'a> Engine<'a> {
                 };
                 self.annotation_interface_verdict(head, container, owner, sel, ctor_sel, has_args)
             }
-            MicroKind::TypeAlias => self.annotation_alias_verdict(head, decl, rest, has_args),
+            // An extension TYPE is an `ExtensionTypeElementImpl` — an
+            // `InterfaceElementImpl` upstream (element.dart: the class
+            // arms apply); a PLAIN extension is an `ExtensionElement`
+            // (the `_extensionGetter` arm — no corpus pin yet, frozen at
+            // the fall-through `invalidAnnotation`). Both carry
+            // `MicroKind::Extension`; the resolved container's kind
+            // decides.
+            MicroKind::Extension => {
+                let (sel, ctor_sel) = self.annotation_selector(rest);
+                let Some((container, owner)) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    head,
+                ) else {
+                    return AnnotationVerdict::Silent;
+                };
+                if container.kind != ContainerKind::ExtensionType {
+                    return AnnotationVerdict::Invalid;
+                }
+                self.annotation_interface_verdict(head, container, owner, sel, ctor_sel, has_args)
+            }
+            MicroKind::TypeAlias => {
+                self.annotation_alias_verdict(head, decl, rest, has_args, self.file)
+            }
             // `PropertyAccessorElement` (a top-level getter) and
             // `VariableElement` (a top-level variable) share the
             // const-variable arm: silent only on a constant with no args.
@@ -12296,9 +12742,12 @@ impl<'a> Engine<'a> {
     }
 
     /// `InterfaceElement` arm — `_classGetter` (no argument list) or
-    /// `_classConstructorInvocation` (argument list). A mixin or
-    /// extension-type container is not an `InterfaceElementImpl` upstream
-    /// and reports `invalidAnnotation`.
+    /// `_classConstructorInvocation` (argument list). A mixin container
+    /// is not an `InterfaceElementImpl` upstream: only its no-argument
+    /// shape reaches a resolvable face (the full dotted name resolves to
+    /// the static accessor itself), a constructor invocation over a
+    /// mixin — which declares no constructors — reports
+    /// `invalidAnnotation`.
     fn annotation_interface_verdict(
         &self,
         name: StringId,
@@ -12311,7 +12760,8 @@ impl<'a> Engine<'a> {
         if !matches!(
             container.kind,
             ContainerKind::Class | ContainerKind::Enum | ContainerKind::ExtensionType
-        ) {
+        ) && !(container.kind == ContainerKind::Mixin && !has_args)
+        {
             return AnnotationVerdict::Invalid;
         }
         if has_args {
@@ -12442,10 +12892,49 @@ impl<'a> Engine<'a> {
             if let Some(site) = self.ctor_decl_site(name, self.intern("new")) {
                 return Some(site.const_ctor);
             }
-            // A declared named/unnamed constructor's site decides; no site
-            // means only the implicit default remains (never const).
-            if container.has_unnamed_constructor {
+            // `class B = A with M;` declares no constructor of its own: its
+            // unnamed face is the synthesized FORWARDING constructor, const
+            // exactly when the superclass's own unnamed is (the
+            // application's `has_const_constructor` aggregate counts only
+            // constructors DECLARED in the application, so it stays false
+            // here). Walk the application chain, bounded — a longer chain
+            // than any real hierarchy is a declaration cycle the oracle
+            // rejects on its own faces.
+            if container.is_mixin_application {
+                let mut super_container = container;
+                for _ in 0..8 {
+                    let Some(next) = super_container.superclass else {
+                        return Some(false);
+                    };
+                    let Some((resolved, owner)) = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        next,
+                    ) else {
+                        return Some(false);
+                    };
+                    if !resolved.is_mixin_application {
+                        return self.annotation_unnamed_ctor_const(next, resolved, owner);
+                    }
+                    super_container = resolved;
+                }
                 return Some(false);
+            }
+            // A declared named/unnamed constructor's site decides; no
+            // latched site means a forward reference (the site table fills
+            // in parse order) or the constructor kind that latches no site
+            // at all — an extension type's representation constructor (the
+            // primary-constructor event updates the model, never the
+            // site table). The model's own const aggregate answers in the
+            // site's place: exact for the implicit default (no constructor
+            // declared means no const one), and for every explicit shape
+            // the corpus pins (`extension type const A(int it)`, a
+            // forward-referenced `const A(...)`).
+            if container.has_unnamed_constructor {
+                return Some(container.has_const_constructor);
             }
             return None;
         }
@@ -12513,17 +13002,25 @@ impl<'a> Engine<'a> {
         decl: &TopDecl,
         rest: Option<&str>,
         has_args: bool,
+        owner: FileId,
     ) -> AnnotationVerdict {
         let aliased_head = match self.fold_alias_ty(decl.var_ty) {
             Ty::Named { name, .. } => name,
             _ => return AnnotationVerdict::Invalid,
         };
+        // The aliased class is named in the ALIAS OWNER's library — a
+        // `typedef B = A;` imported through a prefix carries `A` in its
+        // own file's scope, not the annotation site's. Resolving in the
+        // site's library misses (or mis-hits) and reports
+        // `invalidAnnotation` where upstream's `_typeAliasGetter` stays
+        // silent.
+        let owner_lib = self.graph.library_of_file(owner).unwrap_or(self.lib);
         let Some((container, owner)) = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
-            self.lib,
-            self.file,
+            owner_lib,
+            owner,
             aliased_head,
         ) else {
             return AnnotationVerdict::Invalid;
@@ -12604,12 +13101,18 @@ impl<'a> Engine<'a> {
         head: StringId,
         sel: StringId,
         decl: &TopDecl,
-        _owner: FileId,
+        owner: FileId,
         ctor_sel: Option<StringId>,
         has_args: bool,
     ) -> AnnotationVerdict {
         match decl.kind {
-            MicroKind::Class | MicroKind::Enum => {
+            // A prefixed MIXIN keeps the same split as the class face —
+            // but its `has_args` leg lands on the constructor verdict,
+            // which a mixin (declaring no constructors) always answers
+            // `invalidAnnotation`. An extension TYPE shares the class
+            // arms (`InterfaceElementImpl`); a PLAIN extension stays at
+            // the fall-through (the `_extensionGetter` arm, unpinned).
+            MicroKind::Class | MicroKind::Enum | MicroKind::Mixin | MicroKind::Extension => {
                 // The prefixed container lookup re-runs `lookup_prefixed`
                 // (already answered `Decl`) but reaches the merged element
                 // face — the container's constructor/member tables — through
@@ -12624,6 +13127,11 @@ impl<'a> Engine<'a> {
                 ) else {
                     return AnnotationVerdict::Silent;
                 };
+                if decl.kind == MicroKind::Extension
+                    && container.kind != ContainerKind::ExtensionType
+                {
+                    return AnnotationVerdict::Invalid;
+                }
                 if has_args {
                     self.annotation_ctor_verdict(sel, container, c_owner, ctor_sel, true)
                 } else {
@@ -12632,7 +13140,7 @@ impl<'a> Engine<'a> {
             }
             MicroKind::TypeAlias => {
                 let rest = ctor_sel.map(|c| self.strings.resolve(c).to_string());
-                self.annotation_alias_verdict(sel, decl, rest.as_deref(), has_args)
+                self.annotation_alias_verdict(sel, decl, rest.as_deref(), has_args, owner)
             }
             MicroKind::TopLevelVar => self.annotation_variable_verdict(sel, has_args, false),
             // A prefixed top-level FUNCTION resolves to a `FunctionElement`
@@ -12659,19 +13167,43 @@ impl<'a> Engine<'a> {
             return AnnotationVerdict::Invalid;
         }
         if local {
-            // A function-local const is bound when a later declaration's
-            // metadata resolves (the const-scope walk binds on close, file
-            // order); a still-pending const reads as non-const — matching
-            // the element's own `isConst` at the annotation's resolution.
-            if self
-                .const_scopes
-                .iter()
-                .rev()
-                .any(|scope| scope.contains_key(&name))
-            {
-                return AnnotationVerdict::Silent;
+            // The NEAREST binding answers the const question: a frame
+            // local shadowing an outer (or file-scope) const never
+            // inherits the outer binding's constness — the frame's own
+            // paired scope (`const_scopes[i + 1]` rides `frames[i]`;
+            // index 0 is the file scope) holds the local's answer, and
+            // no entry there means the local itself is not const
+            // (`for (@a var (a) = (0); …)`: the pattern binder `a`
+            // shadows the top-level `const a` and the metadata names
+            // the non-const binder, `invalidAnnotation`). A binding's
+            // const insert always lands in its own declaring frame's
+            // scope (the initializer evaluates while that frame is
+            // last), so the pairing answers exactly.
+            for index in (0..self.frames.len()).rev() {
+                if self.frames[index].locals.contains(&name) {
+                    return if self
+                        .const_scopes
+                        .get(index + 1)
+                        .is_some_and(|scope| scope.contains_key(&name))
+                    {
+                        AnnotationVerdict::Silent
+                    } else {
+                        AnnotationVerdict::Invalid
+                    };
+                }
             }
-            return AnnotationVerdict::Invalid;
+            // No frame holds the name — the verdict reached the local
+            // arm through the top-level initializer world: the file
+            // scope's own entry answers.
+            return if self
+                .const_scopes
+                .first()
+                .is_some_and(|scope| scope.contains_key(&name))
+            {
+                AnnotationVerdict::Silent
+            } else {
+                AnnotationVerdict::Invalid
+            };
         }
         if self.nonconst_top_level.contains(&name) {
             return AnnotationVerdict::Invalid;
@@ -12721,6 +13253,108 @@ impl<'a> Engine<'a> {
     pub(crate) fn emit_undefined_annotation(&mut self, node: SourceRange) {
         if let Some(pending) = self.pending_annotations.last_mut() {
             pending.node = Some(node);
+        }
+    }
+
+    /// `end_type_variables`: the group's declarations consume the metadata
+    /// the group carries — upstream's scope walk wraps the WHOLE variable
+    /// list in the `TypeParameterScope` before visiting it
+    /// (`withTypeParameterScope`, scope_context.dart:60-62), so a type
+    /// variable's metadata resolves with every parameter of its group in
+    /// scope: the annotated variable itself and the later siblings answer
+    /// (a type-parameter element falls through the resolver cascade to
+    /// `invalid_annotation`, annotation_resolver.dart:386-389), while a
+    /// genuinely unresolved name reports `undefined_annotation` exactly
+    /// like any other annotated declaration (`f<@a E>() {}`, the corpus's
+    /// test_typeParameter_metadata_undefined / test_metadata_typeParameter
+    /// pair). The drain runs at the group's close — after the last
+    /// `begin_type_variable` registered the group's names — and only the
+    /// entries latched since `begin_type_variables`
+    /// ([`Engine::tv_annotation_mark`]); the enclosing declaration's own
+    /// still-pending metadata (a field star ahead of a
+    /// `Function<@a T>()?` type) keeps its site drain.
+    ///
+    /// A group inside the live constructor/factory HEAD window
+    /// ([`Engine::ctor_head_tv_window`]) is the illegal constructor type
+    /// parameters: upstream never parses a constructor's `<...>` as a
+    /// type-parameter scope — the head takes the constructor-reference
+    /// recovery, where the bracket's metadata is skipped
+    /// (`skipMetadata` + `annotation_on_type_argument`,
+    /// type_info_impl.dart:1439-1449) and never resolves — so the entries
+    /// and their staged rows retract instead of publishing (the corpus's
+    /// test_constructorPartial3 keeps no `undefined_annotation` rows).
+    pub(crate) fn drain_type_variable_annotations(&mut self, group_mark: usize) {
+        let base = group_mark.min(self.pending_annotations.len());
+        let group = self.pending_annotations.split_off(base);
+        if self.ctor_pending.is_some() && self.ctor_head_tv_window > 1 {
+            self.retract_annotations(group);
+            return;
+        }
+        for pending in &group {
+            self.emit_pending_annotation(pending);
+        }
+    }
+
+    /// The undrained latch dies here: every entry still holding the latch
+    /// attached to no surviving declaration, and upstream resolves an
+    /// annotation's whole subtree only when a declaration consumes the
+    /// metadata (the fasta→analyzer translation keeps members only, so a
+    /// failed unit head — `@p<A>.B.ctor() class C {}` recovers the `.` as
+    /// `expected_executable` and the metadata dies with the failed unit —
+    /// or an unclosed argument group swallowing the rest of the file
+    /// leaves the annotation unreachable). The name verdict is already
+    /// structural (an undrained entry never ran it); the argument and
+    /// type-argument faces the parse staged for the dying subtree retract
+    /// with it — rows from the outermost entry's mark (pass-2 inputs:
+    /// argument identifiers, type-argument uses, literal verdicts) and
+    /// parse-time direct emits anchored inside a dying entry's node span
+    /// (const-context element faces, switch exhaustiveness).
+    ///
+    /// Two death points share this sweep: the recoverable
+    /// `expected_executable`/`expected_class_member` rows (the declaration
+    /// head the metadata belonged to failed mid-file) and the unit end
+    /// (the leftover sweep — an unclosed group may end with no head-failure
+    /// row at all, `f() { @a( switch (x) {} }`).
+    pub(crate) fn retract_doomed_annotations(&mut self) {
+        if self.pending_annotations.is_empty() {
+            return;
+        }
+        let dying = std::mem::take(&mut self.pending_annotations);
+        self.retract_annotations(dying);
+    }
+
+    /// The retraction itself over an explicit dying set: rows staged since
+    /// the outermost entry's mark and every parse-time emit anchored
+    /// inside a dying entry's node span.
+    fn retract_annotations(&mut self, dying: Vec<PendingAnnotation>) {
+        if let Some(mark) = dying.first().map(|entry| entry.row_mark) {
+            self.rows.truncate(mark.min(self.rows.len()));
+        }
+        let spans: Vec<SourceRange> = dying.iter().filter_map(|entry| entry.node).collect();
+        if !spans.is_empty() {
+            let inside = |range: SourceRange| {
+                spans
+                    .iter()
+                    .any(|span| range.offset >= span.offset && range.offset < span.end())
+            };
+            self.report.diagnostics.retain(|d| !inside(d.range));
+            self.report.usage.retain(|d| !inside(d.range));
+            // The post-parse staging faces: a deferred switch covering
+            // re-decides at the teardown join and the drained operand rows
+            // (`??` folds, creation/type-argument stages) re-enter the
+            // resolution walk — both after the parse-time filter above,
+            // so their span-keyed entries die here with the subtree. The
+            // #2345 re-verdict walk reads the completed-switch stack the
+            // same way (`switch.switches.completed` re-decides at the
+            // teardown join — a switch expression the doomed annotation's
+            // argument group swallowed reports nothing, `f() { @a(
+            // switch (x) {} }`).
+            self.pending_switch_coverings.retain(|c| !inside(c.kw));
+            self.deferred_miss_rows.retain(|row| !inside(row.range));
+            self.switch
+                .switches
+                .completed
+                .retain(|ctx| !inside(ctx.switch_kw));
         }
     }
 
@@ -13033,6 +13667,13 @@ mod async_return_tests {
             }
             builder.declare(lib, name, file);
         }
+        // Register the defining unit like the engine flow does: without
+        // the unit row, `library_of_file(file)` misses and every
+        // `declared_outside_core` negative falls to its `None` fallback —
+        // the rig would under-report rows the CLI answers (the #4131
+        // residue: only the harness lacked the mapping, the engine was
+        // already right).
+        builder.unit(lib, file);
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let fold = fold_unit(
