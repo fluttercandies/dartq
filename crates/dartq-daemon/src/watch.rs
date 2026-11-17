@@ -891,7 +891,7 @@ fn watch_loop(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
@@ -917,6 +917,18 @@ mod tests {
         fs::write(&main, "var a = 1;\n").expect("seed");
         (root, main)
     }
+
+    /// Serializes the real-substrate family: every test that arms the OS
+    /// event stream (`FSEvents` on this host, inotify on Linux) floods
+    /// warm-up writes into the same system daemon, and several of them
+    /// running at once is self-inflicted load that widens the very
+    /// first-batch backlog these tests' windows must absorb. One lock
+    /// across the family — the server-side convergence tests take it too,
+    /// through this module — trades a little wall time for that backlog,
+    /// at zero assertion cost. `parking_lot` for the no-poisoning
+    /// semantics: one family member failing must not cascade into
+    /// "poisoned" noise for the rest.
+    pub(crate) static OS_SUBSTRATE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// A burst across several ticks coalesces into one batch on the first
     /// quiet tick; the batch is sorted and deduplicated.
@@ -1045,6 +1057,7 @@ mod tests {
     /// disconnect). One watcher, one thread — the lifecycle never leaks.
     #[test]
     fn watch_thread_delivers_batch_and_stops_on_drop() {
+        let _substrate = OS_SUBSTRATE_LOCK.lock();
         let (root, main) = workspace("thread");
         // The bounded intake shape the server's main loop takes.
         let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(2);
@@ -1080,6 +1093,7 @@ mod tests {
     /// blocks on the send.
     #[test]
     fn watch_thread_full_channel_requeues_and_retries() {
+        let _substrate = OS_SUBSTRATE_LOCK.lock();
         let (root, main) = workspace("full-channel");
         let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(1);
         // Occupy the one slot before the thread exists: the debounced
@@ -1116,6 +1130,7 @@ mod tests {
     /// drop".
     #[test]
     fn watch_thread_reports_creations_and_deletions() {
+        let _substrate = OS_SUBSTRATE_LOCK.lock();
         let (root, _main) = workspace("thread-rediscover");
         // The bounded intake shape the server's main loop takes.
         let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(2);
@@ -1388,25 +1403,51 @@ mod tests {
     /// delivery batch for as long as fseventsd lags under host load
     /// (sub-second quiet, measured past 30s at load 5-8 — every post-arm
     /// write rides that one batch), so a phase pinned against a cold
-    /// stream would time the daemon's backlog, not our kinds.
+    /// stream would time the daemon's backlog, not our kinds. Each phase
+    /// is also retriggerable: a timed-out slice regenerates a genuine
+    /// event of its kind (delete-and-recreate for the Create, a rewrite
+    /// for the Modify, recreate-and-delete for the Remove), so the wait
+    /// is the same retrigger-until-answer idiom that keeps the settle
+    /// tests green — the window bounds total patience, never a single
+    /// one-shot delivery.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn os_event_source_reports_kinds() {
+        let _substrate = OS_SUBSTRATE_LOCK.lock();
         let (root, main) = workspace("os-events");
         let mut source = NotifySource::new(&root).expect("the OS substrate starts");
-        flush_first_batch(&mut source, &main);
+        let warm_lag = flush_first_batch(&mut source, &main);
+        // The first delivered batch proves the stream registered, not
+        // that fseventsd drained to now: the kind phases run behind
+        // whatever backlog remains, so their window is priced from the
+        // lag this host just showed — floored at the settle rationale,
+        // capped at the first-batch bound so a silent substrate still
+        // fails loudly instead of hanging.
+        let kind_window = KIND_WINDOW.max(2 * warm_lag).min(FIRST_BATCH_WINDOW);
 
         let extra = root.join("lib/extra.dart");
         fs::write(&extra, "var b = 2;\n").expect("create");
-        let created = wait_for_event(&mut source, EventKind::Create, &extra);
+        let created = wait_for_event(&mut source, EventKind::Create, &extra, kind_window, || {
+            // A re-write is a Modify and never satisfies an outstanding
+            // Create: the one-shot kind must be regenerated from scratch.
+            fs::remove_file(&extra).expect("re-remove");
+            fs::write(&extra, "var b = 2;\n").expect("re-create");
+        });
         assert_eq!(created, extra, "the create, in the walk's path form");
 
         fs::write(&extra, "var bcd = 234;\n").expect("rewrite");
-        let modified = wait_for_event(&mut source, EventKind::Modify, &extra);
+        let modified = wait_for_event(&mut source, EventKind::Modify, &extra, kind_window, || {
+            fs::write(&extra, "var bcd = 234;\n").expect("re-write");
+        });
         assert_eq!(modified, extra);
 
         fs::remove_file(&extra).expect("remove");
-        let removed = wait_for_event(&mut source, EventKind::Delete, &extra);
+        let removed = wait_for_event(&mut source, EventKind::Delete, &extra, kind_window, || {
+            // The removal is one-shot the same way: recreate, then
+            // remove, for a fresh Delete per cycle.
+            fs::write(&extra, "var b = 2;\n").expect("re-seed");
+            fs::remove_file(&extra).expect("re-remove");
+        });
         assert_eq!(removed, extra);
 
         drop(source);
@@ -1419,16 +1460,31 @@ mod tests {
     /// callback past half a minute — measured, not guessed. Quiet hosts
     /// answer within a second, so the headroom costs nothing there; a
     /// substrate that stays silent for the whole window is breakage, and
-    /// fails the test.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    const FIRST_BATCH_WINDOW: Duration = Duration::from_secs(60);
+    /// fails the test. Shared with the server-side convergence settle —
+    /// which waits out the same first-batch phenomenon — and the cap for
+    /// the kind phases' derived window: one number for one substrate
+    /// behavior, never a second magic constant to drift.
+    pub(crate) const FIRST_BATCH_WINDOW: Duration = Duration::from_secs(60);
 
-    /// Bound for one kind's phase against the warm stream: deliveries
+    /// Floor for one kind's phase against the warm stream: deliveries
     /// after the first batch land in milliseconds, so only a starved or
     /// instrumented build approaches the bound (the `SETTLE_WINDOW`
-    /// rationale) — it costs nothing on normal targets.
+    /// rationale) — it costs nothing on normal targets. The phase's real
+    /// window is derived from the flush's measured lag (the `max` of the
+    /// two, capped at [`FIRST_BATCH_WINDOW`]): the residual backlog a
+    /// just-flushed stream still drains is what the phase must wait out,
+    /// and this host's own measurement prices that better than a second
+    /// magic number.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const KIND_WINDOW: Duration = Duration::from_secs(15);
+
+    /// How often a timed-out kind phase regenerates its event: often
+    /// enough that a fresh one-shot (a recreated file's Create, a
+    /// re-removal's Delete) is always pending, sparing enough not to
+    /// flood the very substrate backlog the window waits out — between
+    /// the flush's 50 ms hammer and the settle idiom's 500 ms slices.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    const RETRIGGER_CADENCE: Duration = Duration::from_millis(250);
 
     /// Drives the substrate until its first delivery batch flushes:
     /// rewrites of `path` retrigger until the Modify for it surfaces —
@@ -1437,10 +1493,13 @@ mod tests {
     /// same first batch, so the pinned phases run only once the stream is
     /// warm and their windows measure our kinds, not the daemon's
     /// backlog. Bounded: a substrate that never delivers fails the test,
-    /// never hangs it.
+    /// never hangs it. Returns the lag the flush took, so the kind phases
+    /// can price their windows from the backlog this host actually
+    /// showed.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn flush_first_batch(source: &mut NotifySource, path: &Path) {
-        let deadline = Instant::now() + FIRST_BATCH_WINDOW;
+    fn flush_first_batch(source: &mut NotifySource, path: &Path) -> Duration {
+        let start = Instant::now();
+        let deadline = start + FIRST_BATCH_WINDOW;
         loop {
             assert!(
                 Instant::now() < deadline,
@@ -1449,18 +1508,31 @@ mod tests {
             fs::write(path, "var a = 1;\n").expect("warm-up write");
             for event in source.drain() {
                 if event.kind == EventKind::Modify && event.path == path {
-                    return;
+                    return start.elapsed();
                 }
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
 
-    /// Drains until an event of `kind` for `path` arrives, or the window
-    /// closes and the test fails — bounded, never a hang.
+    /// Drains until an event of `kind` for `path` arrives, or `window`
+    /// closes and the test fails — bounded, never a hang. The one-shot
+    /// kinds cannot re-write their way to an answer the way the settle
+    /// idiom can (a re-write is a Modify, never the outstanding Create or
+    /// Delete), so `retrigger` regenerates a genuine event of the kind
+    /// after every [`RETRIGGER_CADENCE`] of silence — the same
+    /// retrigger-until-answer armor, with the window bounding total
+    /// patience instead of one one-shot delivery.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn wait_for_event(source: &mut NotifySource, kind: EventKind, path: &Path) -> PathBuf {
-        let deadline = Instant::now() + KIND_WINDOW;
+    fn wait_for_event(
+        source: &mut NotifySource,
+        kind: EventKind,
+        path: &Path,
+        window: Duration,
+        retrigger: impl Fn(),
+    ) -> PathBuf {
+        let deadline = Instant::now() + window;
+        let mut last_retrigger = Instant::now();
         loop {
             for event in source.drain() {
                 if event.kind == kind && event.path == path {
@@ -1472,6 +1544,10 @@ mod tests {
                 "no {kind:?} event for {} within the window",
                 path.display()
             );
+            if last_retrigger.elapsed() >= RETRIGGER_CADENCE {
+                retrigger();
+                last_retrigger = Instant::now();
+            }
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -1484,11 +1560,14 @@ mod tests {
         }
     }
 
-    /// Upper bound for one settle phase (a write or a removal surfacing as a
-    /// batch) — only ever reached on a starved or instrumented build
-    /// (coverage runs the watch thread an order of magnitude slower under
-    /// load); a healthy answer arrives in the first slice, so the bound
-    /// costs nothing on normal targets.
+    /// Upper bound for the warm-stream waits — a post-arm removal surfacing,
+    /// the boot tick, a config advisory — answers that never wait on the
+    /// substrate's first delivery batch, so only a starved or instrumented
+    /// build approaches the bound (coverage runs the watch thread an order
+    /// of magnitude slower under load); a healthy answer arrives in the
+    /// first slice, so the bound costs nothing on normal targets. The
+    /// first trigger's settle is budgeted separately, from
+    /// [`FIRST_BATCH_WINDOW`].
     const SETTLE_WINDOW: Duration = Duration::from_secs(15);
 
     /// Rewrites `path` until the watch thread answers with a Watch batch
@@ -1498,20 +1577,26 @@ mod tests {
     /// The substrate arms asynchronously on the watch thread, and a change
     /// landing before the arm is absorbed — the OS stream's since-now and
     /// the poll baseline alike — so the first trigger retriggers until the
-    /// thread answers instead of racing a fixed settle sleep. Later triggers
-    /// are provably post-arm and never retried. Same-path rewrites dedup in
-    /// the debounce, so the answered batch is still one entry per touched
-    /// path. The match is on the path, not the whole batch: a pre-arm event
-    /// of another file can coalesce into the same drain (the instrumented
-    /// coverage build arms the substrate an order of magnitude slower), and
-    /// such batches are skipped until the rewritten path surfaces. Bounded:
-    /// a thread that never answers fails the test, never hangs it.
+    /// thread answers instead of racing a fixed settle sleep. Retriggering
+    /// defeats that absorption race but not the first-batch backlog: every
+    /// caller's first trigger waits on the substrate's first delivery
+    /// batch (measured past 30s under host load, see
+    /// [`FIRST_BATCH_WINDOW`]), so the settle budget is that window — the
+    /// same alignment the server-side convergence settle takes. Later
+    /// triggers are provably post-arm and never retried. Same-path
+    /// rewrites dedup in the debounce, so the answered batch is still one
+    /// entry per touched path. The match is on the path, not the whole
+    /// batch: a pre-arm event of another file can coalesce into the same
+    /// drain (the instrumented coverage build arms the substrate an order
+    /// of magnitude slower), and such batches are skipped until the
+    /// rewritten path surfaces. Bounded: a thread that never answers fails
+    /// the test, never hangs it.
     fn settle_rewrite(
         path: &Path,
         content: &str,
         receiver: &Receiver<Vec<Incoming>>,
     ) -> (Vec<PathBuf>, usize) {
-        let deadline = Instant::now() + SETTLE_WINDOW;
+        let deadline = Instant::now() + FIRST_BATCH_WINDOW;
         let mut fillers = 0;
         loop {
             assert!(
@@ -1546,6 +1631,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn watch_thread_os_substrate_delivers() {
+        let _substrate = OS_SUBSTRATE_LOCK.lock();
         let (root, main) = workspace("os-spawned");
         let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(4);
         let watcher = Watcher::spawn_with(
@@ -1702,6 +1788,7 @@ mod tests {
     /// re-advises.
     #[test]
     fn config_watch_advises_a_project_config_edit_once() {
+        let _substrate = OS_SUBSTRATE_LOCK.lock();
         let (root, _main) = workspace("config-project");
         let project = root.join(config::FILE_NAME);
         fs::write(&project, "version: 1\n").expect("seed the project config");
@@ -1805,6 +1892,7 @@ mod tests {
     /// change, none of it config.
     #[test]
     fn config_watch_stays_silent_on_quiet_ticks_and_dart_changes() {
+        let _substrate = OS_SUBSTRATE_LOCK.lock();
         let (root, main) = workspace("config-quiet");
         fs::write(root.join(config::FILE_NAME), "version: 1\n").expect("seed the project config");
         let (home, global) = injected_home(&root);

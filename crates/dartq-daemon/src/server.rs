@@ -1079,6 +1079,7 @@ mod tests {
         self, BROKEN_MAIN, CLEAN_MAIN, answered, framed, notification, publishes, request, spawn,
         store_root,
     };
+    use crate::watch::tests::{FIRST_BATCH_WINDOW, OS_SUBSTRATE_LOCK};
     use dartq_snapshot::{DEFAULT_CAPACITY_BYTES, SnapshotConfig, SnapshotStore};
     use std::fs;
     use std::io::BufRead;
@@ -1714,6 +1715,7 @@ mod tests {
     /// debounced batch answers the pre-batch state by design.
     #[test]
     fn watch_batch_converges_the_view() {
+        let _substrate = OS_SUBSTRATE_LOCK.lock();
         let workspace = test_fixtures::Workspace::new(BROKEN_MAIN);
         let main = workspace.path("lib/main.dart");
         let store = SnapshotStore::open(SnapshotConfig {
@@ -1746,9 +1748,15 @@ mod tests {
         // change landing before the arm is absorbed — the OS stream's
         // since-now and the poll baseline alike — so the rewrite retriggers
         // until the batch's clear push answers instead of racing a fixed
-        // settle sleep. Watch events are hints: each batch syncs the same
+        // settle sleep. The budget is the substrate's own first-batch
+        // window: this settle has no warm-up phase, so it waits out the
+        // same fseventsd first-delivery backlog that measurement priced
+        // past 30s under load (see watch's `FIRST_BATCH_WINDOW`) — a 10s
+        // ceiling false-reds long before the substrate's documented
+        // behavior gives up, while a quiet host still answers in the
+        // first slice. Watch events are hints: each batch syncs the same
         // clean content and the view converges on the latest disk state.
-        let settle_deadline = Instant::now() + Duration::from_secs(10);
+        let settle_deadline = Instant::now() + FIRST_BATCH_WINDOW;
         loop {
             assert!(
                 Instant::now() < settle_deadline,
@@ -1814,6 +1822,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn watch_through_an_alias_routes_a_manifest_touch_to_the_refresh() {
+        let _substrate = OS_SUBSTRATE_LOCK.lock();
         let workspace = test_fixtures::Workspace::new(BROKEN_MAIN);
         let alias = workspace.root.with_extension("alias");
         let _ = fs::remove_file(&alias);
