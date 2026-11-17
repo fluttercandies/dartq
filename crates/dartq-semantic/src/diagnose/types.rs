@@ -6770,12 +6770,29 @@ impl Engine<'_> {
     /// (the row's span) and the head token (the initializer-list scan's
     /// start).
     fn const_ctor_sites(&self, container: StringId) -> Vec<ConstCtorSite> {
+        // The closing declaration's own site is the last same-name Container
+        // site noted so far (same-name declarations close in source order):
+        // a later `augment class <same name>`'s close re-runs this flush,
+        // and each close reports only the constructors its own declaration
+        // introduced — upstream visits each constructor node once, and the
+        // whole-element facts (the merged non-final-field set) are complete
+        // at the first close.
+        let Some(closing_site) = self
+            .decl_sites
+            .iter()
+            .rposition(|site| matches!(site.kind, DeclKind::Container) && site.name == container)
+        else {
+            return Vec::new();
+        };
         let mut sites: Vec<ConstCtorSite> = Vec::new();
         for (index, site) in self.decl_sites.iter().enumerate() {
             // A factory is not generative (upstream `isGenerative` false), an
-            // augment declaration carries no row of its own, and every site
-            // without a latched head anchor (nameless recovery) stays out.
-            if site.is_factory
+            // augment declaration carries no row of its own, every site
+            // without a latched head anchor (nameless recovery) stays out,
+            // and earlier same-name declarations' constructors belong to
+            // their own (already flushed) closes.
+            if index <= closing_site
+                || site.is_factory
                 || site.is_augment
                 || !matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
             {
@@ -7078,12 +7095,32 @@ impl Engine<'_> {
     /// the class name — through the constructor name. The `const` keyword
     /// sits immediately before the class name (`class const A.named(...)`);
     /// an unnamed head ends at the begin token itself.
+    ///
+    /// Both anchors belong to the declaration OWNING the head: the upstream
+    /// AST node carries its own `typeName`, while the flush that reaches
+    /// here may run at a later `augment class <same name>`'s close, when
+    /// the file's last same-name Container site is the augmentation's
+    /// (upstream `errorRange`, ast.dart:27068-27073). Anchoring there both
+    /// spans a wrong (backwards, underflowing) range and drops the owning
+    /// header's `const`; the owning site is the last same-name Container
+    /// site whose name token ends at or before the head — inside one
+    /// header the name token always precedes the `(`/`.` head token, and a
+    /// later augmentation's site starts past it.
     fn primary_ctor_error_range(
         &self,
         container: StringId,
         head: SourceRange,
     ) -> Option<SourceRange> {
-        let name = self.container_name_range(container)?;
+        let name = self
+            .decl_sites
+            .iter()
+            .rev()
+            .find(|site| {
+                matches!(site.kind, DeclKind::Container)
+                    && site.name == container
+                    && site.range.end() <= head.offset
+            })?
+            .range;
         let start = self
             .token_before(name.offset)
             .filter(|previous| self.lexeme_at(previous.offset) == Some("const"))

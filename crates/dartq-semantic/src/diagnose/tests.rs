@@ -24466,3 +24466,14 @@ mod ticket_4343_tests;
 #[cfg(test)]
 #[path = "ticket_4344_tests.rs"]
 mod ticket_4344_tests;
+
+// —— #4352 (the primary constructor's errorRange under an augmenting
+// class of the same name: the flush at the augmentation's close re-runs
+// the const face, and the owning-header anchor — last same-name
+// Container site whose name ends at or before the head — replaces the
+// file-last site that spanned backwards across the two declarations and
+// underflowed, or anchored the unnamed variant at the augmentation's
+// name and dropped its `const` row) ——
+#[cfg(test)]
+#[path = "ticket_4352_tests.rs"]
+mod ticket_4352_tests;
