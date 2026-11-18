@@ -10,9 +10,11 @@
 //! 2. the environment override, `DARTQ_FLUTTER` / `DARTQ_DART` (an empty
 //!    value counts as unset);
 //! 3. the project's `.fvmrc`: the first one found walking upward from the
-//!    cwd pins an FVM version, resolving to
+//!    cwd pins an FVM version — the fvm 3.x/4.x JSON `{"flutter": "<v>"}`,
+//!    or the legacy bare version fvm 1.x/2.x wrote — resolving to
 //!    `~/.fvm/versions/<v>/bin/<tool>` (or the pre-3.0
-//!    `~/fvm/versions/<v>`); an empty or uninstalled pin is skipped, never
+//!    `~/fvm/versions/<v>`); a file pinning nothing, a flavor declaration
+//!    dartq does not resolve, or an uninstalled pin is skipped, never
 //!    fatal — one stderr note, and the walk continues;
 //! 4. the first executable of that name on `PATH`.
 //!
@@ -246,25 +248,90 @@ fn non_recursing_named(name: &str, fix: &str, path: &Path, own: Option<&Path>) -
     Some(resolved)
 }
 
-/// The `.fvmrc` step's binary for `tool`: the first `.fvmrc` walking
-/// upward from `cwd` pins a version; when that version's fvm directory
-/// holds `<dir>/bin/<tool>` the binary answers, otherwise one stderr note
-/// and the walk continues — an uninstalled pin is never a refusal (the
-/// chain falls through to `PATH`, matching fvm's own "version not
-/// installed" posture without its hard stop). `None` covers every miss:
-/// no `.fvmrc` on the chain, an empty one, no `home`, or no installed
-/// version anywhere up the walk.
-fn fvmrc_tool_binary(cwd: Option<&Path>, home: Option<&Path>, tool: &str) -> Option<PathBuf> {
-    for dir in cwd?.ancestors() {
-        let fvmrc = dir.join(".fvmrc");
-        let Ok(version) = fs::read_to_string(&fvmrc) else {
-            continue;
-        };
-        let version = version.trim();
-        if version.is_empty() {
-            continue;
+/// One `.fvmrc` read's verdict — the shared outcome both `.fvmrc` steps
+/// (this crate's binary lookup and the commands crate's SDK-root step)
+/// act on alike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FvmrcPin {
+    /// The version the file pins: the JSON object's `flutter` member, or
+    /// the legacy bare-string content.
+    Pin(String),
+    /// A flavor declaration. fvm installs a flavored pin at
+    /// `versions/<version>_<flavor>` — a layout dartq does not resolve —
+    /// so callers note it and fall through rather than mispicking.
+    Flavor(String),
+    /// Nothing pinned: empty content, or a JSON object without a usable
+    /// `flutter` member.
+    Skip,
+}
+
+/// The pin one `.fvmrc`'s content declares. fvm 3.x/4.x writes a JSON
+/// object — `{"flutter": "<version>"}`, optionally with a `"flavor"` —
+/// while fvm 1.x/2.x wrote the bare version as the whole file; content
+/// that is not a JSON object reads the legacy way (trimmed, non-empty =
+/// the pin). An object pins its `flutter` member only when that is a
+/// non-empty string; a flavor declaration outranks the version member —
+/// see [`FvmrcPin::Flavor`].
+#[must_use]
+pub fn fvmrc_version(content: &str) -> FvmrcPin {
+    if let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(content)
+    {
+        if let Some(flavor) = object
+            .get("flavor")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|flavor| !flavor.is_empty())
+        {
+            return FvmrcPin::Flavor(flavor.to_owned());
         }
-        if let Some(bin) = fvm_version_dir(home, version)
+        return match object.get("flutter").and_then(|value| value.as_str()) {
+            Some(version) if !version.trim().is_empty() => {
+                FvmrcPin::Pin(version.trim().to_owned())
+            }
+            _ => FvmrcPin::Skip,
+        };
+    }
+    let version = content.trim();
+    if version.is_empty() {
+        FvmrcPin::Skip
+    } else {
+        FvmrcPin::Pin(version.to_owned())
+    }
+}
+
+/// The `.fvmrc` pins on the walk from `dir` upward, nearest first: each
+/// readable file through [`fvmrc_version`]. Files that pin nothing are
+/// passed over, and a flavor declaration prints one stderr note and is
+/// passed over the same way — dartq does not resolve flavors. The caller
+/// resolves each version against its install layout and notes the misses.
+pub fn fvmrc_versions(dir: &Path) -> impl Iterator<Item = String> + '_ {
+    dir.ancestors().filter_map(|dir| {
+        match fvmrc_version(&fs::read_to_string(dir.join(".fvmrc")).ok()?) {
+            FvmrcPin::Pin(version) => Some(version),
+            FvmrcPin::Flavor(flavor) => {
+                eprintln!(
+                    "dartq: .fvmrc declares flavor {flavor} which dartq does not resolve; \
+                     falling back"
+                );
+                None
+            }
+            FvmrcPin::Skip => None,
+        }
+    })
+}
+
+/// The `.fvmrc` step's binary for `tool`: each `.fvmrc` walking upward
+/// from `cwd` (nearest first) pins a version through [`fvmrc_versions`];
+/// when that version's fvm directory holds `<dir>/bin/<tool>` the binary
+/// answers, otherwise one stderr note and the walk continues — an
+/// uninstalled pin is never a refusal (the chain falls through to
+/// `PATH`, matching fvm's own "version not installed" posture without
+/// its hard stop). `None` covers every miss: no `.fvmrc` on the chain, no
+/// pin in any of them, no `home`, or no installed version anywhere up
+/// the walk.
+fn fvmrc_tool_binary(cwd: Option<&Path>, home: Option<&Path>, tool: &str) -> Option<PathBuf> {
+    for version in fvmrc_versions(cwd?) {
+        if let Some(bin) = fvm_version_dir(home, &version)
             .map(|root| root.join("bin").join(tool))
             && bin.is_file()
         {
@@ -535,6 +602,51 @@ mod tests {
         }
     }
 
+    /// The `.fvmrc` reader's verdicts: the fvm 3.x/4.x JSON shape pins its
+    /// `flutter` member (surrounding whitespace tolerated), the legacy
+    /// bare string still pins, and content carrying no usable version — an
+    /// empty file, an empty/null/non-string `flutter`, an unrelated
+    /// object — reads as a skip rather than a bogus version. A flavor
+    /// declaration is its own verdict; malformed content reads the legacy
+    /// way, so the install lookup (not the parser) is what rejects it.
+    #[test]
+    fn fvmrc_version_reads_json_and_legacy_shapes() {
+        let pin = |version: &str| FvmrcPin::Pin(version.to_owned());
+        assert_eq!(
+            fvmrc_version("{\n  \"flutter\": \"3.32.0\"\n}\n"),
+            pin("3.32.0"),
+            "the real-world JSON shape pins"
+        );
+        assert_eq!(fvmrc_version("{\"flutter\": \" 3.32.0 \"}"), pin("3.32.0"));
+        assert_eq!(fvmrc_version("3.29.3\n"), pin("3.29.3"), "legacy bare pins");
+        assert_eq!(fvmrc_version(" 3.29.3 \n"), pin("3.29.3"));
+        for skip in [
+            "",
+            " \n",
+            "{}",
+            "{\"flutter\": \"\"}",
+            "{\"flutter\": null}",
+            "{\"flutter\": 3}",
+            "{\"dart\": \"3.29.3\"}",
+        ] {
+            assert_eq!(fvmrc_version(skip), FvmrcPin::Skip, "{skip:?} pins nothing");
+        }
+        assert_eq!(
+            fvmrc_version("{\"flutter\": \"3.19.0\", \"flavor\": \"prod\"}"),
+            FvmrcPin::Flavor("prod".to_owned())
+        );
+        assert_eq!(
+            fvmrc_version("{\"flutter\": \"3.19.0\", \"flavor\": null}"),
+            pin("3.19.0"),
+            "a non-string flavor is no declaration"
+        );
+        assert_eq!(
+            fvmrc_version("garbage\n"),
+            pin("garbage"),
+            "non-JSON content reads as the legacy bare pin — the install lookup rejects it"
+        );
+    }
+
     /// The `.fvmrc` step's walk and precedence: the nearest `.fvmrc` wins
     /// (a deeper dir's pin answers over an ancestor's), the version binary
     /// canonicalizes like an override, and a miss anywhere falls through to
@@ -547,8 +659,13 @@ mod tests {
         home.install(".fvm", "3.0.0", "dart");
         let project = scratch.0.join("parent/child");
         fs::create_dir_all(&project).expect("project");
-        fs::write(scratch.0.join("parent/.fvmrc"), "3.0.0\n").expect("outer fvmrc");
-        fs::write(project.join(".fvmrc"), " 3.29.3\n").expect("inner fvmrc");
+        fs::write(
+            scratch.0.join("parent/.fvmrc"),
+            "{\"flutter\": \"3.0.0\"}",
+        )
+        .expect("outer fvmrc");
+        fs::write(project.join(".fvmrc"), "{\n  \"flutter\": \"3.29.3\"\n}\n")
+            .expect("inner fvmrc");
         let path = scratch.sdk("path");
         assert_eq!(
             resolve_in(
@@ -564,59 +681,126 @@ mod tests {
         );
     }
 
-    /// `.fvmrc` edge cases, each still falling through to `PATH`: an
-    /// ancestor's pin answers when the cwd has none; an empty `.fvmrc` is
-    /// skipped for the ancestor's; an uninstalled pin is skipped the same
-    /// way (stderr note aside); and no `.fvmrc` at all is the plain scan.
+    /// `.fvmrc` edge cases, each still falling through to `PATH`: a
+    /// legacy bare-string ancestor pin answers; the real-world JSON shape
+    /// answers too, from a nearer file; a JSON object with an empty
+    /// `flutter` member defers to the ancestor's; an uninstalled pin is
+    /// skipped the same way (stderr note aside); and no `.fvmrc` at all is
+    /// the plain scan.
     #[test]
     fn fvmrc_walk_skips_empty_and_uninstalled() {
         let scratch = Scratch::new("fvmrc-skips");
         let home = FvmHome::new(&scratch);
-        home.install(".fvm", "3.29.3", "flutter");
+        let pinned = home.install(".fvm", "3.29.3", "flutter");
+        let canonical_pin = fs::canonicalize(&pinned).expect("pin resolves");
         let path = scratch.sdk("path");
 
-        // Ancestor pin answers from a bare cwd.
+        // A legacy bare-string ancestor pin answers from a bare cwd.
         let outer = scratch.0.join("outer");
         let child = outer.join("child");
         fs::create_dir_all(&child).expect("child");
         fs::write(outer.join(".fvmrc"), "3.29.3").expect("outer fvmrc");
         assert_eq!(
-            resolve_in(
-                &FLUTTER,
-                None,
-                None,
-                Some(&child),
-                Some(&home.0),
-                Vec::new()
-            ),
-            Some(
-                fs::canonicalize(home.0.join(".fvm/versions/3.29.3/bin/flutter"))
-                    .expect("ancestor pin resolves")
-            )
+            resolve_in(&FLUTTER, None, None, Some(&child), Some(&home.0), Vec::new()),
+            Some(canonical_pin.clone()),
+            "the legacy bare ancestor pin resolves"
         );
 
-        // An empty nearer .fvmrc defers to the ancestor's pin.
-        fs::write(child.join(".fvmrc"), "\n").expect("empty fvmrc");
-        assert!(
-            resolve_in(&FLUTTER, None, None, Some(&child), Some(&home.0), Vec::new()).is_some(),
-            "the empty .fvmrc defers to the ancestor's installed pin"
+        // The real-world JSON shape answers the same way.
+        fs::write(child.join(".fvmrc"), "{\n  \"flutter\": \"3.29.3\"\n}\n")
+            .expect("json fvmrc");
+        assert_eq!(
+            resolve_in(&FLUTTER, None, None, Some(&child), Some(&home.0), Vec::new()),
+            Some(canonical_pin.clone()),
+            "the fvm 3.x JSON pin resolves"
+        );
+
+        // An empty JSON pin defers to the ancestor's.
+        fs::write(child.join(".fvmrc"), "{\"flutter\": \"\"}").expect("empty json fvmrc");
+        assert_eq!(
+            resolve_in(&FLUTTER, None, None, Some(&child), Some(&home.0), Vec::new()),
+            Some(canonical_pin.clone()),
+            "an empty JSON pin defers to the ancestor's installed pin"
         );
 
         // An uninstalled pin nearer the cwd defers to the ancestor's too.
-        fs::write(child.join(".fvmrc"), "9.9.9\n").expect("uninstalled fvmrc");
-        assert!(
-            resolve_in(&FLUTTER, None, None, Some(&child), Some(&home.0), Vec::new()).is_some(),
+        fs::write(child.join(".fvmrc"), "{\"flutter\": \"9.9.9\"}").expect("uninstalled fvmrc");
+        assert_eq!(
+            resolve_in(&FLUTTER, None, None, Some(&child), Some(&home.0), Vec::new()),
+            Some(canonical_pin),
             "the uninstalled pin defers to the ancestor's installed pin"
         );
 
         // A lone uninstalled pin falls through to PATH, never an error.
         let bare = scratch.0.join("bare");
         fs::create_dir_all(&bare).expect("bare");
-        fs::write(bare.join(".fvmrc"), "9.9.9\n").expect("bare fvmrc");
+        fs::write(bare.join(".fvmrc"), "{\"flutter\": \"9.9.9\"}").expect("bare fvmrc");
         assert_eq!(
-            resolve_in(&FLUTTER, None, None, Some(&bare), Some(&home.0), vec![path]),
+            resolve_in(
+                &FLUTTER,
+                None,
+                None,
+                Some(&bare),
+                Some(&home.0),
+                vec![path.clone()]
+            ),
             Some(scratch.0.join("path/flutter")),
-            "an uninstalled pin falls through to PATH"
+            "an uninstalled JSON pin falls through to PATH"
+        );
+
+        // No `.fvmrc` anywhere is the plain scan.
+        let plain = scratch.0.join("plain");
+        fs::create_dir_all(&plain).expect("plain");
+        assert_eq!(
+            resolve_in(
+                &FLUTTER,
+                None,
+                None,
+                Some(&plain),
+                Some(&home.0),
+                vec![path]
+            ),
+            Some(scratch.0.join("path/flutter"))
+        );
+    }
+
+    /// A flavor declaration is a fall-through, not a pin: fvm installs a
+    /// flavored version at `versions/<version>_<flavor>`, a layout dartq
+    /// does not resolve — the walk notes it (the shared reader's stderr
+    /// line) and keeps going: an ancestor's plain pin answers, and a lone
+    /// flavor declaration falls through to `PATH`.
+    #[test]
+    fn fvmrc_flavor_falls_through() {
+        let scratch = Scratch::new("fvmrc-flavor");
+        let home = FvmHome::new(&scratch);
+        let pinned = home.install(".fvm", "3.19.0", "flutter");
+        let outer = scratch.0.join("outer");
+        let child = outer.join("child");
+        fs::create_dir_all(&child).expect("child");
+        fs::write(outer.join(".fvmrc"), "{\"flutter\": \"3.19.0\"}").expect("outer fvmrc");
+        let flavored = "{\"flutter\": \"3.19.0\", \"flavor\": \"prod\"}";
+        fs::write(child.join(".fvmrc"), flavored).expect("flavored fvmrc");
+        assert_eq!(
+            resolve_in(&FLUTTER, None, None, Some(&child), Some(&home.0), Vec::new()),
+            Some(fs::canonicalize(&pinned).expect("pin resolves")),
+            "the flavor declaration defers to the ancestor's plain pin"
+        );
+
+        let bare = scratch.0.join("flavored-only");
+        fs::create_dir_all(&bare).expect("bare");
+        fs::write(bare.join(".fvmrc"), flavored).expect("lone flavored fvmrc");
+        let path = scratch.sdk("flavor-path");
+        assert_eq!(
+            resolve_in(
+                &FLUTTER,
+                None,
+                None,
+                Some(&bare),
+                Some(&home.0),
+                vec![path]
+            ),
+            Some(scratch.0.join("flavor-path/flutter")),
+            "a lone flavor declaration falls through to PATH"
         );
     }
 

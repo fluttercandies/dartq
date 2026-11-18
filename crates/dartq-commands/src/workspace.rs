@@ -314,10 +314,12 @@ pub enum ResolveSdkError {
 /// 1. the explicit `--sdk`/`--sdk-path` flag;
 /// 2. `$DART_SDK` (an empty value reads as unset);
 /// 3. the governing `dartq.yaml`'s top-level `sdk:` locator;
-/// 4. the project's `.fvmrc`: the first one walking upward from `dir` pins
-///    an FVM version, resolving to `<fvm versions>/<v>` then its embedded
-///    `bin/cache/dart-sdk` — an empty or uninstalled pin is skipped (one
-///    stderr note), never a refusal;
+/// 4. the project's `.fvmrc` — the fvm 3.x/4.x JSON `{"flutter": "<v>"}`,
+///    or a legacy bare version: each file walking upward from `dir`
+///    (nearest first) pins an FVM version, resolving to
+///    `<fvm versions>/<v>` then its embedded `bin/cache/dart-sdk` — a file
+///    pinning nothing, a flavor declaration, or an uninstalled pin is
+///    skipped (one stderr note), never a refusal;
 /// 5. the `dart` on `PATH` — the same
 ///    [`dartq_toolchain::find_dart`] lookup the official face spawns —
 ///    through either binary layout (`<sdk>/bin/dart`, or Flutter's
@@ -365,24 +367,19 @@ pub fn resolve_sdk_root(dir: &Path, explicit: Option<&Path>) -> Result<PathBuf, 
     Err(ResolveSdkError::NotFound)
 }
 
-/// The `.fvmrc` step of [`resolve_sdk_root`]: the first `.fvmrc` walking
-/// upward from `dir` pins an FVM version; the version's root resolves
-/// through the shared canonicalizer onto its embedded
-/// `bin/cache/dart-sdk`. An unreadable `.fvmrc` is absent; an empty pin is
-/// skipped; a pin naming no installed version prints one stderr note and
-/// the walk continues — an uninstalled fvm pin is a fallback, never a
-/// refusal (unlike the named steps above, a discovered pin is not the
-/// invocation's own declaration).
+/// The `.fvmrc` step of [`resolve_sdk_root`]: each `.fvmrc` walking upward
+/// from `dir` (nearest first) pins an FVM version through the shared
+/// [`dartq_toolchain::fvmrc_versions`] reader (the JSON `{"flutter": "<v>"}`
+/// shape or a legacy bare version; a file pinning nothing or a flavor
+/// declaration is passed over there, the flavor noted on stderr); the
+/// version's root resolves through the shared canonicalizer onto its
+/// embedded `bin/cache/dart-sdk`. A pin naming no installed version
+/// prints one stderr note and the walk continues — an uninstalled fvm pin
+/// is a fallback, never a refusal (unlike the named steps above, a
+/// discovered pin is not the invocation's own declaration).
 fn fvmrc_sdk_root(dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    for ancestor in dir.ancestors() {
-        let Ok(version) = fs::read_to_string(ancestor.join(".fvmrc")) else {
-            continue;
-        };
-        let version = version.trim();
-        if version.is_empty() {
-            continue;
-        }
-        let Some(version_root) = dartq_toolchain::fvm_version_dir(home, version) else {
+    for version in dartq_toolchain::fvmrc_versions(dir) {
+        let Some(version_root) = dartq_toolchain::fvm_version_dir(home, &version) else {
             eprintln!("dartq: .fvmrc pins {version} but it is not installed — falling back");
             continue;
         };
@@ -3153,12 +3150,14 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// The `.fvmrc` step: the first `.fvmrc` walking up from the analyzed
-    /// dir pins a version whose fvm layout resolves onto the embedded
-    /// `bin/cache/dart-sdk` — ahead of the PATH `dart`. The pin's own
-    /// canonicalizer handles both plain SDK and Flutter-root shapes, and
-    /// the walk's skips (empty pin, uninstalled pin, no `.fvmrc`) fall
-    /// through to PATH, never to a refusal.
+    /// The `.fvmrc` step: each `.fvmrc` walking up from the analyzed dir
+    /// pins a version through the shared reader — the fvm 3.x/4.x JSON
+    /// `{"flutter": "<v>"}` shape or a legacy bare version — whose fvm
+    /// layout resolves onto the embedded `bin/cache/dart-sdk`, ahead of
+    /// the PATH `dart`. The pin's own canonicalizer handles both plain SDK
+    /// and Flutter-root shapes, and the walk's skips (a file pinning
+    /// nothing, a flavor declaration, an uninstalled pin, no `.fvmrc`)
+    /// fall through to PATH, never to a refusal.
     #[test]
     fn the_fvmrc_step_resolves_the_pinned_version() {
         let root = workspace("ws_sdk_fvmrc", &[]).canonicalize().expect("root");
@@ -3167,32 +3166,61 @@ mod tests {
         // `bin/cache/dart-sdk` is the usable SDK.
         let home = root.join("home");
         let flutter = write_flutter_sdk(&home, ".fvm/versions/3.29.3");
+        let sdk = flutter.join("bin").join("cache").join("dart-sdk");
         let project = root.join("parent/child");
         fs::create_dir_all(&project).expect("project dirs");
-        fs::write(root.join("parent/.fvmrc"), "3.29.3\n").expect("outer fvmrc");
+        // The real fvm 3.x/4.x shape: a JSON object naming the version.
+        fs::write(
+            root.join("parent/.fvmrc"),
+            "{\n  \"flutter\": \"3.29.3\"\n}\n",
+        )
+        .expect("outer fvmrc");
 
         // An ancestor's pin answers from a bare member dir, canonicalized
         // onto the embedded dart-sdk.
         assert_eq!(
             fvmrc_sdk_root(&project, Some(&home)),
-            Some(flutter.join("bin").join("cache").join("dart-sdk")),
-            "the ancestor .fvmrc pins the embedded SDK"
+            Some(sdk.clone()),
+            "the ancestor JSON .fvmrc pins the embedded SDK"
         );
 
-        // A nearer pin wins; an empty one defers to the ancestor's.
-        fs::write(project.join(".fvmrc"), "9.9.9\n").expect("near fvmrc");
+        // A nearer uninstalled pin, a file pinning nothing, and a flavor
+        // declaration each defer to the ancestor's installed pin.
+        for deferring in [
+            "{\"flutter\": \"9.9.9\"}",
+            "{\"flutter\": \"\"}",
+            "{\"flutter\": null}",
+            "{\"flutter\": \"3.29.3\", \"flavor\": \"prod\"}",
+        ] {
+            fs::write(project.join(".fvmrc"), deferring).expect("deferring fvmrc");
+            assert_eq!(
+                fvmrc_sdk_root(&project, Some(&home)),
+                Some(sdk.clone()),
+                "{deferring:?} defers to the ancestor's installed pin"
+            );
+        }
+
+        // A legacy bare-string pin still resolves end to end.
+        let legacy = root.join("legacy");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+        fs::write(legacy.join(".fvmrc"), "3.29.3\n").expect("legacy fvmrc");
         assert_eq!(
-            fvmrc_sdk_root(&project, Some(&home)),
-            Some(flutter.join("bin").join("cache").join("dart-sdk")),
-            "an uninstalled nearer pin defers to the ancestor's installed one"
+            fvmrc_sdk_root(&legacy, Some(&home)),
+            Some(sdk.clone()),
+            "the legacy bare-string pin resolves"
         );
 
         // A lone uninstalled pin resolves to nothing (the PATH step takes
-        // it from here).
+        // it from here); a lone flavor declaration is the same miss.
         let bare = root.join("bare");
         fs::create_dir_all(&bare).expect("bare dir");
-        fs::write(bare.join(".fvmrc"), "9.9.9\n").expect("bare fvmrc");
-        assert_eq!(fvmrc_sdk_root(&bare, Some(&home)), None);
+        for missing in [
+            "{\"flutter\": \"9.9.9\"}",
+            "{\"flutter\": \"3.29.3\", \"flavor\": \"prod\"}",
+        ] {
+            fs::write(bare.join(".fvmrc"), missing).expect("bare fvmrc");
+            assert_eq!(fvmrc_sdk_root(&bare, Some(&home)), None, "{missing:?}");
+        }
 
         // No `.fvmrc` anywhere is the plain miss.
         let plain = root.join("plain");

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-11-19
+
+### Fixed
+
+- P0: `.fvmrc` now parses the JSON shape fvm 3.x/4.x actually writes —
+  `{"flutter": "<version>"}` — instead of treating the whole file as a
+  bare version string. 0.1.29's bare-string reader missed every
+  real-world project's pin, printed a bogus "not installed" note naming
+  the file's JSON text, and fell through to `PATH`. Legacy bare-version
+  files still resolve; a `flavor` declaration prints one note and falls
+  through rather than silently mispicking (#4357).
+
 ## [0.1.29] - 2026-11-18
 
 ### Added
