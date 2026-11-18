@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-11-18
+
+### Added
+
+- fvm surfaces, two faces over one layout source. The project `.fvmrc`
+  now participates in every toolchain resolution: it walks cwd-to-root
+  and lands between the explicit pin/environment override and the PATH
+  scan on `find_flutter`, `find_dart`, and `resolve_sdk_root`. First
+  `.fvmrc` wins; an empty or unreadable pin is skipped; a pin naming an
+  uninstalled version prints one stderr note and the walk continues —
+  dartq never hard-fails on a version the host does not have. Alongside,
+  `dartq fvm flutter <args…>` and `dartq fvm dart <args…>` pre-clap
+  dispatch pins the fvm chain (`.fvmrc` → `~/.fvm/default` →
+  `~/fvm/default` → PATH last resort) while `build_cache.flutter` still
+  wins; `dartq fvm dart analyze` re-enters dartq analyze, every other
+  dart verb execs the resolved binary, and a bare `dartq fvm` exits 64
+  with the supported-verb line. The fvm layout facts
+  (`fvm_version_dir`, `fvm_default_root`) move to `dartq_toolchain` so
+  the `sdk: fvm:<v>` locator, the `.fvmrc` walk, and the `dartq fvm`
+  face share one source; the locator keeps its uninstalled→modern-path
+  posture so the axis loader still reports `sdk_unavailable` (#4356).
+- CLI: `dartq session start/status` rows now print the resolved SDK's
+  `sdk_version` leg beside `sdk` — the version file's first line, not
+  the fvm layout's directory name, so an fvm-managed SDK reads `3.13.7`
+  (the Dart version) next to `~/fvm/versions/3.47.9/...` (the Flutter
+  release it embeds) instead of two conflicting facts (#4341).
+- CLI: `--metrics-json` exposes the per-run direct-drive legs and
+  `--stats` reports the direct-drive truth — the analyze face now
+  attributes time to the path it actually took (resident serve vs.
+  daemon fallback vs. in-process direct drive), not a blanket engine
+  clock (#4331).
+- Semantic: the annotation, pattern, const, and inference surfaces get a
+  faces window — every `p.C` resolution now reports its full verdict
+  class across the four surfaces (var-init, argument,
+  field/ctor-initializer, return) through a single registration pass
+  (#4294, #4304).
+- Parser: the metadata anchor law and constructor-head recovery shape —
+  annotations that would previously collapse to the next token now
+  anchor to their own range, and a malformed constructor head recovers
+  into the shape the oracle reports (#4342).
+- Engine: canary coverage for the non-constant set element and
+  strict-inference creation faces — pins the surfaces the conformance
+  sweep hits so a future change cannot silently reclassify them
+  (untracked test additions, #4299-class canary).
+
+### Fixed
+
+- Semantic: a primary constructor's `errorRange` now anchors to the
+  owning declaration — previously a miss on the primary-ctor name could
+  attach the error to the class header and mis-report the range oracle
+  emits (follow-up to the ctor-head anchor law).
+- Daemon: the watch tests are hardened against fseventsd's first-batch
+  lag — the harness now tolerates the macOS watcher delivering its
+  initial event batch slowly instead of racing a fixed window (#4350,
+  #4351).
+
 ## [0.1.28] - 2026-11-16
 
 ### Fixed
