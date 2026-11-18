@@ -2173,7 +2173,9 @@ fn artifact_stamp(path: &Path) -> Option<ArtifactStamp> {
 
 /// Resolves the flutter binary the shim spawns, the way every dartq
 /// face resolves it ([`dartq_toolchain::find_flutter`]): the config
-/// override, then `$DARTQ_FLUTTER`, then a PATH search that skips the
+/// override, then `$DARTQ_FLUTTER`, then the project's `.fvmrc` (the
+/// pinned version's `~/.fvm/versions/<v>/bin/flutter`), then a PATH
+/// search that skips the
 /// running dartq binary itself (either an explicit override or a PATH
 /// hit resolving to this executable would recurse — each shim spawning
 /// another at ~210 processes/second, audit A10; the shared resolver's

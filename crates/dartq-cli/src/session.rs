@@ -64,8 +64,8 @@ struct StartArgs {
     #[arg(default_value = ".")]
     dir: PathBuf,
     /// Dart SDK root; defaults to the shared discovery chain (`$DART_SDK`,
-    /// then `dartq.yaml`'s `sdk:`, then the `dart` on PATH, then the fvm
-    /// default).
+    /// then `dartq.yaml`'s `sdk:`, then the project's `.fvmrc`, then the
+    /// `dart` on PATH, then the fvm default).
     #[arg(long)]
     sdk: Option<PathBuf>,
     /// Output format: `lon` (the default), `json`, or `text` (the
@@ -120,8 +120,9 @@ pub fn run_entry(args: &SessionArgs) -> u8 {
 /// The SDK root a face that attaches to `root`'s session keys on: the one
 /// discovery chain every engine face shares
 /// ([`dartq_commands::workspace::resolve_sdk_root`] — the `--sdk` flag,
-/// `$DART_SDK`, the `dartq.yaml` `sdk:` locator, the `dart` on PATH, the
-/// fvm default), else — only when nothing named an SDK — the live
+/// `$DART_SDK`, the `dartq.yaml` `sdk:` locator, the project's `.fvmrc`,
+/// the `dart` on PATH, the fvm default), else — only when nothing named
+/// an SDK — the live
 /// resident session's own triple (the state file is keyed by root alone,
 /// so a live session names the one SDK to attach under: `session start`
 /// without a flag attaches to it, and the debug/MCP/answer faces inherit
@@ -2127,7 +2128,7 @@ pub(crate) mod tests {
     /// #4105 → #4187: the shared SDK chain every face resolves by — a
     /// root the invocation names (the flag, then `$DART_SDK`, then the
     /// `dartq.yaml` `sdk:` locator) must BE an SDK root, an error on
-    /// anything else; discovery (`PATH` dart, then the fvm default)
+    /// anything else; discovery (`.fvmrc`, `PATH` dart, then the fvm default)
     /// answers only when nothing named one; the live session's own triple
     /// fills the miss; and only then the navigation error, which names
     /// every way. It rewrites `PATH` and `HOME` to switch discovery off

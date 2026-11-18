@@ -315,6 +315,10 @@ and validated ahead of their consumers.
 ```yaml
 version: 1
 
+# The workspace's SDK — the engine faces' third resolution step, after the
+# `--sdk` flag and `$DART_SDK` (then `.fvmrc`, PATH `dart`, fvm default).
+sdk: fvm:3.29.3
+
 # Named SDK contexts — `dartq compatibility --context <label>` axes, in file order.
 contexts:
   stable:
@@ -369,6 +373,17 @@ intercepted when that directory sits ahead of the real flutter on
 `dartq.yaml` (only when none exists) — the cache is on with its
 defaults from the first run; `build_cache.enabled: false` in
 `dartq.yaml` is the one spelling that turns it off.
+
+fvm is a first-class input to the same chain: the first `.fvmrc` walking
+upward from the project directory pins a Flutter version
+(`~/.fvm/versions/<v>`, or the pre-3.0 `~/fvm/versions/<v>`) for every
+face — the `flutter`/`dart` binary lookups and the SDK root alike —
+ahead of `PATH` and the fvm default. An uninstalled pin notes itself on
+stderr and falls through, never a refusal. `dartq fvm flutter <args…>`
+and `dartq fvm dart <args…>` are the explicit spellings: the same faces
+restricted to the fvm chain (`.fvmrc` → the fvm default → `PATH` as the
+last resort), with `dartq fvm dart analyze` routing into dartq's analyze
+face like the `dart` shim does.
 
 Caps live in `dartq.yaml`: `cache.size_limit_gib` bounds both analysis
 stores (snapshots and content store; each defaults to 10 GiB), and

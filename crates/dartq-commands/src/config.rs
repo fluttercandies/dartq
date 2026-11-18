@@ -679,10 +679,10 @@ fn locator_root(locator: &str, config_dir: &Path, what: &str) -> Result<PathBuf,
     )))
 }
 
-/// The FVM version's cache root: `$HOME/.fvm/versions/<version>` (FVM 3's
-/// layout), or the pre-3.0 `$HOME/fvm/versions/<version>` when that is the
-/// one on disk. No installed match → the modern path, which the axis
-/// loader reports as `sdk_unavailable` (failure isolation).
+/// The FVM version's cache root — the [`dartq_toolchain::fvm_version_dir`]
+/// layout fact, with one locator-facing difference: an uninstalled version
+/// still resolves to its canonical modern path so the axis loader — not
+/// this function — reports it as an unavailable SDK (failure isolation).
 ///
 /// # Errors
 ///
@@ -693,29 +693,8 @@ fn fvm_version_root(version: &str) -> Result<PathBuf, ConfigError> {
             "cannot resolve fvm version `{version}`: no home directory"
         )));
     };
-    let modern = home.join(".fvm").join("versions").join(version);
-    let legacy = home.join("fvm").join("versions").join(version);
-    Ok(if legacy.is_dir() && !modern.is_dir() {
-        legacy
-    } else {
-        modern
-    })
-}
-
-/// The FVM default's root — a FLUTTER SDK root whose embedded
-/// `bin/cache/dart-sdk` is the engine's last-resolution SDK: `$HOME/.fvm/
-/// default` (FVM 3's layout), or the pre-3.0 `$HOME/fvm/default` when that
-/// is the one on disk. `None` without a home directory. Whether the root
-/// holds a usable SDK is the resolution chain's probe, not this lookup.
-pub(crate) fn fvm_default_root(home: Option<&Path>) -> Option<PathBuf> {
-    let home = home?;
-    let modern = home.join(".fvm").join("default");
-    let legacy = home.join("fvm").join("default");
-    Some(if legacy.is_dir() && !modern.is_dir() {
-        legacy
-    } else {
-        modern
-    })
+    Ok(dartq_toolchain::fvm_version_dir(Some(home.as_path()), version)
+        .unwrap_or_else(|| home.join(".fvm").join("versions").join(version)))
 }
 
 /// Dedup by exact root, first occurrence wins (axis order stays the
@@ -1517,17 +1496,17 @@ mod tests {
         let home = tempfile::tempdir().expect("home");
         let modern = home.path().join(".fvm").join("default");
         assert_eq!(
-            fvm_default_root(Some(home.path())),
+            dartq_toolchain::fvm_default_root(Some(home.path())),
             Some(modern),
             "the modern layout is the default guess"
         );
         fs::create_dir_all(home.path().join("fvm").join("default")).expect("legacy dir");
         assert_eq!(
-            fvm_default_root(Some(home.path())),
+            dartq_toolchain::fvm_default_root(Some(home.path())),
             Some(home.path().join("fvm").join("default")),
             "the legacy layout wins when it is the one on disk"
         );
-        assert_eq!(fvm_default_root(None), None);
+        assert_eq!(dartq_toolchain::fvm_default_root(None), None);
     }
 
     /// The warm-standby knobs beside the pool's: warm is off by default

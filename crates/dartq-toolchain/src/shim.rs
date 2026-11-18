@@ -222,13 +222,30 @@ pub fn dart_passthrough(argv: &[OsString]) -> i32 {
         );
         return 127;
     };
+    dart_exec(&dart, argv)
+}
+
+/// The `dartq fvm dart` face's passthrough: the same exec as
+/// [`dart_passthrough`] but over a caller-resolved `dart` (the fvm chain's
+/// answer — the face resolves `.fvmrc`/the fvm default itself rather than
+/// re-running the shared chain's env step). `127` when the exec fails.
+#[must_use]
+pub fn dart_passthrough_resolved(dart: &Path, argv: &[OsString]) -> i32 {
+    dart_exec(dart, argv)
+}
+
+/// The passthrough exec both spellings share: `dart` with the original
+/// argv verbatim, `DARTQ_SHIM` stripped so a nested dartq never mistakes
+/// itself for a shim. `exec` replaces the process outright on unix;
+/// elsewhere the child runs and its status answers.
+fn dart_exec(dart: &Path, argv: &[OsString]) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         // A successful exec never returns; the Err it returns IS the
         // exec failure.
-        let error = Command::new(&dart)
+        let error = Command::new(dart)
             .args(argv)
             .current_dir(&cwd)
             .env_remove("DARTQ_SHIM")
@@ -238,7 +255,7 @@ pub fn dart_passthrough(argv: &[OsString]) -> i32 {
     }
     #[cfg(not(unix))]
     {
-        match Command::new(&dart)
+        match Command::new(dart)
             .args(argv)
             .current_dir(&cwd)
             .env_remove("DARTQ_SHIM")

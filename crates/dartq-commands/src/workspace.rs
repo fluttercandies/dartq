@@ -314,12 +314,16 @@ pub enum ResolveSdkError {
 /// 1. the explicit `--sdk`/`--sdk-path` flag;
 /// 2. `$DART_SDK` (an empty value reads as unset);
 /// 3. the governing `dartq.yaml`'s top-level `sdk:` locator;
-/// 4. the `dart` on `PATH` — the same
+/// 4. the project's `.fvmrc`: the first one walking upward from `dir` pins
+///    an FVM version, resolving to `<fvm versions>/<v>` then its embedded
+///    `bin/cache/dart-sdk` — an empty or uninstalled pin is skipped (one
+///    stderr note), never a refusal;
+/// 5. the `dart` on `PATH` — the same
 ///    [`dartq_toolchain::find_dart`] lookup the official face spawns —
 ///    through either binary layout (`<sdk>/bin/dart`, or Flutter's
 ///    `<flutter>/bin/dart` whose SDK sits embedded at
 ///    `<flutter>/bin/cache/dart-sdk`);
-/// 5. the fvm default (`~/.fvm/default`, or the pre-3.0 `~/fvm/default`) —
+/// 6. the fvm default (`~/.fvm/default`, or the pre-3.0 `~/fvm/default`) —
 ///    a Flutter root, resolved through its embedded SDK.
 ///
 /// A root the first three steps name must hold a usable SDK ([`Named`] on
@@ -345,17 +349,51 @@ pub fn resolve_sdk_root(dir: &Path, explicit: Option<&Path>) -> Result<PathBuf, 
     if let Some(named) = config_sdk_root(dir)? {
         return named_sdk_root(&named);
     }
+    if let Some(root) = fvmrc_sdk_root(dir, env::home_dir().as_deref()) {
+        return Ok(root);
+    }
     if let Some(dart) = dartq_toolchain::find_dart(None)
         && let Some(root) = dartq_sdk::dart_sdk_root_of_dart(&dart)
     {
         return Ok(root);
     }
-    if let Some(default) = crate::config::fvm_default_root(env::home_dir().as_deref())
+    if let Some(default) = dartq_toolchain::fvm_default_root(env::home_dir().as_deref())
         && let Some(root) = dartq_sdk::dart_sdk_root(&default)
     {
         return Ok(root);
     }
     Err(ResolveSdkError::NotFound)
+}
+
+/// The `.fvmrc` step of [`resolve_sdk_root`]: the first `.fvmrc` walking
+/// upward from `dir` pins an FVM version; the version's root resolves
+/// through the shared canonicalizer onto its embedded
+/// `bin/cache/dart-sdk`. An unreadable `.fvmrc` is absent; an empty pin is
+/// skipped; a pin naming no installed version prints one stderr note and
+/// the walk continues — an uninstalled fvm pin is a fallback, never a
+/// refusal (unlike the named steps above, a discovered pin is not the
+/// invocation's own declaration).
+fn fvmrc_sdk_root(dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    for ancestor in dir.ancestors() {
+        let Ok(version) = fs::read_to_string(ancestor.join(".fvmrc")) else {
+            continue;
+        };
+        let version = version.trim();
+        if version.is_empty() {
+            continue;
+        }
+        let Some(version_root) = dartq_toolchain::fvm_version_dir(home, version) else {
+            eprintln!("dartq: .fvmrc pins {version} but it is not installed — falling back");
+            continue;
+        };
+        // A version dir that holds no usable SDK root (a partial fvm
+        // install) is the same miss the PATH step's dart may be — keep
+        // walking.
+        if let Some(sdk) = dartq_sdk::dart_sdk_root(&version_root) {
+            return Some(sdk);
+        }
+    }
+    None
 }
 
 /// One named root through the canonicalizer: [`ResolveSdkError::Named`]
@@ -3111,6 +3149,55 @@ mod tests {
             root.canonicalize().expect("root").join("sdk"),
             "the flag wins without reading the config"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `.fvmrc` step: the first `.fvmrc` walking up from the analyzed
+    /// dir pins a version whose fvm layout resolves onto the embedded
+    /// `bin/cache/dart-sdk` — ahead of the PATH `dart`. The pin's own
+    /// canonicalizer handles both plain SDK and Flutter-root shapes, and
+    /// the walk's skips (empty pin, uninstalled pin, no `.fvmrc`) fall
+    /// through to PATH, never to a refusal.
+    #[test]
+    fn the_fvmrc_step_resolves_the_pinned_version() {
+        let root = workspace("ws_sdk_fvmrc", &[]).canonicalize().expect("root");
+        // The home holds one fvm install, laid out like `write_flutter_sdk`:
+        // `<home>/.fvm/versions/3.29.3/` is a Flutter root whose
+        // `bin/cache/dart-sdk` is the usable SDK.
+        let home = root.join("home");
+        let flutter = write_flutter_sdk(&home, ".fvm/versions/3.29.3");
+        let project = root.join("parent/child");
+        fs::create_dir_all(&project).expect("project dirs");
+        fs::write(root.join("parent/.fvmrc"), "3.29.3\n").expect("outer fvmrc");
+
+        // An ancestor's pin answers from a bare member dir, canonicalized
+        // onto the embedded dart-sdk.
+        assert_eq!(
+            fvmrc_sdk_root(&project, Some(&home)),
+            Some(flutter.join("bin").join("cache").join("dart-sdk")),
+            "the ancestor .fvmrc pins the embedded SDK"
+        );
+
+        // A nearer pin wins; an empty one defers to the ancestor's.
+        fs::write(project.join(".fvmrc"), "9.9.9\n").expect("near fvmrc");
+        assert_eq!(
+            fvmrc_sdk_root(&project, Some(&home)),
+            Some(flutter.join("bin").join("cache").join("dart-sdk")),
+            "an uninstalled nearer pin defers to the ancestor's installed one"
+        );
+
+        // A lone uninstalled pin resolves to nothing (the PATH step takes
+        // it from here).
+        let bare = root.join("bare");
+        fs::create_dir_all(&bare).expect("bare dir");
+        fs::write(bare.join(".fvmrc"), "9.9.9\n").expect("bare fvmrc");
+        assert_eq!(fvmrc_sdk_root(&bare, Some(&home)), None);
+
+        // No `.fvmrc` anywhere is the plain miss.
+        let plain = root.join("plain");
+        fs::create_dir_all(&plain).expect("plain dir");
+        assert_eq!(fvmrc_sdk_root(&plain, Some(&home)), None);
 
         fs::remove_dir_all(&root).ok();
     }

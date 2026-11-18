@@ -302,6 +302,24 @@ fn main() -> ExitCode {
         let code = dartq_commands::bcache::run_flutter_explicit(argv);
         return ExitCode::from(u8::try_from(code).unwrap_or(exit::INTERNAL_ERROR));
     }
+    // The explicit fvm face: `dartq fvm flutter <args…>` and `dartq fvm
+    // dart <args…>` pin the fvm resolution chain (`.fvmrc` → the fvm
+    // default → `PATH` as the last resort) ahead of dartq's own grammar —
+    // the tools' flags are theirs, not dartq's. Dispatched beside the
+    // flutter forwarder for the same reason: `fvm flutter --help` is
+    // flutter's to answer, never a clap error. Bare `dartq fvm` and an
+    // unknown verb are the usage tier.
+    if let Some(face) = fvm_face(&raw) {
+        let code = match face {
+            FvmFace::Flutter(args) => dartq_commands::bcache::run_flutter_fvm(args),
+            FvmFace::Dart(args) => fvm_dart_face(args),
+            FvmFace::Usage => {
+                eprintln!("error: `dartq fvm` needs a tool: flutter | dart");
+                i32::from(exit::USAGE)
+            }
+        };
+        return ExitCode::from(u8::try_from(code).unwrap_or(exit::INTERNAL_ERROR));
+    }
     // Lossy argv decode: `env::args` panics (exit 101) on a non-UTF-8
     // argument, ahead of any parse; the lossy spelling keeps the process in
     // control — an invalid path fails downstream resolution as the ordinary
@@ -321,6 +339,61 @@ fn flutter_face_argv(argv: &[std::ffi::OsString]) -> Option<&[std::ffi::OsString
         Some((token, rest)) if token == std::ffi::OsStr::new("flutter") => Some(rest),
         _ => None,
     }
+}
+
+/// The `dartq fvm <tool>` face's routing: `Some` when the raw argv starts
+/// with the `fvm` token — which tool face answers, or the usage tier for
+/// the bare/unknown spellings. `fvm flutter <args…>` is the bcache
+/// forwarder with the fvm-resolved binary (the `build_cache.flutter` pin
+/// still wins ahead of `.fvmrc`); `fvm dart analyze …` re-enters dartq's
+/// analyze face exactly like the `dart` PATH shim, and every other dart
+/// verb execs the resolved dart verbatim. Bare `dartq fvm` and an unknown
+/// verb are the usage tier (64) — dartq does not reimplement fvm's own
+/// `use`/`install`/`list`.
+enum FvmFace<'a> {
+    /// `dartq fvm flutter <args…>` — the bcache forwarder.
+    Flutter(&'a [std::ffi::OsString]),
+    /// `dartq fvm dart <args…>` — analyze re-enters the CLI, the rest exec.
+    Dart(&'a [std::ffi::OsString]),
+    /// Bare `dartq fvm` or an unknown verb — exit 64.
+    Usage,
+}
+
+/// The dispatch core: the first raw token `fvm` selects the face, the
+/// second selects the tool.
+fn fvm_face(argv: &[std::ffi::OsString]) -> Option<FvmFace<'_>> {
+    let (token, rest) = argv.split_first()?;
+    if token != std::ffi::OsStr::new("fvm") {
+        return None;
+    }
+    Some(match rest.split_first() {
+        Some((verb, args)) if verb == std::ffi::OsStr::new("flutter") => FvmFace::Flutter(args),
+        Some((verb, args)) if verb == std::ffi::OsStr::new("dart") => FvmFace::Dart(args),
+        _ => FvmFace::Usage,
+    })
+}
+
+/// `dartq fvm dart <args…>`: `analyze` is dartq's analyze command verbatim
+/// (the argv after the `dart` token IS the subcommand line — the same
+/// contract the `dart` PATH shim ships), so it inherits the job gate and
+/// the analyzer RSS budget; every other dart invocation execs the
+/// fvm-resolved `dart`, argv untouched.
+fn fvm_dart_face(args: &[std::ffi::OsString]) -> i32 {
+    let is_analyze = args
+        .first()
+        .is_some_and(|token| token == std::ffi::OsStr::new("analyze"));
+    if is_analyze {
+        let args: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        return i32::from(run(&args));
+    }
+    let Some(dart) = dartq_toolchain::find_dart_fvm() else {
+        eprintln!("dartq: no dart executable found — install the Dart SDK or an fvm version");
+        return 127;
+    };
+    dartq_toolchain::shim::dart_passthrough_resolved(&dart, args)
 }
 
 /// The `dart` shim face: `dart analyze …` is dartq's analyze command
@@ -733,10 +806,11 @@ struct AnalyzeArgs {
     #[arg(long = "overlay", value_name = "PATH=FILE")]
     overlays: Vec<String>,
     /// Dart SDK root; unset, resolves through the shared discovery chain
-    /// (`$DART_SDK`, then `dartq.yaml`'s `sdk:`, then the `dart` on PATH,
-    /// then the fvm default), and a Flutter SDK root resolves onto its
-    /// embedded `bin/cache/dart-sdk`. The oracle's spelling `--sdk-path`
-    /// is the documented one; `--sdk` stays as a hidden compat alias.
+    /// (`$DART_SDK`, then `dartq.yaml`'s `sdk:`, then the project's
+    /// `.fvmrc`, then the `dart` on PATH, then the fvm default), and a
+    /// Flutter SDK root resolves onto its embedded `bin/cache/dart-sdk`.
+    /// The oracle's spelling `--sdk-path` is the documented one; `--sdk`
+    /// stays as a hidden compat alias.
     #[arg(long = "sdk-path", alias = "sdk", value_name = "PATH")]
     sdk_path: Option<PathBuf>,
     /// Package resolution configuration file (the dartdev `--packages`):
@@ -6925,6 +6999,50 @@ mod tests {
         assert!(flutter_face_argv(&argv(&["analyze", "flutter"])).is_none());
         assert!(flutter_face_argv(&argv(&["fluttertest"])).is_none());
         assert!(flutter_face_argv(&[]).is_none());
+    }
+
+    /// The `dartq fvm` face dispatches on the first raw token and routes
+    /// the second: `flutter`/`dart` select their faces with every trailing
+    /// argument verbatim (`--help` and friends stay the tools' own, never
+    /// dartq's parse), the bare and unknown spellings are the usage tier,
+    /// and any other head stays with the usual CLI.
+    #[test]
+    fn fvm_face_dispatches_flutter_and_dart_verbatim() {
+        let argv = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+        match fvm_face(&argv(&["fvm", "flutter", "--help"])) {
+            Some(FvmFace::Flutter(args)) => {
+                assert_eq!(args, argv(&["--help"]).as_slice(), "flutter's flag is its own")
+            }
+            other => panic!("expected the flutter face, got {}", fvm_face_name(&other)),
+        }
+        match fvm_face(&argv(&["fvm", "dart", "analyze", "pkg/"])) {
+            Some(FvmFace::Dart(args)) => {
+                assert_eq!(args, argv(&["analyze", "pkg/"]).as_slice())
+            }
+            other => panic!("expected the dart face, got {}", fvm_face_name(&other)),
+        }
+        for bad in [argv(&["fvm"]), argv(&["fvm", "use", "3.29.3"])] {
+            assert!(
+                matches!(fvm_face(&bad), Some(FvmFace::Usage)),
+                "bare `dartq fvm` and an unknown verb are the usage tier"
+            );
+        }
+        assert!(fvm_face(&argv(&["analyze"])).is_none());
+        assert!(fvm_face(&argv(&["fvmfoo"])).is_none());
+        assert!(fvm_face(&[]).is_none());
+    }
+
+    /// The routing enum's name, for the panic text — keeps the test's
+    /// failure output readable without a Debug derive on the enum.
+    fn fvm_face_name(face: &Option<FvmFace<'_>>) -> &'static str {
+        match face {
+            Some(FvmFace::Flutter(_)) => "flutter",
+            Some(FvmFace::Dart(_)) => "dart",
+            Some(FvmFace::Usage) => "usage",
+            None => "none",
+        }
     }
 
     /// The dart shim face dispatches on the first raw token: `analyze`

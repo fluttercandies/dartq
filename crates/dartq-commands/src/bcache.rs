@@ -226,7 +226,7 @@ pub fn is_shim_invocation(argv0: Option<&OsStr>) -> bool {
 /// would recurse into the shim itself).
 #[must_use]
 pub fn run_flutter_shim(argv: &[OsString]) -> i32 {
-    forward_flutter(argv, false)
+    forward_flutter(argv, false, FlutterResolve::Shared)
 }
 
 /// The explicit `dartq flutter <args…>` face: the same orchestration as
@@ -241,15 +241,40 @@ pub fn run_flutter_shim(argv: &[OsString]) -> i32 {
 /// and can see who declined.
 #[must_use]
 pub fn run_flutter_explicit(argv: &[OsString]) -> i32 {
-    forward_flutter(argv, true)
+    forward_flutter(argv, true, FlutterResolve::Shared)
 }
 
-/// The forwarder core both flutter faces share: resolve the governing
+/// The `dartq fvm flutter <args…>` face: the same bcache orchestration
+/// as [`run_flutter_explicit`] — config, cache run, child exit code —
+/// but the binary resolves through the fvm chain instead of the shared
+/// one: `.fvmrc` → `~/.fvm/default` → `~/fvm/default`, with `PATH` as
+/// the graceful last resort when no fvm install answers. The config's
+/// `build_cache.flutter` pin still wins (an explicit user pin beats
+/// `.fvmrc`).
+#[must_use]
+pub fn run_flutter_fvm(argv: &[OsString]) -> i32 {
+    forward_flutter(argv, true, FlutterResolve::Fvm)
+}
+
+/// Which binary lookup [`forward_flutter`] runs when the config names no
+/// flutter: the shared chain (`PATH`-bearing) or the fvm-only chain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlutterResolve {
+    /// [`dartq_toolchain::find_flutter`]: env override, `.fvmrc`, then
+    /// `PATH`.
+    Shared,
+    /// [`dartq_toolchain::find_flutter_fvm`]: the env override, `.fvmrc`,
+    /// the fvm default, then `PATH` as the last resort.
+    Fvm,
+}
+
+/// The forwarder core all flutter faces share: resolve the governing
 /// config (fail-open to the passthrough on a malformed one), discover
 /// the real flutter binary, then hand the ORIGINAL argv to the
 /// orchestrator — or exec the passthrough when the cache is disabled.
-/// `explicit` selects the not-found hint and the version-pin note.
-fn forward_flutter(argv: &[OsString], explicit: bool) -> i32 {
+/// `explicit` selects the not-found hint and the version-pin note;
+/// `resolve` picks the binary lookup the face pins.
+fn forward_flutter(argv: &[OsString], explicit: bool, resolve: FlutterResolve) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = match discover_shim_config(&cwd) {
         Ok(config) => config,
@@ -261,7 +286,19 @@ fn forward_flutter(argv: &[OsString], explicit: bool) -> i32 {
     let override_bin = config
         .as_ref()
         .and_then(|config| config.flutter_bin.as_deref());
-    let Some(flutter) = discover_flutter(override_bin) else {
+    let found = match resolve {
+        FlutterResolve::Shared => discover_flutter(override_bin),
+        // The pin is the face's own explicit step, ahead of the fvm
+        // chain — `find_tool_fvm` runs only when no pin answers; the
+        // canonicalize matches `discover_flutter`'s contract.
+        FlutterResolve::Fvm => override_bin
+            .and_then(|pin| discover_flutter(Some(pin)))
+            .or_else(|| {
+                dartq_toolchain::find_flutter_fvm()
+                    .map(|found| fs::canonicalize(&found).unwrap_or(found))
+            }),
+    };
+    let Some(flutter) = found else {
         let hint = if explicit {
             " — install Flutter, or point build_cache's `flutter` key or \
              DARTQ_FLUTTER at its binary"
